@@ -1,0 +1,43 @@
+<!doctype html>
+<!--
+  正交意图（维护于 2026-09-06 Asia/Shanghai）：
+    1. 文档骨架 + theme-color/favicon 携带图标色 #bd8600（非 CSS 品牌资产法则）
+    2. 无闪烁主题引导（首帧前同步内联，html.js 存活标记）
+  原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website。
+  logo 信源（Owner 2026-09-06）：opendweb-icon-direct.png（琥珀 hue 95）。
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#bd8600" />
+    <link rel="icon" type="image/png" sizes="1254x1254" href="%sveltekit.assets%/opendweb-icon.png" />
+    <link rel="apple-touch-icon" href="%sveltekit.assets%/opendweb-icon.png" />
+    <script>
+      (() => {
+        // 无闪烁主题引导 + JS 存活标记（reveal/card-grid 的隐藏态以 html.js 为门，
+        // 预渲染与无 JS 输出保持完全可见）。localStorage key "theme"：
+        // light | dark | system，与注册表 theme-toggle 的契约一致。
+        const root = document.documentElement;
+        root.classList.add("js");
+        const isTheme = (value) => value === "light" || value === "dark" || value === "system";
+        let theme = "system";
+        try {
+          const stored = window.localStorage.getItem("theme");
+          if (isTheme(stored)) theme = stored;
+        } catch {
+          theme = "system";
+        }
+        const prefersDark =
+          typeof window.matchMedia === "function" &&
+          window.matchMedia("(prefers-color-scheme: dark)").matches;
+        root.classList.toggle("dark", theme === "dark" || (theme === "system" && prefersDark));
+        root.style.colorScheme = root.classList.contains("dark") ? "dark" : "light";
+      })();
+    </script>
+    %sveltekit.head%
+  </head>
+  <body>
+    <div style="display: contents">%sveltekit.body%</div>
+  </body>
+</html>

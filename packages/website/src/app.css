@@ -1,0 +1,160 @@
+/* -------------------------------------------------------------------------
+ * dweb 站点样式入口（维护于 2026-09-06 Asia/Shanghai）。
+ *
+ * 共享设计语言 token 表由注册表安装为 src/lib/jixoai.css（registry item
+ * `jixoai-theme`，--brand-hue: 87，来源图标琥珀节点 #ffc52f）。0.3.0 版
+ * 注册表 sheet 已自带完整的 Tailwind token→utility 映射（popover/
+ * destructive/input/ring/radius/shadows 全部在内 —— unipty NOTES 记录的
+ * 留空坑在该版本已被上游修复），本文件只保留站点自身补充：
+ *   - base 层（body 字体/底色、focus-visible、selection、button cursor）
+ *   - 站点表面：readonly-code 代码面 + 微型构建期 tokenizer 色板、数据表
+ *
+ * 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website。
+ * ---------------------------------------------------------------------- */
+@import "tailwindcss";
+@import "./lib/jixoai.css";
+@plugin '@tailwindcss/typography';
+
+@layer base {
+  * {
+    @apply border-border;
+    corner-shape: bevel;
+    accent-color: var(--primary);
+  }
+  html {
+    scroll-behavior: smooth;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-mono);
+  }
+  .font-nav {
+    font-family: var(--font-nav);
+  }
+  button {
+    cursor: pointer;
+  }
+  :where(a, button):focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 30%, transparent);
+  }
+}
+
+/* 站点 token 补充：readonly-code 表面（注册表 sheet 未定义的站点级 token）。 */
+:root {
+  --readonly-code-bg: color-mix(in oklab, var(--muted) 42%, var(--background));
+  --readonly-code-border: color-mix(in oklab, var(--border) 18%, transparent);
+  --readonly-code-meta-bg: color-mix(in oklab, var(--accent) 12%, var(--background));
+  --readonly-code-meta-fg: color-mix(in oklab, var(--accent) 58%, var(--foreground));
+
+  /* 微型构建期 tokenizer 色板（无 mdsvex/shiki 的确定性替代，tech-stack
+   * 参考：小型站点可用消费相同主题 token 的确定性 tokenizer）。 */
+  --tok-comment: color-mix(in oklab, var(--foreground) 44%, transparent);
+  --tok-string: var(--accent);
+  --tok-keyword: var(--primary);
+  --tok-number: color-mix(in oklab, var(--secondary) 78%, var(--foreground));
+}
+.dark {
+  --readonly-code-bg: color-mix(in oklab, var(--muted) 78%, var(--background));
+  --readonly-code-border: color-mix(in oklab, var(--border) 18%, transparent);
+  --readonly-code-meta-bg: color-mix(in oklab, var(--accent) 18%, var(--background));
+  --readonly-code-meta-fg: color-mix(in oklab, var(--accent) 60%, oklch(1 0 0));
+
+  --tok-comment: color-mix(in oklab, var(--foreground) 55%, transparent);
+  --tok-string: var(--accent);
+  --tok-keyword: var(--primary);
+  --tok-number: var(--secondary);
+}
+
+/* -------------------------------------------------------------------------
+ * readonly-code 代码面（快速开始样例）。
+ * ---------------------------------------------------------------------- */
+.readonly-code {
+  background: var(--readonly-code-bg);
+  border: 1px solid var(--readonly-code-border);
+}
+.readonly-code pre {
+  margin: 0;
+  overflow-x: auto;
+  padding: 0.875rem;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+.readonly-code-meta {
+  background: var(--readonly-code-meta-bg);
+  border-bottom: 1px solid var(--readonly-code-border);
+  color: var(--readonly-code-meta-fg);
+  display: flex;
+  font-size: 11px;
+  gap: 0.5rem;
+  letter-spacing: 0.08em;
+  padding: 0.32rem 0.75rem;
+}
+.readonly-code-meta .prompt {
+  color: var(--primary);
+}
+.tok-comment {
+  color: var(--tok-comment);
+}
+.tok-string {
+  color: var(--tok-string);
+}
+.tok-keyword {
+  color: var(--tok-keyword);
+}
+.tok-number {
+  color: var(--tok-number);
+}
+
+/* -------------------------------------------------------------------------
+ * 数据表（npm 包清单）。
+ * ---------------------------------------------------------------------- */
+.table-scroll {
+  overflow-x: auto;
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.data-table th {
+  background: var(--muted);
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-weight: 600;
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+}
+.data-table td {
+  border: 1px solid color-mix(in oklab, var(--border) 32%, transparent);
+  padding: 0.45rem 0.6rem;
+  vertical-align: top;
+}
+.data-table td.dim {
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.data-table tbody tr {
+  transition: background-color 150ms ease-out;
+}
+.data-table tbody tr:hover {
+  background: color-mix(in oklab, var(--muted) 26%, transparent);
+}
+.data-table code {
+  color: var(--accent);
+}
+
+/* 减色动效：注册表 sheet 已中和 reveal/press；这里覆盖站点自身的过渡。 */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .data-table tbody tr {
+    transition: none;
+  }
+}

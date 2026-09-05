@@ -1,0 +1,27 @@
+{
+  "name": "dweb-website",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Private static official site for dweb (opendweb); consumes the jixoai design-language registry and deploys to GitHub Pages.",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev --port 13322",
+    "build": "vite build && node scripts/postbuild.mjs",
+    "preview": "vite preview --port 13322"
+  },
+  "devDependencies": {
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource/share-tech-mono": "^5.2.7",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.59.1",
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tailwindcss/typography": "^0.5.19",
+    "@tailwindcss/vite": "^4.2.1",
+    "clsx": "^2.1.1",
+    "svelte": "^5.55.5",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.2.1",
+    "vite": "^8.0.0"
+  }
+}

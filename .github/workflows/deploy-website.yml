@@ -1,0 +1,99 @@
+name: deploy-website
+
+# 官网站点交付（2026-09-06，openspec/changes/2026-09-06-add-website）：
+# push main + 手动触发 → 过滤安装 → 子路径模式构建（SITE_BASE=/dweb，DNS 由
+# Owner 管理前的事实）→ 静态检查 → GitHub Pages。与 ci/docker/release 三个
+# 既有 workflow 并行无冲突（不触碰 crates 与发布流水线）。
+# 自定义域切换：Owner 配好 DNS 后在 workflow_dispatch 输入或仓库变量中启用
+# SITE_CNAME=1 + SITE_URL=https://<domain>（构建写 CNAME 并切换为根路径服务）。
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      cname:
+        description: "Build in custom-domain mode (SITE_CNAME=1)"
+        required: false
+        type: boolean
+        default: false
+      site_url:
+        description: "Custom-domain origin for CNAME mode (e.g. https://dweb.example.com)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-website
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install the website toolchain (filtered)
+        run: pnpm install --frozen-lockfile --filter dweb-website...
+      - name: Resolve the serving mode
+        id: mode
+        run: |
+          if [ "${{ inputs.cname }}" = "true" ]; then
+            url="${{ inputs.site_url }}"
+            [ -z "$url" ] && { echo "cname=true requires site_url"; exit 1; }
+            echo "site_base=" >> "$GITHUB_OUTPUT"
+            echo "site_url=$url" >> "$GITHUB_OUTPUT"
+          else
+            echo "site_base=/dweb" >> "$GITHUB_OUTPUT"
+            echo "site_url=https://gaubee.github.io/dweb" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the static site (subpath mode until DNS exists)
+        env:
+          SITE_BASE: ${{ steps.mode.outputs.site_base }}
+          SITE_URL: ${{ steps.mode.outputs.site_url }}
+          SITE_CNAME: ${{ inputs.cname == true && '1' || '' }}
+        run: pnpm --filter dweb-website run build
+      - name: Static checks (artifact shape + relative assets + AI export)
+        run: |
+          set -eu
+          dist=packages/website/dist
+          test -f "$dist/index.html"
+          test -f "$dist/llms.txt"
+          test -f "$dist/llms-full.txt"
+          test -f "$dist/index.md"
+          # adapter-static 默认 paths.relative=true：产物引用 ./ 相对路径，
+          # 子路径 (/dweb/) 与域根都能原样服务 —— 逐一验证引用的资产真实存在。
+          missing=0
+          for ref in $(grep -o '[src|href]="\./[^"]*"' "$dist/index.html" | sed 's/.*"\.\(\/[^"]*\)"/\1/' | sort -u); do
+            test -e "$dist$ref" || { echo "missing asset: $ref"; missing=1; }
+          done
+          test "$missing" -eq 0
+          # AI 导出：绝对 URL 前缀随模式变化；CNAME 模式额外要求 CNAME 文件
+          if [ "${{ steps.mode.outputs.site_base }}" = "/dweb" ]; then
+            grep -q 'https://gaubee.github.io/dweb' "$dist/llms.txt"
+            test ! -e "$dist/CNAME"
+          else
+            test -f "$dist/CNAME"
+          fi
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: packages/website/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
