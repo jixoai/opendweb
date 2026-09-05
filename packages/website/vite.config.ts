@@ -12,7 +12,7 @@ import { llmsTxt } from "./src/vite-plugins/llms-txt.mjs";
 
 // 站点对外绝对地址：默认 GitHub Pages 子路径；CNAME 切换时由 SITE_URL 覆盖
 // （postbuild.mjs 用同一变量的 host 写 dist/CNAME，两个模式共用一个事实源）。
-const siteUrl = process.env.SITE_URL ?? "https://gaubee.github.io/dweb";
+const siteUrl = process.env.SITE_URL ?? "https://jixoai.github.io/opendweb";
 
 export default defineConfig({
   plugins: [

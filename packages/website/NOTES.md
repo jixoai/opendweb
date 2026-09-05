@@ -1,7 +1,7 @@
 # dweb Website Implementation Notes
 
 Private static official site for dweb (`dweb-website`), served from GitHub
-Pages at `gaubee.github.io/dweb` (subpath mode) until the Owner configures a
+Pages at `jixoai.github.io/opendweb` (subpath mode) until the Owner configures a
 custom domain. Bootstrapped from the official jixoai design-language registry
 (<https://ui.jixoai.com>) — hue 95, sourced from the Owner-designated logo
 `opendweb-icon-direct.png`'s amber node `rgb(253 211 9)` (oklch 95.3°;
@@ -85,18 +85,18 @@ them.
 
 | Mode | Env | base | CNAME |
 | ---- | --- | ---- | ----- |
-| subpath (default until DNS) | `SITE_BASE=/dweb` | `/dweb` | not written |
+| subpath (default until DNS) | `SITE_BASE=/opendweb` | `/opendweb` | not written |
 | custom domain (Owner) | `SITE_CNAME=1` + `SITE_URL=https://<domain>` | `""` | written from SITE_URL host |
 
 `SITE_URL` also feeds the llms-txt generator's absolute URLs (default
-`https://gaubee.github.io/dweb`). Internal links resolve through
+`https://jixoai.github.io/opendweb`). Internal links resolve through
 `$app/paths` `base` (never hardcoded prefixes); adapter-static's default
 `paths.relative` then emits `./`-relative asset URLs, so the same artifact
 shape serves from both the `/dweb/` subpath and a domain root.
 
 ## Verification record (2026-09-06)
 
-- `SITE_BASE=/dweb pnpm build` → dist + `[llms-txt] 1 pages → 3 files`.
+- `SITE_BASE=/opendweb pnpm build` → dist + `[llms-txt] 1 pages → 3 files`.
 - Double build: the AI export layer (`llms.txt` / `llms-full.txt` / `index.md`)
   is byte-identical across runs (the spec's determinism requirement).
   `index.html` itself differs run-to-run ONLY in rolldown content-hash chunk

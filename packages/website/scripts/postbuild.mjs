@@ -4,7 +4,7 @@
 //
 // 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website —
 // 自定义域 CNAME 由 Owner 管理并用构建开关门控，DNS 就绪前从
-// gaubee.github.io/dweb 子路径服务。两种模式的用法见 README.md。
+// jixoai.github.io/opendweb 子路径服务。两种模式的用法见 README.md。
 import { writeFileSync } from "node:fs";
 
 if (process.env.SITE_CNAME === "1") {

@@ -1,7 +1,7 @@
 name: deploy-website
 
 # 官网站点交付（2026-09-06，openspec/changes/2026-09-06-add-website）：
-# push main + 手动触发 → 过滤安装 → 子路径模式构建（SITE_BASE=/dweb，DNS 由
+# push main + 手动触发 → 过滤安装 → 子路径模式构建（SITE_BASE=/opendweb，DNS 由
 # Owner 管理前的事实）→ 静态检查 → GitHub Pages。与 ci/docker/release 三个
 # 既有 workflow 并行无冲突（不触碰 crates 与发布流水线）。
 # 自定义域切换：Owner 配好 DNS 后在 workflow_dispatch 输入或仓库变量中启用
@@ -53,7 +53,7 @@ jobs:
             echo "site_url=$url" >> "$GITHUB_OUTPUT"
           else
             echo "site_base=/dweb" >> "$GITHUB_OUTPUT"
-            echo "site_url=https://gaubee.github.io/dweb" >> "$GITHUB_OUTPUT"
+            echo "site_url=https://jixoai.github.io/opendweb" >> "$GITHUB_OUTPUT"
           fi
       - name: Build the static site (subpath mode until DNS exists)
         env:
@@ -77,8 +77,8 @@ jobs:
           done
           test "$missing" -eq 0
           # AI 导出：绝对 URL 前缀随模式变化；CNAME 模式额外要求 CNAME 文件
-          if [ "${{ steps.mode.outputs.site_base }}" = "/dweb" ]; then
-            grep -q 'https://gaubee.github.io/dweb' "$dist/llms.txt"
+          if [ "${{ steps.mode.outputs.site_base }}" = "/opendweb" ]; then
+            grep -q 'https://jixoai.github.io/opendweb' "$dist/llms.txt"
             test ! -e "$dist/CNAME"
           else
             test -f "$dist/CNAME"

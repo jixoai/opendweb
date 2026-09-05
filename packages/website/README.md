@@ -22,10 +22,10 @@ custom-domain serving from one build configuration. The deploy workflow
 
 | Mode | Env | Effect |
 | ---- | --- | ------ |
-| subpath | `SITE_BASE=/dweb` | `kit.paths.base = "/dweb"`; serves from `gaubee.github.io/dweb`; no CNAME file |
+| subpath | `SITE_BASE=/opendweb` | `kit.paths.base = "/opendweb"`; serves from `jixoai.github.io/opendweb`; no CNAME file |
 | custom domain | `SITE_CNAME=1` `SITE_URL=https://<domain>` | `kit.paths.base = ""`; postbuild writes `dist/CNAME` from the SITE_URL host; llms.txt absolute URLs follow SITE_URL |
 
-`SITE_URL` defaults to `https://gaubee.github.io/dweb` and feeds the llms-txt
+`SITE_URL` defaults to `https://jixoai.github.io/opendweb` and feeds the llms-txt
 generator. Internal links resolve through `$app/paths` `base` — never
 hardcoded prefixes.
 

@@ -4,13 +4,13 @@
 //   3. SITE_CNAME=1 门控的根路径模式（Owner 配置 DNS 后的自定义域切换）
 //
 // 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website —
-// 新增官网站点，gaubee.github.io/dweb 子路径部署起步，CNAME 由 Owner 管理并用
+// 新增官网站点，jixoai.github.io/opendweb 子路径部署起步，CNAME 由 Owner 管理并用
 // 构建开关门控（详见 packages/website/README.md 的两种构建模式）。
 import adapter from "@sveltejs/adapter-static";
 import { vitePreprocess } from "@sveltejs/vite-plugin-svelte";
 
 // 两种服务模式（proposal 决策，不引入更多开关）：
-//   默认（子路径）：SITE_BASE=/dweb → base "/dweb"，不写 CNAME 文件
+//   默认（子路径）：SITE_BASE=/opendweb → base "/opendweb"，不写 CNAME 文件
 //   CNAME 模式：SITE_CNAME=1 → base ""（域根服务），postbuild 写 dist/CNAME
 // base 必须是 "" 或以 "/" 开头的合法 kit.paths.base 值；非法值直接失败（宁可构建红）。
 const cnameMode = process.env.SITE_CNAME === "1";
