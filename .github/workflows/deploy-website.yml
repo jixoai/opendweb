@@ -52,7 +52,7 @@ jobs:
             echo "site_base=" >> "$GITHUB_OUTPUT"
             echo "site_url=$url" >> "$GITHUB_OUTPUT"
           else
-            echo "site_base=/dweb" >> "$GITHUB_OUTPUT"
+            echo "site_base=/opendweb" >> "$GITHUB_OUTPUT"
             echo "site_url=https://jixoai.github.io/opendweb" >> "$GITHUB_OUTPUT"
           fi
       - name: Build the static site (subpath mode until DNS exists)
@@ -70,7 +70,7 @@ jobs:
           test -f "$dist/llms-full.txt"
           test -f "$dist/index.md"
           # adapter-static 默认 paths.relative=true：产物引用 ./ 相对路径，
-          # 子路径 (/dweb/) 与域根都能原样服务 —— 逐一验证引用的资产真实存在。
+          # 子路径 (/opendweb/) 与域根都能原样服务 —— 逐一验证引用的资产真实存在。
           missing=0
           for ref in $(grep -o '[src|href]="\./[^"]*"' "$dist/index.html" | sed 's/.*"\.\(\/[^"]*\)"/\1/' | sort -u); do
             test -e "$dist$ref" || { echo "missing asset: $ref"; missing=1; }
