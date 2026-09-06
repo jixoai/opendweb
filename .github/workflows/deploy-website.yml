@@ -46,9 +46,9 @@ jobs:
       - name: Resolve the serving mode
         id: mode
         run: |
-          if [ "${{ inputs.cname }}" = "true" ]; then
+          if [ "${{ inputs.cname }}" != "false" ]; then
             url="${{ inputs.site_url }}"
-            [ -z "$url" ] && { echo "cname=true requires site_url"; exit 1; }
+            [ -z "$url" ] && url="https://opendweb.jixoai.com"
             echo "site_base=" >> "$GITHUB_OUTPUT"
             echo "site_url=$url" >> "$GITHUB_OUTPUT"
           else
@@ -69,16 +69,28 @@ jobs:
           test -f "$dist/llms.txt"
           test -f "$dist/llms-full.txt"
           test -f "$dist/index.md"
-          # adapter-static 默认 paths.relative=true：产物引用 ./ 相对路径，
-          # 子路径 (/opendweb/) 与域根都能原样服务 —— 逐一验证引用的资产真实存在。
+          # zh 镜像（2026-09-06 site-i18n-zh）：页面 + locale 级 llms 导出齐全
+          test -f "$dist/zh/index.html"
+          test -f "$dist/zh/llms.txt"
+          test -f "$dist/zh/index.md"
+          grep -q '<html lang="zh"' "$dist/zh/index.html"
+          grep -q '<html lang="en"' "$dist/index.html"
+          grep -q 'hreflang="x-default"' "$dist/zh/index.html"
+          # adapter-static 默认 paths.relative=true：产物引用 ./ 相对路径
+          # （子页 /zh/ 为 ../），子路径 (/opendweb/) 与域根都能原样服务 ——
+          # 逐一按页所在目录验证引用的资产真实存在。
           missing=0
-          for ref in $(grep -o '[src|href]="\./[^"]*"' "$dist/index.html" | sed 's/.*"\.\(\/[^"]*\)"/\1/' | sort -u); do
-            test -e "$dist$ref" || { echo "missing asset: $ref"; missing=1; }
+          for page in "$dist/index.html" "$dist/zh/index.html"; do
+            dir=$(dirname "$page")
+            for ref in $(grep -oE '(src|href)="\.\.?/[^"]*"' "$page" | sed -E 's/^(src|href)="([^"]*)"/\2/' | sort -u); do
+              test -e "$dir/$ref" || { echo "missing asset: $ref (from $page)"; missing=1; }
+            done
           done
           test "$missing" -eq 0
           # AI 导出：绝对 URL 前缀随模式变化；CNAME 模式额外要求 CNAME 文件
           if [ "${{ steps.mode.outputs.site_base }}" = "/opendweb" ]; then
             grep -q 'https://jixoai.github.io/opendweb' "$dist/llms.txt"
+            grep -q 'https://jixoai.github.io/opendweb/zh/llms.txt' "$dist/llms.txt"
             test ! -e "$dist/CNAME"
           else
             test -f "$dist/CNAME"

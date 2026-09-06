@@ -23,8 +23,9 @@ answered "y" safely (the hue always ends at 95).
 site items plus every closure item that landed on disk:
 
 - site: `scrollbar-measure`, `website-scaffold`, `terminal-header`,
-  `terminal-footer`, `theme-toggle`, `hero-section`, `section-card`,
-  `press-button`, `terminal-card`, `card-grid`, `llms-txt`
+  `terminal-footer`, `theme-toggle`, `language-switcher` (2026-09-06
+  site-i18n-zh), `hero-section`, `section-card`, `press-button`,
+  `terminal-card`, `card-grid`, `llms-txt`
 - closure: `jixoai-theme` (init), `utils`, `icons`, `defaults`, `density`,
   `paint`, `context-plugin`, `navigation-menu`, `popover`, `separator`, `figure`
 
@@ -78,8 +79,56 @@ them.
   sibling variant was removed once the Owner pinned `direct`; favicon is the
   PNG alone).
 - MPA view transitions (`view-transitions-toolkit` `useAutoTypes`) are not
-  wired: the site is a single page; the scaffold's cross-document choreography
-  has nothing to animate.
+  wired: the site is a single page per locale; the scaffold's cross-document
+  choreography has nothing to animate.
+
+## Site i18n — `/` = en, `/zh/` = zh mirror (2026-09-06 site-i18n-zh)
+
+- **Route model**: `/` stays English (stable URLs, per proposal decision);
+  `/zh/` is the Chinese mirror. The zh page overrides `trailingSlash` to
+  `"always"` (`src/routes/zh/+page.ts`) so its canonical URL is the directory
+  index — adapter-static writes `dist/zh/index.html` and static servers
+  (GitHub Pages, `python3 -m http.server`) answer `/zh/` with 200 directly.
+  The root layout's `"never"` keeps governing `/`. `svelte.config.js`
+  prerender entries are `["/", "/zh/"]` (crawl stays off).
+- **Content layer**: `src/lib/i18n/` — `schema.ts` (one `WebsiteContent`
+  contract), `locales/en.ts` (moved verbatim from the old `+page.svelte`;
+  the npm table stays single-sourced in `constants.ts`), `locales/zh.ts`
+  (copy sourced from README-zh.md, terms cross-checked against
+  EXAMPLE-zh.md — nothing invented). Both routes render the SAME
+  `src/lib/pages/home-page.svelte`; anchor ids (`#features` etc.) are
+  locale-invariant by schema.
+- **`<html lang>`**: app.html carries a `%lang%` placeholder replaced by
+  `src/hooks.server.ts` (`transformPageChunk`), the openspecui bilingual
+  pattern — the prerendered HTML is the truth, no JS patch. TRAP hit and
+  fixed: `String.replace` only replaces the FIRST occurrence, and the
+  app.html header comment originally spelled the placeholder literally, so
+  the comment ate the replacement and the real attribute kept `%lang%`.
+  The hook now uses `replaceAll` AND the comment never spells the token.
+- **canonical/hreflang** (en/zh/x-default, absolute): emitted from each
+  `+page.svelte` via `SITE_URL` from `src/lib/site-url.ts`, which reads the
+  `__SITE_URL__` vite `define` — same fact source (`SITE_URL` env, default
+  `https://jixoai.github.io/opendweb`) as the llms plugin and the CNAME
+  gate. hreflang uses `zh` (not `zh-CN`) per the change spec.
+- **Language switcher**: registry item `language-switcher` (0.3.0, `pair`
+  variant) wired into terminal-header's `switcher` slot beside the compact
+  ThemeToggle (`switcherFrame={false}`, one flex cluster — the openspecui
+  composition). Hrefs are `${base}/` and `${base}/zh/` plus the live
+  `location.hash` (tracked via `hashchange`) so switching preserves the
+  current anchor; SvelteKit's SSR link relativization renders them as
+  `./`/`../` forms, which resolve correctly from either page (verified by
+  HTTP spot checks of every emitted ref).
+- **llms export locale split**: vite `llmsTxt` config gained
+  `locale: { segments: ["zh"], default: "en" }` — en at root is the default
+  locale's index (unsegmented), zh gets `zh/llms.txt`, root `llms.txt` gains
+  an "Other languages" section, and `llms-full.txt` follows the default
+  locale only (a mixed-language dump defeats retrieval). Per-page `.md`
+  mirrors ship for both locales (`index.md`, `zh/index.md`).
+- **Kit drift note**: this repo's lockfile resolves `@sveltejs/kit` 2.70.3
+  (`^2.59.1`), while the openspecui reference runs a pinned 2.59.1 — the
+  `%lang%` hook pattern works on both, but template internals
+  (precompiled `templates.app`) differ; re-verify the lang replacement if
+  kit major-bumps again.
 
 ## Serving modes (one build, two targets)
 
@@ -96,17 +145,22 @@ shape serves from both the `/dweb/` subpath and a domain root.
 
 ## Verification record (2026-09-06)
 
-- `SITE_BASE=/opendweb pnpm build` → dist + `[llms-txt] 1 pages → 3 files`.
-- Double build: the AI export layer (`llms.txt` / `llms-full.txt` / `index.md`)
-  is byte-identical across runs (the spec's determinism requirement).
-  `index.html` itself differs run-to-run ONLY in rolldown content-hash chunk
-  filenames and the `__sveltekit_<hash>` variable name — SvelteKit/vite-8
-  artifact bytes are not fully reproducible; no build-time timestamp is
-  embedded in page content.
-- Preview server spot checks under the `/dweb/` mount: page, all CSS/JS
-  chunks, icon assets, and the three llms exports all return 200.
+- `SITE_BASE=/opendweb pnpm build` → dist + `[llms-txt] 2 pages → 5 files`
+  (en + zh mirrors; was `1 pages → 3 files` before the i18n change).
+- Double build: the AI export layer (`llms.txt` / `llms-full.txt` /
+  `index.md` / `zh/llms.txt` / `zh/index.md`) is byte-identical across runs
+  (the spec's determinism requirement). `index.html` itself differs
+  run-to-run ONLY in rolldown content-hash chunk filenames and the
+  `__sveltekit_<hash>` variable name — SvelteKit/vite-8 artifact bytes are
+  not fully reproducible; no build-time timestamp is embedded in page
+  content.
+- Static spot checks (`python3 -m http.server`, dist mounted as
+  `/opendweb/`): `/`, `/zh/`, both locale llms exports, icon, and EVERY
+  relative asset ref the zh page emits (`../_app/...` form) return 200;
+  `zh/index.html` ships `lang="zh"`, canonical `/zh/`, and the
+  en/zh/x-default hreflang set.
 - CNAME gate (standalone postbuild): off → no file; `SITE_CNAME=1` +
   `SITE_URL=https://<domain>` → `dist/CNAME` with the host; a github.io
   SITE_URL or a missing SITE_URL is a hard error.
 - `vite dev` serves on port 13322 (slow cold start on the network disk is
-  I/O, not configuration).
+  I/O, not configuration; sub-agents use their own port assignment).

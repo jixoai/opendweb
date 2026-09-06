@@ -7,8 +7,10 @@ export const SITE_TITLE = "dweb";
 export const SITE_DOMAIN = "github.com/Gaubee/dweb";
 export const SITE_SUBTITLE = "application-level networking";
 export const GITHUB_URL = "https://github.com/Gaubee/dweb";
+export const README_URL = "https://github.com/Gaubee/dweb/blob/main/README.md";
 export const README_ZH_URL = "https://github.com/Gaubee/dweb/blob/main/README-zh.md";
 export const EXAMPLE_URL = "https://github.com/Gaubee/dweb/blob/main/EXAMPLE.md";
+export const EXAMPLE_ZH_URL = "https://github.com/Gaubee/dweb/blob/main/EXAMPLE-zh.md";
 export const DOCKER_URL = "https://github.com/Gaubee/dweb/pkgs/container/dweb";
 
 /** README「Packages」表的站点呈现（npm 链接 + 角色，一字不虚）。 */

@@ -136,6 +136,13 @@
         "src/lib/surface-motion.ts": "67865ab34c210fb5f30f9128bb5940272dae067668d8cd86e96a757759694aa0",
         "src/lib/ui/popover/popover-defaults.svelte.ts": "9b7aeffabd4c2772b870744b8442fe9700493d26880718fb9515fe5d37e6ad97"
       }
+    },
+    "language-switcher": {
+      "files": {
+        "src/lib/ui/language-switcher/language-switcher.svelte": "84d4c5abcc24bade5bbecf88641f9dbf49734a65d36ca5522958a2a79ddd77dd",
+        "src/lib/ui/language-switcher/index.ts": "a72251a1cc444ccade54626ded0f285a41f208be2882c9b281fd4a03277e8038",
+        "src/lib/ui/language-switcher/language-switcher-defaults.svelte.ts": "3f7604ca149764ca5e0e84376d2d2b884f29b0acc7ff94078131bd40e0260f46"
+      }
     }
   }
 }

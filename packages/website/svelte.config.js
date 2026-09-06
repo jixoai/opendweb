@@ -26,9 +26,12 @@ const config = {
     adapter: adapter({ pages: "dist", assets: "dist", strict: true }),
     paths: { base: rawBase },
     prerender: {
-      // 单页落地页：显式 entry、不爬取（站内只有锚点与外部链接）。
+      // 单页落地页 × 两 locale：显式 entry、不爬取（站内只有锚点与外部链接）。
+      // `/zh/` 带尾斜杠 —— zh/+page.ts 的 trailingSlash "always" 产物是目录
+      // index（dist/zh/index.html），静态服务器对 /zh/ 直接 200。
+      // （2026-09-06 site-i18n-zh 增补 zh 镜像 entry。）
       crawl: false,
-      entries: ["/"],
+      entries: ["/", "/zh/"],
     },
     // trailingSlash 是页面级选项（+layout.ts 导出），不属于 kit 配置。
   },

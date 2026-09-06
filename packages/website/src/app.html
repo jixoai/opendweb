@@ -3,10 +3,15 @@
   正交意图（维护于 2026-09-06 Asia/Shanghai）：
     1. 文档骨架 + theme-color/favicon 携带图标色 #bd8600（非 CSS 品牌资产法则）
     2. 无闪烁主题引导（首帧前同步内联，html.js 存活标记）
-  原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website。
+    3. 根元素 lang 占位符由 hooks.server.ts 按 route（/zh 镜像 → zh，其余 → en）
+       在渲染期替换 —— 预渲染产物即带正确语言标记（SSG 真值，非 JS 补丁）。
+       注意：本注释绝不写该占位符的字面全文（hooks 用 replaceAll 兜底，但注释
+       字面量会污染输出注释本身）。
+  原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website；
+  lang 占位符为 2026-09-06 site-i18n-zh 增补。
   logo 信源（Owner 2026-09-06）：opendweb-icon-direct.png（琥珀 hue 95）。
 -->
-<html lang="en">
+<html lang="%lang%">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
