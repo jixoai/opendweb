@@ -11,6 +11,8 @@
   jixoai 家族一致的站点 chrome，仅 hue（95）与内容不同。
   2026-09-06 site-i18n-zh：nav/footer/aria 文案改由 locale 字典注入（`/` = en，
   `/zh/` = zh），锚点 id 两 locale 一致。
+  2026-09-06 locale-negotiation：显式切换写入 localStorage lang——app.html
+  首帧协商读它为最高优先级（显式选择永远压过浏览器语言检测）。
   站内链接法则：走 $app/paths 的 base（homeHref），绝不硬编码前缀。
 -->
 <script lang="ts">
@@ -72,6 +74,19 @@
     { code: 'en', label: 'EN', href: enHref },
     { code: 'zh', label: '中文', href: zhHref },
   ]);
+
+  // app.html 协商的持久化（委托挂在 bezel 包裹层——registry 切换器渲染的是
+  // 带 hreflang 的普通锚点，从锚点读目标 locale，registry 件零改动）。
+  const persistLocale = (event: MouseEvent) => {
+    const code = (event.target as HTMLElement | null)?.closest('a[hreflang]')?.getAttribute('hreflang');
+    if (code === 'en' || code === 'zh') {
+      try {
+        window.localStorage.setItem('lang', code);
+      } catch {
+        /* storage 不可用——导航本身照常进行 */
+      }
+    }
+  };
 </script>
 
 <AppShell>
@@ -98,7 +113,7 @@
         />
       {/snippet}
       {#snippet switcher()}
-        <div class="flex flex-wrap items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2" onclick={persistLocale}>
           <ThemeToggle variant="compact" />
           <LanguageSwitcher
             variant="pair"

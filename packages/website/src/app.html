@@ -7,6 +7,10 @@
        在渲染期替换 —— 预渲染产物即带正确语言标记（SSG 真值，非 JS 补丁）。
        注意：本注释绝不写该占位符的字面全文（hooks 用 replaceAll 兜底，但注释
        字面量会污染输出注释本身）。
+    4. 语言协商（2026-09-06 locale-negotiation 变更，首帧前同步执行）：zh 偏好
+       访问者落在默认（en）面时，同路径同 hash 一次性 replace 到 /zh/ 镜像；
+       显式选择（localStorage lang，切换器写入）优先于浏览器语言检测。检测只在
+       默认面发生，非默认面永不跳转（结构性防环：跳转目标必带 /zh/ 前缀）。
   原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website；
   lang 占位符为 2026-09-06 site-i18n-zh 增补。
   logo 信源（Owner 2026-09-06）：opendweb-icon-direct.png（琥珀 hue 95）。
@@ -18,6 +22,44 @@
     <meta name="theme-color" content="#bd8600" />
     <link rel="icon" type="image/png" sizes="1254x1254" href="%sveltekit.assets%/opendweb-icon.png" />
     <link rel="apple-touch-icon" href="%sveltekit.assets%/opendweb-icon.png" />
+    <script>
+      (() => {
+        // 语言协商，首帧前执行（openspec change 2026-09-06-locale-negotiation）：
+        // zh 偏好访问者落在默认（en）面时，同路径 + 同 hash 一次性 replace 到
+        // /zh/ 镜像（location.replace 不留历史）。优先级：显式选择
+        // （localStorage lang，根布局切换器写入）> navigator.languages 逐项取
+        // 主子标签的首个命中（zh-CN/zh-Hans → zh）。
+        // 结构性防环：脚本只从默认面跳走、目标必带 /zh/ 前缀（条件不再成立）、
+        // 绝无从 /zh/ 跳回。
+        const siteBase = '%site_base%'; // 构建期由 hooks.server.ts 按 kit.paths.base 同源 env 烘焙
+        const path = window.location.pathname;
+        const route =
+          siteBase !== '' && `${path}/`.startsWith(`${siteBase}/`)
+            ? path.slice(siteBase.length) || '/'
+            : path;
+        if (/^\/zh(?:\/|$)/.test(route)) return; // 已在 zh 面——永不跳转
+        const negotiate = () => {
+          try {
+            const stored = window.localStorage.getItem('lang');
+            if (stored === 'zh' || stored === 'en') return stored; // 显式选择永远压过检测
+          } catch {
+            /* storage 不可用 → 落入浏览器检测 */
+          }
+          const langs = navigator.languages ?? (navigator.language ? [navigator.language] : []);
+          for (const tag of langs) {
+            const primary = String(tag).split('-')[0].toLowerCase();
+            if (primary === 'zh') return 'zh';
+            if (primary === 'en') return 'en'; // 默认面已是 en——首个命中即定
+          }
+          return null;
+        };
+        if (negotiate() === 'zh') {
+          window.location.replace(
+            `${siteBase}/zh${route === '/' ? '/' : route}${window.location.hash}`,
+          );
+        }
+      })();
+    </script>
     <script>
       (() => {
         // 无闪烁主题引导 + JS 存活标记（reveal/card-grid 的隐藏态以 html.js 为门，

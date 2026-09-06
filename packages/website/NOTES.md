@@ -193,3 +193,37 @@ shape serves from both the `/dweb/` subpath and a domain root.
   lang/hreflang, relative-asset existence, llms absolute-URL prefixes,
   CNAME gate); the deploy workflow's static assertions grep URLs only, so
   no workflow changes were needed for the copy.
+
+## Locale negotiation (2026-09-06 locale-negotiation change)
+
+- Pre-paint bootstrap in `src/app.html` (inline, before first paint): a
+  zh-preferring visitor on the DEFAULT (en) surface is sent once to the
+  same page under `/zh/` (path + hash preserved) via `location.replace`
+  (no history entry). Precedence: explicit persisted choice
+  (localStorage `lang`) > first `navigator.languages` match on the
+  primary subtag (zh-CN/zh-Hans → zh; en-US wins the stay, so
+  `['en-US','zh-CN']` stays — first match wins).
+- **The law: detection only happens on the default-language surface; the
+  non-default surface never redirects.** Loop-proof by construction:
+  the script only redirects away from the default surface, the target
+  always carries the `/zh/` prefix (so the condition can never hold
+  again), and nothing ever redirects back from `/zh/`. Crawlers/no-JS
+  get the static default (hreflang carries the alternates).
+- Base-aware by baking: `hooks.server.ts` substitutes the serving-mode
+  base into the script from the SAME env law as `kit.paths.base` in
+  svelte.config.js (SITE_CNAME=1 → '', else SITE_BASE normalized) —
+  env parsing, NOT the `$app/paths` `base` the hook already imports for
+  lang detection, because that value is page-relative during
+  prerendering. Verified baked values in both modes' dist: `''`
+  (CNAME) and `'/opendweb'` (SITE_BASE=/opendweb).
+- Switcher persistence lives in the layout as a DELEGATED click handler
+  on the bezel wrapper (reads the clicked anchor's `hreflang`) — the
+  registry `language-switcher` item stays byte-identical to its lock.
+  An explicit click always beats detection afterwards.
+- Verification (playwright-core 1.63, machine-cached Chromium): 3-site
+  matrix × both serving modes — zh-CN → `/zh/` (hash preserved),
+  zh-Hans-CN primary-subtag hit, en-US stay, en-US-first list stay,
+  pt-BR-first list walk → `/zh/`, stored `zh` honored, stored `en` on
+  `/zh/` stays (no bounce), zh-CN on `/zh/` stays (loop law) — 16/16
+  per-mode cases + real-click switcher persistence all green; builds in
+  both modes PASS with no residual placeholders in dist.
