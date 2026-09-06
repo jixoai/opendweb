@@ -51,15 +51,17 @@ jobs:
             [ -z "$url" ] && url="https://opendweb.jixoai.com"
             echo "site_base=" >> "$GITHUB_OUTPUT"
             echo "site_url=$url" >> "$GITHUB_OUTPUT"
+            echo "cname=1" >> "$GITHUB_OUTPUT"
           else
             echo "site_base=/opendweb" >> "$GITHUB_OUTPUT"
             echo "site_url=https://jixoai.github.io/opendweb" >> "$GITHUB_OUTPUT"
+            echo "cname=" >> "$GITHUB_OUTPUT"
           fi
       - name: Build the static site (custom-domain mode by default)
         env:
           SITE_BASE: ${{ steps.mode.outputs.site_base }}
           SITE_URL: ${{ steps.mode.outputs.site_url }}
-          SITE_CNAME: ${{ inputs.cname != false && '1' || '' }}
+          SITE_CNAME: ${{ steps.mode.outputs.cname }}
         run: pnpm --filter dweb-website run build
       - name: Static checks (artifact shape + relative assets + AI export)
         run: |
