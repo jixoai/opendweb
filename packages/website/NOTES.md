@@ -216,10 +216,11 @@ shape serves from both the `/dweb/` subpath and a domain root.
   lang detection, because that value is page-relative during
   prerendering. Verified baked values in both modes' dist: `''`
   (CNAME) and `'/opendweb'` (SITE_BASE=/opendweb).
-- Switcher persistence lives in the layout as a DELEGATED click handler
-  on the bezel wrapper (reads the clicked anchor's `hreflang`) — the
-  registry `language-switcher` item stays byte-identical to its lock.
-  An explicit click always beats detection afterwards.
+- Switcher persistence moved INTO the registry `language-switcher`
+  (consumer-feedback-fixes P0-2, 2026-09-06 upgrade): the component's
+  own click handler writes localStorage `lang`, so the layout-level
+  DELEGATED click handler on the bezel wrapper was REMOVED. An explicit
+  click still always beats detection.
 - Verification (playwright-core 1.63, machine-cached Chromium): 3-site
   matrix × both serving modes — zh-CN → `/zh/` (hash preserved),
   zh-Hans-CN primary-subtag hit, en-US stay, en-US-first list stay,
@@ -227,3 +228,32 @@ shape serves from both the `/dweb/` subpath and a domain root.
   `/zh/` stays (no bounce), zh-CN on `/zh/` stays (loop law) — 16/16
   per-mode cases + real-click switcher persistence all green; builds in
   both modes PASS with no residual placeholders in dist.
+
+## Upstream consumer-feedback-fixes consumption (2026-09-06)
+
+- `npx jixoai-ui upgrade` (registry ui.jixoai.com, run with proxy env
+  unset): updated 8 / unchanged 52 / skipped 3. Updated:
+  `jixoai-theme`, `theme-toggle`, `hero-section`, `press-button`,
+  `llms-txt` (vite-plugins/llms-txt.mjs), `defaults`,
+  `context-plugin`, `language-switcher`. Lock 21 → 21; lock↔disk hash
+  verify 59/60 exact (the one divergence is `jixoai.css`: lock records
+  the pre-hue canonical hash by design, disk carries the re-applied
+  hue — verified `--brand-hue: 95`).
+- Hack removal: the `persistLocale` event-delegation hack in
+  `+layout.svelte` (bezel wrapper `onclick` reading `a[hreflang]`)
+  deleted — the upgraded registry switcher ships the persistence
+  contract itself (P0-2: click → `localStorage.lang`, try/catch
+  silent, pure anchor navigation). Header comment updated.
+- `theme-toggle` optional `labels` prop not consumed (`variant=
+  "compact"`, icon-only). `jixoai.css` comment-context fix consumed.
+- Verification: `pnpm install --frozen-lockfile --filter
+  dweb-website...` (no lockfile change); dual-mode builds PASS —
+  subpath (SITE_BASE=/opendweb SITE_URL=https://jixoai.github.io/
+  opendweb, CNAME gate off) + CNAME (SITE_CNAME=1
+  SITE_URL=https://opendweb.jixoai.com, dist/CNAME written); CI inline
+  static-check block re-run against the CNAME dist: ALL PASS.
+  Playwright headless against the CNAME dist served locally (the dev
+  server on the network volume stalls in uninterruptible IO — see
+  friction log): click 中文 → `lang=zh` + `/zh/`, reload stays zh
+  (`<html lang="zh">`), click EN → `lang=en` + `/`, reload stays en —
+  6/6 green.

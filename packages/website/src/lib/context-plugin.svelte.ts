@@ -136,7 +136,11 @@ const READ_ONLY: WeakSet<object> = new WeakSet();
  * def and its imports to be one object; the factory never copies).
  */
 export function defineContextDef<K extends string, T>(def: ContextDefInit<K, T>): ContextDef<K, T> {
-  (def as ContextDef<K, T>)[DEF_BRAND] = true;
+  // the brand stamps through a MUTABLE CARRIER cast (TS 5.9,
+  // consumer-feedback-fixes P1-4): assigning through the readonly
+  // branded interface itself is a compile error — the carrier shape
+  // writes the same field with identical runtime effect
+  (def as { [DEF_BRAND]?: true })[DEF_BRAND] = true;
   return Object.freeze(def) as ContextDef<K, T>;
 }
 
@@ -144,7 +148,8 @@ export function defineContextDef<K extends string, T>(def: ContextDefInit<K, T>)
 export function defineReadOnlyContextDef<K extends string, T>(
   def: ContextDefInit<K, T>,
 ): ReadOnlyContextDef<K, T> {
-  (def as ReadOnlyContextDef<K, T>).readOnly = true;
+  // same carrier-cast lane as the brand stamp above (TS 5.9)
+  (def as { readOnly?: true }).readOnly = true;
   READ_ONLY.add(def);
   return defineContextDef(def) as ReadOnlyContextDef<K, T>;
 }

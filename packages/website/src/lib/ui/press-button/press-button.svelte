@@ -321,11 +321,6 @@
   // same value as d.variant, named beside resolvedRaised for the
   // pose-vs-texture pairing
   const resolvedVariant = $derived(d.variant);
-  // the flat STAMP (Owner ruling 2026-09-04): the kernel's corner-tint
-  // border keys on it — the pressed face is one carved light model,
-  // not an inset beside a static frame. Same gate as the pose block
-  // (flat × non-link; link carries no jx-press at all)
-  const flat = $derived(!resolvedRaised && resolvedVariant !== 'link');
 
   // the zone texture context — same read-once pattern, its own key
   // (the joined ButtonGroup writes it flat — the cluster-shadow law,
@@ -336,6 +331,15 @@
   // adopts, never mints physics of its own
   const texture = getContext<PressTextureApi | undefined>(PRESS_TEXTURE_KEY);
   const resolvedRaised = $derived(raised ?? texture?.raised ?? true);
+
+  // the flat STAMP (Owner ruling, 2026-09-04): the kernel's corner-tint
+  // border keys on it — the pressed face is one carved light model,
+  // not an inset beside a static frame. Same gate as the pose block
+  // (flat × non-link; link carries no jx-press at all). Declared
+  // BELOW resolvedRaised on purpose: TS 5.9 flags the forward
+  // reference — $derived bodies evaluate lazily, so the reorder is
+  // semantics-neutral (consumer-feedback-fixes P1-4)
+  const flat = $derived(!resolvedRaised && resolvedVariant !== 'link');
 
   // ---- the one-shot success flash (the async idiom's second step) -----
   // ONE idiom, component-owned: flash() paints the ✓ glyph +
