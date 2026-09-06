@@ -73,7 +73,7 @@ them.
 - No `--radius-*: initial` reset supplement (unipty adds one): the 0.3.0 sheet
   ships without it and nothing on the site uses default `rounded-*` utilities
   beyond the law's rounded-full pills.
-- Logo (Owner decision 2026-09-06): `opendweb-icon-direct.png` is THE logo.
+- Logo (Owner decision 2026-09-07, superseding the 2026-09-06 direct PNG): `opendweb-icon.svg` is THE logo — the vector canon (four organic nodes + glass connector; amber `#fdd309` = oklch 95.3°, hue 95 unchanged). The 1254px transparent PNG is its Chromium render, kept for apple-touch-icon; the favicon prefers the SVG.
   It is promoted verbatim to `assets/opendweb-icon.png` and the site's
   `static/` (no SVG redraw — an earlier traced `opendweb-icon.svg` from a
   sibling variant was removed once the Owner pinned `direct`; favicon is the

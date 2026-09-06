@@ -13,13 +13,15 @@
        默认面发生，非默认面永不跳转（结构性防环：跳转目标必带 /zh/ 前缀）。
   原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website；
   lang 占位符为 2026-09-06 site-i18n-zh 增补。
-  logo 信源（Owner 2026-09-06）：opendweb-icon-direct.png（琥珀 hue 95）。
+  logo 信源（Owner 2026-09-07）：opendweb-icon.svg（矢量正典，四节点 + 玻璃连接形；
+  琥珀 #fdd309 = oklch 95.3°，hue 95 不变；PNG 为其 1254px 渲染，apple-touch 专用）。
 -->
 <html lang="%lang%">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#bd8600" />
+    <link rel="icon" type="image/svg+xml" href="%sveltekit.assets%/opendweb-icon.svg" />
     <link rel="icon" type="image/png" sizes="1254x1254" href="%sveltekit.assets%/opendweb-icon.png" />
     <link rel="apple-touch-icon" href="%sveltekit.assets%/opendweb-icon.png" />
     <script>

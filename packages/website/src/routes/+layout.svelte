@@ -91,9 +91,9 @@
       {/each}
       <NavigationMenuLink href={GITHUB_URL}>{content.chrome.githubLabel}</NavigationMenuLink>
       {#snippet logo()}
-        <!-- 官方图标（assets/opendweb-icon.png，Owner 指定 direct 变体） -->
+        <!-- 官方图标（assets/opendweb-icon.svg，Owner 2026-09-07 矢量正典） -->
         <img
-          src="{base}/opendweb-icon.png"
+          src="{base}/opendweb-icon.svg"
           alt=""
           class="h-6 w-6"
           loading="eager"
