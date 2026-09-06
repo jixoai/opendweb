@@ -10,6 +10,11 @@
  *   - 站点表面：readonly-code 代码面 + 微型构建期 tokenizer 色板、数据表
  *
  * 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website。
+ *
+ * 移动端打磨覆盖（2026-09-06 mobile-audit，P2）：对锁定 registry chrome
+ * （terminal-header / hero-section —— 文件按 jixoai-ui.lock 保持字节不变）
+ * 的呈现层 seam 覆盖，挂在组件自带的稳定钩子上；规则刻意 unlayered，
+ * 必须压过组件内的 utility cascade。见文末"移动端打磨覆盖"专节。
  * ---------------------------------------------------------------------- */
 @import "tailwindcss";
 @import "./lib/jixoai.css";
@@ -147,6 +152,50 @@
 }
 .data-table code {
   color: var(--accent);
+}
+
+/* -------------------------------------------------------------------------
+ * 移动端打磨覆盖（2026-09-06 mobile-audit，P2）—— 锁定 registry chrome 的
+ * 呈现层 seam：registry 文件保持字节不变（jixoai-ui.lock），每条规则都挂
+ * 在锁定组件已自带的稳定钩子上；刻意 unlayered —— 必须压过组件内部
+ * layered 的 utility cascade。
+ *
+ * 1. zh hero 标题：hero H1 以 `text-wrap: balance` 换行；CJK 文案里少数
+ *    ASCII 空格（英文词两侧）被 balancer 拉伸到 2-3 字宽，读起来像误伤
+ *    的两端对齐。zh 标题改为左对齐毛边换行；其它语言保持 balance 不变。
+ * 2. header 品牌副标题（domain 行）：<sm 堆叠层没有它的空间，registry
+ *    的 truncate seam 会把它截成 "jixo.…" —— 窄档只显示 wordmark，
+ *    sm+ 恢复完整品牌块。
+ * 3. 汉堡按钮热区：指针模态 chrome band 把按钮定在 32px（外框 38px）；
+ *    用一个不可见 ::after 把触达热区扩到 44px 触控下限，不改任何视觉。
+ * ---------------------------------------------------------------------- */
+:lang(zh) [data-jx-hero-title] {
+  text-align: left;
+  /* 用 `wrap` 而非 `normal` 是刻意的，两重原因：构建压缩器会把裸
+   * `text-wrap: normal` 当初始值剥掉；且 Chromium 145 会静默拒绝声明
+   * 里的 `normal` 关键字（2026-09-06 mobile-audit 实测：inline
+   * setProperty('text-wrap','normal','important') 被丢弃），其余关键字
+   * 全部接受。`wrap` 即普通换行的显式形式（mode: wrap, style: normal）
+   * —— 不做行宽平衡，CJK 里 ASCII 空格不再被拉开（含 web 字体未就绪
+   * 的 fallback 阶段，即审查报告拉伸出现的场景）。不认识 `wrap` 关键字
+   * 的老引擎忽略本声明、维持 utility 的 balance —— 无回归。
+   * !important 压过锁定组件 layered 的 text-balance utility。 */
+  text-wrap: wrap !important;
+}
+
+@media (max-width: 39.99rem) {
+  .jx-nav [data-jx-chrome] > a span.font-nav.truncate.text-sm {
+    display: none;
+  }
+}
+
+.jx-nav button[aria-label='Toggle navigation'] {
+  position: relative;
+}
+.jx-nav button[aria-label='Toggle navigation']::after {
+  content: '';
+  inset: -6px;
+  position: absolute;
 }
 
 /* 减色动效：注册表 sheet 已中和 reveal/press；这里覆盖站点自身的过渡。 */
