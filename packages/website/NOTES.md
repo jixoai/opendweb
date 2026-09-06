@@ -1,6 +1,8 @@
 # dweb Website Implementation Notes
 
-Private static official site for dweb (`dweb-website`), served from GitHub
+Private static official site for OpenDWeb (`opendweb-website`; repo renamed
+from Gaubee/dweb to jixoai/opendweb on 2026-09-07 — package name, filters and
+brand copy synchronized in the same rename pass), served from GitHub
 Pages at `jixoai.github.io/opendweb` (subpath mode) until the Owner configures a
 custom domain. Bootstrapped from the official jixoai design-language registry
 (<https://ui.jixoai.com>) — hue 95, sourced from the Owner-designated logo
@@ -247,7 +249,8 @@ shape serves from both the `/dweb/` subpath and a domain root.
 - `theme-toggle` optional `labels` prop not consumed (`variant=
   "compact"`, icon-only). `jixoai.css` comment-context fix consumed.
 - Verification: `pnpm install --frozen-lockfile --filter
-  dweb-website...` (no lockfile change); dual-mode builds PASS —
+  opendweb-website...` (no lockfile change; filter renamed with the package
+  on 2026-09-07); dual-mode builds PASS —
   subpath (SITE_BASE=/opendweb SITE_URL=https://jixoai.github.io/
   opendweb, CNAME gate off) + CNAME (SITE_CNAME=1
   SITE_URL=https://opendweb.jixoai.com, dist/CNAME written); CI inline

@@ -1,8 +1,10 @@
-# dweb
+# OpenDWeb
 
 [English](README.md)
 
-应用级组网平台（dweb-cloud）：让多设备应用组成逻辑网络（类似游戏房间，不是系统级 VPN），支持受控邀请他人加入；P2P 直连优先，回退到可自托管的 Relay。
+应用级组网平台（OpenDWeb-Cloud）：让多设备应用组成逻辑网络（类似游戏房间，不是系统级 VPN），支持受控邀请他人加入；P2P 直连优先，回退到可自托管的 Relay。
+
+> 2026-09-07 改名：仓库已迁移到 [jixoai/opendweb](https://github.com/jixoai/opendweb)（原 Gaubee/dweb），品牌词统一为 **OpenDWeb**。接口标识不变——`DWEB_*` 环境变量、`dweb1.` 邀请令牌前缀、`~/.dweb-*` 数据目录均继续可用。
 
 ```text
 身份层   Ed25519 EndpointId（稳定身份，与网络地址解耦；展示串 z-base-32）
@@ -23,7 +25,7 @@
 - `packages/opendweb` — `opendweb` CLI（server + marketplace/plugin/config 命令）
 - `packages/opendweb-config` — `@jixo/opendweb-config` 本地插件 helper（definePlugin）
 - `packages/opendweb-ext-cf` — `@jixo/opendweb-ext-cf` Cloudflare Tunnel 插件
-- `docker/` — 镜像 `ghcr.io/gaubee/dweb`（rendezvous 8787 + relay 3340）
+- `docker/` — 镜像 `ghcr.io/jixoai/opendweb`（rendezvous 8787 + relay 3340）
 
 ## 快速开始（体验 example）
 
@@ -31,7 +33,7 @@
 # 1. 启动自托管 server（gateway + relay）—— 顶层 CLI
 npx opendweb server
 #   仓库内开发: pnpm --filter opendweb exec node bin/opendweb.mjs server
-#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 #   横幅会列出本机全部 Network 地址——任一地址即客户端唯一配置入口，
 #   gateway 经 /services.json 自动发现 relay。
 
@@ -69,10 +71,12 @@ join 失败带稳定错误码（`error[join/<code>]`，如 `no-reachable-path` �
 ## 服务器部署（docker）
 
 ```bash
-docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 # 客户端配置单一入口（gateway 自动发现 relay）：
 #   config set relay http://<relay-host>:8787
 ```
+
+镜像已随仓库迁移到 `jixoai` 命名空间（2026-09-07 rename）；旧 `ghcr.io/gaubee/dweb` 路径的历史 tag 仍可拉取。
 
 不带 docker 时，`npx opendweb server` 运行同一二进制。server 选项：
 
@@ -81,8 +85,8 @@ npx opendweb server --gateway 0.0.0.0:9999  # 自定义端口（--opt=value 同�
 npx opendweb server --relay 0.0.0.0:3350    # 自定义 relay 端口
 npx opendweb server --no-relay              # 关闭 relay
 DWEB_TRUST_PROXY=1 npx opendweb server      # 反代 TLS 终结时采信 X-Forwarded-Proto
-npx opendweb server --public-gateway https://dweb.example.com \
-                    --public-relay   https://dweb.example.com   # 见下文公网公告
+npx opendweb server --public-gateway https://opendweb.example.com \
+                    --public-relay   https://opendweb.example.com   # 见下文公网公告
 ```
 
 gateway（8787）承载 `/healthz`、`/services.json`、`/rendezvous/{id}` 与 `/` 纯文本摘要；
@@ -101,7 +105,7 @@ curl http://localhost:8787/services.json  # -> 机器可读服务清单
 | `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay 监听 |
 | `DWEB_RELAY_ENABLED` | `true` | `false`/`0`/`off` 关闭 relay |
 | `DWEB_TRUST_PROXY` | 未设 | 反代 TLS 终结时设 `1` 才采信 `X-Forwarded-Proto` |
-| `DWEB_PUBLIC_GATEWAY_URL` | 未设 | 反代/隧道后的公网 gateway 入口（如 `https://dweb.example.com`）；设置后 services.json/横幅按条目公告该值 |
+| `DWEB_PUBLIC_GATEWAY_URL` | 未设 | 反代/隧道后的公网 gateway 入口（如 `https://opendweb.example.com`）；设置后 services.json/横幅按条目公告该值 |
 | `DWEB_PUBLIC_RELAY_URL` | 未设 | 公网 relay 入口；与 gateway 覆盖相互独立（flag `--public-gateway`/`--public-relay` 同义） |
 
 优先级 `flag > env > default`；非法公网 URL 启动即硬错误。
@@ -124,11 +128,11 @@ Cloudflare Tunnel 参考（免费版即可；域名需托管在 CF）：
 # Public Hostname 按单域名路径分流：/relay*、/ping* -> http://dweb:3340，
 # 其余 -> http://dweb:8787（iroh 客户端自行拼 /relay 路径，单域名即可工作）
 cd docker && TUNNEL_TOKEN=... \
-  DWEB_PUBLIC_GATEWAY_URL=https://dweb.example.com \
-  DWEB_PUBLIC_RELAY_URL=https://dweb.example.com \
+  DWEB_PUBLIC_GATEWAY_URL=https://opendweb.example.com \
+  DWEB_PUBLIC_RELAY_URL=https://opendweb.example.com \
   docker compose up -d
 # 不发布任何宿主端口（纯隧道暴露）；客户端（任意网络）：
-#   config set relay https://dweb.example.com
+#   config set relay https://opendweb.example.com
 ```
 
 直连打洞不经过隧道（iroh QUIC peer↔peer）；隧道只承载 rendezvous/services.json
@@ -149,9 +153,9 @@ plugin add|get`。
 opendweb plugin add cf          # 安装进当前项目（探测包管理器），锁定 name@version
 opendweb cf setup               # 交互引导（终端）：逐项询问 token/hostname/mode，
                                 # 预览计划后 apply / dry-run / abort 三选一
-opendweb cf setup --hostname dweb.example.com   # 非交互：API 推 ingress、路由 DNS、
+opendweb cf setup --hostname opendweb.example.com   # 非交互：API 推 ingress、路由 DNS、
                                                 # 写 opendweb.config.toml、端到端自检
-opendweb cf plan --hostname dweb.example.com    # 零副作用预览（setup 亦有 --dry-run）
+opendweb cf plan --hostname opendweb.example.com    # 零副作用预览（setup 亦有 --dry-run）
 opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # 追加候选 globs（仅 npm:）
 ```
 
@@ -165,8 +169,8 @@ opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # 追加候选 globs�
 configVersion = 1
 
 [server]
-publicGatewayUrl = "https://dweb.example.com"
-publicRelayUrl = "https://relay.dweb.example.com"
+publicGatewayUrl = "https://opendweb.example.com"
+publicRelayUrl = "https://relay.opendweb.example.com"
 
 [[plugins]]
 name = "cf"                      # npm 插件（marketplace 解析）；选项是数据
@@ -283,4 +287,4 @@ pnpm --filter @jixo/opendweb-example test        # node --test（双进程 relay
 
 ## 许可证
 
-MIT OR Apache-2.0。仓库：<https://github.com/Gaubee/dweb>。
+MIT OR Apache-2.0。仓库：<https://github.com/jixoai/opendweb>。

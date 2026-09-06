@@ -1,6 +1,6 @@
-# dweb Example — End-to-End Testing Guide
+# OpenDWeb Example — End-to-End Testing Guide
 
-This guide walks you through testing dweb's published npm packages end to end. Follow it after every release to verify the full stack.
+This guide walks you through testing OpenDWeb's published npm packages end to end. Follow it after every release to verify the full stack.
 
 **Current version: v0.3.1** | [中文版](EXAMPLE-zh.md)
 

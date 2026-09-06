@@ -1,5 +1,6 @@
 /* -------------------------------------------------------------------------
- * dweb 站点样式入口（维护于 2026-09-06 Asia/Shanghai）。
+ * OpenDWeb 站点样式入口（维护于 2026-09-06 Asia/Shanghai；2026-09-07 rename
+ * 展示层去 dweb 化，品牌词 dweb → OpenDWeb）。
  *
  * 共享设计语言 token 表由注册表安装为 src/lib/jixoai.css（registry item
  * `jixoai-theme`，--brand-hue: 87，来源图标琥珀节点 #ffc52f）。0.3.0 版

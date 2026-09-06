@@ -1,5 +1,5 @@
 {
-  "name": "dweb-monorepo",
+  "name": "opendweb-monorepo",
   "private": true,
   "version": "0.3.2",
   "packageManager": "pnpm@10.0.0",
@@ -9,6 +9,6 @@
     "typecheck": "pnpm -r --if-present run typecheck",
     "build:rs": "cargo build --workspace --release",
     "test:rs": "cargo test --workspace",
-    "example": "pnpm --filter @dweb/example start"
+    "example": "pnpm --filter @jixo/opendweb-example start"
   }
 }

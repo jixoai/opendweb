@@ -210,9 +210,11 @@ jobs:
     permissions:
       contents: write # 创建 Release（发布 job 仍只需 read）
     env:
-      # 镜像历史命名空间：repo 由 Gaubee/dweb 改名 jixoai/opendweb 前的全部
-      # tag 都在 gaubee 名下（已实证 0.4.2/1.0.1-cli/1.0.3-cf/latest 均 200）；
-      # 改名后 docker.yml（IMAGE_NAME=github.repository）新构建落 jixoai 名下。
+      # 镜像命名空间（2026-09-07 rename 同步）：新构建发布到 jixoai 名下
+      # （docker.yml 的 IMAGE_NAME=github.repository 动态解析）；repo 由
+      # Gaubee/dweb 改名前的全部 tag 都在 gaubee 名下（已实证
+      # 0.4.2/1.0.1-cli/1.0.3-cf/latest 均 200），notes 里作为迁移说明引用。
+      DOCKER_IMAGE: ghcr.io/jixoai/opendweb
       DOCKER_IMAGE_LEGACY: ghcr.io/gaubee/dweb
     steps:
       - uses: actions/checkout@v4
@@ -293,10 +295,10 @@ jobs:
             echo "## Docker"
             echo
             echo '```bash'
-            echo "docker run -d -p 8787:8787 -p 3340:3340 ${DOCKER_IMAGE_LEGACY}:${VER}"
+            echo "docker run -d -p 8787:8787 -p 3340:3340 ${DOCKER_IMAGE}:${VER}"
             echo '```'
             echo
-            echo "Images for every tag built before the repo rename live under \`${DOCKER_IMAGE_LEGACY}\`; builds after the rename publish under \`ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')\`."
+            echo "Images for every tag built before the repo rename live under \`${DOCKER_IMAGE_LEGACY}\` (historical tags remain pullable); current builds publish under \`${DOCKER_IMAGE}\`."
           } > /tmp/notes.md
           cat /tmp/notes.md
       - name: Create the GitHub Release (idempotent)

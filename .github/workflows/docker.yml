@@ -1,5 +1,10 @@
 name: docker
 
+# 2026-09-07 rename（展示层去 dweb 化，Owner 指令）：镜像路径随仓库改名
+# jixoai/opendweb —— IMAGE_NAME=github.repository 动态解析，无需硬编码；
+# 改名后的新构建发布到 ghcr.io/jixoai/opendweb，改名前的历史 tag 仍在
+# ghcr.io/gaubee/dweb（只读可用）。
+
 on:
   push:
     branches: [main]

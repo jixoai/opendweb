@@ -1,4 +1,4 @@
-# dweb Example 测试手册
+# OpenDWeb Example 测试手册
 
 [English version](EXAMPLE.md)
 

@@ -15,6 +15,9 @@
   （consumer-feedback-fixes P0-2，upgrade 消费）：组件点击自写 localStorage
   lang——app.html 首帧协商读它为最高优先级（显式选择永远压过浏览器语言检测）。
   站内链接法则：走 $app/paths 的 base（homeHref），绝不硬编码前缀。
+  2026-09-07 rename（展示层去 dweb 化，Owner 指令）：header 品牌词
+  OpenDWeb（CSS uppercase 呈现为 OPENDWEB）、footer 幽灵字标 OPENDWEB、
+  版权行 jixoai/opendweb、deploy 链接 ghcr.io/jixoai/opendweb。
 -->
 <script lang="ts">
   import '../app.css';
@@ -80,7 +83,7 @@
 <AppShell>
   {#snippet header()}
     <TerminalHeader
-      brand="dweb"
+      brand="OpenDWeb"
       domain={SITE_DOMAIN}
       subtitle={content.chrome.subtitle}
       homeHref={home}
@@ -135,7 +138,7 @@
   {@render children()}
 
   {#snippet footer()}
-    <TerminalFooter ghost="DWEB" copyright="MIT OR Apache-2.0 · Gaubee/dweb">
+    <TerminalFooter ghost="OPENDWEB" copyright="MIT OR Apache-2.0 · jixoai/opendweb">
       <TerminalFooterColumn title="project">
         <a href={GITHUB_URL}>GitHub</a>
         <a href={locale === 'zh' ? README_URL : README_ZH_URL}>{content.chrome.readmeLabel}</a>
@@ -149,7 +152,7 @@
         {/each}
       </TerminalFooterColumn>
       <TerminalFooterColumn title="deploy">
-        <a href={DOCKER_URL}>ghcr.io/gaubee/dweb</a>
+        <a href={DOCKER_URL}>ghcr.io/jixoai/opendweb</a>
       </TerminalFooterColumn>
     </TerminalFooter>
   {/snippet}

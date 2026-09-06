@@ -1,8 +1,8 @@
 {
-  "name": "dweb-website",
+  "name": "opendweb-website",
   "version": "0.0.0",
   "private": true,
-  "description": "Private static official site for dweb (opendweb); consumes the jixoai design-language registry and deploys to GitHub Pages.",
+  "description": "Private static official site for OpenDWeb (repo jixoai/opendweb); consumes the jixoai design-language registry and deploys to GitHub Pages.",
   "license": "MIT OR Apache-2.0",
   "type": "module",
   "scripts": {

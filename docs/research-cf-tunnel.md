@@ -64,7 +64,7 @@
 
 ### L0 — 部署物（零代码，可立即做）
 
-`docker/compose.yaml`：`ghcr.io/gaubee/dweb` + `cloudflare/cloudflared` sidecar（`TUNNEL_TOKEN` 注入，public hostname 在面板配）。裸机替代：launchd/systemd 分别拉起 `opendweb server` 与 `cloudflared tunnel run`。
+`docker/compose.yaml`：`ghcr.io/jixoai/opendweb`（2026-09-07 rename：镜像路径随仓库迁移 jixoai 命名空间，历史 tag 仍在 `ghcr.io/gaubee/dweb`）+ `cloudflare/cloudflared` sidecar（`TUNNEL_TOKEN` 注入，public hostname 在面板配）。裸机替代：launchd/systemd 分别拉起 `opendweb server` 与 `cloudflared tunnel run`。
 
 得益于 F4+F5，**今天就能跑通**：客户端 `config set relay https://relay.dweb.example.com` → 404 → legacy 模式直连 relay。（gateway 的 services.json 公告 URL 是错的，见 F6，所以 gateway-first 流程暂不可用。）
 

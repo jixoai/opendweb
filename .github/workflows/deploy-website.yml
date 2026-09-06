@@ -6,6 +6,8 @@ name: deploy-website
 # 既有 workflow 并行无冲突（不触碰 crates 与发布流水线）。
 # 自定义域切换：Owner 配好 DNS 后在 workflow_dispatch 输入或仓库变量中启用
 # SITE_CNAME=1 + SITE_URL=https://<domain>（构建写 CNAME 并切换为根路径服务）。
+# 2026-09-07 rename（展示层去 dweb 化，Owner 指令）：包名 dweb-website →
+# opendweb-website，--filter 引用同步；占位域名示例改 opendweb.example.com。
 
 on:
   push:
@@ -18,7 +20,7 @@ on:
         type: boolean
         default: false
       site_url:
-        description: "Custom-domain origin for CNAME mode (e.g. https://dweb.example.com)"
+        description: "Custom-domain origin for CNAME mode (e.g. https://opendweb.example.com)"
         required: false
         type: string
 
@@ -42,7 +44,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - name: Install the website toolchain (filtered)
-        run: pnpm install --frozen-lockfile --filter dweb-website...
+        run: pnpm install --frozen-lockfile --filter opendweb-website...
       - name: Resolve the serving mode
         id: mode
         run: |
@@ -62,7 +64,7 @@ jobs:
           SITE_BASE: ${{ steps.mode.outputs.site_base }}
           SITE_URL: ${{ steps.mode.outputs.site_url }}
           SITE_CNAME: ${{ steps.mode.outputs.cname }}
-        run: pnpm --filter dweb-website run build
+        run: pnpm --filter opendweb-website run build
       - name: Static checks (artifact shape + relative assets + AI export)
         run: |
           set -eu

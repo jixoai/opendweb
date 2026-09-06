@@ -3,15 +3,18 @@
 //
 // 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website —
 // 内容全部取自仓库 README.md / README-zh.md，不虚构。
-export const SITE_TITLE = "dweb";
-export const SITE_DOMAIN = "github.com/Gaubee/dweb";
+// 2026-09-07 rename：展示层去 dweb 化（Owner 指令，GitHub 仓库已改名
+// jixoai/opendweb）——品牌词 OpenDWeb，外部链接/容器包页全部指向
+// jixoai/opendweb 命名空间（ghcr 包页为 jixoai/opendweb/pkgs/container/opendweb）。
+export const SITE_TITLE = "OpenDWeb";
+export const SITE_DOMAIN = "github.com/jixoai/opendweb";
 export const SITE_SUBTITLE = "application-level networking";
-export const GITHUB_URL = "https://github.com/Gaubee/dweb";
-export const README_URL = "https://github.com/Gaubee/dweb/blob/main/README.md";
-export const README_ZH_URL = "https://github.com/Gaubee/dweb/blob/main/README-zh.md";
-export const EXAMPLE_URL = "https://github.com/Gaubee/dweb/blob/main/EXAMPLE.md";
-export const EXAMPLE_ZH_URL = "https://github.com/Gaubee/dweb/blob/main/EXAMPLE-zh.md";
-export const DOCKER_URL = "https://github.com/Gaubee/dweb/pkgs/container/dweb";
+export const GITHUB_URL = "https://github.com/jixoai/opendweb";
+export const README_URL = "https://github.com/jixoai/opendweb/blob/main/README.md";
+export const README_ZH_URL = "https://github.com/jixoai/opendweb/blob/main/README-zh.md";
+export const EXAMPLE_URL = "https://github.com/jixoai/opendweb/blob/main/EXAMPLE.md";
+export const EXAMPLE_ZH_URL = "https://github.com/jixoai/opendweb/blob/main/EXAMPLE-zh.md";
+export const DOCKER_URL = "https://github.com/jixoai/opendweb/pkgs/container/opendweb";
 
 /** README「Packages」表的站点呈现（npm 链接 + 角色，一字不虚）。 */
 export const NPM_PACKAGES: readonly { pkg: string; role: string }[] = [

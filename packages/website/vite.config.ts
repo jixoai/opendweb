@@ -9,6 +9,8 @@
 // AI 导出层随构建产出 llms.txt / llms-full.txt / 每页 .md 镜像，绝对 URL。
 // 2026-09-06 site-i18n-zh：llms locale 分段（zh/ 镜像独立 zh/llms.txt，根
 // index 追加 Other languages 段）+ define 注入站点绝对地址。
+// 2026-09-07 rename（展示层去 dweb 化，Owner 指令）：llms 标题品牌词
+// dweb → OpenDWeb。
 import { sveltekit } from "@sveltejs/kit/vite";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
@@ -25,7 +27,7 @@ export default defineConfig({
     llmsTxt({
       distDir: "dist",
       siteUrl,
-      title: "dweb",
+      title: "OpenDWeb",
       summary:
         "Application-level networking platform: multi-device apps form logical networks (game rooms, not system VPNs) with Ed25519 identity, signed-fact rosters, invite-gated membership, and iroh/QUIC direct connections with self-hosted relay fallback.",
       // en 在根（`/` = en 页，非跳板），zh 镜像在 /zh/：根 index 归 default

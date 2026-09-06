@@ -7,13 +7,18 @@
 // 2026-09-06-release-automation-and-copy —— 升级为意图叙事：问题先行（逻辑
 // 网络 ≠ 系统 VPN）→ 三层模型（identity/roster/session）→ 证据（邀请流、
 // relay 回退、插件生态、Node SDK）；版本号为 npm 实测，与 en 同步 bump。
+// 2026-09-07 rename（展示层去 dweb 化，Owner 指令）：品牌词 dweb → OpenDWeb；
+// docker 镜像引用 ghcr.io/gaubee/dweb → ghcr.io/jixoai/opendweb（ghcr 包随
+// 仓库迁移命名空间）；占位域名 dweb.example.com → opendweb.example.com。
+// 保留的技术标识（产品接口面，不在本次改名范围）：DWEB_* 环境变量、
+// dweb1./dwebkey1. 令牌前缀、~/.dweb-a/b 示例数据目录。
 import type { WebsiteContent } from '$lib/i18n/schema';
 
 export const zh: WebsiteContent = {
   meta: {
-    siteTitle: 'dweb · 应用级组网平台',
+    siteTitle: 'OpenDWeb · 应用级组网平台',
     description:
-      '多设备应用需要的是逻辑网络，而不是系统级 VPN：dweb 给应用游戏房间般的语义——受控邀请的成员制、稳定的 Ed25519 身份、签名事实名册，以及带自托管 relay 回退的 iroh/QUIC 直连。',
+      '多设备应用需要的是逻辑网络，而不是系统级 VPN：OpenDWeb 给应用游戏房间般的语义——受控邀请的成员制、稳定的 Ed25519 身份、签名事实名册，以及带自托管 relay 回退的 iroh/QUIC 直连。',
   },
   chrome: {
     subtitle: '应用级组网',
@@ -30,7 +35,7 @@ export const zh: WebsiteContent = {
     exampleLabel: 'EXAMPLE（中文）',
   },
   hero: {
-    eyebrow: 'dweb · 应用级组网',
+    eyebrow: 'OpenDWeb · 应用级组网',
     titleLead: '多设备应用需要的是',
     titleEm: '逻辑网络',
     titleTail: ' —— 类似游戏房间，不是系统级 VPN。',
@@ -41,7 +46,7 @@ export const zh: WebsiteContent = {
       'MIT OR Apache-2.0',
     ],
     summary:
-      '设备在网络间漂移、地址常变；应用真正缺的是一个「房间」——一个属于自己的逻辑网络：凭邀请加入、身份稳定、能直连。dweb 在应用层组成这样的逻辑网络：Ed25519 EndpointId 承载身份，签名事实名册承载成员，iroh/QUIC 直连优先、自托管 relay 回退——无需把整台机器拖进系统级 VPN。',
+      '设备在网络间漂移、地址常变；应用真正缺的是一个「房间」——一个属于自己的逻辑网络：凭邀请加入、身份稳定、能直连。OpenDWeb 在应用层组成这样的逻辑网络：Ed25519 EndpointId 承载身份，签名事实名册承载成员，iroh/QUIC 直连优先、自托管 relay 回退——无需把整台机器拖进系统级 VPN。',
     quickStartLabel: '快速开始',
     barTitle: 'opendweb — server',
     command: 'npx opendweb server',
@@ -88,7 +93,7 @@ export const zh: WebsiteContent = {
       id: 'server',
       eyebrow: '交付 · 自托管',
       title: '一行命令 server',
-      summary: '控制平面自己托管：npx opendweb server 或 docker ghcr.io/gaubee/dweb —— gateway 8787 + relay 3340。',
+      summary: '控制平面自己托管：npx opendweb server 或 docker ghcr.io/jixoai/opendweb —— gateway 8787 + relay 3340。',
     },
     {
       id: 'plugins',
@@ -111,7 +116,7 @@ export const zh: WebsiteContent = {
     scriptMeta: 'quick-start.sh',
     script: `# 1. 启动自托管 server（gateway + relay）—— 顶层 CLI
 npx opendweb server
-#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   也可用 docker: docker run -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 #   横幅会列出本机全部 Network 地址——任一地址即客户端唯一配置入口，
 #   gateway 经 /services.json 自动发现 relay。
 
@@ -137,7 +142,7 @@ npx @jixo/opendweb-example chat --data ~/.dweb-b`,
   relay        3340   enabled`,
     note: [
       { t: 'text', v: '不用 npx 自托管：' },
-      { t: 'link', v: 'docker ghcr.io/gaubee/dweb', kind: 'docker' },
+      { t: 'link', v: 'docker ghcr.io/jixoai/opendweb', kind: 'docker' },
       { t: 'text', v: '。反代或隧道后面，设置 ' },
       { t: 'code', v: 'DWEB_PUBLIC_GATEWAY_URL / DWEB_PUBLIC_RELAY_URL' },
       { t: 'text', v: ' —— 厂商中立的方案见 README。' },
@@ -185,10 +190,10 @@ npx @jixo/opendweb-example chat --data ~/.dweb-b`,
     pluginLabel: '插件 —— Cloudflare Tunnel',
     pluginMeta: 'opendweb — cf 插件',
     pluginSample: `opendweb plugin add cf          # 安装进当前项目（探测包管理器），锁定 name@version
-opendweb cf setup --hostname dweb.example.com
+opendweb cf setup --hostname opendweb.example.com
                                  # API 推 ingress、路由 DNS、
                                  # 写 opendweb.config.toml、端到端自检
-opendweb cf plan --hostname dweb.example.com    # 零副作用预览`,
+opendweb cf plan --hostname opendweb.example.com    # 零副作用预览`,
     sdkLabel: 'Node SDK —— 应用内嵌 fabric',
     sdkMeta: 'sdk.cjs',
     sdkSample: `const { Fabric } = require("@jixo/opendweb-client-sdk");

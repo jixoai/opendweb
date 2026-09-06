@@ -1,8 +1,10 @@
-# dweb
+# OpenDWeb
 
 [中文版](README-zh.md)
 
-Application-level networking platform (dweb-cloud): lets multi-device applications form logical networks — like game rooms, not a system-level VPN — with controlled, invite-based membership. Peers connect directly over QUIC when possible and fall back to a self-hostable relay.
+Application-level networking platform (OpenDWeb-Cloud): lets multi-device applications form logical networks — like game rooms, not a system-level VPN — with controlled, invite-based membership. Peers connect directly over QUIC when possible and fall back to a self-hostable relay.
+
+> 2026-09-07 rename: the repository moved to [jixoai/opendweb](https://github.com/jixoai/opendweb) (formerly Gaubee/dweb); the brand is now **OpenDWeb**. Interface identifiers are unchanged — `DWEB_*` env vars, the `dweb1.` invite-token prefix, and `~/.dweb-*` data dirs keep working.
 
 ```text
 Identity  Ed25519 EndpointId (stable identity, decoupled from network
@@ -29,7 +31,9 @@ Sync      opaque envelopes, bidirectional send/receive (Automerge
 | [`@jixo/opendweb-config`](https://www.npmjs.com/package/@jixo/opendweb-config) | `definePlugin` helper for local plugin files (runtime-agnostic: deno / bun / node) |
 | [`@jixo/opendweb-ext-cf`](https://www.npmjs.com/package/@jixo/opendweb-ext-cf) | Cloudflare Tunnel plugin: ingress push via API, DNS routing, end-to-end verification, optional cloudflared co-spawn |
 
-All packages are published at v0.2.1. Server deployments on other platforms can use the docker image `ghcr.io/gaubee/dweb`.
+All packages are published at v0.2.1. Server deployments on other platforms can use the docker image `ghcr.io/jixoai/opendweb`.
+
+> The docker image moved to the `jixoai` namespace with the repository rename; historical tags under the old `ghcr.io/gaubee/dweb` path remain pullable.
 
 ## Repository layout
 
@@ -41,14 +45,14 @@ All packages are published at v0.2.1. Server deployments on other platforms can 
 - `packages/opendweb` — the `opendweb` CLI (server + marketplace/plugin/config commands)
 - `packages/opendweb-config` — `@jixo/opendweb-config` local plugin helper
 - `packages/opendweb-ext-cf` — `@jixo/opendweb-ext-cf` Cloudflare Tunnel plugin
-- `docker/` — image `ghcr.io/gaubee/dweb` (rendezvous 8787 + relay 3340)
+- `docker/` — image `ghcr.io/jixoai/opendweb` (rendezvous 8787 + relay 3340)
 
 ## Quick start
 
 ```bash
 # 1. Start the self-hosted server (gateway + relay) — top-level CLI
 npx opendweb server
-#   or: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   or: docker run -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 #   The banner lists every Network address. Any of them is the single
 #   config entry for clients — the gateway discovers the relay URL
 #   automatically via /services.json.
@@ -95,7 +99,7 @@ Join failures carry stable error codes (`error[join/<code>]`): e.g. `NO_REACHABL
 ## Self-hosting the server
 
 ```bash
-docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+docker run -d -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 # Clients configure the single entry point (the gateway discovers the relay):
 #   config set relay http://<relay-host>:8787
 ```
@@ -107,8 +111,8 @@ npx opendweb server --gateway 0.0.0.0:9999  # custom gateway port (--opt=value a
 npx opendweb server --relay 0.0.0.0:3350    # custom relay port
 npx opendweb server --no-relay              # relay off
 DWEB_TRUST_PROXY=1 npx opendweb server      # behind a TLS-terminating reverse proxy
-npx opendweb server --public-gateway https://dweb.example.com \
-                    --public-relay   https://dweb.example.com   # see below
+npx opendweb server --public-gateway https://opendweb.example.com \
+                    --public-relay   https://opendweb.example.com   # see below
 ```
 
 The gateway (port 8787) serves `/healthz`, `/services.json`, `/rendezvous/{id}` and a plain-text summary at `/`; the relay (port 3340) is a separate listener. Verify a running server with:
@@ -126,7 +130,7 @@ curl http://localhost:8787/services.json  # -> machine-readable service manifest
 | `DWEB_RELAY_HTTP_BIND` | `0.0.0.0:3340` | relay listen address |
 | `DWEB_RELAY_ENABLED` | `true` | set to `false`/`0`/`off` to disable the relay |
 | `DWEB_TRUST_PROXY` | unset | set `1` behind a TLS-terminating reverse proxy to honor `X-Forwarded-Proto` |
-| `DWEB_PUBLIC_GATEWAY_URL` | unset | public gateway entry behind a reverse proxy/tunnel (e.g. `https://dweb.example.com`); when set, services.json and the banner advertise this value for the entry |
+| `DWEB_PUBLIC_GATEWAY_URL` | unset | public gateway entry behind a reverse proxy/tunnel (e.g. `https://opendweb.example.com`); when set, services.json and the banner advertise this value for the entry |
 | `DWEB_PUBLIC_RELAY_URL` | unset | public relay entry; independent of the gateway override (flags `--public-gateway`/`--public-relay` are equivalent) |
 
 Precedence is `flag > env > default`. Invalid public URLs are hard errors at startup.
@@ -150,11 +154,11 @@ Cloudflare Tunnel reference (free tier works; the domain must be hosted on CF):
 # everything else -> http://dweb:8787 (iroh clients build the /relay path themselves,
 # so a single domain is enough)
 cd docker && TUNNEL_TOKEN=... \
-  DWEB_PUBLIC_GATEWAY_URL=https://dweb.example.com \
-  DWEB_PUBLIC_RELAY_URL=https://dweb.example.com \
+  DWEB_PUBLIC_GATEWAY_URL=https://opendweb.example.com \
+  DWEB_PUBLIC_RELAY_URL=https://opendweb.example.com \
   docker compose up -d
 # No host ports are published (tunnel-only exposure). Clients (from any network):
-#   config set relay https://dweb.example.com
+#   config set relay https://opendweb.example.com
 ```
 
 Direct hole-punching never goes through the tunnel (iroh QUIC peer-to-peer); the tunnel only carries the short rendezvous/services.json requests and relay fallback traffic (WS — iroh's 15s pings keep it alive through CF's 100s idle timeout). Field research and risks (measured mainland-China latency, ToS boundaries): `docs/research-cf-tunnel.md`.
@@ -167,9 +171,9 @@ Vendor and workflow integrations are plugins — the CLI core stays vendor-neutr
 opendweb plugin add cf          # install into the current project (detected pm), lock name@version
 opendweb cf setup               # interactive wizard (terminal): asks for token/hostname/mode,
                                 # previews the plan, then apply / dry-run / abort
-opendweb cf setup --hostname dweb.example.com   # non-interactive: push ingress via CF API, route DNS,
+opendweb cf setup --hostname opendweb.example.com   # non-interactive: push ingress via CF API, route DNS,
                                                 # write opendweb.config.toml, verify end-to-end
-opendweb cf plan --hostname dweb.example.com    # zero-side-effect preview (also --dry-run on setup)
+opendweb cf plan --hostname opendweb.example.com    # zero-side-effect preview (also --dry-run on setup)
 opendweb marketplace add "npm:@your-org/opendweb-ext-*"   # more candidate globs (npm: only)
 ```
 
@@ -181,8 +185,8 @@ The orchestration layer is pure data (TOML preferred, JSON accepted — one sche
 configVersion = 1
 
 [server]
-publicGatewayUrl = "https://dweb.example.com"
-publicRelayUrl = "https://relay.dweb.example.com"
+publicGatewayUrl = "https://opendweb.example.com"
+publicRelayUrl = "https://relay.opendweb.example.com"
 
 [[plugins]]
 name = "cf"                      # npm plugin (marketplace-resolved); options are data
@@ -283,4 +287,4 @@ pnpm --filter @jixo/opendweb-example test           # node --test (two-process r
 
 ## License
 
-MIT OR Apache-2.0. Repository: <https://github.com/Gaubee/dweb>.
+MIT OR Apache-2.0. Repository: <https://github.com/jixoai/opendweb>.

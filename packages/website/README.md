@@ -1,6 +1,7 @@
-# dweb website
+# opendweb website
 
-Private static official site for [dweb](https://github.com/Gaubee/dweb),
+Private static official site for [OpenDWeb](https://github.com/jixoai/opendweb)
+(repo renamed from Gaubee/dweb on 2026-09-07),
 rendered in the shared jixoai identity (brand hue 95 — the logo's amber node)
 and consumed from the official design-language registry at
 <https://ui.jixoai.com>. Zero runtime dependencies; the devDependencies are
@@ -9,9 +10,9 @@ the site toolchain only. Implementation notes: [NOTES.md](./NOTES.md).
 ## Commands
 
 ```bash
-pnpm --filter dweb-website run dev      # vite dev on port 13322
-pnpm --filter dweb-website run build    # vite build + CNAME gate postbuild
-pnpm --filter dweb-website run preview  # vite preview on port 13322
+pnpm --filter opendweb-website run dev      # vite dev on port 13322
+pnpm --filter opendweb-website run build    # vite build + CNAME gate postbuild
+pnpm --filter opendweb-website run preview  # vite preview on port 13322
 ```
 
 ## Serving modes

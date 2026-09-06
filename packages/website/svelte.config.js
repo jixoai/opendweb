@@ -1,6 +1,7 @@
 // 正交意图（维护于 2026-09-06 Asia/Shanghai）：
 //   1. adapter-static 严格静态产物（dist/，无服务端运行时）
-//   2. SITE_BASE 环境变量 → kit.paths.base（GitHub Pages 子路径 /dweb 起步）
+//   2. SITE_BASE 环境变量 → kit.paths.base（GitHub Pages 子路径起步；仓库
+//      已改名 jixoai/opendweb，子路径为 /opendweb —— 2026-09-07 rename）
 //   3. SITE_CNAME=1 门控的根路径模式（Owner 配置 DNS 后的自定义域切换）
 //
 // 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website —

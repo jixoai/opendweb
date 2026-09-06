@@ -7,14 +7,19 @@
 // （逻辑网络 ≠ 系统 VPN）→ 三层模型（identity/roster/session）→ 证据（邀请
 // 流、relay 回退、插件生态、Node SDK）。事实源 README.md / EXAMPLE.md；
 // 版本号为 npm 实测（发布时随 NOTES.md 的维护规则同步 bump）。
+// 2026-09-07 rename（展示层去 dweb 化，Owner 指令）：品牌词 dweb → OpenDWeb；
+// docker 镜像引用 ghcr.io/gaubee/dweb → ghcr.io/jixoai/opendweb（ghcr 包随
+// 仓库迁移命名空间）；占位域名 dweb.example.com → opendweb.example.com。
+// 保留的技术标识（产品接口面，不在本次改名范围）：DWEB_* 环境变量、
+// dweb1./dwebkey1. 令牌前缀、~/.dweb-a/b 示例数据目录。
 import { NPM_PACKAGES } from '$lib/constants';
 import type { WebsiteContent } from '$lib/i18n/schema';
 
 export const en: WebsiteContent = {
   meta: {
-    siteTitle: 'dweb · application-level networking platform',
+    siteTitle: 'OpenDWeb · application-level networking platform',
     description:
-      'Multi-device apps need logical networks, not a system VPN: dweb gives applications game-room semantics — invite-based membership, stable Ed25519 identity, signed-fact rosters, and iroh/QUIC direct connections with self-hosted relay fallback.',
+      'Multi-device apps need logical networks, not a system VPN: OpenDWeb gives applications game-room semantics — invite-based membership, stable Ed25519 identity, signed-fact rosters, and iroh/QUIC direct connections with self-hosted relay fallback.',
   },
   chrome: {
     subtitle: 'application-level networking',
@@ -31,7 +36,7 @@ export const en: WebsiteContent = {
     exampleLabel: 'EXAMPLE.md',
   },
   hero: {
-    eyebrow: 'dweb · application-level networking',
+    eyebrow: 'OpenDWeb · application-level networking',
     titleLead: 'Multi-device apps need ',
     titleEm: 'logical networks',
     titleTail: ' — game rooms, not system VPNs.',
@@ -42,7 +47,7 @@ export const en: WebsiteContent = {
       'MIT OR Apache-2.0',
     ],
     summary:
-      'Devices drift across networks and addresses; what an app lacks is a room — a logical network it owns, joined by invitation, with stable identity and direct connections. dweb forms that logical network at the application level: Ed25519 EndpointId for identity, signed-fact rosters for membership, iroh/QUIC direct connections with a self-hostable relay as fallback — no system-level VPN dragging the whole machine in.',
+      'Devices drift across networks and addresses; what an app lacks is a room — a logical network it owns, joined by invitation, with stable identity and direct connections. OpenDWeb forms that logical network at the application level: Ed25519 EndpointId for identity, signed-fact rosters for membership, iroh/QUIC direct connections with a self-hostable relay as fallback — no system-level VPN dragging the whole machine in.',
     quickStartLabel: 'Quick start',
     barTitle: 'opendweb — server',
     command: 'npx opendweb server',
@@ -95,7 +100,7 @@ export const en: WebsiteContent = {
       eyebrow: 'Delivery · Self-hosting',
       title: 'One-liner server',
       summary:
-        'The control plane is yours to host: npx opendweb server or docker ghcr.io/gaubee/dweb — gateway 8787 + relay 3340.',
+        'The control plane is yours to host: npx opendweb server or docker ghcr.io/jixoai/opendweb — gateway 8787 + relay 3340.',
     },
     {
       id: 'plugins',
@@ -120,7 +125,7 @@ export const en: WebsiteContent = {
     scriptMeta: 'quick-start.sh',
     script: `# 1. Start the self-hosted server (gateway + relay) — top-level CLI
 npx opendweb server
-#   or: docker run -p 8787:8787 -p 3340:3340 ghcr.io/gaubee/dweb
+#   or: docker run -p 8787:8787 -p 3340:3340 ghcr.io/jixoai/opendweb
 #   The banner lists every Network address. Any of them is the single
 #   config entry for clients — the gateway discovers the relay URL
 #   automatically via /services.json.
@@ -147,7 +152,7 @@ npx @jixo/opendweb-example chat --data ~/.dweb-b`,
   relay        3340   enabled`,
     note: [
       { t: 'text', v: 'Self-host without npx: ' },
-      { t: 'link', v: 'docker ghcr.io/gaubee/dweb', kind: 'docker' },
+      { t: 'link', v: 'docker ghcr.io/jixoai/opendweb', kind: 'docker' },
       { t: 'text', v: '. Behind a reverse proxy or tunnel, set ' },
       { t: 'code', v: 'DWEB_PUBLIC_GATEWAY_URL / DWEB_PUBLIC_RELAY_URL' },
       { t: 'text', v: ' — see the README for the vendor-neutral recipe.' },
@@ -170,10 +175,10 @@ npx @jixo/opendweb-example chat --data ~/.dweb-b`,
     pluginLabel: 'Plugin — Cloudflare Tunnel',
     pluginMeta: 'opendweb — cf plugin',
     pluginSample: `opendweb plugin add cf            # install (detected pm), lock name@version
-opendweb cf setup --hostname dweb.example.com
+opendweb cf setup --hostname opendweb.example.com
                                   # push ingress via CF API, route DNS,
                                   # write opendweb.config.toml, verify end-to-end
-opendweb cf plan --hostname dweb.example.com   # zero-side-effect preview`,
+opendweb cf plan --hostname opendweb.example.com   # zero-side-effect preview`,
     sdkLabel: 'Node SDK — fabric in your app',
     sdkMeta: 'sdk.cjs',
     sdkSample: `const { Fabric } = require("@jixo/opendweb-client-sdk");
