@@ -1,9 +1,12 @@
-// 正交意图（维护于 2026-09-06 Asia/Shanghai）：英文文案字典 —— 自
-// routes/+page.svelte 原地迁入（一字不改），`/` 页与 layout chrome 的内容源。
+// 正交意图（维护于 2026-09-06 Asia/Shanghai）：英文文案字典 —— `/` 页与
+// layout chrome 的内容源（2026-09-06-add-website 自 +page.svelte 迁入；
+// site-i18n-zh 起作为 en locale，URL 稳定在 `/`）。
 //
-// 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/2026-09-06-add-website —
-// 内容全部来自 README.md 定位，不虚构声明；2026-09-06-site-i18n-zh 起
-// 作为 en locale 字典（URL 稳定在 `/`）。
+// 原始需求（2026-09-06 Asia/Shanghai）：openspec/changes/
+// 2026-09-06-release-automation-and-copy —— 文案升级为意图叙事：问题先行
+// （逻辑网络 ≠ 系统 VPN）→ 三层模型（identity/roster/session）→ 证据（邀请
+// 流、relay 回退、插件生态、Node SDK）。事实源 README.md / EXAMPLE.md；
+// 版本号为 npm 实测（发布时随 NOTES.md 的维护规则同步 bump）。
 import { NPM_PACKAGES } from '$lib/constants';
 import type { WebsiteContent } from '$lib/i18n/schema';
 
@@ -11,7 +14,7 @@ export const en: WebsiteContent = {
   meta: {
     siteTitle: 'dweb · application-level networking platform',
     description:
-      'dweb lets multi-device applications form logical networks — like game rooms, not a system-level VPN — with controlled, invite-based membership, Ed25519 identity, signed-fact rosters, and iroh/QUIC direct connections with self-hosted relay fallback.',
+      'Multi-device apps need logical networks, not a system VPN: dweb gives applications game-room semantics — invite-based membership, stable Ed25519 identity, signed-fact rosters, and iroh/QUIC direct connections with self-hosted relay fallback.',
   },
   chrome: {
     subtitle: 'application-level networking',
@@ -29,7 +32,7 @@ export const en: WebsiteContent = {
   },
   hero: {
     eyebrow: 'dweb · application-level networking',
-    titleLead: 'Application-level ',
+    titleLead: 'Multi-device apps need ',
     titleEm: 'logical networks',
     titleTail: ' — game rooms, not system VPNs.',
     badges: [
@@ -39,74 +42,74 @@ export const en: WebsiteContent = {
       'MIT OR Apache-2.0',
     ],
     summary:
-      'Multi-device applications form logical networks — like game rooms, not a system-level VPN — with controlled, invite-based membership. Peers connect directly over QUIC when possible and fall back to a self-hostable relay.',
+      'Devices drift across networks and addresses; what an app lacks is a room — a logical network it owns, joined by invitation, with stable identity and direct connections. dweb forms that logical network at the application level: Ed25519 EndpointId for identity, signed-fact rosters for membership, iroh/QUIC direct connections with a self-hostable relay as fallback — no system-level VPN dragging the whole machine in.',
     quickStartLabel: 'Quick start',
     barTitle: 'opendweb — server',
     command: 'npx opendweb server',
     outputs: [
-      '* opendweb server v0.2.1',
+      '* opendweb server v0.4.2',
       '> Local:   http://localhost:8787',
       '> Network: http://192.168.1.100:8787',
       'gateway 8787 · rendezvous 8787 · relay 3340',
     ],
   },
-  featuresHeading: "What's inside",
+  featuresHeading: 'The three-layer answer, then delivery',
   features: [
     {
       id: 'identity',
-      eyebrow: 'Identity',
+      eyebrow: 'Layer 1 · Identity',
       title: 'Ed25519 EndpointId',
       summary:
-        'Stable identity decoupled from network addresses; z-base-32 display form.',
+        'Addresses change as devices move; members should not. Stable identity decoupled from network addresses — z-base-32 display form, the same node across address changes.',
     },
     {
       id: 'roster',
-      eyebrow: 'Roster',
+      eyebrow: 'Layer 2 · Roster',
       title: 'Signed facts, converged by union-merge',
       summary:
-        'Genesis/Grant/Join/Revoke facts are content-addressed (BLAKE3) and converge by union-merge.',
+        'Membership verifiable without a central database: Genesis/Grant/Join/Revoke facts are signed, content-addressed (BLAKE3), and converge by union-merge.',
     },
     {
       id: 'invites',
-      eyebrow: 'Membership',
+      eyebrow: 'Layer 2 · Membership',
       title: 'Controlled, invite-based joins',
       summary:
-        'Issuer-online single redemption: challenge-response PoP plus invite_id CAS consumption.',
+        'A room is only a room if joining is by invitation. Issuer-online single redemption: challenge-response PoP plus invite_id CAS consumption — each token redeemed exactly once.',
     },
     {
       id: 'session',
-      eyebrow: 'Session',
+      eyebrow: 'Layer 3 · Session',
       title: 'iroh 1.1: QUIC direct + relay fallback',
       summary:
-        'Direct connections with NAT traversal; falls back to a self-hostable relay. Gating on both sides — gate before data.',
+        'Members talk directly whenever the network allows. QUIC direct with NAT traversal; falls back to a self-hostable relay. Gating on both sides — gate before data; per-frame resource caps.',
     },
     {
       id: 'sync',
-      eyebrow: 'Sync',
+      eyebrow: 'Payload',
       title: 'Opaque envelopes, bidirectional',
       summary:
-        'Send/receive opaque envelopes both ways; an Automerge adapter is planned as a separate change.',
+        'The fabric does not dictate your data model. Send/receive opaque envelopes both ways; an Automerge adapter is planned as a separate change.',
     },
     {
       id: 'server',
-      eyebrow: 'Self-hosting',
+      eyebrow: 'Delivery · Self-hosting',
       title: 'One-liner server',
       summary:
-        'npx opendweb server or docker ghcr.io/gaubee/dweb — gateway 8787 + relay 3340.',
+        'The control plane is yours to host: npx opendweb server or docker ghcr.io/gaubee/dweb — gateway 8787 + relay 3340.',
     },
     {
       id: 'plugins',
-      eyebrow: 'Plugins',
+      eyebrow: 'Delivery · Plugins',
       title: 'Marketplace, vendor-neutral core',
       summary:
-        'Any non-builtin first token dispatches adaptively; missing plugins fetch on first use. Cloudflare Tunnel ships as a plugin.',
+        'Vendor integrations are opt-in, not baked in. Any non-builtin first token dispatches adaptively; missing plugins fetch on first use. Cloudflare Tunnel ships as a plugin.',
     },
     {
       id: 'sdk',
-      eyebrow: 'SDK',
+      eyebrow: 'Delivery · SDK',
       title: 'Node SDK (napi-rs)',
       summary:
-        '@jixo/opendweb-client-sdk embeds fabrics in your own app (darwin-arm64 / win32-x64).',
+        'Embed the fabric instead of shelling out: @jixo/opendweb-client-sdk embeds fabrics in your own app (darwin-arm64 / win32-x64).',
     },
   ],
   quickStart: {
@@ -134,7 +137,7 @@ npx @jixo/opendweb-example chat --data ~/.dweb-a
 npx @jixo/opendweb-example join --data ~/.dweb-b <token>
 npx @jixo/opendweb-example chat --data ~/.dweb-b`,
     bannerMeta: 'expected server banner',
-    banner: `* opendweb server v0.2.1
+    banner: `* opendweb server v0.4.2
 > Local:   http://localhost:8787
 > Network: http://192.168.1.100:8787
 
@@ -154,7 +157,7 @@ npx @jixo/opendweb-example chat --data ~/.dweb-b`,
     eyebrow: 'Packages',
     title: 'One CLI, one server binary, one SDK — all published',
     summary:
-      'All packages are published at v0.2.1. The server CLI is the marketplace host; plugins and the Node SDK extend the same fabric.',
+      'Current published line: opendweb 0.4.2 · client-sdk / server-binary / example 0.3.2 · ext-cf 1.0.3 · config 0.1.0. The server CLI is the marketplace host; plugins and the Node SDK extend the same fabric.',
     pkgHeader: 'npm package',
     roleHeader: 'Role',
     rows: NPM_PACKAGES,

@@ -164,3 +164,32 @@ shape serves from both the `/dweb/` subpath and a domain root.
   SITE_URL or a missing SITE_URL is a hard error.
 - `vite dev` serves on port 13322 (slow cold start on the network disk is
   I/O, not configuration; sub-agents use their own port assignment).
+
+## Copy upgrade — purpose-led narrative (2026-09-06 release-automation-and-copy)
+
+- **Narrative structure** (both locales, schema unchanged): hero now leads
+  with the problem — multi-device apps need *logical networks* (game-room
+  semantics: invite-based membership, stable identity, direct connections),
+  not a system-level VPN — then names the three-layer answer (badges +
+  Layer 1/2/3 feature eyebrows: EndpointId / Roster+Membership / Session),
+  with delivery surfaces (Payload / Self-hosting / Plugins / SDK) as
+  `Delivery ·` cards. Every feature summary is motivation-first; all facts
+  traceable to README.md / EXAMPLE.md, nothing invented.
+- **Version facts are npm-truth, not tag-truth**: the v0.4.2 tag carries
+  `opendweb` 0.4.1 in-tree (0.4.2 actually shipped from the `v1.0.1-cli`
+  tag), so the site's version line was written from `npm view` results
+  (opendweb 0.4.2 · client-sdk / server-binary / example 0.3.2 · ext-cf
+  1.0.3 · config 0.1.0), and the sample server banners were bumped
+  v0.2.1 → v0.4.2. **Maintenance rule: bump the four version mentions
+  (both locales' `packages.summary` + `hero.outputs`/`quickStart.banner`)
+  at every release** — they are prose-embedded by design (no build-time
+  injection), so NOTES records them as the release checklist item.
+- **en/zh isomorphism** is proven at runtime (vite build does not
+  typecheck): esbuild-bundle both locale files with
+  `--alias:$lib=src/lib`, then deep-diff the key shape — ids
+  (`features[].id`, `chrome.anchors[].id`) must match exactly (they drive
+  the language-switcher anchor preservation).
+- Both serving modes rebuilt green after the rewrite (artifact shape,
+  lang/hreflang, relative-asset existence, llms absolute-URL prefixes,
+  CNAME gate); the deploy workflow's static assertions grep URLs only, so
+  no workflow changes were needed for the copy.

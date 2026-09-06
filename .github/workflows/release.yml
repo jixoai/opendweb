@@ -1,9 +1,27 @@
+# 正交意图（维护于 2026-09-06 Asia/Shanghai，openspec/changes/
+# 2026-09-06-release-automation-and-copy）：
+#   1. tag v* → mingw 交叉编译新鲜 Windows 产物（exe + napi dll）
+#   2. tag v* → npm 发布（OIDC trusted publishing；单包 patch skip 守卫）
+#   3. npm 发布成功 → 自动创建同名 GitHub Release（L1：jixoai.com 读
+#      latest release 显示版本号；notes=按包提炼 + 版本表 + 升级行 + docker 引用）
+#   4. workflow_dispatch release_current=true → 「补切当前版本 Release」引导
+#      模式（跳过构建与发布，仅解析 tag → 生成 notes → 创建 Release）
 name: release
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      release_current:
+        description: "Bootstrap mode: cut the GitHub Release for the current version (no build, no publish — notes only)"
+        required: false
+        type: boolean
+        default: false
+      tag:
+        description: "Bootstrap target tag (default: v<packages/opendweb version>; must already exist)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -11,7 +29,9 @@ permissions:
 
 jobs:
   build-windows:
-    # tag push 时 mingw 交叉编译出新鲜 Windows 产物，替代 in-repo 手动提交的旧文件
+    # tag push 时 mingw 交叉编译出新鲜 Windows 产物，替代 in-repo 手动提交的旧文件。
+    # 引导模式（release_current=true）只补切 Release，不需要这份重量级构建。
+    if: inputs.release_current != true
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -173,3 +193,125 @@ jobs:
           [ "$(npm view "opendweb@$V" version 2>/dev/null)" = "$V" ] \
             && echo "skip: already published @$V" || npm publish --access public --provenance
         working-directory: packages/opendweb
+
+  cut-release:
+    # GitHub Release（L1）—— npm 发布成功后自动切出同名 Release；或由
+    # workflow_dispatch 引导模式为既有版本补切。notes 按包提炼（tag 区间的
+    # 提交按目录分组）+ tag 处各包版本表 + 升级行 + docker 镜像引用。
+    needs: publish-npm
+    # dispatch 时 publish-npm 被 if 守卫 skip，needs 链会连带 skip —— 必须
+    # always() 打开 needs 门，再在表达式里区分两种路径：
+    #   a) tag push 且 npm 发布成功；b) 引导模式（不依赖发布结果）
+    if: >-
+      always() &&
+      ((needs.publish-npm.result == 'success' && startsWith(github.ref, 'refs/tags/v')) ||
+       (github.event_name == 'workflow_dispatch' && inputs.release_current))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 创建 Release（发布 job 仍只需 read）
+    env:
+      # 镜像历史命名空间：repo 由 Gaubee/dweb 改名 jixoai/opendweb 前的全部
+      # tag 都在 gaubee 名下（已实证 0.4.2/1.0.1-cli/1.0.3-cf/latest 均 200）；
+      # 改名后 docker.yml（IMAGE_NAME=github.repository）新构建落 jixoai 名下。
+      DOCKER_IMAGE_LEGACY: ghcr.io/gaubee/dweb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # notes 需要 tag 处的 package.json 与跨 tag 提交区间
+      - name: Resolve the release tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            t="${{ inputs.tag }}"
+            if [ -z "$t" ]; then
+              t="v$(node -p "require('./packages/opendweb/package.json').version")"
+            fi
+            git rev-parse -q --verify "refs/tags/$t" >/dev/null \
+              || { echo "::error::tag $t not found in the repository"; exit 1; }
+            echo "tag=$t" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Compose release notes (per-package + versions + upgrade + docker)
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          VER="${TAG#v}"
+
+          # tag 处各包版本表（发布真值）
+          pkgver() {
+            git show "$TAG:packages/$1/package.json" \
+              | node -p "const p=JSON.parse(require('fs').readFileSync(0,'utf8'));p.name+'|'+p.version"
+          }
+          CLI="$(pkgver opendweb)"; CLI_NAME="${CLI%%|*}"; CLI_VER="${CLI##*|}"
+          SDK="$(pkgver client-sdk)"; SDK_NAME="${SDK%%|*}"; SDK_VER="${SDK##*|}"
+
+          {
+            echo "Windows artifacts (\`dweb-server\` exe + napi dll) for this tag are built fresh by the release workflow and ship inside the npm tarballs."
+            echo
+            echo "## npm packages (versions at this tag)"
+            echo
+            echo "| npm package | version |"
+            echo "| --- | --- |"
+            for d in opendweb server-binary client-sdk example opendweb-config opendweb-ext-cf; do
+              row="$(pkgver "$d")"
+              printf '| \`%s\` | %s |\n' "${row%%|*}" "${row##*|}"
+            done
+            echo
+
+            # 按包提炼：tag 区间提交按目录分组（无前序 tag 时区间=本 tag 提交）
+            PREV="$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)"
+            RANGE="${PREV:+$PREV..}$TAG"
+            echo "## Changes${PREV:+ since $PREV}"
+            echo
+            section() {
+              local label="$1"; shift
+              local logs
+              logs="$(git log --no-merges --format='- %s' "$RANGE" -- "$@")"
+              if [ -n "$logs" ]; then printf '### %s\n\n%s\n\n' "$label" "$logs"; fi
+            }
+            {
+              section 'opendweb (CLI)' packages/opendweb
+              section '@jixo/opendweb-ext-cf (Cloudflare Tunnel plugin)' packages/opendweb-ext-cf
+              section '@jixo/opendweb-client-sdk' packages/client-sdk
+              section '@jixo/opendweb-server-binary' packages/server-binary
+              section '@jixo/opendweb-example' packages/example
+              section '@jixo/opendweb-config' packages/opendweb-config
+              section 'fabric kernel & server (crates)' crates
+              section 'docker & infra' docker .github scripts
+            } > /tmp/sections.md
+            if [ -s /tmp/sections.md ]; then cat /tmp/sections.md; else echo "- (no package-scoped commits captured in $RANGE)"; echo; fi
+
+            echo "## Upgrade"
+            echo
+            echo '```bash'
+            echo "npx ${CLI_NAME}@${CLI_VER} server   # or: npm i -g ${CLI_NAME}@${CLI_VER}"
+            echo "npm i ${SDK_NAME}@${SDK_VER}        # Node SDK"
+            echo '```'
+            echo
+            echo "## Docker"
+            echo
+            echo '```bash'
+            echo "docker run -d -p 8787:8787 -p 3340:3340 ${DOCKER_IMAGE_LEGACY}:${VER}"
+            echo '```'
+            echo
+            echo "Images for every tag built before the repo rename live under \`${DOCKER_IMAGE_LEGACY}\`; builds after the rename publish under \`ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')\`."
+          } > /tmp/notes.md
+          cat /tmp/notes.md
+      - name: Create the GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG already exists; nothing to do"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes-file /tmp/notes.md \
+            --verify-tag \
+            --latest
