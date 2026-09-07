@@ -1,0 +1,54 @@
+# One-off ghcr namespace migration (Owner directive 2026-09-07):
+# gaubee/dweb → jixoai/opendweb. The repo rename moved FUTURE builds to
+# the new namespace (docker.yml IMAGE_NAME=github.repository), but every
+# tag cut before the rename lives only under ghcr.io/gaubee/dweb. This
+# workflow copies all of them across with crane (manifests + blobs,
+# digests preserved) using the repo's own GITHUB_TOKEN, then attempts to
+# flip the new package public. Idempotent: re-running re-copies tags
+# whose digests already match (crane skips unchanged layers).
+name: image-migration
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  copy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz" | tar -xz crane
+          sudo mv crane /usr/local/bin/
+          crane version
+
+      - name: Log in to ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Copy every tag from the legacy namespace
+        run: |
+          set -euo pipefail
+          SRC=ghcr.io/gaubee/dweb
+          DST=ghcr.io/jixoai/opendweb
+          TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:gaubee/dweb:pull" | jq -r .token)
+          TAGS=$(curl -s -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/gaubee/dweb/tags/list" | jq -r '.tags[]')
+          echo "tags: $(echo "$TAGS" | tr '\n' ' ')"
+          for t in $TAGS; do
+            echo "→ $t"
+            crane copy "$SRC:$t" "$DST:$t"
+          done
+
+      - name: Set the new package public (best effort)
+        run: |
+          set +e
+          code=$(curl -s -o /tmp/vis.json -w '%{http_code}' -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/jixoai/packages/container/opendweb" \
+            -d '{"visibility":"public"}')
+          echo "visibility PATCH → HTTP $code"
+          cat /tmp/vis.json
+          exit 0
