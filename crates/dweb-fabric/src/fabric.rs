@@ -379,6 +379,36 @@ fn n0_default_urls() -> Vec<String> {
     urls
 }
 
+/// invite 令牌携带的 relay URL（c1，纯函数供确定性测试）：
+/// - online 且 active_url 存在：返回**实际在线**的 relay——joiner 经它必然
+///   可达 issuer（配置首条可能是死条目，盲取会把 join 钉死在死 relay 上）；
+///   active_url 为 watcher 的归一化形态（可能带尾 "/"），映射回配置原样
+///   字符串（HB 8.1 对外回显配置形态）。
+/// - 其余（disabled / 快照未沉降 / active 不在配置内）：回退配置序首条
+///   （R3 P1-4：n0 与快照 urls 同源），与旧行为一致。
+fn invite_relay_url(relay: &RelayConfig, snapshot: &RelayStatusSnapshot) -> String {
+    let config_first = match relay {
+        RelayConfig::Disabled => return String::new(),
+        RelayConfig::Custom(urls) => urls.first().cloned().unwrap_or_default(),
+        RelayConfig::N0Default => n0_default_urls().first().cloned().unwrap_or_default(),
+    };
+    if snapshot.online == Some(true)
+        && let Some(active) = &snapshot.active_url
+    {
+        let candidates: Vec<String> = match relay {
+            RelayConfig::Custom(urls) => urls.clone(),
+            RelayConfig::N0Default => n0_default_urls(),
+            RelayConfig::Disabled => Vec::new(),
+        };
+        // 命中配置原样串（规范化键比较）；不命中（不应发生）时仍用在线事实
+        return candidates
+            .into_iter()
+            .find(|u| same_relay_url(u, active))
+            .unwrap_or_else(|| active.clone());
+    }
+    config_first
+}
+
 /// shutdown drain 主体（R4 P1-1：由后台任务持有，调用方 Future 取消不中断）。
 /// 全部收尾完成后 `send_replace(true)`——无订阅者也落值，顺序晚到调用即见 true。
 async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
@@ -411,6 +441,13 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     // guard 在显式作用域内释放，绝不跨 await。
     let watcher_task = { inner.relay_watcher_task.lock().unwrap().take() };
     if let Some(task) = watcher_task {
+        task.abort();
+        let _ = task.await;
+    }
+    // c2：会话自动重连 manager 先于 endpoint 释放退出（此后不再派发新的
+    // 重拨 worker；已在途的 worker 由 accept_children 登记表统一收割）
+    let reconnect_manager = { inner.reconnect_manager_task.lock().unwrap().take() };
+    if let Some(task) = reconnect_manager {
         task.abort();
         let _ = task.await;
     }
@@ -767,6 +804,11 @@ pub struct FabricInner {
     lifecycle_gate: Arc<std::sync::Mutex<bool>>,
     /// 已接受连接的处理子任务（R8-2）：外层 loop join 后关闭登记，再逐个收割。
     accept_children: std::sync::Mutex<AcceptChildren>,
+    /// c2 会话自动重连：意外死亡通知通道（closed_task 同代次分支发送；
+    /// UnboundedSender clone 进 FabricInner，manager 消费）。
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<EndpointId>,
+    /// c2 会话自动重连监管 manager（start() 常驻；shutdown 显式 abort + join）。
+    reconnect_manager_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 外层 accept loop 本身也纳入 shutdown 收敛证明。
     accept_loop_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// shutdown 完成通知（R3 P1-1）：true 后 watch 订阅者立即放行
@@ -1427,6 +1469,8 @@ impl Fabric {
         } else {
             None
         };
+        // c2：会话自动重连通道（closed_task 发送 -> manager 消费派发 worker）
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
         let inner = Arc::new(FabricInner {
             identity,
             roster: Arc::new(Mutex::new(roster)),
@@ -1450,11 +1494,16 @@ impl Fabric {
             shutdown_started,
             lifecycle_gate,
             accept_children: std::sync::Mutex::new(AcceptChildren::default()),
+            reconnect_tx: reconnect_tx.clone(),
+            reconnect_manager_task: std::sync::Mutex::new(None),
             accept_loop_task: std::sync::Mutex::new(None),
             shutdown_done: tokio::sync::watch::channel(false).0,
             proxy_is_none: matches!(config.http_proxy, HttpProxyConfig::None),
             join_timeout_ms: config.join_timeout_ms,
         });
+        // c2：会话自动重连监管 manager 常驻（消费意外死亡通知派发退避重拨）
+        let reconnect_manager = spawn_reconnect_manager(&inner, reconnect_rx);
+        *inner.reconnect_manager_task.lock().unwrap() = Some(reconnect_manager);
         let accept_loop = spawn_accept_loop(&inner);
         *inner.accept_loop_task.lock().unwrap() = Some(accept_loop);
         Ok(Fabric { inner })
@@ -1581,11 +1630,13 @@ impl Fabric {
             }
             None => None,
         };
-        let relay_url = match &self.inner.relay {
-            RelayConfig::Disabled => String::new(),
-            RelayConfig::Custom(urls) => urls.first().cloned().unwrap_or_default(),
-            // R3 P1-4：与快照 urls 同源（排序后首条 = 配置序最小）
-            RelayConfig::N0Default => n0_default_urls().first().cloned().unwrap_or_default(),
+        // c1：令牌携带 issuer **实际在线**的 relay（快照 active_url；已连接
+        // = joiner 经它必然可达 issuer），并映射回配置原样字符串（HB 8.1：
+        // 对外回显配置形态，不做规范化改写）。快照未就绪（刚启动尚未沉降
+        // online）时回退配置序首条——与旧行为一致，宁缺勿假。
+        let relay_url = {
+            let snapshot = self.inner.relay_snapshot.lock().unwrap().clone();
+            invite_relay_url(&self.inner.relay, &snapshot)
         };
         // 安全门只信一个来源：显式 advertise_addrs（构造期已校验/去重）。
         let addrs = self.inner.advertise_addrs.clone();
@@ -1704,7 +1755,15 @@ impl Fabric {
                     .to_owned(),
             });
         }
-        let addr = session::endpoint_addr_from_invite(&token)?;
+        // c1：本地 relay 配置作为补充拨号候选（与 connect 的合并语义一致，
+        // known-addrs-boundary 冻结“custom relay 候选始终参与，learned 是
+        // 补充”）。令牌携带的 issuer relay 在前、配置候选在后（EndpointAddr
+        // 内部去重）；issuer 配置的首条 relay（令牌来源）死亡时，同列表中的
+        // 其余 relay 兜底承接，join 不再被单死条目阻断。
+        let addr = Self::with_local_relay_candidates(
+            session::endpoint_addr_from_invite(&token)?,
+            &self.inner.relay,
+        );
         // 7：deadline 包住 connect + redeem（到期取消等待并关闭已建立的连接）。
         let join_err = join_with_deadline(
             &self.inner.endpoint,
@@ -1951,17 +2010,19 @@ impl Fabric {
             // iroh 同 NodeId 去重窗口。
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(2), entry.conn.closed()).await;
+        }
+        // c2：显式断开一律记录（即便此刻无活跃条目——会话可能刚死于网络），
+        // 自动重连监管据此让位：用户 disconnect 语义不被后台重拨覆盖。
+        {
+            let mut rd = self.inner.recent_disconnects.lock().await;
+            // P1-7：有界（容量 1024，超限逐出最旧——HashMap 迭代序不定，
+            // 但淘汰语义只需近似 LRU；正常流量下成功重拨即删除）
+            if rd.len() >= 1024
+                && let Some(victim) = rd.keys().next().cloned()
             {
-                let mut rd = self.inner.recent_disconnects.lock().await;
-                // P1-7：有界（容量 1024，超限逐出最旧——HashMap 迭代序不定，
-                // 但淘汰语义只需近似 LRU；正常流量下成功重拨即删除）
-                if rd.len() >= 1024
-                    && let Some(victim) = rd.keys().next().cloned()
-                {
-                    rd.remove(&victim);
-                }
-                rd.insert(id, std::time::Instant::now());
+                rd.remove(&victim);
             }
+            rd.insert(id, std::time::Instant::now());
         }
         Ok(())
     }
@@ -2071,6 +2132,15 @@ impl Fabric {
                 addr = addr.with_ip_addr(ip);
             }
         }
+        Self::with_local_relay_candidates(addr, relay)
+    }
+
+    /// 本地 relay 配置追加为拨号候选（c1）：custom 全量按配置序、n0 全量
+    /// 默认列表（R3 P1-4 同源）；不可解析项跳过（构造期已校验，防御性）。
+    /// join 与 connect 共用——令牌携带的 issuer relay 失效（死条目）时，
+    /// 配置列表中的其余 relay 兜底承接（iroh 对 EndpointAddr 的全部路径
+    /// 并发发起初始包，天然 dial-failover）。
+    fn with_local_relay_candidates(mut addr: EndpointAddr, relay: &RelayConfig) -> EndpointAddr {
         match relay {
             RelayConfig::Disabled => {}
             RelayConfig::Custom(urls) => {
@@ -2296,6 +2366,13 @@ impl Fabric {
                             inner.emit_gated(FabricEvent::PeerDisconnected {
                                 endpoint_id: id_disp,
                             });
+                            // c2：非人为移除（代次匹配 = 条目仍在表内，无人
+                            // disconnect/revoke）的会话死亡请求自动重连监管
+                            //（manager 在 start() 常驻；经 channel 请求，避免
+                            // insert_peer -> reconnect -> connect -> insert_peer
+                            // 的递归 future Send 环）。显式断开走 None 分支，
+                            // 不重连。
+                            let _ = inner.reconnect_tx.send(remote);
                         }
                         // 更新代次的连接已接管：静默退出
                         Some(_) => {}
@@ -2372,6 +2449,100 @@ pub struct MemberInfo {
     pub endpoint_id: String,
     pub display_name: Option<String>,
     pub since_ms: u64,
+}
+
+/// c2 会话自动重连：监管 manager（[`spawn_reconnect_manager`]，start() 常驻）
+/// 收到对端会话意外死亡的通知后，为该对端派发本退避重拨 worker——1s 起
+/// 倍增、上限 30s，直至重连成功 / 本地显式断开（recent_disconnects）/
+/// 对端不再是成员 / fabric 关闭。重拨完全复用 [`Fabric::connect`] 的准入
+/// 语义（幂等、single-flight、shutdown 拒绝、成员门控），因此并发的
+/// 人工 connect 与监管重拨天然合流。
+async fn session_reconnect_worker(inner: Arc<FabricInner>, remote: EndpointId) {
+    const BACKOFF_START: std::time::Duration = std::time::Duration::from_secs(1);
+    const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+    let fabric = Fabric {
+        inner: Arc::clone(&inner),
+    };
+    let id_disp = endpoint_id_display(&remote);
+    let mut backoff = BACKOFF_START;
+    let mut shutdown_rx = inner.shutdown_done.subscribe();
+    loop {
+        // 退避等待可被 shutdown 完成通知提前唤醒（完成门：无任务残留）
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown_rx.changed() => return,
+        }
+        if inner.lifecycle_closing() {
+            return;
+        }
+        // 本地显式断开（disconnect 语义不被自动重连覆盖）
+        if inner.recent_disconnects.lock().await.contains_key(&remote) {
+            tracing::debug!(peer = %id_disp, "session reconnect cancelled: explicit disconnect");
+            return;
+        }
+        // 已有活跃连接（并发人工 connect / 对端重拨先行成功）：worker 结束
+        {
+            let peers = inner.peers.lock().await;
+            if peers
+                .get(&remote)
+                .is_some_and(|e| !e.closed.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return;
+            }
+        }
+        match fabric.connect(&id_disp).await {
+            Ok(()) => {
+                tracing::debug!(peer = %id_disp, "session auto-reconnected");
+                return; // 新连接的 closed_task 接力下一轮监管
+            }
+            Err(FabricError::Session(SessionError::NotMember(_))) => {
+                // 对端已撤销/移除：停止重拨
+                tracing::debug!(peer = %id_disp, "session reconnect cancelled: not a member");
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(peer = %id_disp, err = %e, "session reconnect attempt failed");
+                backoff = (backoff * 2).min(BACKOFF_MAX);
+            }
+        }
+    }
+}
+
+/// c2 会话自动重连监管 manager：消费意外死亡通知（closed_task 同代次分支
+/// 经 `reconnect_tx` 发送），为每个对端派发退避重拨 worker（登记进
+/// accept_children 生命周期表，shutdown 可收割）；manager 自身随 shutdown
+/// 完成通知退出。重复通知（同一对端多次死亡堆积）由 worker 的
+/// “已有活跃连接即返回” + connect single-flight 自然合流。
+fn spawn_reconnect_manager(
+    inner: &Arc<FabricInner>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<EndpointId>,
+) -> tokio::task::JoinHandle<()> {
+    let inner = Arc::clone(inner);
+    tokio::spawn(async move {
+        let mut shutdown_rx = inner.shutdown_done.subscribe();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => break,
+                req = rx.recv() => {
+                    let Some(remote) = req else { break };
+                    if inner.lifecycle_closing() {
+                        break;
+                    }
+                    let worker = tokio::spawn(session_reconnect_worker(
+                        Arc::clone(&inner),
+                        remote,
+                    ));
+                    if let Some(task) =
+                        register_lifecycle_task(&inner.accept_children, worker)
+                    {
+                        // registry 已关闭（shutdown 收尾中）：本地收割不留残留
+                        task.abort();
+                        let _ = task.await;
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// 接受循环：按 ALPN 分派；regular 做成员门控；redeem 仅 root 受理。
@@ -2741,6 +2912,93 @@ mod tests {
         // Disabled + 无 learned：空（调用方按 NoAddressingInfo 拒绝）
         let addr = Fabric::merge_dial_candidates(&any_id(5), &[], &RelayConfig::Disabled);
         assert!(addr.addrs.is_empty());
+    }
+
+    // ---- c1/c2 relay failover ------------------------------------------------------
+
+    fn snapshot(online: Option<bool>, active_url: Option<String>) -> RelayStatusSnapshot {
+        RelayStatusSnapshot {
+            mode: "custom",
+            urls: Vec::new(),
+            online,
+            active_url,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn invite_relay_url_prefers_live_relay_and_maps_back_to_config_form() {
+        let cfg = RelayConfig::Custom(vec![
+            "https://dead.example".to_owned(),
+            "https://alive.example".to_owned(),
+        ]);
+        // online 且 active_url 指向活条目（watcher 归一化形态带尾 "/"）：
+        // 令牌携带活条目，且映射回配置原样字符串（无尾斜杠）
+        let url = invite_relay_url(
+            &cfg,
+            &snapshot(Some(true), Some("https://alive.example/".to_owned())),
+        );
+        assert_eq!(url, "https://alive.example");
+        // 快照未沉降（online=None）：回退配置序首条（与旧行为一致）
+        let url = invite_relay_url(&cfg, &snapshot(None, None));
+        assert_eq!(url, "https://dead.example");
+        // offline：同样回退配置序首条（宁缺勿假）
+        let url = invite_relay_url(
+            &cfg,
+            &snapshot(Some(false), Some("https://alive.example".to_owned())),
+        );
+        assert_eq!(url, "https://dead.example");
+        // disabled：恒空
+        assert_eq!(
+            invite_relay_url(&RelayConfig::Disabled, &snapshot(None, None)),
+            ""
+        );
+    }
+
+    #[test]
+    fn join_dial_candidates_merge_token_relay_with_local_config() {
+        // c1 单元冻结：join 的拨号候选 = 令牌 issuer relay（learned）+ 本地
+        // relay 配置全量——issuer 配置首条（令牌来源）死亡时，同列表其余
+        // relay 兜底承接，不再被单死条目阻断
+        let token_addr = session::endpoint_addr_from_invite(&test_token(
+            "https://dead.example",
+            &["192.168.1.4:9000"],
+        ))
+        .unwrap();
+        let addr = Fabric::with_local_relay_candidates(
+            token_addr,
+            &RelayConfig::Custom(vec![
+                "https://dead.example".to_owned(),
+                "https://alive.example".to_owned(),
+            ]),
+        );
+        let urls = relay_urls_of(&addr);
+        // EndpointAddr 内部为去重集合（BTreeSet 序）；iroh 对全部已知路径
+        // 并发发初始包，候选“参与”即 failover，顺序无功能语义
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert!(urls.contains(&norm_url("https://dead.example")));
+        assert!(urls.contains(&norm_url("https://alive.example")));
+        assert!(
+            addr.ip_addrs()
+                .any(|ip| ip.to_string() == "192.168.1.4:9000")
+        );
+    }
+
+    /// 构造最小邀请令牌（单测用；字段语义同 roster::issue_invite 产物）。
+    fn test_token(relay: &str, direct: &[&str]) -> crate::protocol::InviteToken {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = crate::identity::NodeIdentity::from_seed([0x42; 32]);
+        let (mut roster, _fid) = crate::roster::Roster::create(&identity, dir.path(), 0).unwrap();
+        roster
+            .issue_invite(
+                &identity,
+                relay.to_owned(),
+                direct.iter().map(|s| s.to_string()).collect(),
+                None,
+                60_000,
+                0,
+            )
+            .unwrap()
     }
 
     // ---- HB 5.1 RelayTlsTrust 受限枚举 ---------------------------------------------
