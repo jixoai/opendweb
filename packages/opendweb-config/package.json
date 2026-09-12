@@ -4,7 +4,10 @@
   "description": "opendweb local plugin helper — definePlugin wraps the declare/hook subprocess protocol (runtime-agnostic ESM)",
   "license": "MIT OR Apache-2.0",
   "type": "module",
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js"
@@ -14,6 +17,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Gaubee/dweb.git"
+    "url": "git+https://github.com/jixoai/opendweb.git"
   }
 }
