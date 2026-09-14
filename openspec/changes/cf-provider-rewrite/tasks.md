@@ -86,6 +86,11 @@
 - [x] 4.2 R1 整改（b1cb51b，发布 1.0.1）：全部阻塞修复；cf 126/126（+18
       用例）、下游 92/92、pack:dry 递归扫描（静态+动态 import）368KB、
       tsc 干净
-- [ ] 4.3 Codex R2 复验：**服务端故障中断**（模型 API 403 GROUP_DELETED，
-      重连 100 次未果）——待服务恢复后重跑 R2（复核 R1 七项 CLOSED 状态与
-      回归检查）；workspace 已回收
+- [x] 4.3 Codex R2 复验：**服务端故障中断**（模型 API 403 GROUP_DELETED，
+      重连 100 次未果）——2026-09-14 由 ZCode 子代理补做（Owner 授权"让子代理
+      推进"）：git HEAD 逐项核验 R1 七项阻塞 7/7 CLOSED（file:line + 测试双证据），
+      回归链（含 5fa6c3c：1.0.1 曾带冒号 scope live 缺陷、1.0.2 闭合）无新缺陷；
+      127/127 + tsc 0 + 发布产物实证（dist 444KB 零外部导入）；综合评分
+      8.5/10 Release-ready（R1 3.5 → 8.5）。非阻塞 follow-up：B5 残余（仅
+      Tunnel-Read token 在 create/PUT 裸 403 无恢复菜单）、3.4 SDK 真实对拍、
+      3.2 public client

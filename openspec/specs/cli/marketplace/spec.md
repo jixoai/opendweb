@@ -1,6 +1,12 @@
-# cli/marketplace
+# cli/marketplace Specification
 
-## ADDED Requirements
+## Purpose
+
+定义插件市场的候选来源与自适应子命令解析：非 builtin 的首个子命令 token
+按 marketplace 声明的 globs 展开为候选包名依次解析，含安装即信任的安全
+模型边界与自愈安装语义。
+
+## Requirements
 
 ### Requirement: marketplace 候选配置
 

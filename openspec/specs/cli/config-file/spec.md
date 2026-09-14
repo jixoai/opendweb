@@ -1,6 +1,11 @@
-# cli/config-file
+# cli/config-file Specification
 
-## ADDED Requirements
+## Purpose
+
+定义 opendweb 的静态配置文件（TOML/JSON 双格式）与插件编排：优先级链
+flag > env > config > default，插件统一对象契约与 3+1 生命周期钩子挂点。
+
+## Requirements
 
 ### Requirement: 静态配置文件（编排层零代码）
 
