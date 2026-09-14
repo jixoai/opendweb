@@ -111,5 +111,16 @@
       下文 import config 面（`.`）与 CLI 面（`./opendweb-plugin`）并
       断言形状；负向验证双向：@clack 泄漏命中泄漏扫描、未知 bare
       import（zod）命中 clean-tar 消费者失败，均非零退出）
-- [ ] 7.3 tsdown 构建性能：dts 生成主导串行构建耗时，调查并行/缓存
-      方案（不阻塞正确性，仅影响 test/pack:dry 门禁成本）
+- [x] 7.3 tsdown 构建性能：dts 生成主导串行构建耗时，调查并行/缓存
+      方案（不阻塞正确性，仅影响 test/pack:dry 门禁成本）（2026-09-14
+      评估完成，实施待定：实测整包构建 606s wall 仅 21.6s CPU（3%），
+      其中 rolldown PLUGIN_TIMINGS 显示 92%（638s/10 入口）耗在
+      rolldown-plugin-dts:generate——瓶颈是宿主机内存压力（swap 16.9/
+      17GB，页等待）而非 dts 计算本身；
+      tsdown 0.22.14 / rolldown-plugin-dts 0.27.14 选项面无持久缓存、
+      无 dts 并行开关。可选路线：generator 'oxc'（isolated
+      declarations，源面仅 cli.ts/auth.ts 两处违规可低成本达标）但会
+      整体改写已发布 .d.mts 且无金样等价门禁，I/O 受限环境下收益无法
+      体现 → 不实施；'tsgo' 实验性+新依赖；dts entry 过滤只减 emit 不
+      减 program 成本；farm 迁移超范围。待上游 dts 缓存落地或构建回到
+      CPU 受限主机时复评，首选 oxc 路线（两处注解 + d.mts 等价金样））
