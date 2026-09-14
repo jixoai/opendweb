@@ -94,6 +94,21 @@ let tunnelPending: StartupState | null = null; // 已 spawn 但仍在健康窗�
 let tunnelChild: ActiveTunnel | null = null; // 当前活跃记录 { child, watchdog }，供 preStop 摘除本 child 的观察器
 let tunnelStopAll: Promise<void> | null = null; // 进行中的全程停止 Promise（并发 preStop 共享，R6-Major）
 
+/**
+ * 白盒测试注入面（plugin-marketplace 7.1）：构造黑盒不可达的悬挂态——
+ * 「active 记录指向已退出 child」。Node 在 SIGCHLD 处理里同步设置 exitCode
+ * 并派发 exit，watchdog 必然先清理记录，故该防御分支无法经公开 API 确定
+ * 性复现。仅测试使用；生产代码不得调用。
+ */
+export const _testLifecycle = {
+  injectActiveTunnel(child: ChildProcess, watchdog: () => void): void {
+    tunnelChild = { child, watchdog };
+  },
+  activeTunnelChild(): ChildProcess | null {
+    return tunnelChild?.child ?? null;
+  },
+};
+
 /** 退出标签（区分正常退出码与信号终止），watchdog 与悬挂清理共用 */
 function exitLabelOf(child: ChildProcess): string {
   if (child.exitCode !== null) return `code ${child.exitCode}`;

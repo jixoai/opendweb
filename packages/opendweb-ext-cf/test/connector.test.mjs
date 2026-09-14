@@ -4,7 +4,7 @@
 // SIGINT+SIGKILL 回收、缺二进制降级。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -17,6 +17,7 @@ import {
   ensureCloudflaredBin,
   spawnCloudflared,
   stopCloudflared,
+  _testLifecycle,
 } from "../dist/connector.mjs";
 
 // ---- 二进制定位（无网络路径） ----
@@ -402,6 +403,59 @@ test("spawn: explicit graceMs argument overrides the environment default", { ski
     await spawnCloudflared("placeholder", 200); // 200ms 即过窗
     await stopCloudflared(); // 立即回收，证明 spawn 确实成功 promote
   } finally {
+    await restore();
+  }
+});
+
+// 8) stale-record 生命周期回归（plugin-marketplace 7.1）：「active 记录指向
+//    已退出 child」黑盒不可达——Node 的 SIGCHLD 回调同步设置 exitCode 并派发
+//    exit，watchdog 必然先清理记录。经 _testLifecycle 白盒注入确定性构造：
+//    恰好一条 WARNING、旧 watchdog 同步摘除（被扣住的 exit 事件此后派发也不
+//    得双报）、随后允许新 spawn 且新 child 可被 stop 回收。
+test("spawn: a stale active record for an exited child warns once, drops the old watchdog, and allows a new spawn", { skip: process.platform === "win32" }, async () => {
+  const { restore, spawnLog } = await lifecycleEnv(
+    150,
+    '#!/bin/sh\necho $$ >> "$DWEB_CF_SPAWN_LOG"\nexec /bin/sleep 30\n',
+  );
+  const cap = captureStderr();
+  try {
+    await stopCloudflared().catch(() => {}); // 归一模块状态（前置用例的残留）
+
+    // 真实的「已退出 child」（exitCode=3）+ 一个仍挂在其 exit 上的 watchdog
+    // （黑盒路径里由 grace promote 注册；此处的 exit 已派发过，注入后不再有
+    // 自然派发的机会——等价于事件被无限延迟的悬挂现场）
+    const dead = spawn("/bin/sh", ["-c", "exit 3"], { stdio: "ignore" });
+    await new Promise((resolve) => dead.once("exit", resolve));
+    assert.equal(dead.exitCode, 3);
+    let watchdogFired = 0;
+    const watchdog = () => {
+      watchdogFired++;
+      console.error("WARNING: stale-injected watchdog fired (must never happen)");
+    };
+    dead.once("exit", watchdog);
+    assert.equal(dead.listeners("exit").length, 1);
+    _testLifecycle.injectActiveTunnel(dead, watchdog);
+    assert.equal(_testLifecycle.activeTunnelChild(), dead);
+
+    // 触发 stale 防御分支：同步告警恰好一次、摘除旧 watchdog、随后照常新 spawn
+    await spawnCloudflared("placeholder");
+    assert.equal(cap.warnings.length, 1, `expected exactly one WARNING, got: ${cap.warnings.join(" | ")}`);
+    assert.match(cap.warnings[0], /WARNING: cloudflared exited \(code 3\); the public tunnel is down/);
+    assert.equal(watchdogFired, 0, "the stale watchdog must be detached synchronously, never dispatched");
+    assert.equal(dead.listeners("exit").length, 0, "the old watchdog listener must be removed from the exited child");
+    assert.notEqual(_testLifecycle.activeTunnelChild(), dead, "the stale record must be superseded by the new spawn");
+
+    // 双保险防双报：被扣住的 exit 事件此刻才派发，也不得出现第二条 WARNING
+    dead.emit("exit", 3, null);
+    assert.equal(cap.warnings.length, 1, "no double WARNING after the withheld exit event is finally dispatched");
+
+    // 新 spawn 真实发生且全程可回收
+    const pids = (await waitForSpawnLog(spawnLog)).split("\n").filter(Boolean);
+    assert.equal(pids.length, 1, `expected exactly one new spawn, got: ${pids}`);
+    await stopCloudflared();
+    assert.equal(pidAlive(pids[0]), false, "the new child must be reaped by stop");
+  } finally {
+    cap.restore();
     await restore();
   }
 });

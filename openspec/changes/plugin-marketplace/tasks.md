@@ -92,10 +92,16 @@
 
 ## 7. cf 插件 TS+tsdown 迁移后续项（Codex R2 终审 9/10 可合并，2026-08-30 登记）
 
-- [ ] 7.1 stale-record 生命周期回归：确定性构造「active 记录指向已退出
+- [x] 7.1 stale-record 生命周期回归：确定性构造「active 记录指向已退出
       child」的状态（黑盒不可达——Node 的 SIGCHLD 回调同步设置 exitCode
       并派发 exit；需测试导出钩子或拆分生命周期模块后白盒注入），断言
       恰好一条 WARNING、旧 watchdog 摘除、随后允许新 spawn
+      （2026-09-14 完成：connector.ts 导出 `_testLifecycle` 测试注入面
+      ——两方案中侵入最小（约 15 行导出 vs 拆分生命周期模块）；测试注入
+      「真实已退出 child（exit 3）+ 仍挂在其 exit 上的 watchdog」构造
+      悬挂态，断言恰好一条 WARNING、旧 watchdog 同步摘除（exit listener
+      1→0，被扣住的 exit 事件此后补派发也不双报）、随后新 spawn 被允许
+      且 stop 全程回收。connector 13/13）
 - [ ] 7.2 pack:dry 升级为 clean-tar 消费者导入测试：解包 tarball 到
       临时目录后从包上下文 import 两个 exports 面，端到端证明零运行时
       依赖可解析
