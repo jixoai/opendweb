@@ -58,8 +58,17 @@
       精确匹配（含端口）；端口被占时 login 报错并提示（已实现），多端口
       预注册方案待真实 client 实测后评估
 - [ ] 3.4 CF_CLIENT=sdk 与 rest 的真实 API 对拍（需真实凭据的一次性冒烟）
-- [ ] 3.5 cloudflared npm 无 checksum（README 已注记）；可选 CLOUDFLARED_BIN
-      自供；后续评估官方 checksum 清单校验
+- [x] 3.5 cloudflared npm 无 checksum（README 已注记）；可选 CLOUDFLARED_BIN
+      自供；后续评估官方 checksum 清单校验（2026-09-14 评估完成，实施
+      不可行——官方无 checksum 清单可消费：GitHub releases 最近 5 版
+      （2026.8.1–2026.9.1）资产无任何 checksum 文件（gh api 实测）；上游
+      开放议题 cloudflare/cloudflared#1617（checksums/artifact
+      attestations）与 #1410（.sha256 旁挂文件）均未落地；pkg.cloudflare.com
+      的 SHA256 仅覆盖 apt/yum 仓库 .deb/.rpm 包元数据，不覆盖 npm:cloudflared
+      install.js 实际下载的 GitHub release 裸资产（darwin .tgz / linux 裸
+      二进制 / win .exe）。安全边界维持 README 注记（TLS 传输 + PATH/
+      CLOUDFLARED_BIN 自供优先），待 #1617 落地后按「下载清单+比对、离线
+      跳过」语义复评实施）
 
 ## 4. 复审闭环（2026-08-31）
 
