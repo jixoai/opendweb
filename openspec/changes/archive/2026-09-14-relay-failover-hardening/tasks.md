@@ -59,7 +59,7 @@
 
 ## 4. 已知边界与后续项（登记）
 
-- [ ] 4.1 c2 集成测试的"宕机期间重拨必然失败、恢复后经 relay 成功"腿在本机
+- [x] 4.1 c2 集成测试的"宕机期间重拨必然失败、恢复后经 relay 成功"腿在本机
       无法低成本端到端复现：loopback 上 iroh 打洞总能建直连路径（iroh
       builder 恒预置 0.0.0.0/[::] 默认 socket，bind_addr 是追加而非替换），
       重拨会走 iroh 内部记忆的直连路径。该腿的 relay 拨号部分由 c1 用例覆盖
@@ -67,8 +67,21 @@
       自动重连为上游行为（actor.rs 无限退避重试 + 上游
       test_active_relay_reconnect）。现场 relay-only 部署的重腿验证留给
       ai-fly 三机回归
-- [ ] 4.2 令牌仍携带单条 relay URL（wire 格式不动）：issuer invite 时快照
+      ——2026-09-14 三机实测通过（本机 provider / macmini relay
+      `@jixo/opendweb-server-binary@0.4.3` 3340 / gaubeehonor Windows
+      consumer，SDK 0.4.3 napi）：gaubeehonor 出站 UDP→本机经防火墙规则
+      阻断（3 探测包零到达实证），直连打洞不可能，会话 relay-only；
+      杀 relay → 4s relay-offline → 在途 echo timeout → ~31s
+      peer-disconnected（closed_task 判死）→ 宕机窗口 110s+ 内 29 次
+      PING FAIL、零重连成功（必然失败腿）；重启 relay（同端口 http）→
+      13s 内 peer-connected 自动重连 + PING ok 持续恢复，全程无进程重启。
+      观测补充：SDK linkStatus 在 relay-only 会话上恒 unknown
+      （path watcher 未收到 PathEvent::Selected），已知观测缺口不影响判定
+      （隔离性由 UDP 探测实证）；probe 脚本首轮因 unhandled rejection
+      崩溃（测试脚本自身 bug，修复后 v2 完整跑通）
+- [x] 4.2 令牌仍携带单条 relay URL（wire 格式不动）：issuer invite 时快照
       未沉降（刚启动、net_report 未完成）则回退配置首条——若首条恰为死
       条目，joiner 侧 2.2 的候选合并仍可兜底（同列表场景），但跨列表配置
       的 joiner 无兜底。彻底解法是令牌携带多 relay（协议变更），登记为
-      后续项
+      后续项 —— 已登记为独立 change
+      `openspec/changes/invite-token-multi-relay/proposal.md`（2026-09-14）
