@@ -83,9 +83,12 @@
       ≠ 包内入口 symlink 逃逸，后者仍硬拒）；补嵌套依赖树回归
       （2026-09-14：scanPackageRoots 以 nearest/verified 分流越界落点，
       嵌套遮蔽回归补齐，既有逃逸/错身份硬拒全部保持，opendweb 95/95）
-- [ ] 6.2 并发停止回归断言增强：fake child 收到 SIGINT 后延迟退出，先
+- [x] 6.2 并发停止回归断言增强：fake child 收到 SIGINT 后延迟退出，先
       单独断言第二个 preStop 仍 pending；另加真实 CLI 双信号集成回归，
       验证 server.stop() 仅在唯一 preStop 流程完成后触发
+      （2026-09-14：抽取 makeSingleFlightShutdown 导出单测——child 延迟
+      退出窗口内第二信号仍 pending、exit 未抢跑；真实 CLI 双信号 e2e——
+      窗口内 gateway 仍健康、preStop 恰执行一次、退出码 0）
 
 ## 7. cf 插件 TS+tsdown 迁移后续项（Codex R2 终审 9/10 可合并，2026-08-30 登记）
 

@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildBanner,
+  makeSingleFlightShutdown,
   networkIPv4s,
   resolveServerArgs,
   splitBind,
@@ -543,6 +544,140 @@ test("opendweb server e2e: child bind failure propagates non-zero exit, no banne
   } finally {
     first.kill("SIGINT");
     await waitExit(first);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// R6-Major 复审 6.2：并发停止回归（单飞编排单测 + 真实 CLI 双信号集成）
+// ---------------------------------------------------------------------------
+
+test("makeSingleFlightShutdown: second signal stays pending while the single flow awaits the delayed child (R6-Major 复审 6.2)", async () => {
+  // fake child：收到 SIGINT 后延迟 ~900ms 才退出（模拟 cloudflared 优雅停；
+  // 余量按高负载机器放宽）。用 node 而非 shell trap——非交互 sh 的 trap 要
+  // 等前台命令结束才触发，时序不可控
+  const child = spawn(
+    NODE,
+    [
+      "-e",
+      "const keep = setInterval(() => {}, 1e9);" +
+        "process.on('SIGINT', () => { clearInterval(keep); setTimeout(() => process.exit(0), 900); });",
+    ],
+    { stdio: "ignore" },
+  );
+  let preStopCalls = 0;
+  let stopCalls = 0;
+  let exitCalls = 0;
+  const shutdown = makeSingleFlightShutdown({
+    runPreStop: async () => {
+      preStopCalls++;
+      await new Promise((r) => setTimeout(r, 150));
+    },
+    stopServer: () => {
+      stopCalls++;
+      return new Promise((resolve) => {
+        child.once("exit", resolve);
+        child.kill("SIGINT");
+      });
+    },
+    exit: () => {
+      exitCalls++;
+    },
+  });
+  try {
+    const first = shutdown(); // 第一次 SIGINT
+    await new Promise((r) => setTimeout(r, 60)); // preStop 仍在等待
+    const second = shutdown(); // 第二次 SIGINT：必须复用同一 in-flight 流程
+    assert.equal(second, first, "second signal must reuse the single in-flight promise");
+    await new Promise((r) => setTimeout(r, 200));
+    // 此时 preStop 已完成、stopServer 已发 SIGINT、fake child 处于延迟退出窗口。
+    // 中间态断言（此前回归缺口：旧断言只看最终态）——第二个信号不得已结算，
+    // exit 不得抢在子进程终态前触发，preStop/stop 各只跑一次
+    assert.equal(child.exitCode, null, "fake child must still be in its delayed-exit window");
+    assert.equal(preStopCalls, 1);
+    assert.equal(stopCalls, 1);
+    assert.equal(exitCalls, 0, "exit must not fire before the child's terminal event");
+    let secondSettled = false;
+    void second.then(
+      () => (secondSettled = true),
+      () => (secondSettled = true),
+    );
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(secondSettled, false, "second call stays pending while the single flow awaits the child");
+    // child 终态 → exit(0) → 单飞 promise 结算（有界等待防回归挂死）
+    await Promise.race([
+      first,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("shutdown flow did not complete")), 10000)),
+    ]);
+    assert.equal(secondSettled, true);
+    assert.equal(exitCalls, 1);
+  } finally {
+    child.kill("SIGKILL");
+    await waitExit(child);
+  }
+});
+
+test("server e2e: double SIGINT keeps one preStop flow; server.stop only after it completes (R6-Major 复审 6.2)", async () => {
+  const env = await pluginProjectEnv();
+  const logFile = path.join(env.dir, "prestop.log");
+  const gatewayPort = await freePort();
+  const relayPort = await freePort();
+  await fsp.copyFile(path.join(FIXTURES_DIR, "slow-prestop.mjs"), path.join(env.dir, "slow-prestop.mjs"));
+  await fsp.writeFile(
+    path.join(env.dir, "opendweb.config.toml"),
+    ['configVersion = 1', "", "[[plugins]]", 'file = "slow-prestop.mjs"'].join("\n") + "\n",
+    "utf8",
+  );
+  const child = spawn(
+    NODE,
+    [CLI, "server", "--gateway", `127.0.0.1:${gatewayPort}`, "--relay", `127.0.0.1:${relayPort}`],
+    {
+      cwd: env.dir,
+      env: {
+        PATH: process.env.PATH,
+        HOME: process.env.HOME,
+        DWEB_HOME: env.home,
+        NO_COLOR: "1",
+        SLOW_PRESTOP_LOG: logFile,
+        SLOW_PRESTOP_DELAY_MS: "1200",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let out = "";
+  child.stdout.on("data", (d) => (out += d));
+  child.stderr.on("data", (d) => (out += d));
+  const logText = () => {
+    try {
+      return fs.readFileSync(logFile, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  try {
+    await waitUntil(() => out.includes("Press Ctrl+C to stop"), 20000);
+
+    // 第一次 SIGINT → 唯一 preStop 流程启动（marker 先落盘再延迟）
+    child.kill("SIGINT");
+    await waitUntil(() => logText().includes("preStop-start"), 10000);
+
+    // preStop 窗口内第二次 SIGINT：不得抢跑 server.stop/exit——gateway 仍健康、
+    // CLI 仍存活（若第二次信号抢先停 server，healthz 立即失效）
+    child.kill("SIGINT");
+    await waitHealthy(`http://127.0.0.1:${gatewayPort}`, 2000);
+    assert.equal(child.exitCode, null, "CLI must stay alive through the preStop window");
+    assert.ok(!logText().includes("preStop-done"), "preStop must still be pending at this point");
+
+    // preStop 完成 → server.stop → 退出码 0；preStop 恰好执行一次（单飞，
+    // 第二个信号不得触发第二条停止流程）
+    await waitUntil(() => logText().includes("preStop-done"), 10000);
+    await waitUntil(() => child.exitCode !== null || child.signalCode !== null, 10000);
+    assert.equal(child.exitCode, 0);
+    assert.equal(child.signalCode, null);
+    const starts = logText().split("\n").filter((l) => l === "preStop-start").length;
+    assert.equal(starts, 1, "exactly one preStop invocation across both signals");
+  } finally {
+    child.kill("SIGKILL");
+    await waitExit(child);
   }
 });
 

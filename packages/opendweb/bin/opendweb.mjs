@@ -374,6 +374,28 @@ function stripConfigFlag(rest) {
   return { configFlag, argv };
 }
 
+/**
+ * R6-Major 单飞停止编排（复审 6.2 导出供回归测试）：SIGINT/SIGTERM 与重复
+ * 信号共享同一停止流程——第二次调用复用同一 in-flight promise，不得绕过
+ * 仍在等待的 preStop（如 cloudflared 子进程终态）抢先 server.stop/exit。
+ * 流程时序：runPreStop（尽力，失败由调用方降级）→ stopServer（等子进程
+ * 终态落定）→ exit(0)。
+ * @param {{ runPreStop: () => Promise<void>, stopServer: () => Promise<void>, exit?: (code: number) => void }} input
+ * @returns {() => Promise<void>} 信号处理器：幂等，重复调用返回同一 promise
+ */
+export function makeSingleFlightShutdown({ runPreStop, stopServer, exit = (code) => process.exit(code) }) {
+  let inFlight = null;
+  return () => {
+    inFlight ??= (async () => {
+      await runPreStop();
+      // exit 等 stop 落定（.finally 兜底 stopServer 异常路径）；单飞 promise
+      // 在完整停止流程结束时才结算——重复信号在窗口内拿到的是 pending 态
+      await stopServer().finally(() => exit(0));
+    })();
+    return inFlight;
+  };
+}
+
 async function runServer(rest) {
   const { configFlag, argv: serverArgv } = stripConfigFlag(rest);
   // 静态配置发现与解析（零执行；plugin-marketplace D4）
@@ -473,20 +495,19 @@ async function runServer(rest) {
     console.log(`  ${line}`);
   }
 
-  // R6-Major：SIGINT/SIGTERM 与重复信号共享同一停止流程——第二次调用不得
-  // 绕过仍在等待的 preStop（如 cloudflared 子进程终态）抢先 server.stop/exit
-  let shuttingDown = null;
-  const shutdown = () => {
-    shuttingDown ??= (async () => {
+  // R6-Major：SIGINT/SIGTERM 与重复信号共享同一停止流程（单飞编排器语义
+  // 见 makeSingleFlightShutdown）——第二次调用不得绕过仍在等待的 preStop
+  // （如 cloudflared 子进程终态）抢先 server.stop/exit
+  const shutdown = makeSingleFlightShutdown({
+    runPreStop: async () => {
       // preStop：尽力执行（失败仅 WARNING），再停 server
       const preStop = await fireHook({ plugins, hook: "server.preStop", payload: { server: { ...final } } });
       for (const f of preStop.failures) {
         console.error(`WARNING[plugin/${asciiEscape(f.name)}]: preStop failed (${asciiEscape(f.error)})`);
       }
-      server.stop().finally(() => process.exit(0));
-    })();
-    return shuttingDown;
-  };
+    },
+    stopServer: () => server.stop(),
+  });
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   const code = await server.exited;
