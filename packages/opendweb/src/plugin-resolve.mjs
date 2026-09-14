@@ -73,15 +73,19 @@ export function resolvePluginRootEntry(pkg, cwd) {
  * R6-B2：containment 以「期望包根」为显式值（expectedPackageRoot），两条
  * 路径复用同一不变量 isWithinPackage(expectedRoot, realpath(entry))——不再
  * 由入口祖先的同名 metadata 推断（同名包外 symlink 可骗过推断）。
+ * 复审 6.1：Node 落点在期望根之外时按「Node 实际选中的目录」分流——
+ * nearest === verified 说明 Node 解析的就是已验证包本身，入口 realpath
+ * 越界只能是包内 symlink 逃逸（硬拒）；nearest 是近层错身份目录（Node 不
+ * 校验 package.json 身份，会解析到遮蔽目录）时，受控转向已验证的外层
+ * expectedRoot 走 fs 解析，不再把整个候选判为未安装。
  * @param {string} pkg
  * @param {string} cwd
  * @param {string[]} exportPaths
  * @returns {string | null}
  */
 function resolvePackageEntry(pkg, cwd, exportPaths) {
-  const expectedRoot = expectedPackageRoot(pkg, cwd);
-  // 期望包根不存在或身份不符（name !== pkg）时 req.resolve 沿同一 node_modules
-  // 链也必然失败——直接判未安装（候选序列语义不变）
+  const { nearest, verified: expectedRoot } = scanPackageRoots(pkg, cwd);
+  // 链上不存在身份相符的副本（name === pkg）＝ 未安装——候选序列语义不变
   if (expectedRoot === null) return null;
   const base = path.join(cwd, "package.json");
   const req = createRequire(base);
@@ -95,9 +99,15 @@ function resolvePackageEntry(pkg, cwd, exportPaths) {
       } catch {
         return null;
       }
-      // 入口真实路径必须落在期望包根内；逃逸（symlink 指向包外）= 拒绝，
-      // 且不再尝试该候选的其它入口（包本身不可信）
-      return isWithinPackage(expectedRoot, entryReal) ? entryReal : null;
+      if (isWithinPackage(expectedRoot, entryReal)) return entryReal;
+      if (nearest === expectedRoot) {
+        // 包内入口 symlink 逃逸：Node 选中已验证包但入口真实路径越界 =
+        // 包本身不可信，硬拒且不再尝试该候选的其它入口
+        return null;
+      }
+      // 近层错身份目录遮蔽：Node 落点不是期望根——所有 exportPath 都会
+      // 解析到同一遮蔽目录，直接受控转向外层 expectedRoot 走 fs 解析
+      return resolvePackageEntryFromFs(expectedRoot, exportPaths);
     } catch {
       // Try every valid entry for this candidate before falling back to fs.
     }
@@ -106,28 +116,41 @@ function resolvePackageEntry(pkg, cwd, exportPaths) {
 }
 
 /**
- * 期望包根（R6-B2）：沿 cwd 的 node_modules 向上找到 <pkg> 目录，realpath
- * 后要求其 package.json 声明 name === pkg（目录名 + 元数据双重身份）。
- * 身份不符的目录不作为期望根（继续向上找外层副本；都找不到则 null）。
+ * 沿 cwd 的 node_modules 链向上扫描 <pkg>（R6-B2 + 复审 6.1）：
+ * - verified：首个 realpath 后 package.json 声明 name === pkg 的副本
+ *   （目录名 + 元数据双重身份）＝ 期望包根；身份不符的层级跳过，继续
+ *   向上找外层副本（都找不到则 null）。
+ * - nearest：链上首个存在的 <pkg> 目录（不校验身份）＝ Node 解析算法
+ *   实际会选中的目录；nearest !== verified 即「近层错身份目录遮蔽外层
+ *   合法副本」。
  * @param {string} pkg
  * @param {string} cwd
- * @returns {string | null}
+ * @returns {{ nearest: string | null, verified: string | null }}
  */
-function expectedPackageRoot(pkg, cwd) {
+function scanPackageRoots(pkg, cwd) {
   const packageParts = pkg.split("/");
-  if (packageParts.some((part) => part === "" || part === "." || part === "..")) return null;
+  if (packageParts.some((part) => part === "" || part === "." || part === "..")) {
+    return { nearest: null, verified: null };
+  }
   let searchDir = path.resolve(cwd);
+  let nearest = null;
+  let verified = null;
   for (;;) {
     const linked = path.join(searchDir, "node_modules", ...packageParts);
     try {
       const root = realpathSync(linked);
-      const meta = readPackageMeta(path.join(root, "package.json"));
-      if (meta !== null && meta.name === pkg) return root;
+      if (nearest === null) nearest = root;
+      if (verified === null) {
+        const meta = readPackageMeta(path.join(root, "package.json"));
+        if (meta !== null && meta.name === pkg) verified = root;
+      }
     } catch {
       /* not installed at this level; walk up */
     }
+    // verified 命中即可停：nearest 必在同级或更早层级已捕获
+    if (verified !== null) return { nearest, verified };
     const parent = path.dirname(searchDir);
-    if (parent === searchDir) return null;
+    if (parent === searchDir) return { nearest, verified };
     searchDir = parent;
   }
 }
@@ -143,9 +166,11 @@ function readPackageMeta(p) {
 }
 
 /**
- * Post-install fs fallback against Node's same-process negative directory
- * cache. The expected root is already identity-verified (name === pkg), so the
- * only remaining job is entry selection + containment.
+ * Fs resolution against the verified expected root. Two entry paths share it:
+ * bypassing Node's same-process negative directory cache after a post-install
+ * miss, and the 复审 6.1 shadow redirect (Node picked a nearer wrong-identity
+ * directory). The expected root is already identity-verified (name === pkg),
+ * so the only remaining job is entry selection + containment.
  * @param {string} expectedRoot
  * @param {string[]} exportPaths
  * @returns {string | null}

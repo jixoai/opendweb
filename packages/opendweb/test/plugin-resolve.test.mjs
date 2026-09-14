@@ -145,6 +145,50 @@ test("resolvePluginEntry: directory-name match with a mismatched package identit
   );
 });
 
+// 复审 6.1：嵌套依赖树里，近层错身份目录（目录名 = 请求包、package.json 声明
+// 别的身份）会遮蔽外层已验证的合法副本——Node 解析不校验身份，会解析到遮蔽
+// 目录；resolver 必须受控转向已验证的外层 expectedRoot 走 fs 解析（注释承诺
+// 「继续向上找外层副本」），而不是把候选判为未安装。语义边界：这与包内入口
+// symlink 逃逸（R5-B2，硬拒）不同——Node 选中 nearer!==verified 的目录时，
+// 越界落点是遮蔽所致而非包不可信。
+test("resolvePluginEntry: near wrong-identity dir shadowing an outer verified copy redirects to the outer root (复审 6.1)", async () => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-nested-"));
+  // 外层：已验证合法副本（fixture，manifest name === "echo"）
+  await fsp.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "outer", private: true }), "utf8");
+  await fsp.cp(path.join(FIXTURES, "opendweb-echo"), path.join(root, "node_modules", "opendweb-echo"), { recursive: true });
+  // 嵌套内层：同名目录、错身份（name: "evil-shadow"）、入口可被 Node 解析
+  const nested = path.join(root, "work", "deep");
+  const shadowDir = path.join(nested, "node_modules", "opendweb-echo");
+  await fsp.mkdir(shadowDir, { recursive: true });
+  await fsp.writeFile(path.join(nested, "package.json"), JSON.stringify({ name: "deep", private: true }), "utf8");
+  await fsp.writeFile(
+    path.join(shadowDir, "package.json"),
+    JSON.stringify({ name: "evil-shadow", version: "9.9.9", type: "module", exports: { "./opendweb-plugin": "./plugin.js" } }),
+  );
+  await fsp.writeFile(
+    path.join(shadowDir, "plugin.js"),
+    'export default { name: "shadow", apiVersion: 1, commands: [], run: async () => ({ exit: 1 }) };',
+  );
+
+  // 解析必须落在外层已验证副本（而非 null、而非遮蔽目录的入口）
+  const entry = resolvePluginEntry("opendweb-echo", nested);
+  const outerEntry = await fsp.realpath(path.join(root, "node_modules", "opendweb-echo", "plugin.js"));
+  assert.equal(entry, outerEntry);
+  // 端到端：自适应解析加载的是外层副本（manifest name "echo"）；遮蔽目录的
+  // 清单 name "shadow" 若被加载会触发 name 硬错误
+  const resolved = await resolveAdaptive({ name: "echo", globs: DEFAULT_GLOBS, cwd: nested });
+  assert.equal(resolved.pkg, "opendweb-echo");
+  assert.equal(resolved.manifest.name, "echo");
+
+  // 边界：外层副本不存在时（只剩近层错身份遮蔽），身份语义不变 = 未安装
+  await fsp.rm(path.join(root, "node_modules", "opendweb-echo"), { recursive: true, force: true });
+  assert.equal(resolvePluginEntry("opendweb-echo", nested), null);
+  await assert.rejects(
+    () => resolveAdaptive({ name: "echo", globs: DEFAULT_GLOBS, cwd: nested }),
+    (e) => e instanceof PluginNotResolved,
+  );
+});
+
 test("resolveAdaptive: declaration order wins; unresolvable candidates are skipped", async () => {
   const dir = await projectWith("opendweb-echo");
   // 默认序：@jixo/opendweb-echo（未安装）→ opendweb-echo（已安装）
