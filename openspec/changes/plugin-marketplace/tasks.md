@@ -102,8 +102,14 @@
       悬挂态，断言恰好一条 WARNING、旧 watchdog 同步摘除（exit listener
       1→0，被扣住的 exit 事件此后补派发也不双报）、随后新 spawn 被允许
       且 stop 全程回收。connector 13/13）
-- [ ] 7.2 pack:dry 升级为 clean-tar 消费者导入测试：解包 tarball 到
+- [x] 7.2 pack:dry 升级为 clean-tar 消费者导入测试：解包 tarball 到
       临时目录后从包上下文 import 两个 exports 面，端到端证明零运行时
-      依赖可解析
+      依赖可解析（2026-09-14 完成：门禁重写为 scripts/pack-dry.mjs，
+      保留原静态检查——零依赖/泄漏扫描（静态+动态）/体积上限；新增
+      真实 npm pack → tarball 解包进空消费者目录的 node_modules（与
+      npm install 零依赖 tarball 的落盘等价、确定性离线）→ 消费者上
+      下文 import config 面（`.`）与 CLI 面（`./opendweb-plugin`）并
+      断言形状；负向验证双向：@clack 泄漏命中泄漏扫描、未知 bare
+      import（zod）命中 clean-tar 消费者失败，均非零退出）
 - [ ] 7.3 tsdown 构建性能：dts 生成主导串行构建耗时，调查并行/缓存
       方案（不阻塞正确性，仅影响 test/pack:dry 门禁成本）
