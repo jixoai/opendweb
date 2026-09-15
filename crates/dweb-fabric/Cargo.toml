@@ -18,6 +18,7 @@ rustls-pki-types = "1"
 blake3 = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
+bytes = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 # Debug (non-canonical) JSON projection of facts; canonical bytes are hand-written.

@@ -1,3 +1,4 @@
+pub mod continuity;
 pub mod fabric;
 pub mod identity;
 // 有界 known_addrs 存储（HB 3.1 内部实现细节）

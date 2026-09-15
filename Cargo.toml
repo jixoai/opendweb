@@ -15,6 +15,7 @@ repository = "https://github.com/Gaubee/dweb"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+bytes = "1"
 iroh = "=1.1.0"
 iroh-relay = { version = "=1.1.0", features = ["server"] }
 iroh-base = "=1.1.0"

@@ -4,7 +4,7 @@
 
 - [x] 1.0 会话生命周期契约冻结（R3 补）：SESSION_INIT 建会话流程、token
       签发/轮换/无绝对过期语义、`openSession` 幂等入口——design.md §2.3.0 定稿
-- [ ] 1.1 冻结术语与公共帧头（48B 头、帧类型表、flags）进 design.md 附录；
+- [x] 1.1 冻结术语与公共帧头（48B 头、帧类型表、flags）进 design.md 附录；
       建立 Rust 侧二进制 fixture（合法 round-trip + malformed 负例）与
       offset/ACK/SACK property tests（fixture 主路径 = Rust + N-API 黑盒；
       TS 解码器 fixture 仅逃生舱可选）
