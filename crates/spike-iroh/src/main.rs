@@ -21,6 +21,8 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, T
 use n0_future::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod probes;
+
 const ALPN: &[u8] = b"spike/1";
 const MSG_LIMIT: usize = 64 * 1024;
 
@@ -55,6 +57,17 @@ async fn main() -> Result<()> {
         "relay-selftest" => cmd_relay_selftest().await,
         "n0-selftest" => cmd_n0_selftest().await,
         "keygen" => cmd_keygen().await,
+        "probe-exporter" => probes::probe_exporter().await,
+        "probe-datagram" => probes::probe_datagram().await,
+        "probe-timeouts" => probes::probe_timeouts(
+            rest.first().and_then(|v| v.parse().ok()).unwrap_or(25),
+        )
+        .await,
+        "probe-close" => probes::probe_close().await,
+        "probe-flow" => probes::probe_flow(
+            rest.first().and_then(|v| v.parse().ok()).unwrap_or(128),
+        )
+        .await,
         other => bail!("未知子命令: {other}"),
     }
 }

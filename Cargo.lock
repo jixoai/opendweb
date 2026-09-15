@@ -3660,6 +3660,7 @@ name = "spike-iroh"
 version = "0.4.3"
 dependencies = [
  "anyhow",
+ "bytes",
  "iroh",
  "iroh-relay",
  "n0-future",

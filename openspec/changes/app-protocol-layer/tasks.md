@@ -2,22 +2,22 @@
 
 ## Phase 0：术语冻结、wire fixture 与 iroh probe
 
-- [ ] 1.0 会话生命周期契约冻结（R3 补）：SESSION_INIT 建会话流程、token
+- [x] 1.0 会话生命周期契约冻结（R3 补）：SESSION_INIT 建会话流程、token
       签发/轮换/无绝对过期语义、`openSession` 幂等入口——design.md §2.3.0 定稿
 - [ ] 1.1 冻结术语与公共帧头（48B 头、帧类型表、flags）进 design.md 附录；
       建立 Rust 侧二进制 fixture（合法 round-trip + malformed 负例）与
       offset/ACK/SACK property tests（fixture 主路径 = Rust + N-API 黑盒；
       TS 解码器 fixture 仅逃生舱可选）
-- [ ] 1.2 iroh probe：`export_keying_material` 跨连接适用性（A/B 连接对比 +
+- [x] 1.2 iroh probe：`export_keying_material` 跨连接适用性（A/B 连接对比 +
       同连接 path migration 对比）+ N-API 暴露安全性
-- [ ] 1.3 iroh probe：datagram 支持面（最大 payload/丢包/relay 行为）
-- [ ] 1.4 iroh probe：keepalive/path idle/connection idle 默认值实测时间线
+- [x] 1.3 iroh probe：datagram 支持面（最大 payload/丢包/relay 行为）
+- [x] 1.4 iroh probe：keepalive/path idle/connection idle 默认值实测时间线
       （PING、PathEvent::Selected/Closed、closed() 边界）
-- [ ] 1.5 iroh probe：close reason 错误映射表（本地/远端/超时/stateless
+- [x] 1.5 iroh probe：close reason 错误映射表（本地/远端/超时/stateless
       reset/relay 中断）；`connectionEpoch` 自生成方案确认
-- [ ] 1.6 iroh probe：流控并发上限（128 logical stream × 慢读 + 大 replay，
+- [x] 1.6 iroh probe：流控并发上限（128 logical stream × 慢读 + 大 replay，
       control stream 不被阻塞）
-- [ ] 1.7 每项 probe 产出存档：源码路径+版本、命令、原始输出、判定、对协议
+- [x] 1.7 每项 probe 产出存档：源码路径+版本、命令、原始输出、判定、对协议
       草案的影响；未过查证不冻结 timeout/token 派生方案
 - [ ] 1.8 Rust↔N-API HTTP/WS handler ABI 定稿（R3 补草案 design.md §3.4：
       handler TS 执行、body 流桥接、背压与 ACK 同源、取消/shutdown drain、
