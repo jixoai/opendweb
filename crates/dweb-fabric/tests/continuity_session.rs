@@ -11,15 +11,18 @@
 //!   TOKEN_INVALID（两代滑窗的 e2e 面；窗口挤出语义在 session.rs 单测）
 //! - 多流并发恢复：大流 + 小流同时重放，双双字节精确完成（轮转交织的
 //!   e2e 面；公平性序在 session.rs 单测）
+//! - 恢复后的旧 epoch DATA/ACK 由同一 pump fence 丢弃：stale 计数增加、
+//!   journal 与 Active phase 不变
 //!
 //! 运行：`--test-threads=1`（固定端口跨测试竞争）。
 
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::session::{
-    self, decode_resume_ok, encode_session_init, reject_reason, encode_resume_init,
+    self, decode_resume_ok, encode_resume_init, encode_session_init, init_reason, reject_reason,
     RequestState, SessionOptions,
 };
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
@@ -166,6 +169,63 @@ async fn session_handshake_roundtrip_and_ack_release() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// P0-2：双端同时以 `open_session` 建会话时，按
+/// `(EndpointId, sessionId)` 全序收敛到同一个 canonical sid；同 peer 不保留
+/// 两个已接受会话。
+#[tokio::test]
+async fn session_dual_open_session_converges_to_one_sid() {
+    let (a, b, _da, _db) = pair().await;
+    let a_id = a.endpoint_id();
+    let b_id = b.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let accept_a = {
+        let provider = a.clone();
+        let peer = b_id.clone();
+        tokio::spawn(async move { session::accept_any(&provider, &peer, opts).await })
+    };
+    let accept_b = {
+        let provider = b.clone();
+        let peer = a_id.clone();
+        tokio::spawn(async move { session::accept_any(&provider, &peer, opts).await })
+    };
+
+    let (a_result, b_result) = tokio::time::timeout(Duration::from_secs(45), async {
+        tokio::join!(
+            open_session_bounded(&a, &b_id, opts),
+            open_session_bounded(&b, &a_id, opts),
+        )
+    })
+    .await
+    .expect("双端 open_session 有界");
+    let a_session = a_result;
+    let b_session = b_result;
+    assert_eq!(
+        a_session.shared().session_id,
+        b_session.shared().session_id,
+        "双端并发 INIT 必须收敛到同一 sid"
+    );
+
+    let accepted_a = tokio::time::timeout(Duration::from_secs(10), accept_a)
+        .await
+        .expect("A provider accept 有界")
+        .expect("A provider task");
+    let accepted_b = tokio::time::timeout(Duration::from_secs(10), accept_b)
+        .await
+        .expect("B provider accept 有界")
+        .expect("B provider task");
+    let accepted: Vec<_> = [accepted_a, accepted_b]
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    assert_eq!(accepted.len(), 1, "同 peer 只能有一个 provider canonical session");
+    assert_eq!(
+        accepted[0].shared().session_id,
+        a_session.shared().session_id,
+        "provider canonical sid 与双方句柄一致"
+    );
 }
 
 /// s2：SSE 中途断线续传——断在多个 chunk 边界，字节级精确重组 + 上游执行恰好一次。
@@ -457,8 +517,8 @@ async fn session_multi_stream_resume_interleaved() {
     provider.abort();
 }
 
-/// s6（硬化 P0-1）：并发双 RESUME 同 token——恰一个 RESUME_OK、一个
-/// TOKEN_INVALID（try_rotate 原子裁决 + Active 期 previous 闸门）。
+/// s6（硬化 P0-1）：同 nonce 的并发 RESUME 重发同一 RESUME_OK；异 nonce
+/// 对 previous 的精确匹配仍可开启一个串行 winner。
 #[tokio::test]
 async fn session_concurrent_double_resume_single_winner() {
     let (a, b, _da, _db) = pair().await;
@@ -545,19 +605,85 @@ async fn session_concurrent_double_resume_single_winner() {
         token_gen + 1,
         "generation 恰前进一次（单次轮换）"
     );
-    // 2) 异 nonce 携 previous 凭据：拒绝（单胜——previous 仅经 nonce 绑定
-    //    pending 可用，陌生 nonce 不得二次轮换）
+    // 2) 异 nonce 携 previous 凭据：previous 精确匹配仍可开启新的串行
+    //    winner（不是 cached 幂等路径）。
     let t3 = a.continuity_open_transport(&b_id).await.unwrap();
     let r3 = send_resume_with_nonce(t3, [7u8; 16]).await;
-    assert_eq!(
-        r3.frame_type,
-        FrameType::ResumeReject,
-        "异 nonce + previous 凭据必须拒绝"
-    );
-    assert_eq!(
-        r3.payload.first().copied().unwrap_or(0),
-        reject_reason::TOKEN_INVALID
-    );
+    assert_eq!(r3.frame_type, FrameType::ResumeOk, "previous 精确匹配可恢复");
+    assert_eq!(decode_resume_ok(&r3.payload).unwrap().0, results[0].0 + 1);
+    provider.abort();
+}
+
+/// P0 transition barrier：RESUME_OK 已缓存但新 owner 尚未提交时，重复
+/// transport 只能收到缓存结果并半关；owner 只由真正 winner 前进一次。
+#[tokio::test]
+async fn session_resume_cached_duplicate_does_not_change_owner() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let provider = tokio::spawn(async move {
+        let initial = session::accept_any(&b, &a_id, opts).await.expect("initial accept");
+        let gate_rx = initial.shared().resume_gate.enable();
+        let owner_before = initial.shared().debug_channel_owner();
+        ready_tx
+            .send((initial.shared().clone(), gate_rx, owner_before))
+            .unwrap_or_else(|_| panic!("barrier handoff"));
+        let b1 = b.clone();
+        let b2 = b.clone();
+        let a1 = a_id.clone();
+        let a2 = a_id.clone();
+        let p1 = tokio::spawn(async move { session::accept_any(&b1, &a1, opts).await });
+        let p2 = tokio::spawn(async move { session::accept_any(&b2, &a2, opts).await });
+        let _ = tokio::join!(p1, p2);
+    });
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let (shared, mut gate_rx, owner_before) = ready_rx.await.expect("barrier ready");
+    let (generation, token) = client.shared().debug_current_token();
+    let sid = client.shared().session_id;
+
+    let send = |mut t: dweb_fabric::continuity::ContinuityTransport| async move {
+        t.send(&Frame {
+            frame_type: FrameType::ResumeInit,
+            flags: 0,
+            session_id: sid,
+            stream_id: 0,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from(encode_resume_init(
+                generation,
+                generation,
+                &[9u8; 16],
+                &token,
+                &[],
+            )),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), t.recv())
+            .await
+            .expect("resume response")
+            .unwrap()
+    };
+    let t1 = a.continuity_open_transport(&b_id).await.unwrap();
+    let t2 = a.continuity_open_transport(&b_id).await.unwrap();
+    let j1 = tokio::spawn(send(t1));
+    let j2 = tokio::spawn(send(t2));
+    tokio::time::timeout(Duration::from_secs(10), gate_rx.changed())
+        .await
+        .expect("winner reaches ResumeGate")
+        .expect("gate remains open");
+    assert_eq!(shared.debug_channel_owner(), owner_before, "barrier 内尚未提交 owner");
+    shared.resume_gate.release();
+    let (winner, duplicate) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(j1, j2)
+    })
+    .await
+    .expect("winner released");
+    assert_eq!(winner.expect("winner task").frame_type, FrameType::ResumeOk);
+    assert_eq!(duplicate.expect("duplicate task").frame_type, FrameType::ResumeOk);
+    assert_eq!(shared.debug_channel_owner(), owner_before + 1, "仅 winner 提交新 owner");
     provider.abort();
 }
 
@@ -608,10 +734,166 @@ async fn session_init_idempotent_and_token_gate() {
         FrameType::SessionInitOk,
         "同 sid+token 重发必须幂等 OK"
     );
-    // 伪造 token → REJECT 0x02 TOKEN_INVALID
+    // 伪造 token → INIT REJECT 0x02 MALFORMED（INIT 与 RESUME reason 命名空间独立）
     let resp = send_init([0xEEu8; 16]).await;
     assert_eq!(resp.frame_type, FrameType::SessionInitReject);
-    assert_eq!(resp.payload[0], reject_reason::TOKEN_INVALID);
+    assert_eq!(resp.payload[0], init_reason::MALFORMED);
+    provider.abort();
+}
+
+/// P0-4：畸形 SESSION_INIT 必须在 wire 上回 INIT_REJECT(MALFORMED)，不能静默
+/// 结束传输或把错误误报成 RESUME reason。
+#[tokio::test]
+async fn session_init_malformed_rejects_on_wire() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let provider = tokio::spawn(async move { session::accept_any(&b, &a_id, opts).await });
+
+    let sid = [0x53u8; 16];
+    let mut raw = a.continuity_open_transport(&b_id).await.unwrap();
+    raw.send(&Frame {
+        frame_type: FrameType::SessionInit,
+        flags: 0,
+        session_id: sid,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from_static(&[session::PROTOCOL_VERSION]),
+    })
+    .await
+    .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), raw.recv())
+        .await
+        .expect("malformed INIT response 有界")
+        .unwrap();
+    assert_eq!(response.frame_type, FrameType::SessionInitReject);
+    assert_eq!(response.session_id, sid, "INIT_REJECT header 回显被拒 sid");
+    assert_eq!(response.payload.first(), Some(&init_reason::MALFORMED));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), provider)
+            .await
+            .expect("malformed provider task 有界")
+            .expect("provider task")
+            .is_err(),
+        "畸形 INIT 应结束本次接纳而非建立 session"
+    );
+}
+
+/// P0-3d：绕过本地 OPEN 名额门、从真实 continuity wire 发送 129 个 OPEN；
+/// 远端只接受前 128 个，第 129 个计入协议违例并丢弃。
+#[tokio::test]
+async fn session_wire_rejects_129th_open() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let provider_task = tokio::spawn(async move {
+        session::accept_any(&b, &a_id, opts)
+            .await
+            .expect("provider accept")
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let provider = provider_task.await.expect("provider task");
+    let sid = client.shared().session_id;
+    for index in 0..=session::MAX_ACTIVE_STREAMS {
+        let stream_id = index as u64 * 2 + 1;
+        client
+            .channel()
+            .send_frame(&Frame {
+                frame_type: FrameType::Open,
+                flags: dweb_fabric::continuity::frame::flags::START,
+                session_id: sid,
+                stream_id,
+                direction: Direction::ClientToProvider,
+                byte_offset: 0,
+                payload: Bytes::from(format!(
+                    "{{\"requestId\":\"{stream_id}\",\"idempotencyKey\":\"wire-{stream_id}\"}}"
+                )),
+            })
+            .await
+            .expect("OPEN wire send");
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while provider.shared().protocol_violations() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "第 129 个 OPEN 未被拒绝");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(provider.shared().protocol_violations(), 1);
+}
+
+/// P0 transition：真实断线恢复完成后，旧 channel 的 DATA/ACK 即便已从旧
+/// transport 收到，也只能穿过同一 dispatch fence 计为 stale；不得交付、释放
+/// journal 或把新代拉离 Active。
+#[tokio::test]
+async fn session_old_epoch_data_and_ack_are_fenced_after_resume() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let provider = tokio::spawn(async move {
+        loop {
+            let _ = session::accept_any(&b, &a_id, opts).await;
+        }
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let stream = client.open_stream("old-epoch-fence").await.unwrap();
+    client
+        .prepare_send(stream, &Bytes::from_static(b"journal-before-stale"))
+        .await
+        .expect("journal seed");
+    let old_channel = client.channel();
+
+    a.continuity_reset(&b_id).await.unwrap();
+    client.resume(&a).await.expect("resume");
+    assert_eq!(client.phase().await, session::SessionPhase::Active);
+    let journal_before = client.shared().journal_held_bytes(stream).await;
+    let stale_before = client.shared().stale_frames();
+
+    // `old_channel` 是真实恢复前的 channel；测试钩子复用 pump 的完整
+    // fence/dispatch 路径，模拟它在换代后才取得的旧连接帧。
+    let old_data = Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        session_id: client.shared().session_id,
+        stream_id: stream,
+        direction: Direction::ProviderToClient,
+        byte_offset: 0,
+        payload: Bytes::from_static(b"old-epoch-data"),
+    };
+    let old_ack = Frame {
+        frame_type: FrameType::Ack,
+        flags: 0,
+        session_id: client.shared().session_id,
+        stream_id: stream,
+        direction: Direction::ClientToProvider,
+        byte_offset: journal_before as u64,
+        payload: Bytes::new(),
+    };
+    old_channel
+        .debug_dispatch_frame(&old_data)
+        .await
+        .expect("stale DATA dispatch");
+    old_channel
+        .debug_dispatch_frame(&old_ack)
+        .await
+        .expect("stale ACK dispatch");
+
+    assert_eq!(client.shared().stale_frames(), stale_before + 2);
+    assert_eq!(
+        client.shared().journal_held_bytes(stream).await,
+        journal_before,
+        "旧 ACK 不得释放新代 journal"
+    );
+    assert_eq!(
+        client.phase().await,
+        session::SessionPhase::Active,
+        "旧 DATA/ACK 不得改变新代 phase"
+    );
     provider.abort();
 }
 

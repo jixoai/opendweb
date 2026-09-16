@@ -39,8 +39,8 @@
 //!   resume campaign 生成一个 nonce（重试复用）；provider 侧 RESUME 的
 //!   nonce+凭据命中 `pending`（轮换已发生、新通道未确认）→ 重发缓存的
 //!   同 (generation, token) RESUME_OK（不二次轮换）；异 nonce 或凭据不符
-//!   → 按当前窗口裁决（current 恒可用；previous 仅经 pending 缓存路径
-//!   可达）。pending 在新代首次成功 Deliver / 合法 ACK 推进时清除。
+//!   → 按当前窗口裁决（current/previous 均须精确匹配）；pending 在新代
+//!   首次成功 Deliver / 合法 ACK 推进时清除。
 //! - **epoch/owner fencing**（R3-2）：`SessionChannel` 携带 (epoch, owner)
 //!   ——pump 收帧后先 fence（与 ResumeCtl 快照比对），旧通道帧丢弃计数、
 //!   不进 journal 不回 ACK；旧通道退出不把新代拉回 Recovering；通道安装
@@ -168,19 +168,17 @@ impl TokenWindow {
     /// 原子裁决+轮换（P0-1）：validate 与 rotate 在调用方保证的同一临界区内
     /// 完成——两步之间不存在可观测的中间态，并发 RESUME 无法同过旧 token。
     /// - (generation, token) 匹配 current → 轮换（generation 单调 +1）。
-    /// - 匹配 previous 且 `allow_previous`（当前代不活跃——OK-lost 重试窗口）
-    ///   → 轮换。
+    /// - 匹配 previous → 轮换。
     /// - 其它 → None（TOKEN_INVALID）。
     fn try_rotate(
         &mut self,
         generation: u64,
         token: &[u8; 16],
         new_token: [u8; 16],
-        allow_previous: bool,
     ) -> Option<(u64, [u8; 16])> {
         let current_match = self.current.0 == generation && &self.current.1 == token;
-        let previous_match = allow_previous
-            && matches!(&self.previous, Some((g, t)) if *g == generation && t == token);
+        let previous_match =
+            matches!(&self.previous, Some((g, t)) if *g == generation && t == token);
         if !current_match && !previous_match {
             return None;
         }
@@ -281,6 +279,9 @@ struct ResumeCtl {
     /// 当前胜者通道（owner, Weak——生命周期由强引用者持有，无环）。
     channel: Option<(u64, std::sync::Weak<SessionChannel>)>,
     pending: Option<PendingResume>,
+    /// current/previous 窗口是否仍可用于恢复。与 `tokens.clear_previous`
+    /// 在同一把 ResumeCtl 锁内切换，避免确认与下一次 RESUME 交错。
+    previous_live: bool,
 }
 
 /// barrier 测试钩子（R3-1，Codex 步骤 6）：`accept_resume` 在**轮换完成、
@@ -357,8 +358,10 @@ pub struct SessionShared {
     is_client: bool,
     /// 恢复控制单锁（R3-1：token 窗口 + phase + 通道 owner/epoch + pending）。
     resume_control: std::sync::Mutex<ResumeCtl>,
-    /// previous/pending 是否占位（热路径无谓锁快路径；rotate 置位、confirm 复位）。
-    previous_live: std::sync::atomic::AtomicBool,
+    /// 收帧处理 lease 与通道 transition 互斥：读 lease 覆盖 fence 检查和
+    /// `handle_frame` 提交，写 transition 先停止旧泵并等待所有 lease 排空。
+    frame_gate: tokio::sync::RwLock<()>,
+    channel_transition: tokio::sync::Mutex<()>,
     streams: tokio::sync::Mutex<HashMap<u64, StreamCtx>>,
     next_stream_id: std::sync::atomic::AtomicU64,
     /// 副作用状态机：stream_id → (state, 幂等键)。
@@ -410,8 +413,10 @@ impl SessionShared {
                 channel_owner: 0,
                 channel: None,
                 pending: None,
+                previous_live: false,
             }),
-            previous_live: std::sync::atomic::AtomicBool::new(false),
+            frame_gate: tokio::sync::RwLock::new(()),
+            channel_transition: tokio::sync::Mutex::new(()),
             streams: tokio::sync::Mutex::new(HashMap::new()),
             next_stream_id: std::sync::atomic::AtomicU64::new(if is_client { 1 } else { 2 }),
             requests: tokio::sync::Mutex::new(HashMap::new()),
@@ -447,28 +452,45 @@ impl SessionShared {
         ctl.active_epoch == epoch && ctl.channel_owner == owner
     }
 
-    /// 通道安装（R3-2d：唯一安装路径，全部经 ResumeCtl 单锁）：
-    /// - Force：无条件接管（owner 单调 +1，active_epoch 更新；旧通道被 fence）。
-    /// - IfVacant：既有通道存活（强引用在且未 dead）→ None（拒绝，调用方
-    ///   半关本传输）；否则同 Force。
-    /// 弱引用只在 owner 大于已登记 owner 时覆写（并发安装的写序无关性）。
-    fn install_channel(
+    /// 通道安装（R3-2d/P0 transition）：所有切换先串行化，停止旧泵并等待
+    /// 其 frame-handler read lease 排空，再在 ResumeCtl 内提交新的 owner/epoch。
+    /// 这样旧帧不可能在 fence 检查后、owner 替换后继续提交。
+    async fn install_channel(
         self: &Arc<Self>,
-        send: TransportSend,
+        mut send: TransportSend,
         recv: TransportRecv,
         policy: InstallPolicy,
     ) -> Option<Arc<SessionChannel>> {
-        let epoch = send.epoch;
-        let mut ctl = self.resume_control.lock().unwrap();
+        let _transition = self.channel_transition.lock().await;
+        let old = self.current_channel();
         if policy == InstallPolicy::IfVacant {
-            if let Some((_, weak)) = &ctl.channel {
-                if let Some(chan) = weak.upgrade() {
-                    if !chan.is_dead() {
-                        return None;
-                    }
+            if let Some(chan) = old.as_ref() {
+                if !chan.is_dead() {
+                    // Duplicate INIT/RESUME transport is acknowledged by the
+                    // caller, then half-closed without changing ownership.
+                    // A stopping pump still owns the transition until it has
+                    // actually exited, so it is not vacant yet.
+                    let _ = send.finish();
+                    return None;
                 }
             }
+            // A RESUME winner has already reserved the owner while its OK is
+            // in flight. A cached duplicate must not become an interim owner
+            // merely because the previous pump has just died.
+            if self.resume_control.lock().unwrap().pending.is_some() {
+                let _ = send.finish();
+                return None;
+            }
         }
+        if let Some(chan) = old {
+            chan.request_stop();
+            chan.wait_stopped().await;
+        }
+        // The pump normally drains before this point. The write guard is the
+        // final lease barrier for a handler that was between fence and commit.
+        let _frame_barrier = self.frame_gate.write().await;
+        let epoch = send.epoch;
+        let mut ctl = self.resume_control.lock().unwrap();
         let owner = ctl.channel_owner + 1;
         ctl.channel_owner = owner;
         ctl.active_epoch = epoch;
@@ -479,6 +501,9 @@ impl SessionShared {
             arrivals: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
             arrivals_notify: tokio::sync::Notify::new(),
             dead: std::sync::atomic::AtomicBool::new(false),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            stop_notify: tokio::sync::Notify::new(),
+            stopped_notify: tokio::sync::Notify::new(),
             epoch,
             owner,
         });
@@ -495,9 +520,11 @@ impl SessionShared {
     /// client 侧收到 RESUME_OK 的轮换（R5：旧 current 降 previous）。
     fn rotate_token(&self, new_generation: u64, new_token: [u8; 16]) {
         let mut ctl = self.resume_control.lock().unwrap();
+        if ctl.tokens.current() == (new_generation, new_token) {
+            return;
+        }
         ctl.tokens.rotate(new_generation, new_token);
-        self.previous_live
-            .store(true, std::sync::atomic::Ordering::Release);
+        ctl.previous_live = true;
     }
 
     fn current_token(&self) -> (u64, [u8; 16]) {
@@ -517,9 +544,9 @@ impl SessionShared {
     /// 临界区）：
     /// - nonce+凭据命中 pending（轮换已发生、新通道未确认——OK-lost 重试
     ///   窗口）→ 重发缓存结果（同 generation/token，不二次轮换）。
-    /// - 否则按当前窗口裁决：current 恒可用；previous **仅经 pending 缓存
-    ///   路径可达**（异 nonce 的 previous 凭据 = TOKEN_INVALID——并发双
-    ///   RESUME 恰一胜出，generation 恰前进一次）。
+    /// - 否则按当前窗口裁决：current 或 previous 均可精确匹配；只有同一
+    ///   nonce+来源凭据才是缓存重发。不同 campaign 即使使用 previous，也
+    ///   是新的串行 winner，由 transition/owner lease 收口。
     /// 返回 (generation, token, cached)。
     fn decide_resume(
         &self,
@@ -534,7 +561,7 @@ impl SessionShared {
                 return Some((p.result_generation, p.result_token, true));
             }
         }
-        let Some((g, t)) = ctl.tokens.try_rotate(generation, token, new_token, false) else {
+        let Some((g, t)) = ctl.tokens.try_rotate(generation, token, new_token) else {
             return None;
         };
         ctl.pending = Some(PendingResume {
@@ -544,8 +571,7 @@ impl SessionShared {
             result_generation: g,
             result_token: t,
         });
-        self.previous_live
-            .store(true, std::sync::atomic::Ordering::Release);
+        ctl.previous_live = true;
         Some((g, t, false))
     }
 
@@ -559,16 +585,14 @@ impl SessionShared {
     }
 
     /// 新代确认（R3-1c / P1-5 / design §2.3.0 R5）：新代首次成功 Deliver 或
-    /// 合法 ACK 推进 → pending 幂等缓存与 previous 代**同一临界区内**清除
-    /// （R2 的 clear_previous 与 rotate 交错竞态由此闭合）。
+    /// 合法 ACK 推进 → pending 幂等缓存与 previous 代在 ResumeCtl 同一临界区
+    /// 内清除（R2 的 clear_previous 与 rotate 交错竞态由此闭合）。
     fn note_confirmed(&self) {
-        if self
-            .previous_live
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            let mut ctl = self.resume_control.lock().unwrap();
+        let mut ctl = self.resume_control.lock().unwrap();
+        if ctl.previous_live {
             ctl.pending = None;
             ctl.tokens.clear_previous();
+            ctl.previous_live = false;
         }
     }
 
@@ -1365,6 +1389,10 @@ pub struct SessionChannel {
     arrivals_notify: tokio::sync::Notify,
     /// pump 退出即置位（通道终结——arrivals 排空后 next_incoming 返回 None）。
     dead: std::sync::atomic::AtomicBool,
+    /// transition 请求旧 pump 停止；通过 select 唤醒其 recv 等待。
+    stopping: std::sync::atomic::AtomicBool,
+    stop_notify: tokio::sync::Notify,
+    stopped_notify: tokio::sync::Notify,
     /// 本通道的 transport epoch（创建时取 TransportSend.epoch；fence 键 1/2）。
     epoch: u64,
     /// 本通道的 owner id（ResumeCtl 单调分配；fence 键 2/2——同 epoch 的
@@ -1376,18 +1404,38 @@ impl SessionChannel {
     /// 安装通道（R3-2d：唯一安装路径——owner 分配 + active_epoch 更新 +
     /// Weak 登记/单调覆写全部在 ResumeCtl 单锁内；策略见 [`InstallPolicy`]）。
     /// 返回 None = IfVacant 被拒（既有通道存活；调用方应半关本传输）。
-    pub(crate) fn install(
+    pub(crate) async fn install(
         shared: &Arc<SessionShared>,
         send: TransportSend,
         recv: TransportRecv,
         policy: InstallPolicy,
     ) -> Option<Arc<Self>> {
-        shared.install_channel(send, recv, policy)
+        shared.install_channel(send, recv, policy).await
     }
 
     /// 通道是否已终结（pump 退出）——IfVacant 策略的存活判定。
     pub fn is_dead(&self) -> bool {
         self.dead.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn request_stop(&self) {
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_notify.notify_waiters();
+    }
+
+    async fn wait_stopped(&self) {
+        loop {
+            // `enable` registers this waiter before the atomic recheck. The
+            // pump uses `notify_waiters`, which otherwise has no retained
+            // permit and could be lost between the check and `.await`.
+            let stopped = self.stopped_notify.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
+            if self.is_dead() {
+                return;
+            }
+            stopped.await;
+        }
     }
 
     /// 本通道是否仍是当前胜者（fence 快照）。
@@ -1517,6 +1565,7 @@ impl SessionChannel {
         let out = self.pump_inner().await;
         self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
         self.arrivals_notify.notify_waiters();
+        self.stopped_notify.notify_waiters();
         out
     }
 
@@ -1524,7 +1573,19 @@ impl SessionChannel {
         loop {
             let f = {
                 let mut recv = self.recv.lock().await;
-                match recv.recv().await {
+                // Register before checking `stopping`: `notify_waiters` has
+                // no retained permit, so checking first could miss a stop
+                // request and leave the old pump blocked in recv.
+                let stop = self.stop_notify.notified();
+                tokio::pin!(stop);
+                stop.as_mut().enable();
+                if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+                match tokio::select! {
+                    _ = stop.as_mut() => return Ok(()),
+                    result = recv.recv() => result,
+                } {
                     Ok(f) => f,
                     Err(TransportError::Ended) => {
                         if self.is_current() {
@@ -1540,30 +1601,7 @@ impl SessionChannel {
                     }
                 }
             };
-            // R3-2 fence：旧通道（epoch/owner 任一不符）的迟到帧丢弃计数
-            // ——不进 journal、不回 ACK、不改交付面（design §2.7 规则 5）。
-            if !self.is_current() {
-                self.shared.stale_frame_count.fetch_add(
-                    1,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                continue;
-            }
-            let outcome = self.shared.handle_frame(&f).await;
-            if let Some(stream_id) = outcome.new_open {
-                self.arrivals.lock().await.push_back(stream_id);
-                self.arrivals_notify.notify_waiters();
-            }
-            if let Some(ctrl) = outcome.reply {
-                if let Err(e) = self.send_frame(&ctrl).await {
-                    // 连接死亡同样进入 Recovering（recv 侧未必再被轮到）
-                    // ——仅当本通道仍是当前胜者（R3-2c）
-                    if self.is_current() {
-                        self.shared.set_phase(SessionPhase::Recovering).await;
-                    }
-                    return Err(e);
-                }
-            }
+            self.dispatch_frame(&f).await?;
             if trace_enabled() {
                 strace!(
                     "pump {} {:?} sid={} stream={} off={} len={}",
@@ -1576,6 +1614,44 @@ impl SessionChannel {
                 );
             }
         }
+    }
+
+    /// Fence and commit one received frame. The read lease covers both the
+    /// owner check and every resulting side effect, including an immediate
+    /// control reply, so a channel transition cannot replace the owner in the
+    /// middle of this dispatch.
+    async fn dispatch_frame(&self, f: &Frame) -> Result<(), FabricError> {
+        let _frame_lease = self.shared.frame_gate.read().await;
+        if !self.is_current() {
+            self.shared
+                .stale_frame_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
+        let outcome = self.shared.handle_frame(f).await;
+        if let Some(stream_id) = outcome.new_open {
+            self.arrivals.lock().await.push_back(stream_id);
+            self.arrivals_notify.notify_waiters();
+        }
+        if let Some(ctrl) = outcome.reply {
+            if let Err(e) = self.send_frame(&ctrl).await {
+                // Connection death also enters Recovering (the receive side
+                // may never run again), but only while this channel remains
+                // the winner under the same frame lease.
+                if self.is_current() {
+                    self.shared.set_phase(SessionPhase::Recovering).await;
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Test-only observation hook for a frame that was received by a specific
+    /// epoch/owner channel. It deliberately reuses the pump dispatch path.
+    #[doc(hidden)]
+    pub async fn debug_dispatch_frame(&self, f: &Frame) -> Result<(), FabricError> {
+        self.dispatch_frame(f).await
     }
 
     fn spawn_pump(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -1710,9 +1786,6 @@ impl Session {
     }
 
     fn install_channel(&self, channel: Arc<SessionChannel>) {
-        if let Some(old) = self.pump.lock().unwrap().take() {
-            old.abort();
-        }
         let pump = channel.spawn_pump();
         *self.pump.lock().unwrap() = Some(pump);
         *self.channel.write().unwrap() = channel;
@@ -1761,11 +1834,29 @@ pub(crate) enum InitAdmission {
     /// 同 sid 但 token 不符（伪造/竞态）→ REJECT 0x02 MALFORMED（INIT 表
     /// ——数值与旧 TOKEN_INVALID 相同，语义按 §2.3.0 冻结表）。
     TokenMismatch,
+    /// 同 peer 已有 canonical 会话，当前 INIT 是败方。
+    Canonical(Arc<SessionShared>),
+    /// 新候选按全序胜出，旧的 negotiating shared 已从 per-peer index 撤回。
+    Replaced(Arc<SessionShared>, Arc<SessionShared>),
+}
+
+struct RegistryEntry {
+    shared: Arc<SessionShared>,
+    /// `(EndpointId, sessionId)` 全序中的 initiator；provider 入站 INIT
+    /// 使用 remote，client campaign 使用本端 identity。
+    initiator: Option<crate::identity::EndpointId>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    sessions: HashMap<[u8; 16], RegistryEntry>,
+    /// per-peer canonical index，保证同 peer 不并存不同 session。
+    peers: HashMap<String, [u8; 16]>,
 }
 
 #[derive(Default)]
 pub struct SessionRegistry {
-    inner: tokio::sync::Mutex<HashMap<[u8; 16], Arc<SessionShared>>>,
+    inner: tokio::sync::Mutex<RegistryState>,
 }
 
 impl SessionRegistry {
@@ -1773,11 +1864,9 @@ impl SessionRegistry {
         Self::default()
     }
 
-    /// SESSION_INIT 准入（P0-2）：
-    /// - 无此 sid → 登记新会话（绑定 peer_id + token；fresh=true）。
-    /// - 有此 sid 且 peer 一致且 token 与登记代一致 → 幂等 OK（fresh=false，
-    ///   重发既有会话——client 重试用同一 sid/token，ghost 收敛）。
-    /// - peer 不符 → PeerMismatch；token 不符 → TokenMismatch。
+    /// Test-only legacy admission helper; production INIT uses the ordered
+    /// per-peer path below so concurrent campaigns share one canonical index.
+    #[cfg(test)]
     pub(crate) async fn admit_init(
         &self,
         session_id: [u8; 16],
@@ -1785,24 +1874,116 @@ impl SessionRegistry {
         peer_id: String,
         limits: JournalLimits,
     ) -> InitAdmission {
-        let mut map = self.inner.lock().await;
-        if let Some(existing) = map.get(&session_id) {
-            if existing.peer_id != peer_id {
+        let mut state = self.inner.lock().await;
+        if let Some(existing) = state.sessions.get(&session_id) {
+            if existing.shared.peer_id != peer_id {
                 return InitAdmission::PeerMismatch;
             }
-            if !existing.init_token_is(&token) {
+            if !existing.shared.init_token_is(&token) {
                 return InitAdmission::TokenMismatch;
             }
-            return InitAdmission::Admitted(existing.clone(), false);
+            return InitAdmission::Admitted(Arc::clone(&existing.shared), false);
         }
-        let shared = SessionShared::new(session_id, token, peer_id, false, limits);
-        map.insert(session_id, Arc::clone(&shared));
+        let shared = SessionShared::new(session_id, token, peer_id.clone(), false, limits);
+        state.sessions.insert(
+            session_id,
+            RegistryEntry {
+                shared: Arc::clone(&shared),
+                initiator: None,
+            },
+        );
+        state.peers.entry(peer_id).or_insert(session_id);
         InitAdmission::Admitted(shared, true)
     }
 
-    pub(crate) async fn get(&self, session_id: &[u8; 16]) -> Option<Arc<SessionShared>> {
-        self.inner.lock().await.get(session_id).cloned()
+    /// Ordered per-peer INIT admission. A still-negotiating local campaign may
+    /// be replaced only when the incoming `(EndpointId, sessionId)` is smaller;
+    /// an active/recovering canonical session always wins and rejects newcomers.
+    pub(crate) async fn admit_init_ordered(
+        &self,
+        session_id: [u8; 16],
+        token: [u8; 16],
+        peer_id: String,
+        incoming_endpoint: crate::identity::EndpointId,
+        limits: JournalLimits,
+    ) -> InitAdmission {
+        let mut state = self.inner.lock().await;
+        if let Some(existing) = state.sessions.get(&session_id) {
+            if existing.shared.peer_id != peer_id {
+                return InitAdmission::PeerMismatch;
+            }
+            if !existing.shared.init_token_is(&token) {
+                return InitAdmission::TokenMismatch;
+            }
+            return InitAdmission::Admitted(Arc::clone(&existing.shared), false);
+        }
+        let mut replaced = None;
+        if let Some(&canonical_sid) = state.peers.get(&peer_id) {
+            if let Some(existing) = state.sessions.get(&canonical_sid) {
+                let existing_phase = existing.shared.phase_sync();
+                let incoming_wins = existing_phase == SessionPhase::Negotiating
+                    && existing
+                        .initiator
+                        .is_some_and(|id| (incoming_endpoint, session_id) < (id, canonical_sid));
+                if !incoming_wins {
+                    return InitAdmission::Canonical(Arc::clone(&existing.shared));
+                }
+                replaced = state.sessions.remove(&canonical_sid).map(|entry| entry.shared);
+                state.peers.remove(&peer_id);
+            }
+        }
+        let shared = SessionShared::new(session_id, token, peer_id.clone(), false, limits);
+        state.sessions.insert(
+            session_id,
+            RegistryEntry {
+                shared: Arc::clone(&shared),
+                initiator: Some(incoming_endpoint),
+            },
+        );
+        state.peers.insert(peer_id, session_id);
+        if let Some(old) = replaced {
+            InitAdmission::Replaced(shared, old)
+        } else {
+            InitAdmission::Admitted(shared, true)
+        }
     }
+
+    /// Register an outgoing client campaign so an inbound concurrent INIT can
+    /// compare it and the loser can later adopt the canonical shared state.
+    pub(crate) async fn register_local(
+        &self,
+        shared: Arc<SessionShared>,
+        peer_id: String,
+        initiator: crate::identity::EndpointId,
+    ) {
+        let mut state = self.inner.lock().await;
+        let sid = shared.session_id;
+        state.sessions.entry(sid).or_insert(RegistryEntry {
+            shared,
+            initiator: Some(initiator),
+        });
+        state.peers.entry(peer_id).or_insert(sid);
+    }
+
+    pub(crate) async fn remove_if(&self, session_id: &[u8; 16]) {
+        let mut state = self.inner.lock().await;
+        let Some(entry) = state.sessions.remove(session_id) else {
+            return;
+        };
+        if state.peers.get(&entry.shared.peer_id) == Some(session_id) {
+            state.peers.remove(&entry.shared.peer_id);
+        }
+    }
+
+    pub(crate) async fn get(&self, session_id: &[u8; 16]) -> Option<Arc<SessionShared>> {
+        self.inner
+            .lock()
+            .await
+            .sessions
+            .get(session_id)
+            .map(|entry| Arc::clone(&entry.shared))
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1866,7 +2047,7 @@ pub fn encode_session_init_reject(
     canonical_epoch: u64,
     generation: u64,
 ) -> Vec<u8> {
-    let mut p = Vec::with_capacity(41);
+    let mut p = Vec::with_capacity(33);
     p.push(reason);
     p.extend_from_slice(canonical_session_id);
     put_u64(&mut p, canonical_epoch);
@@ -1876,7 +2057,7 @@ pub fn encode_session_init_reject(
 
 /// 解析 SESSION_INIT_REJECT（严格长度；畸形 → None；canonical 可为全零）。
 pub fn decode_session_init_reject(p: &[u8]) -> Option<(u8, [u8; 16], u64, u64)> {
-    if p.len() != 41 {
+    if p.len() != 33 {
         return None;
     }
     let mut canonical = [0u8; 16];
@@ -2027,13 +2208,13 @@ fn entropy_err() -> FabricError {
 
 /// 由已装通道组装会话句柄（pump 启动）。IfVacant 被拒 → None（调用方
 /// 半关传输并按「被存活通道取代」处理）。
-fn mk_session(
+async fn mk_session(
     shared: Arc<SessionShared>,
     send: TransportSend,
     recv: TransportRecv,
     policy: InstallPolicy,
 ) -> Option<Session> {
-    let channel = SessionChannel::install(&shared, send, recv, policy)?;
+    let channel = SessionChannel::install(&shared, send, recv, policy).await?;
     let pump = channel.spawn_pump();
     Some(Session {
         shared,
@@ -2065,6 +2246,16 @@ pub async fn open_session(
 ) -> Result<Session, FabricError> {
     let session_id = rand_16().ok_or_else(entropy_err)?;
     let token = rand_16().ok_or_else(entropy_err)?;
+    let shared = SessionShared::new(session_id, token, peer_id.to_string(), true, opts.limits);
+    fabric
+        .inner
+        .continuity_sessions
+        .register_local(
+            Arc::clone(&shared),
+            peer_id.to_string(),
+            fabric.inner.identity.endpoint_id(),
+        )
+        .await;
     fabric.inner.continuity_campaigns.lock().await.insert(
         peer_id.to_string(),
         InitCampaign {
@@ -2073,10 +2264,11 @@ pub async fn open_session(
     );
     let mut last: Option<FabricError> = None;
     for _ in 0..CONVERGENCE_RETRY {
-        match open_session_attempt(fabric, peer_id, opts, session_id, token).await {
+        match open_session_attempt(fabric, peer_id, session_id, token, Arc::clone(&shared)).await {
             Ok(s) => return Ok(s),
             Err(TryAgain::Definitive(e)) => {
                 cleanup_campaign(fabric, peer_id, session_id).await;
+                fabric.inner.continuity_sessions.remove_if(&session_id).await;
                 return Err(e);
             }
             Err(TryAgain::Transport(e)) => {
@@ -2088,6 +2280,7 @@ pub async fn open_session(
         }
     }
     cleanup_campaign(fabric, peer_id, session_id).await;
+    fabric.inner.continuity_sessions.remove_if(&session_id).await;
     Err(last.expect("至少一次尝试"))
 }
 
@@ -2105,9 +2298,9 @@ async fn cleanup_campaign(fabric: &Fabric, peer_id: &str, session_id: [u8; 16]) 
 async fn open_session_attempt(
     fabric: &Fabric,
     peer_id: &str,
-    opts: SessionOptions,
     session_id: [u8; 16],
     token: [u8; 16],
+    shared: Arc<SessionShared>,
 ) -> Result<Session, TryAgain> {
     strace!("open attempt start peer={peer_id}");
     let mut transport = super::manager::open_transport(fabric, peer_id)
@@ -2151,6 +2344,11 @@ async fn open_session_attempt(
     match resp.frame_type {
         FrameType::SessionInitOk => {
             // R3-3：全载荷解析 + 回显校验（header/payload sid 一致性）
+            if resp.session_id != session_id {
+                return Err(TryAgain::Definitive(FabricError::Session(
+                    SessionError::Connect("SESSION_INIT_OK header sid mismatch".into()),
+                )));
+            }
             let Some((echo_sid, _accepted_epoch, _generation)) =
                 decode_session_init_ok(&resp.payload)
             else {
@@ -2163,21 +2361,28 @@ async fn open_session_attempt(
                     SessionError::Connect("SESSION_INIT_OK sid mismatch".into()),
                 )));
             }
-            let shared =
-                SessionShared::new(session_id, token, peer_id.to_string(), true, opts.limits);
             shared.set_phase(SessionPhase::Active).await;
             let (send, recv) = transport.into_split();
             // 新会话无既有通道，Force 安装恒成功
             mk_session(shared, send, recv, InstallPolicy::Force)
+                .await
                 .ok_or_else(|| TryAgain::Transport(channel_superseded_err()))
         }
         FrameType::SessionInitReject => {
             // R3-3c：并发双 INIT 败方收敛——canonical 三元组指向对端胜方
             // 会话，从本地注册表采纳（不产生双会话并存）。
-            if let Some((_reason, canonical, _epoch, _gen)) =
+            if resp.session_id != session_id {
+                return Err(TryAgain::Definitive(FabricError::Session(
+                    SessionError::Connect("SESSION_INIT_REJECT header sid mismatch".into()),
+                )));
+            }
+            if let Some((reason, canonical, _epoch, _gen)) =
                 decode_session_init_reject(&resp.payload)
             {
-                if canonical != [0u8; 16] && canonical != session_id {
+                if reason == init_reason::ALREADY_ACTIVE
+                    && canonical != [0u8; 16]
+                    && canonical != session_id
+                {
                     strace!(
                         "open lost race, adopting canonical {}",
                         hex8(&canonical)
@@ -2189,10 +2394,18 @@ async fn open_session_attempt(
                             session_id: canonical,
                         },
                     );
+                    fabric.inner.continuity_sessions.remove_if(&session_id).await;
                     let session = adopt_session(fabric, canonical)
                         .await
                         .map_err(TryAgain::Definitive)?;
                     return Ok(session);
+                }
+                if reason == init_reason::MALFORMED || reason == init_reason::POLICY_DENIED {
+                    return Err(TryAgain::Definitive(FabricError::Session(
+                        SessionError::Connect(format!(
+                            "session init rejected: reason={reason:#x}"
+                        )),
+                    )));
                 }
             }
             Err(TryAgain::Definitive(FabricError::Session(
@@ -2258,6 +2471,40 @@ pub async fn accept_any(
 
 /// provider：SESSION_INIT → 准入裁决（P0-2：幂等 + peer/token 绑定）→
 /// SESSION_INIT_OK / SESSION_INIT_REJECT（reason u8）。
+async fn send_init_reject(
+    transport: &mut super::transport::ContinuityTransport,
+    session_id: [u8; 16],
+    reason: u8,
+    canonical: Option<&Arc<SessionShared>>,
+) -> Result<(), FabricError> {
+    let (canonical_sid, canonical_epoch, generation) = canonical
+        .map(|shared| {
+            (
+                shared.session_id,
+                shared.debug_active_epoch(),
+                shared.current_generation(),
+            )
+        })
+        .unwrap_or(([0u8; 16], 0, 0));
+    transport
+        .send(&Frame {
+            frame_type: FrameType::SessionInitReject,
+            flags: 0,
+            session_id,
+            stream_id: 0,
+            direction: Direction::ProviderToClient,
+            byte_offset: 0,
+            payload: Bytes::from(encode_session_init_reject(
+                reason,
+                &canonical_sid,
+                canonical_epoch,
+                generation,
+            )),
+        })
+        .await
+        .map_err(map_transport_err)
+}
+
 async fn accept_session_init(
     fabric: &Fabric,
     peer_id: &str,
@@ -2266,66 +2513,113 @@ async fn accept_session_init(
     init: Frame,
 ) -> Result<Session, FabricError> {
     let p = &init.payload;
-    if p.len() != 41 || p[0] != PROTOCOL_VERSION {
-        return Err(FabricError::Session(SessionError::Connect(
-            "malformed SESSION_INIT".into(),
-        )));
+    if p.len() != 41 || p.first().copied() != Some(PROTOCOL_VERSION) {
+        send_init_reject(&mut transport, init.session_id, init_reason::MALFORMED, None).await?;
+        let _ = transport.finish();
+        return Err(FabricError::Session(SessionError::Connect("malformed SESSION_INIT".into())));
     }
     let mut sid = [0u8; 16];
     sid.copy_from_slice(&p[1..17]);
     let mut token = [0u8; 16];
     token.copy_from_slice(&p[17..33]);
-    let shared = match fabric
+    let local_epoch = get_u64(p, 33).unwrap_or(0);
+    if sid != init.session_id || sid == [0u8; 16] || token == [0u8; 16] || local_epoch == 0 {
+        send_init_reject(&mut transport, init.session_id, init_reason::MALFORMED, None).await?;
+        let _ = transport.finish();
+        return Err(FabricError::Session(SessionError::Connect(
+            "malformed SESSION_INIT identity fields".into(),
+        )));
+    }
+    let incoming_endpoint = endpoint_id_parse(peer_id).map_err(FabricError::from)?;
+    // Read the per-peer campaign before registry admission. This is the
+    // concurrent dual-INIT tie-break input; registry admission repeats the
+    // check under its own lock for non-campaign canonical sessions.
+    let local_campaign = fabric
+        .inner
+        .continuity_campaigns
+        .lock()
+        .await
+        .get(peer_id)
+        .copied();
+    if let Some(campaign) = local_campaign {
+        if campaign.session_id != sid {
+            let local_endpoint = fabric.inner.identity.endpoint_id();
+            let local_shared = fabric
+                .inner
+                .continuity_sessions
+                .get(&campaign.session_id)
+                .await;
+            let local_is_active = local_shared
+                .as_ref()
+                .is_some_and(|shared| shared.phase_sync() != SessionPhase::Negotiating);
+            let incoming_wins = (incoming_endpoint, sid) < (local_endpoint, campaign.session_id);
+            if local_is_active || !incoming_wins {
+                let canonical = fabric
+                    .inner
+                    .continuity_sessions
+                    .get(&campaign.session_id)
+                    .await;
+                send_init_reject(
+                    &mut transport,
+                    sid,
+                    init_reason::ALREADY_ACTIVE,
+                    canonical.as_ref(),
+                )
+                .await?;
+                let _ = transport.finish();
+                return Err(FabricError::Session(SessionError::Connect(
+                    "session init rejected: ALREADY_ACTIVE".into(),
+                )));
+            }
+            let mut campaigns = fabric.inner.continuity_campaigns.lock().await;
+            if campaigns
+                .get(peer_id)
+                .is_some_and(|current| current.session_id == campaign.session_id)
+            {
+                campaigns.remove(peer_id);
+            }
+        }
+    }
+    let admission = fabric
         .inner
         .continuity_sessions
-        .admit_init(sid, token, peer_id.to_string(), opts.limits)
+        .admit_init_ordered(
+            sid,
+            token,
+            peer_id.to_string(),
+            incoming_endpoint,
+            opts.limits,
+        )
         .await
-    {
-        InitAdmission::Admitted(shared, _is_new) => shared,
+    ;
+    let (shared, fresh) = match admission {
+        InitAdmission::Admitted(shared, is_new) => (shared, is_new),
+        InitAdmission::Replaced(shared, _old) => (shared, true),
+        InitAdmission::Canonical(canonical) => {
+            send_init_reject(
+                &mut transport,
+                sid,
+                init_reason::ALREADY_ACTIVE,
+                Some(&canonical),
+            )
+            .await?;
+            let _ = transport.finish();
+            return Err(FabricError::Session(SessionError::Connect(
+                "session init rejected: ALREADY_ACTIVE".into(),
+            )));
+        }
         InitAdmission::PeerMismatch => {
-            // 同 sid 绑定其它 peer：策略拒绝（REJECT 0x06）
-            transport
-                .send(&Frame {
-                    frame_type: FrameType::SessionInitReject,
-                    flags: 0,
-                    session_id: sid,
-                    stream_id: 0,
-                    direction: Direction::ProviderToClient,
-                    byte_offset: 0,
-                    payload: Bytes::from(encode_session_init_reject(
-                        reject_reason::POLICY_DENIED,
-                        &[0u8; 16],
-                        0,
-                        0,
-                    )),
-                })
-                .await
-                .map_err(map_transport_err)?;
+            send_init_reject(&mut transport, sid, init_reason::POLICY_DENIED, None).await?;
+            let _ = transport.finish();
             return Err(FabricError::Session(SessionError::Connect(
                 "session init rejected: POLICY_DENIED (peer mismatch)".into(),
             )));
         }
         InitAdmission::TokenMismatch => {
-            // 同 sid 但 token 不符（伪造/竞态）：REJECT 0x02
-            transport
-                .send(&Frame {
-                    frame_type: FrameType::SessionInitReject,
-                    flags: 0,
-                    session_id: sid,
-                    stream_id: 0,
-                    direction: Direction::ProviderToClient,
-                    byte_offset: 0,
-                    payload: Bytes::from(encode_session_init_reject(
-                        reject_reason::TOKEN_INVALID,
-                        &[0u8; 16],
-                        0,
-                        0,
-                    )),
-                })
-                .await
-                .map_err(map_transport_err)?;
+            send_init_reject(&mut transport, sid, init_reason::MALFORMED, None).await?;
+            let _ = transport.finish();
             return Err(FabricError::Session(SessionError::Connect(
-                "session init rejected: TOKEN_INVALID".into(),
+                "session init rejected: MALFORMED".into(),
             )));
         }
     };
@@ -2341,21 +2635,26 @@ async fn accept_session_init(
         })
         .await
         .map_err(map_transport_err)?;
-    shared.set_phase(SessionPhase::Active).await;
+    if fresh {
+        shared.set_phase(SessionPhase::Active).await;
+    }
+    let policy = if fresh {
+        InstallPolicy::Force
+    } else {
+        InstallPolicy::IfVacant
+    };
     let (send, recv) = transport.into_split();
-    // fresh INIT 与幂等重发同途：后到传输即 client 实际使用的传输——Force
-    // 接管（owner 递增，旧泵经 R3-2c 不误置 Recovering）
-    Ok(mk_session(shared, send, recv, InstallPolicy::Force)
-        .expect("Force 安装恒成功"))
+    mk_session(shared, send, recv, policy)
+        .await
+        .ok_or_else(channel_superseded_err)
 }
 
 /// provider：RESUME_INIT → **原子裁决+轮换**（`try_rotate`——validate 与
 /// rotate 单临界区，P0-1）→ RESUME_OK → 摘要裁剪 journal → **先装通道
 /// （pump 并发排水）再后台重放**（P1-5：双向大 replay 不在握手路径上互等）
 /// → 重发 FIN → Active。
-/// previous 代闸门：仅当前代不活跃（phase != Active，OK-lost 重试窗口）时
-/// 可用——会话 Active 期间的 previous 凭据 → TOKEN_INVALID（并发双 RESUME
-/// 恰一胜出）。
+/// current/previous 均按精确 `(generation, token)` 匹配；同一 pending
+/// campaign 的重发走缓存，通道 owner 仍由 transition 串行收口。
 async fn accept_resume(
     fabric: &Fabric,
     mut transport: super::transport::ContinuityTransport,
@@ -2401,7 +2700,7 @@ async fn accept_resume(
     // R3-1：原子裁决（单锁：nonce 幂等 + token 窗口——previous 可用性判定
     // 在锁内由 pending 推导，Codex 指出的锁外相位窗口不复存在）
     let new_token = rand_16().ok_or_else(entropy_err)?;
-    let Some((new_generation, new_token, _resent)) =
+    let Some((new_generation, new_token, cached)) =
         shared.decide_resume(parsed.nonce, parsed.local_generation, &parsed.token, new_token)
     else {
         transport
@@ -2432,9 +2731,15 @@ async fn accept_resume(
     // P1-5：**先 split + 建通道（pump 立即排水对端重放/ACK）**，重放转后台
     // 任务经 channel 发送——恢复握手里不再有大数据量同步发送，与对端的
     // 反向重放并发进行（QUIC 流控互等死锁闭合）。
+    let policy = if cached {
+        InstallPolicy::IfVacant
+    } else {
+        InstallPolicy::Force
+    };
     let (send, recv) = transport.into_split();
-    let session = mk_session(Arc::clone(&shared), send, recv, InstallPolicy::Force)
-        .expect("fresh RESUME 轮换 Force 安装恒成功");
+    let session = mk_session(Arc::clone(&shared), send, recv, policy)
+        .await
+        .ok_or_else(channel_superseded_err)?;
     {
         let replay_shared = Arc::clone(&shared);
         let replay_chan = session.channel();
@@ -2474,7 +2779,9 @@ async fn accept_resume(
             }
         });
     }
-    shared.set_phase(SessionPhase::Active).await;
+    if !cached {
+        shared.set_phase(SessionPhase::Active).await;
+    }
     Ok(session)
 }
 
@@ -2563,6 +2870,7 @@ async fn resume_attempt(
             let chan = session
                 .shared
                 .install_channel(send, recv, InstallPolicy::Force)
+                .await
                 .expect("client 恢复轮换接管恒成功");
             session.install_channel(Arc::clone(&chan));
             session.shared.set_phase(SessionPhase::Active).await;
@@ -2682,25 +2990,26 @@ mod tests {
         assert!(w.validate(3, &[3u8; 16]));
     }
 
-    /// P0-1：原子裁决+轮换——current 恒可用；previous 受 allow_previous 闸门。
+    /// P0-1：原子裁决+轮换——current/previous 均可精确匹配；
+    /// owner transition 负责单胜收口。
     #[test]
     fn token_window_try_rotate_adjudication() {
         let mut w = TokenWindow::new([1u8; 16]);
-        // current 匹配（allow_previous 无关）→ 轮换
-        assert!(w.try_rotate(1, &[1u8; 16], [2u8; 16], false).is_some());
-        // previous 匹配 + 会话 Active（allow=false，并发双 RESUME）→ 拒绝
+        // current 精确匹配 → 轮换。
+        assert!(w.try_rotate(1, &[1u8; 16], [2u8; 16]).is_some());
+        // previous 精确匹配同样可恢复（design §2.3.0 R5）。
         assert!(
-            w.try_rotate(1, &[1u8; 16], [3u8; 16], false).is_none(),
-            "Active 期间的 previous 凭据必须拒绝（恰一胜出）"
+            w.try_rotate(1, &[1u8; 16], [3u8; 16]).is_some(),
+            "previous 精确匹配必须可恢复"
         );
-        // previous 匹配 + OK-lost 重试窗口（allow=true）→ 轮换
-        let out = w.try_rotate(1, &[1u8; 16], [3u8; 16], true).unwrap();
-        assert_eq!(out.0, 3, "generation = current.0 + 1（单调）");
+        // 再次轮换 current，generation 继续单调前进。
+        let out = w.try_rotate(3, &[3u8; 16], [4u8; 16]).unwrap();
+        assert_eq!(out.0, 4, "generation = current.0 + 1（单调）");
         // 错 token / 错 generation → 拒绝
-        assert!(w.try_rotate(2, &[9u8; 16], [4u8; 16], true).is_none());
-        assert!(w.try_rotate(1, &[3u8; 16], [4u8; 16], true).is_none());
+        assert!(w.try_rotate(2, &[9u8; 16], [4u8; 16]).is_none());
+        assert!(w.try_rotate(1, &[3u8; 16], [4u8; 16]).is_none());
         // 新 current 恒可用
-        assert!(w.try_rotate(3, &[3u8; 16], [4u8; 16], false).is_some());
+        assert!(w.try_rotate(4, &[4u8; 16], [5u8; 16]).is_some());
     }
 
     /// P1-5 / R5：previous 清除后旧代凭据立即失效。
@@ -2991,23 +3300,17 @@ mod tests {
             JournalLimits::default(),
         );
         shared.rotate_token(2, [3u8; 16]); // previous=(1,[2]) current=(2,[3])
+        shared.handle_frame(&open_frame([1u8; 16], 1)).await;
         shared
             .handle_frame(&data_frame([1u8; 16], 1, 0, b"data"))
             .await;
-        // decide_resume（R3-1）：previous 凭据仅经 nonce 绑定 pending 可用；
-        // 确认后 pending 与 previous 同锁清除——裸 previous 凭据恒拒绝
-        assert!(
-            shared
-                .decide_resume([9u8; 16], 1, &[2u8; 16], [4u8; 16])
-                .is_none(),
-            "首次成功交付后 previous 凭据失效（无 nonce 缓存路径）"
-        );
-        assert!(
-            shared
-                .decide_resume([9u8; 16], 2, &[3u8; 16], [5u8; 16])
-                .is_some(),
-            "current 不受影响"
-        );
+        // 新代首次合法交付确认后，previous 与 pending 同锁清除。
+        assert!(shared
+            .decide_resume([9u8; 16], 1, &[2u8; 16], [4u8; 16])
+            .is_none());
+        assert!(shared
+            .decide_resume([10u8; 16], 2, &[3u8; 16], [5u8; 16])
+            .is_some(), "current 不受影响");
     }
 
     /// P1-4：同幂等键双流 DATA 归并到 canonical 流交付。
