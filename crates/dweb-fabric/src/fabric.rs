@@ -451,6 +451,12 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
         task.abort();
         let _ = task.await;
     }
+    // continuity 连接全部 deliberate 关闭（supervisor 不触发重连；watch 置
+    // Closing——快照订阅者可观测收尾态）
+    inner
+        .continuity
+        .close_all(crate::continuity::state::ConnectionPhase::Closing, "shutdown")
+        .await;
     inner.endpoint.close().await;
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
     // 生产者可以把晚到 child push 到已 take 的表中。
@@ -710,13 +716,13 @@ struct InflightState {
 /// 只在外层 accept loop 与 inflight producer 都收敛后置位，因而 take 之后不存在
 /// 晚到生产者。
 #[derive(Default)]
-struct AcceptChildren {
-    closing: bool,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+pub(crate) struct AcceptChildren {
+    pub(crate) closing: bool,
+    pub(crate) tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// 注册一个生命周期任务；closing 后返回句柄给调用方立即 abort+join。
-fn register_lifecycle_task(
+pub(crate) fn register_lifecycle_task(
     registry: &std::sync::Mutex<AcceptChildren>,
     task: tokio::task::JoinHandle<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -760,18 +766,18 @@ impl Drop for FlightGuard {
 }
 
 pub struct FabricInner {
-    identity: NodeIdentity,
-    roster: Arc<Mutex<Roster>>,
+    pub(crate) identity: NodeIdentity,
+    pub(crate) roster: Arc<Mutex<Roster>>,
     /// [R8-1] 所有运行时名册写入的提交锁；shutdown 先等它，再置生命周期门。
     roster_commit: Mutex<()>,
-    endpoint: Endpoint,
+    pub(crate) endpoint: Endpoint,
     peers: Arc<Mutex<HashMap<EndpointId, PeerEntry>>>,
     events: broadcast::Sender<FabricEvent>,
-    relay: RelayConfig,
+    pub(crate) relay: RelayConfig,
     advertise_addrs: Vec<String>,
     /// 从邀请令牌/连接学到的对端可达信息（relay URL 或 ip:port）；
     /// 有界（HB 3.1：per-endpoint 1024 地址 / 全局 65536 endpoint，FIFO 淘汰）。
-    known_addrs: Mutex<KnownAddrs>,
+    pub(crate) known_addrs: Mutex<KnownAddrs>,
     /// 近期主动断开的对端与时刻：connect 预沉降用（iroh 同 NodeId 去重窗口）。
     recent_disconnects: Mutex<HashMap<EndpointId, std::time::Instant>>,
     /// connect 的 per-EndpointId single-flight（R7）：entry 携带 generation，
@@ -803,7 +809,7 @@ pub struct FabricInner {
     /// “检查后悬挂、完成后补发”的窗口。门置位后抑制后续生命周期事件。
     lifecycle_gate: Arc<std::sync::Mutex<bool>>,
     /// 已接受连接的处理子任务（R8-2）：外层 loop join 后关闭登记，再逐个收割。
-    accept_children: std::sync::Mutex<AcceptChildren>,
+    pub(crate) accept_children: std::sync::Mutex<AcceptChildren>,
     /// c2 会话自动重连：意外死亡通知通道（closed_task 同代次分支发送；
     /// UnboundedSender clone 进 FabricInner，manager 消费）。
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<EndpointId>,
@@ -812,11 +818,16 @@ pub struct FabricInner {
     /// 外层 accept loop 本身也纳入 shutdown 收敛证明。
     accept_loop_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// shutdown 完成通知（R3 P1-1）：true 后 watch 订阅者立即放行
-    shutdown_done: tokio::sync::watch::Sender<bool>,
+    pub(crate) shutdown_done: tokio::sync::watch::Sender<bool>,
     /// 生效代理策略是否为 none（RELAY_OFFLINE 探针适用条件之一）。
     proxy_is_none: bool,
     /// join 总时限（毫秒）。
     join_timeout_ms: u64,
+    /// continuity 连接状态面（app-protocol-layer Phase 1）：快照/epoch/
+    /// stateSeq watch；死亡重连只进 watch，不发 FabricEvent。
+    pub(crate) continuity: crate::continuity::ContinuityState,
+    /// continuity 拨号 single-flight（per-peer）。
+    pub(crate) continuity_dialing: crate::continuity::manager::DialingGuard,
 }
 
 impl FabricInner {
@@ -857,7 +868,7 @@ impl FabricInner {
         );
     }
 
-    fn lifecycle_closing(&self) -> bool {
+    pub(crate) fn lifecycle_closing(&self) -> bool {
         // [R8-1] 按 request -> gate 读取一致快照；两把同步锁均在本函数内
         // 释放，调用方不得把任一 guard 带过 await。
         let requested = self.shutdown_started.lock().unwrap();
@@ -874,7 +885,7 @@ impl FabricInner {
 
 #[derive(Clone)]
 pub struct Fabric {
-    inner: Arc<FabricInner>,
+    pub(crate) inner: Arc<FabricInner>,
 }
 
 /// store 路径的身份解析：load 命中即用；缺失时按 allow_create 决定
@@ -1404,7 +1415,11 @@ impl Fabric {
         }
         builder = builder
             .secret_key(identity.secret_key().clone())
-            .alpns(vec![ALPN_REGULAR.to_vec(), ALPN_REDEEM.to_vec()]);
+            .alpns(vec![
+                ALPN_REGULAR.to_vec(),
+                ALPN_REDEEM.to_vec(),
+                crate::continuity::ALPN_CONTINUITY.to_vec(),
+            ]);
         let endpoint = builder.bind().await?;
         // R3 P1-3：10s online 等待仅作为“沉降触发”——其布尔结果**不**写入快照
         //（与随后的 watcher 观测分属两个时刻，会产生 online/active_url 错配）；
@@ -1495,6 +1510,8 @@ impl Fabric {
             lifecycle_gate,
             accept_children: std::sync::Mutex::new(AcceptChildren::default()),
             reconnect_tx: reconnect_tx.clone(),
+            continuity: crate::continuity::ContinuityState::new(),
+            continuity_dialing: crate::continuity::manager::DialingGuard::default(),
             reconnect_manager_task: std::sync::Mutex::new(None),
             accept_loop_task: std::sync::Mutex::new(None),
             shutdown_done: tokio::sync::watch::channel(false).0,
@@ -1823,6 +1840,48 @@ impl Fabric {
         }
     }
 
+    /// continuity：对端连接状态快照（snapshot-before-subscribe 语义）。
+    pub async fn continuity_snapshot(
+        &self,
+        peer_id: &str,
+    ) -> Result<crate::continuity::ConnectionStateSnapshot, FabricError> {
+        let id = endpoint_id_parse(peer_id).map_err(FabricError::from)?;
+        Ok((*self.inner.continuity.snapshot(&id).await).clone())
+    }
+
+    /// continuity：订阅对端状态流（watch；初值即最新，lag 自动收敛）。
+    pub async fn continuity_watch(
+        &self,
+        peer_id: &str,
+    ) -> Result<
+        tokio::sync::watch::Receiver<std::sync::Arc<crate::continuity::ConnectionStateSnapshot>>,
+        FabricError,
+    > {
+        let id = endpoint_id_parse(peer_id).map_err(FabricError::from)?;
+        Ok(self.inner.continuity.watch(&id).await)
+    }
+
+    /// continuity：在当前代次连接上开 raw 传输（帧收发）。
+    pub async fn continuity_open_transport(
+        &self,
+        peer_id: &str,
+    ) -> Result<crate::continuity::ContinuityTransport, FabricError> {
+        crate::continuity::manager::open_transport(self, peer_id).await
+    }
+
+    /// continuity：接受对端打开的 continuity 流（服务端形态）。
+    pub async fn continuity_accept_stream(
+        &self,
+        peer_id: &str,
+    ) -> Result<crate::continuity::ContinuityTransport, FabricError> {
+        crate::continuity::manager::accept_stream(self, peer_id).await
+    }
+
+    /// continuity：非故意关闭当前连接（故障注入——触发状态翻转与重连）。
+    pub async fn continuity_reset(&self, peer_id: &str) -> Result<(), FabricError> {
+        crate::continuity::manager::reset(self, peer_id).await
+    }
+
     /// 连接成员（常规 ALPN，双向门控 + 名册同步）。
     pub async fn connect(&self, id: &str) -> Result<(), FabricError> {
         let id = endpoint_id_parse(id).map_err(|_| FabricError::BadEndpointId(id.into()))?;
@@ -2119,7 +2178,7 @@ impl Fabric {
     /// EndpointAddr 内部为去重集合（P1-6：多 relay 全量进入，不截断故障
     /// 切换能力）。不可解析的 learned 条目跳过（令牌侧已在 precheck 拒绝，
     /// 此处防御 add_known_addr 的手工注入）。
-    fn merge_dial_candidates(
+    pub(crate) fn merge_dial_candidates(
         id: &EndpointId,
         learned: &[String],
         relay: &RelayConfig,
@@ -2603,6 +2662,15 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
                         }
                     }
                     conn.close(0u32.into(), b"redeem-done");
+                } else if alpn == crate::continuity::ALPN_CONTINUITY {
+                    // continuity 连接：member 门控 + winner 采纳；死亡/重连
+                    // 只进 ContinuityState watch，不发 FabricEvent。
+                    let ok = { inner2.roster.lock().await.is_member(&remote, now_ms()) };
+                    if !ok {
+                        conn.close(1u32.into(), b"not a member");
+                        return;
+                    }
+                    crate::continuity::manager::register_incoming(&inner2, remote, conn).await;
                 } else if alpn == ALPN_REGULAR {
                     let ok = { inner2.roster.lock().await.is_member(&remote, now_ms()) };
                     if !ok {

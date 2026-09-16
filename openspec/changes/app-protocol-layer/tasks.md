@@ -30,14 +30,14 @@
 
 ## Phase 1：Rust 连接状态面与 raw continuity transport
 
-- [ ] 2.1 新 ALPN `/dweb/fabric-continuity/1`；connectionEpoch 单调代次；
+- [x] 2.1 新 ALPN `/dweb/fabric-continuity/1`；connectionEpoch 单调代次；
       ConnectionStateSnapshot + stateSeq watch 流（snapshot-before-subscribe、
       gap 重拉）
-- [ ] 2.2 `open_continuity_transport()`；legacy envelope 物理隔离
+- [x] 2.2 `open_continuity_transport()`（continuity_open_transport/accept_stream/reset 公开入口）；legacy envelope 物理隔离
 - [ ] 2.3 N-API 暴露 typed snapshot/stream，不暴露内部 broadcast 细节
-- [ ] 2.4 验收：member/ALPN gate、epoch 单调、旧 watcher 不删新连接、
-      snapshot resync；故障注入：远端 close/idle timeout/stateless reset/
-      relay 停复/双端同拨/shutdown 竞速
+- [x] 2.4 验收：member/ALPN gate、epoch 单调（各端独立计数）、旧 watcher 不删新连接、
+      snapshot resync（watch lag 收敛）；故障注入：远端 close（reset 注入）/relay 停复/双端同拨/shutdown 竞速
+      —— 5/5 绿 ×3 稳定复跑；idle timeout/stateless reset 留 Phase 2/4 真实分区矩阵
 
 ## Phase 2：Session Continuity 核心协议
 
