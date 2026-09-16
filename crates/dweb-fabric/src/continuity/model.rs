@@ -214,7 +214,10 @@ impl RecvWindow {
 pub struct JournalLimits {
     pub max_session_bytes: usize,
     pub max_stream_bytes: usize,
+    /// 单流段数上限（design §2.6 表：512）。
     pub max_segments: usize,
+    /// session 级段数上限（design §2.6 表：4096——全部流聚合）。
+    pub max_session_segments: usize,
 }
 
 impl Default for JournalLimits {
@@ -222,7 +225,8 @@ impl Default for JournalLimits {
         Self {
             max_session_bytes: 8 * 1024 * 1024,
             max_stream_bytes: 2 * 1024 * 1024,
-            max_segments: 4096,
+            max_segments: 512,
+            max_session_segments: 4096,
         }
     }
 }
@@ -609,6 +613,7 @@ mod tests {
             max_session_bytes: 1 << 20,
             max_stream_bytes: 4096,
             max_segments: 512,
+            max_session_segments: 4096,
         };
         for _round in 0..300 {
             let mut j = StreamJournal::new(1, lim);

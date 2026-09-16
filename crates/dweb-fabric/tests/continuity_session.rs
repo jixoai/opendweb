@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::session::{
-    self, encode_session_init, reject_reason, encode_resume_init, RequestState,
-    SessionOptions,
+    self, decode_resume_ok, encode_session_init, reject_reason, encode_resume_init,
+    RequestState, SessionOptions,
 };
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
@@ -494,27 +494,70 @@ async fn session_concurrent_double_resume_single_winner() {
             .expect("resume 响应有界")
             .unwrap()
     };
+    let send_resume_with_nonce =
+        |mut t: dweb_fabric::continuity::ContinuityTransport, nonce: [u8; 16]| async move {
+            t.send(&Frame {
+                frame_type: FrameType::ResumeInit,
+                flags: 0,
+                session_id: sid,
+                stream_id: 0,
+                direction: Direction::ClientToProvider,
+                byte_offset: 0,
+                payload: Bytes::from(encode_resume_init(
+                    token_gen,
+                    token_gen,
+                    &nonce,
+                    &token,
+                    &[],
+                )),
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), t.recv())
+                .await
+                .expect("resume 响应有界")
+                .unwrap()
+        };
     let t1 = a.continuity_open_transport(&b_id).await.unwrap();
     let t2 = a.continuity_open_transport(&b_id).await.unwrap();
+    // —— R3 语义矩阵（Codex 复评步骤 6）——
+    // 1) 同 nonce 并发双发（OK-lost 重试形态）：双 OK 且载荷**完全一致**
+    //    （幂等缓存重发——不二次轮换，generation 恰前进一次）
     let (r1, r2) = tokio::join!(send_resume(t1), send_resume(t2));
     let mut oks = 0usize;
-    let mut token_invalid = 0usize;
+    let mut results: Vec<(u64, [u8; 16])> = Vec::new();
     for r in [r1, r2] {
         match r.frame_type {
-            FrameType::ResumeOk => oks += 1,
-            FrameType::ResumeReject => {
-                assert_eq!(
-                    r.payload.first().copied().unwrap_or(0),
-                    reject_reason::TOKEN_INVALID,
-                    "拒绝原因必须是 TOKEN_INVALID"
-                );
-                token_invalid += 1;
+            FrameType::ResumeOk => {
+                oks += 1;
+                results.push(decode_resume_ok(&r.payload).expect("RESUME_OK 载荷可解析"));
             }
             other => panic!("unexpected {other:?}"),
         }
     }
-    assert_eq!(oks, 1, "并发双 RESUME 恰一胜出");
-    assert_eq!(token_invalid, 1, "败者必须 TOKEN_INVALID（不装双 channel）");
+    assert_eq!(oks, 2, "同 nonce 并发 = 幂等路径：双方都得 OK");
+    assert_eq!(
+        results[0], results[1],
+        "幂等重发同一 (generation, token)——不二次轮换"
+    );
+    assert_eq!(
+        results[0].0,
+        token_gen + 1,
+        "generation 恰前进一次（单次轮换）"
+    );
+    // 2) 异 nonce 携 previous 凭据：拒绝（单胜——previous 仅经 nonce 绑定
+    //    pending 可用，陌生 nonce 不得二次轮换）
+    let t3 = a.continuity_open_transport(&b_id).await.unwrap();
+    let r3 = send_resume_with_nonce(t3, [7u8; 16]).await;
+    assert_eq!(
+        r3.frame_type,
+        FrameType::ResumeReject,
+        "异 nonce + previous 凭据必须拒绝"
+    );
+    assert_eq!(
+        r3.payload.first().copied().unwrap_or(0),
+        reject_reason::TOKEN_INVALID
+    );
     provider.abort();
 }
 

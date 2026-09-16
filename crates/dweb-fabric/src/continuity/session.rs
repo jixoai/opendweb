@@ -26,14 +26,29 @@
 //! 硬化轮裁定记录（2026-09-16，Codex 复核 4.5/10 NO-GO 的整改）：
 //! - **ACK commit point**（P0-3）：ACK 只推进到应用消费水位 `committed_offset`
 //!   （recv 出队推进并补发）——慢消费者期间发送侧 journal 不释放，反压闭合。
-//! - **双端并发 INIT winner 不适用**（P0-2 裁定）：会话恒由 client 发起
-//!   （provider 仅 accept），不存在双端同发 INIT 的收敛面——provider 侧幂等
-//!   裁决（同 sid+token → OK 重发既有会话；token 不符 → REJECT 0x02；
-//!   peer 不符 → REJECT 0x06）即为收敛路径。design §2.3.0 的 deterministic
-//!   winner 规则在「双向均可发起」的模型下才有意义，本实现不引入。
-//! - **previous 代恢复闸门**（P0-1）：previous token 仅在当前代不活跃
-//!   （phase != Active——OK-lost 重试窗口）时可用；会话 Active 期间的
-//!   previous 凭据 → TOKEN_INVALID（并发双 RESUME 恰一胜出）。
+//! - **双端并发 INIT deterministic winner**（R3-3c，**已实现**——R2 的
+//!   「不适用」裁定被 Codex 驳回，design §2.3.0 明文要求）：本端对同 peer
+//!   的发起中 session 登记（`FabricInner::continuity_campaigns`）；INIT 交叉
+//!   时接收侧按 `(EndpointId, sessionId)` 全序取较小者为 canonical——胜者
+//!   REJECT(ALREADY_ACTIVE + canonical 三元组)，败者撤回发起并从本地注册表
+//!   采纳 canonical 会话（`adopt_session`），双端独立收敛到同一 session，
+//!   不产生双会话并存。
+//! - **恢复单胜 + nonce 幂等**（R3-1，取代 R2 的 phase 闸门——Codex 不接受
+//!   锁外 phase 判定）：恢复裁决/轮换/phase/epoch/通道 owner 全部内聚在
+//!   `resume_control` 单把 std::sync::Mutex（`ResumeCtl`）。client 每个
+//!   resume campaign 生成一个 nonce（重试复用）；provider 侧 RESUME 的
+//!   nonce+凭据命中 `pending`（轮换已发生、新通道未确认）→ 重发缓存的
+//!   同 (generation, token) RESUME_OK（不二次轮换）；异 nonce 或凭据不符
+//!   → 按当前窗口裁决（current 恒可用；previous 仅经 pending 缓存路径
+//!   可达）。pending 在新代首次成功 Deliver / 合法 ACK 推进时清除。
+//! - **epoch/owner fencing**（R3-2）：`SessionChannel` 携带 (epoch, owner)
+//!   ——pump 收帧后先 fence（与 ResumeCtl 快照比对），旧通道帧丢弃计数、
+//!   不进 journal 不回 ACK；旧通道退出不把新代拉回 Recovering；通道安装
+//!   只经 `ResumeCtl`（owner 单调，弱引用随 owner 比较）。
+//! - **入站资源门**（R3-4）：入站 OPEN 原子预占 128 名额（超限计数丢弃）；
+//!   未见过流的 DATA/ACK/FIN/RESET 违规计数丢弃（不 or_insert）；已终结流
+//!   幂等丢弃（§2.7 规则 4）；direction/奇偶校验（§2.2）；journal 段数上限
+//!   接线（session 4096 / 单流 512，design §2.6 表值）。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -41,6 +56,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::fabric::{Fabric, FabricError};
+use crate::identity::{endpoint_id_parse};
 use crate::session::SessionError;
 
 use super::frame::{self, Direction, Frame, FrameType};
@@ -71,6 +87,18 @@ pub mod reject_reason {
     pub const VERSION_UNSUPPORTED: u8 = 0x07;
     pub const REQUEST_STATE_LOST: u8 = 0x08;
     pub const TOKEN_REVOKED: u8 = 0x09;
+}
+
+/// SESSION_INIT_REJECT reason（design §2.3.0 冻结表——与 RESUME 表是
+/// **不同帧类型的独立命名空间**，数值不可混读：INIT 0x02 = MALFORMED，
+/// RESUME 0x02 = TOKEN_INVALID）。
+pub mod init_reason {
+    /// 已有 canonical 会话（并发双 INIT 收敛用）。
+    pub const ALREADY_ACTIVE: u8 = 0x01;
+    /// 载荷/头校验失败（长度异常、header≠payload sid、零 sid/token）。
+    pub const MALFORMED: u8 = 0x02;
+    /// 策略拒绝（peer 绑定不符）。
+    pub const POLICY_DENIED: u8 = 0x03;
 }
 
 /// 请求副作用状态（§2.8）：STARTED 后恢复轮不得自动重执行。
@@ -227,16 +255,110 @@ struct DeliverQueue {
     bytes: usize,
 }
 
+/// 恢复裁决的幂等缓存（R3-1）：胜出 attempt 呈交的 (nonce, 前代凭据) 与
+/// 轮换结果的绑定——同 campaign 重试（OK 丢失）重发缓存结果，不二次轮换。
+struct PendingResume {
+    nonce: [u8; 16],
+    /// 胜出 attempt 呈交的凭据（轮换前）——幂等重发的匹配键。
+    from_generation: u64,
+    from_token: [u8; 16],
+    /// 轮换结果缓存（RESUME_OK 载荷重发值）。
+    result_generation: u64,
+    result_token: [u8; 16],
+}
+
+/// 恢复控制（R3-1：**单锁内聚**）——恢复裁决（token 窗口）、phase 迁移、
+/// 当前胜者通道 (epoch, owner)、pending 幂等缓存全部在这一个临界区内完成，
+/// 不存在跨锁可观测中间态。std::sync::Mutex：所有方法同步短临界区、
+/// 永不跨 await 持有。
+struct ResumeCtl {
+    tokens: TokenWindow,
+    phase: SessionPhase,
+    /// 当前胜者通道的 transport epoch（fence 快照面，R3-2）。
+    active_epoch: u64,
+    /// 当前胜者通道 owner id（单调递增；同 epoch 双通道由它区分）。
+    channel_owner: u64,
+    /// 当前胜者通道（owner, Weak——生命周期由强引用者持有，无环）。
+    channel: Option<(u64, std::sync::Weak<SessionChannel>)>,
+    pending: Option<PendingResume>,
+}
+
+/// barrier 测试钩子（R3-1，Codex 步骤 6）：`accept_resume` 在**轮换完成、
+/// Active 置位之前**受控暂停——测试在该窗口注入第二/第三个 RESUME 验证
+/// 单胜与幂等。生产恒零开销（enabled=false 时 wait 立即返回）。
+#[doc(hidden)]
+pub struct ResumeGate {
+    enabled: std::sync::atomic::AtomicBool,
+    /// 0 = idle / 1 = reached（轮换已完成，暂停中）/ 2 = released。
+    state: tokio::sync::watch::Sender<u8>,
+}
+
+impl ResumeGate {
+    fn new() -> Self {
+        let (tx, _rx) = tokio::sync::watch::channel(0u8);
+        Self {
+            enabled: std::sync::atomic::AtomicBool::new(false),
+            state: tx,
+        }
+    }
+
+    /// 启用并订阅状态（测试面：先订阅再注入，防错过 reached 边沿）。
+    pub fn enable(&self) -> tokio::sync::watch::Receiver<u8> {
+        self.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.state.subscribe()
+    }
+
+    /// 释放暂停（测试面）。
+    pub fn release(&self) {
+        self.state.send_modify(|v| *v = 2);
+    }
+
+    /// 轮换后暂停点：reached 置位 → 等 release（有界 30s 防悬挂）。
+    pub(crate) async fn wait(&self) {
+        if !self.enabled.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        self.state.send_modify(|v| *v = 1);
+        let mut rx = self.state.subscribe();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                loop {
+                    if *rx.borrow() >= 2 {
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            },
+        )
+        .await;
+    }
+}
+
+/// 通道安装策略（R3-2d：安装只经 ResumeCtl）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallPolicy {
+    /// 强制接管：新代通道无条件成为胜者（owner 单调递增；旧通道被 fence）。
+    /// 用于**新**握手（fresh INIT / fresh RESUME 轮换）与 client 恢复换通道。
+    Force,
+    /// 仅在无存活通道时装入：用于**重复**握手的传输接管（幂等 INIT 重发 /
+    /// RESUME 幂等缓存重发）——既有通道存活则拒绝（半关本传输），防止
+    /// 双通道并存；既有通道已死则本传输接管。
+    IfVacant,
+}
+
 /// 双端共享的会话核心：provider 侧常驻注册表跨连接存活（进程重启即丢——
 /// RESUME 统一 REQUEST_STATE_LOST）；client 侧由 Session 句柄持有。
 pub struct SessionShared {
     pub session_id: [u8; 16],
     pub peer_id: String,
     is_client: bool,
-    tokens: std::sync::Mutex<TokenWindow>,
-    /// previous 代是否仍占位（避免热路径无谓锁；rotate 置位、clear 复位）。
+    /// 恢复控制单锁（R3-1：token 窗口 + phase + 通道 owner/epoch + pending）。
+    resume_control: std::sync::Mutex<ResumeCtl>,
+    /// previous/pending 是否占位（热路径无谓锁快路径；rotate 置位、confirm 复位）。
     previous_live: std::sync::atomic::AtomicBool,
-    phase: tokio::sync::Mutex<SessionPhase>,
     streams: tokio::sync::Mutex<HashMap<u64, StreamCtx>>,
     next_stream_id: std::sync::atomic::AtomicU64,
     /// 副作用状态机：stream_id → (state, 幂等键)。
@@ -253,15 +375,19 @@ pub struct SessionShared {
     /// 交付队列（stream_id → 有序字节），应用侧 recv 消费。
     delivered: tokio::sync::Mutex<HashMap<u64, DeliverQueue>>,
     delivered_notify: tokio::sync::Notify,
-    /// 异 session_id 帧计数（P0-1：旧代/串线帧不污染会话）。
+    /// 异 session_id 帧计数（P0-1：旧代/串线帧不污染会话）+ 旧通道 fence
+    /// 计数（R3-2：epoch/owner 不符的迟到帧）。
     stale_frame_count: std::sync::atomic::AtomicU64,
     /// 伪造 ACK（offset 超发）违例计数（P0-3）。
     ack_violation_count: std::sync::atomic::AtomicU64,
+    /// 入站协议违例计数（R3-4：未见过流的帧 / direction·奇偶违例 /
+    /// OPEN 名额超限 / 终结流后越界帧）。
+    protocol_violation_count: std::sync::atomic::AtomicU64,
     /// client resume single-flight（P0-1：并发 resume 恰一执行者）。
     resume_in_flight: std::sync::atomic::AtomicBool,
-    /// 当前代通道（Weak 注册——SessionChannel::new 时自登记；恢复轮换通道
-    /// 后引擎经 shared 统一解析当前代，provider 侧跨 Session 实例存活）。
-    current_channel: std::sync::RwLock<Option<std::sync::Weak<SessionChannel>>>,
+    /// barrier 测试钩子（R3-1；生产零开销）。
+    #[doc(hidden)]
+    pub resume_gate: ResumeGate,
     limits: JournalLimits,
 }
 
@@ -277,9 +403,15 @@ impl SessionShared {
             session_id,
             peer_id,
             is_client,
-            tokens: std::sync::Mutex::new(TokenWindow::new(token)),
+            resume_control: std::sync::Mutex::new(ResumeCtl {
+                tokens: TokenWindow::new(token),
+                phase: SessionPhase::Negotiating,
+                active_epoch: 0,
+                channel_owner: 0,
+                channel: None,
+                pending: None,
+            }),
             previous_live: std::sync::atomic::AtomicBool::new(false),
-            phase: tokio::sync::Mutex::new(SessionPhase::Negotiating),
             streams: tokio::sync::Mutex::new(HashMap::new()),
             next_stream_id: std::sync::atomic::AtomicU64::new(if is_client { 1 } else { 2 }),
             requests: tokio::sync::Mutex::new(HashMap::new()),
@@ -291,69 +423,152 @@ impl SessionShared {
             delivered_notify: tokio::sync::Notify::new(),
             stale_frame_count: std::sync::atomic::AtomicU64::new(0),
             ack_violation_count: std::sync::atomic::AtomicU64::new(0),
+            protocol_violation_count: std::sync::atomic::AtomicU64::new(0),
             resume_in_flight: std::sync::atomic::AtomicBool::new(false),
-            current_channel: std::sync::RwLock::new(None),
+            resume_gate: ResumeGate::new(),
             limits,
         })
     }
 
-    /// 当前代通道（构造后由 SessionChannel::new 登记；始终有效）。
+    /// 当前代通道（经 ResumeCtl 解析——owner 单调，恢复轮换后指向新代；
+    /// provider 侧跨 Session 实例存活）。
     pub fn current_channel(&self) -> Option<Arc<SessionChannel>> {
-        self.current_channel
-            .read()
+        self.resume_control
+            .lock()
             .unwrap()
+            .channel
             .as_ref()
-            .and_then(|w| w.upgrade())
+            .and_then(|(_, w)| w.upgrade())
     }
 
+    /// fence 快照（R3-2）：通道是否仍是当前胜者（epoch+owner 双匹配）。
+    pub(crate) fn channel_is_current(&self, epoch: u64, owner: u64) -> bool {
+        let ctl = self.resume_control.lock().unwrap();
+        ctl.active_epoch == epoch && ctl.channel_owner == owner
+    }
+
+    /// 通道安装（R3-2d：唯一安装路径，全部经 ResumeCtl 单锁）：
+    /// - Force：无条件接管（owner 单调 +1，active_epoch 更新；旧通道被 fence）。
+    /// - IfVacant：既有通道存活（强引用在且未 dead）→ None（拒绝，调用方
+    ///   半关本传输）；否则同 Force。
+    /// 弱引用只在 owner 大于已登记 owner 时覆写（并发安装的写序无关性）。
+    fn install_channel(
+        self: &Arc<Self>,
+        send: TransportSend,
+        recv: TransportRecv,
+        policy: InstallPolicy,
+    ) -> Option<Arc<SessionChannel>> {
+        let epoch = send.epoch;
+        let mut ctl = self.resume_control.lock().unwrap();
+        if policy == InstallPolicy::IfVacant {
+            if let Some((_, weak)) = &ctl.channel {
+                if let Some(chan) = weak.upgrade() {
+                    if !chan.is_dead() {
+                        return None;
+                    }
+                }
+            }
+        }
+        let owner = ctl.channel_owner + 1;
+        ctl.channel_owner = owner;
+        ctl.active_epoch = epoch;
+        let chan = Arc::new(SessionChannel {
+            shared: Arc::clone(self),
+            send: tokio::sync::Mutex::new(send),
+            recv: tokio::sync::Mutex::new(recv),
+            arrivals: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+            arrivals_notify: tokio::sync::Notify::new(),
+            dead: std::sync::atomic::AtomicBool::new(false),
+            epoch,
+            owner,
+        });
+        if ctl
+            .channel
+            .as_ref()
+            .is_none_or(|(o, _)| owner > *o)
+        {
+            ctl.channel = Some((owner, Arc::downgrade(&chan)));
+        }
+        Some(chan)
+    }
+
+    /// client 侧收到 RESUME_OK 的轮换（R5：旧 current 降 previous）。
     fn rotate_token(&self, new_generation: u64, new_token: [u8; 16]) {
-        let mut w = self.tokens.lock().unwrap();
-        w.rotate(new_generation, new_token);
+        let mut ctl = self.resume_control.lock().unwrap();
+        ctl.tokens.rotate(new_generation, new_token);
         self.previous_live
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn current_token(&self) -> (u64, [u8; 16]) {
-        self.tokens.lock().unwrap().current()
+        self.resume_control.lock().unwrap().tokens.current()
     }
 
     /// 当前代 generation（迟到响应竞态判定用）。
     fn current_generation(&self) -> u64 {
-        self.tokens.lock().unwrap().current_generation()
+        self.resume_control
+            .lock()
+            .unwrap()
+            .tokens
+            .current_generation()
     }
 
-    /// 原子裁决+轮换（P0-1）：validate 与 rotate 在**单个 std::sync::Mutex
-    /// 临界区**内完成。`allow_previous` = 当前代不活跃（OK-lost 重试窗口）。
-    /// 返回新代 (generation, token)；失败 None（→ TOKEN_INVALID）。
-    fn try_rotate(
+    /// RESUME 原子裁决（R3-1：裁决+轮换+pending 记账在同一 ResumeCtl
+    /// 临界区）：
+    /// - nonce+凭据命中 pending（轮换已发生、新通道未确认——OK-lost 重试
+    ///   窗口）→ 重发缓存结果（同 generation/token，不二次轮换）。
+    /// - 否则按当前窗口裁决：current 恒可用；previous **仅经 pending 缓存
+    ///   路径可达**（异 nonce 的 previous 凭据 = TOKEN_INVALID——并发双
+    ///   RESUME 恰一胜出，generation 恰前进一次）。
+    /// 返回 (generation, token, cached)。
+    fn decide_resume(
         &self,
+        nonce: [u8; 16],
         generation: u64,
         token: &[u8; 16],
         new_token: [u8; 16],
-        allow_previous: bool,
-    ) -> Option<(u64, [u8; 16])> {
-        let mut w = self.tokens.lock().unwrap();
-        let out = w.try_rotate(generation, token, new_token, allow_previous);
-        if out.is_some() {
-            self.previous_live
-                .store(true, std::sync::atomic::Ordering::Release);
+    ) -> Option<(u64, [u8; 16], bool)> {
+        let mut ctl = self.resume_control.lock().unwrap();
+        if let Some(p) = &ctl.pending {
+            if p.nonce == nonce && p.from_generation == generation && &p.from_token == token {
+                return Some((p.result_generation, p.result_token, true));
+            }
         }
-        out
+        let Some((g, t)) = ctl.tokens.try_rotate(generation, token, new_token, false) else {
+            return None;
+        };
+        ctl.pending = Some(PendingResume {
+            nonce,
+            from_generation: generation,
+            from_token: *token,
+            result_generation: g,
+            result_token: t,
+        });
+        self.previous_live
+            .store(true, std::sync::atomic::Ordering::Release);
+        Some((g, t, false))
     }
 
     /// SESSION_INIT 幂等裁决用：INIT token 与登记代是否一致。
     fn init_token_is(&self, token: &[u8; 16]) -> bool {
-        self.tokens.lock().unwrap().current_token_is(token)
+        self.resume_control
+            .lock()
+            .unwrap()
+            .tokens
+            .current_token_is(token)
     }
 
-    /// previous 代清除（P1-5 / design §2.3.0 R5：新代首次成功交付后旧代
-    /// 立即失效——收敛后旧凭据不可再恢复）。
-    fn clear_previous_token(&self) {
+    /// 新代确认（R3-1c / P1-5 / design §2.3.0 R5）：新代首次成功 Deliver 或
+    /// 合法 ACK 推进 → pending 幂等缓存与 previous 代**同一临界区内**清除
+    /// （R2 的 clear_previous 与 rotate 交错竞态由此闭合）。
+    fn note_confirmed(&self) {
         if self
             .previous_live
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
-            self.tokens.lock().unwrap().clear_previous();
+            let mut ctl = self.resume_control.lock().unwrap();
+            ctl.pending = None;
+            ctl.tokens.clear_previous();
         }
     }
 
@@ -366,6 +581,12 @@ impl SessionShared {
     /// 观测面：伪造 ACK（offset 超发）违例计数。
     pub fn ack_violations(&self) -> u64 {
         self.ack_violation_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 观测面：入站协议违例计数（R3-4：未见流帧/direction/奇偶/名额/越界）。
+    pub fn protocol_violations(&self) -> u64 {
+        self.protocol_violation_count
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -406,6 +627,18 @@ impl SessionShared {
         self.current_token()
     }
 
+    /// 测试观测面：当前胜者通道 owner（barrier 测试断言 channel_owner 唯一）。
+    #[doc(hidden)]
+    pub fn debug_channel_owner(&self) -> u64 {
+        self.resume_control.lock().unwrap().channel_owner
+    }
+
+    /// 测试观测面：当前胜者通道 transport epoch（fence 测试）。
+    #[doc(hidden)]
+    pub fn debug_active_epoch(&self) -> u64 {
+        self.resume_control.lock().unwrap().active_epoch
+    }
+
     /// 本端接收方向（对端→本端 DATA 的 direction 域）。
     fn recv_direction(&self) -> Direction {
         if self.is_client {
@@ -434,12 +667,21 @@ impl SessionShared {
         }
     }
 
+    /// phase 读取（ResumeCtl 内聚——R3-1；异步签名保持既有调用面）。
     pub async fn phase(&self) -> SessionPhase {
-        *self.phase.lock().await
+        self.phase_sync()
+    }
+
+    fn phase_sync(&self) -> SessionPhase {
+        self.resume_control.lock().unwrap().phase
     }
 
     async fn set_phase(&self, p: SessionPhase) {
-        *self.phase.lock().await = p;
+        self.set_phase_sync(p);
+    }
+
+    fn set_phase_sync(&self, p: SessionPhase) {
+        self.resume_control.lock().unwrap().phase = p;
     }
 
     /// 副作用状态机：OPEN 落 ACCEPTED（幂等键归并——重复 OPEN 返回既有流，
@@ -565,8 +807,9 @@ impl SessionShared {
     }
 
     /// 记录发送段（journal 前置闸门——上限即背压面；未 ACK 时内存有界）。
-    /// P0-3：先聚合**全部流** held_bytes 做 session 级上限检查
+    /// P0-3：先聚合**全部流** held_bytes 做 session 级字节上限检查
     /// （`max_session_bytes`），再走单流 journal 检查。
+    /// R3-4d：session 级段数上限（4096——聚合全部流段计数；design §2.6 表）。
     pub(crate) async fn record_send(&self, stream_id: u64, payload: &Bytes) -> Result<u64, FabricError> {
         let mut streams = self.streams.lock().await;
         let session_held: usize = streams.values().map(|c| c.journal.held_bytes()).sum();
@@ -579,6 +822,15 @@ impl SessionShared {
                 }
                 .to_string(),
             )));
+        }
+        // R3-4d：session 级段数（保守口径：按 BTreeMap 原生段计数，不做
+        // 相邻段合并——合并后计数只会更小，原生计数是上限的保守界）。
+        let session_segments: usize = streams.values().map(|c| c.journal.segments_len()).sum();
+        if session_segments >= self.limits.max_session_segments {
+            return Err(FabricError::Session(SessionError::Connect(format!(
+                "journal session segment cap exceeded: {session_segments} >= {}",
+                self.limits.max_session_segments
+            ))));
         }
         let ctx = streams
             .entry(stream_id)
@@ -608,6 +860,8 @@ impl SessionShared {
     /// 处理一帧（收侧核心：去重/交付/ACK 生成/journal 释放）。
     /// P0-1：首行校验 session_id——异会话帧（旧代/串线）丢弃并计数，不污染。
     /// P1-4：stream_id 先经 alias 映射到 canonical 再处理。
+    /// R3-4：入站资源门——direction/奇偶校验（§2.2）、未见流帧丢弃、
+    /// OPEN 原子预占 128 名额、终结流幂等丢弃（§2.7 规则 4）。
     async fn handle_frame(&self, f: &Frame) -> FrameOutcome {
         if f.session_id != self.session_id {
             self.stale_frame_count
@@ -617,13 +871,56 @@ impl SessionShared {
                 new_open: None,
             };
         }
+        // R3-4c direction 闸门（§2.2）：对端发来的数据面帧（OPEN/DATA/FIN/
+        // RESET）direction 必须是对端的发送方向；ACK 的 direction 是被确认
+        // 方向 = 本端发送方向。违例计数丢弃。
+        match f.frame_type {
+            FrameType::Data | FrameType::Open | FrameType::Fin | FrameType::Reset => {
+                if f.direction != self.recv_direction() {
+                    self.count_violation();
+                    return FrameOutcome::drop();
+                }
+            }
+            FrameType::Ack => {
+                if f.direction != self.send_direction() {
+                    self.count_violation();
+                    return FrameOutcome::drop();
+                }
+            }
+            _ => {}
+        }
+        // R3-4c 奇偶闸门（§2.2）：OPEN 的 stream_id 奇偶必须与发起方一致
+        // （client 奇 / provider 偶）。非 OPEN 帧不在此校验——响应帧合法地
+        // 出现在对端发起的流上，其合法性由「流必须先 OPEN（未见流丢弃）」
+        // 与 direction 闸门共同闭合。
+        if f.frame_type == FrameType::Open {
+            let stream_is_odd = f.stream_id % 2 == 1;
+            let peer_initiates_odd = !self.is_client;
+            if stream_is_odd != peer_initiates_odd {
+                self.count_violation();
+                return FrameOutcome::drop();
+            }
+        }
         match f.frame_type {
             FrameType::Data => {
                 let sid = self.resolve_stream(f.stream_id).await;
                 let mut streams = self.streams.lock().await;
-                let ctx = streams
-                    .entry(sid)
-                    .or_insert_with(|| StreamCtx::new(sid, self.limits));
+                // R3-4b：未见过的流（无 OPEN 预占/非本端发送流）不 or_insert
+                // ——违规计数丢弃，恶意/失常对端无法凭 DATA 无限造流。
+                let Some(ctx) = streams.get_mut(&sid) else {
+                    drop(streams);
+                    self.count_violation();
+                    return FrameOutcome::drop();
+                };
+                // §2.7 规则 4 语义：已终结流的越界 DATA（超出已宣告 final
+                // offset）违规丢弃；final 内的重复段走下方正常去重幂等。
+                if let Some(final_off) = ctx.remote_final {
+                    if f.byte_offset + f.payload.len() as u64 > final_off {
+                        drop(streams);
+                        self.count_violation();
+                        return FrameOutcome::drop();
+                    }
+                }
                 let action = ctx.recv.feed(f.byte_offset, f.payload.clone(), GAP_CAP);
                 match action {
                     Ok(SegmentAction::Deliver(payload)) => {
@@ -646,8 +943,8 @@ impl SessionShared {
                         dq.bytes += queued_len;
                         drop(q);
                         self.delivered_notify.notify_waiters();
-                        // 新代首次成功交付 → previous 失效（P1-5 / R5 收敛）
-                        self.clear_previous_token();
+                        // 新代首次成功交付 → pending/previous 失效（R3-1c）
+                        self.note_confirmed();
                         FrameOutcome {
                             reply: Some(ack),
                             new_open: None,
@@ -683,8 +980,9 @@ impl SessionShared {
                         // 内容不一致 / gap 溢出 → 流 RESET(PROTOCOL_ERROR)：
                         // 回发对端 + 本地终结（双端流死，不交付脏数据）
                         ctx.remote_final = Some(ctx.recv.expected_offset());
+                        let reset = mk_reset(self.session_id, sid, self.send_direction());
                         FrameOutcome {
-                            reply: Some(mk_reset(self.session_id, sid)),
+                            reply: Some(reset),
                             new_open: None,
                         }
                     }
@@ -692,21 +990,24 @@ impl SessionShared {
             }
             FrameType::Ack => {
                 // ACK.direction = 被确认数据的方向；匹配本端发送方向才推进
-                if f.direction == self.send_direction() {
-                    let sid = self.resolve_stream(f.stream_id).await;
-                    let mut streams = self.streams.lock().await;
-                    if let Some(ctx) = streams.get_mut(&sid) {
-                        if f.byte_offset > ctx.journal.next_offset() {
-                            // P0-3e 伪造 ACK（超发确认）：拒绝推进 + 计数
-                            // （合法域 ≤ next_send 才允许 clamp 推进）
-                            self.ack_violation_count
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        } else {
-                            ctx.journal.advance_ack(f.byte_offset);
-                            // 新代首次合法 ACK → previous 失效（P1-5 / R5 收敛）
-                            self.clear_previous_token();
-                        }
+                //（direction 闸门前置已保证；此处推进 journal）
+                let sid = self.resolve_stream(f.stream_id).await;
+                let mut streams = self.streams.lock().await;
+                if let Some(ctx) = streams.get_mut(&sid) {
+                    if f.byte_offset > ctx.journal.next_offset() {
+                        // P0-3e 伪造 ACK（超发确认）：拒绝推进 + 计数
+                        // （合法域 ≤ next_send 才允许 clamp 推进）
+                        self.ack_violation_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        ctx.journal.advance_ack(f.byte_offset);
+                        // 新代首次合法 ACK → pending/previous 失效（R3-1c）
+                        self.note_confirmed();
                     }
+                } else {
+                    // R3-4b：未见过的流的 ACK——违规计数丢弃
+                    drop(streams);
+                    self.count_violation();
                 }
                 FrameOutcome {
                     reply: None,
@@ -716,10 +1017,24 @@ impl SessionShared {
             FrameType::Fin => {
                 let sid = self.resolve_stream(f.stream_id).await;
                 let mut streams = self.streams.lock().await;
-                let ctx = streams
-                    .entry(sid)
-                    .or_insert_with(|| StreamCtx::new(sid, self.limits));
-                ctx.remote_final = Some(f.byte_offset + f.payload.len() as u64);
+                // R3-4b：未见过的流不 or_insert——违规计数丢弃
+                let Some(ctx) = streams.get_mut(&sid) else {
+                    drop(streams);
+                    self.count_violation();
+                    return FrameOutcome::drop();
+                };
+                let incoming_final = f.byte_offset + f.payload.len() as u64;
+                // §2.7 规则 4：已终结流——相同 terminal 幂等丢弃；不同
+                // final offset 视为协议错误（计数丢弃）
+                if let Some(existing) = ctx.remote_final {
+                    if existing != incoming_final {
+                        drop(streams);
+                        self.count_violation();
+                        return FrameOutcome::drop();
+                    }
+                    return FrameOutcome::drop();
+                }
+                ctx.remote_final = Some(incoming_final);
                 drop(streams);
                 self.delivered_notify.notify_waiters();
                 FrameOutcome {
@@ -731,20 +1046,37 @@ impl SessionShared {
                 let idem = parse_idem_key(&f.payload);
                 let (canonical, is_new) = self.on_open(f.stream_id, &idem).await;
                 if is_new {
+                    // R3-4a：入站 OPEN 原子预占 128 名额（design §2.6「超限
+                    // 拒绝 OPEN」——RESET 无 reason 载荷面，走计数拒绝路径，
+                    // 注释说明；对端经超时暴露）。超限回滚幂等登记防幻影。
+                    if self.reserve_stream_slot(canonical).await.is_err() {
+                        self.rollback_open(canonical, &idem).await;
+                        self.count_violation();
+                        return FrameOutcome::drop();
+                    }
                     self.open_metas
                         .lock()
                         .await
                         .insert(canonical, f.payload.clone());
+                    FrameOutcome {
+                        reply: None,
+                        new_open: Some(canonical),
+                    }
                 } else if canonical != f.stream_id {
                     // P1-4：同幂等键不同 stream_id → 建立 canonical 别名
                     self.aliases
                         .lock()
                         .await
                         .insert(f.stream_id, canonical);
-                }
-                FrameOutcome {
-                    reply: None,
-                    new_open: is_new.then_some(canonical),
+                    FrameOutcome {
+                        reply: None,
+                        new_open: None,
+                    }
+                } else {
+                    FrameOutcome {
+                        reply: None,
+                        new_open: None,
+                    }
                 }
             }
             FrameType::Reset => {
@@ -752,9 +1084,13 @@ impl SessionShared {
                 let mut streams = self.streams.lock().await;
                 if let Some(ctx) = streams.get_mut(&sid) {
                     ctx.remote_final = Some(ctx.recv.expected_offset());
+                    drop(streams);
+                    self.delivered_notify.notify_waiters();
+                } else {
+                    // R3-4b：未见过的流——违规计数丢弃
+                    drop(streams);
+                    self.count_violation();
                 }
-                drop(streams);
-                self.delivered_notify.notify_waiters();
                 FrameOutcome {
                     reply: None,
                     new_open: None,
@@ -765,6 +1101,19 @@ impl SessionShared {
                 new_open: None,
             },
         }
+    }
+
+    fn count_violation(&self) {
+        self.protocol_violation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// OPEN 名额超限的幂等登记回滚（R3-4a）：撤销 on_open 的全部记账，
+    /// 使同幂等键的合法重试不被幻影登记吞掉。
+    async fn rollback_open(&self, stream_id: u64, idem_key: &str) {
+        self.idem_index.lock().await.remove(idem_key);
+        self.requests.lock().await.remove(&stream_id);
+        self.stream_keys.lock().await.remove(&stream_id);
     }
 
     /// OPEN 元数据（原始 JSON payload；HTTP 引擎解析 method/path/headers）。
@@ -871,6 +1220,15 @@ pub(crate) struct FrameOutcome {
     pub new_open: Option<u64>,
 }
 
+impl FrameOutcome {
+    fn drop() -> Self {
+        Self {
+            reply: None,
+            new_open: None,
+        }
+    }
+}
+
 fn mk_ack(sid: [u8; 16], stream: u64, data_direction: Direction, offset: u64) -> Frame {
     Frame {
         frame_type: FrameType::Ack,
@@ -888,13 +1246,15 @@ fn hex8(sid: &[u8; 16]) -> String {
     sid.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
-fn mk_reset(sid: [u8; 16], stream: u64) -> Frame {
+fn mk_reset(sid: [u8; 16], stream: u64, send_direction: Direction) -> Frame {
     Frame {
         frame_type: FrameType::Reset,
         flags: frame::flags::RESET,
         session_id: sid,
         stream_id: stream,
-        direction: Direction::ClientToProvider,
+        // R3-4c：RESET 是发送方的数据面帧——direction 必须取发送方方向
+        //（接收端闸门按 §2.2 校验）。
+        direction: send_direction,
         byte_offset: 0,
         payload: Bytes::new(),
     }
@@ -992,6 +1352,8 @@ fn timeout_err(what: &str) -> FabricError {
 
 /// 会话通道：一条 bidi 流上的会话帧收发。收半边由 pump 独占消费；
 /// 发半边按帧粒度加锁（ACK 回发与数据发送互不阻塞超过单帧时延）。
+/// R3-2：通道携带 (epoch, owner)——pump 收帧先 fence（ResumeCtl 快照
+/// 比对），旧通道的迟到帧丢弃计数、退出不把新代拉回 Recovering。
 pub struct SessionChannel {
     shared: Arc<SessionShared>,
     send: tokio::sync::Mutex<TransportSend>,
@@ -1003,21 +1365,34 @@ pub struct SessionChannel {
     arrivals_notify: tokio::sync::Notify,
     /// pump 退出即置位（通道终结——arrivals 排空后 next_incoming 返回 None）。
     dead: std::sync::atomic::AtomicBool,
+    /// 本通道的 transport epoch（创建时取 TransportSend.epoch；fence 键 1/2）。
+    epoch: u64,
+    /// 本通道的 owner id（ResumeCtl 单调分配；fence 键 2/2——同 epoch 的
+    /// 双通道由它区分）。
+    owner: u64,
 }
 
 impl SessionChannel {
-    fn new(shared: Arc<SessionShared>, send: TransportSend, recv: TransportRecv) -> Arc<Self> {
-        let chan = Arc::new(Self {
-            shared: Arc::clone(&shared),
-            send: tokio::sync::Mutex::new(send),
-            recv: tokio::sync::Mutex::new(recv),
-            arrivals: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
-            arrivals_notify: tokio::sync::Notify::new(),
-            dead: std::sync::atomic::AtomicBool::new(false),
-        });
-        // 当前代自登记（Weak——通道生命周期由强引用者持有，无环）
-        *shared.current_channel.write().unwrap() = Some(Arc::downgrade(&chan));
-        chan
+    /// 安装通道（R3-2d：唯一安装路径——owner 分配 + active_epoch 更新 +
+    /// Weak 登记/单调覆写全部在 ResumeCtl 单锁内；策略见 [`InstallPolicy`]）。
+    /// 返回 None = IfVacant 被拒（既有通道存活；调用方应半关本传输）。
+    pub(crate) fn install(
+        shared: &Arc<SessionShared>,
+        send: TransportSend,
+        recv: TransportRecv,
+        policy: InstallPolicy,
+    ) -> Option<Arc<Self>> {
+        shared.install_channel(send, recv, policy)
+    }
+
+    /// 通道是否已终结（pump 退出）——IfVacant 策略的存活判定。
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 本通道是否仍是当前胜者（fence 快照）。
+    fn is_current(&self) -> bool {
+        self.shared.channel_is_current(self.epoch, self.owner)
     }
 
     pub fn shared(&self) -> &Arc<SessionShared> {
@@ -1134,8 +1509,10 @@ impl SessionChannel {
         }
     }
 
-    /// 会话泵：独占收半边——收帧 → 语义处理 → 控制帧立即回发。
-    /// 连接死亡（Ended/Io）→ Recovering + dead 置位并返回（恢复由 resume 驱动）。
+    /// 会话泵：独占收半边——收帧 → fence（R3-2）→ 语义处理 → 控制帧立即
+    /// 回发。连接死亡（Ended/Io）→ Recovering + dead 置位并返回（恢复由
+    /// resume 驱动）；**旧通道退出不改 phase**（owner 已让位——不得把新代
+    /// 拉回 Recovering）。
     async fn pump(self: Arc<Self>) -> Result<(), FabricError> {
         let out = self.pump_inner().await;
         self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1150,15 +1527,28 @@ impl SessionChannel {
                 match recv.recv().await {
                     Ok(f) => f,
                     Err(TransportError::Ended) => {
-                        self.shared.set_phase(SessionPhase::Recovering).await;
+                        if self.is_current() {
+                            self.shared.set_phase(SessionPhase::Recovering).await;
+                        }
                         return Ok(());
                     }
                     Err(e) => {
-                        self.shared.set_phase(SessionPhase::Recovering).await;
+                        if self.is_current() {
+                            self.shared.set_phase(SessionPhase::Recovering).await;
+                        }
                         return Err(map_transport_err(e));
                     }
                 }
             };
+            // R3-2 fence：旧通道（epoch/owner 任一不符）的迟到帧丢弃计数
+            // ——不进 journal、不回 ACK、不改交付面（design §2.7 规则 5）。
+            if !self.is_current() {
+                self.shared.stale_frame_count.fetch_add(
+                    1,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                continue;
+            }
             let outcome = self.shared.handle_frame(&f).await;
             if let Some(stream_id) = outcome.new_open {
                 self.arrivals.lock().await.push_back(stream_id);
@@ -1167,7 +1557,10 @@ impl SessionChannel {
             if let Some(ctrl) = outcome.reply {
                 if let Err(e) = self.send_frame(&ctrl).await {
                     // 连接死亡同样进入 Recovering（recv 侧未必再被轮到）
-                    self.shared.set_phase(SessionPhase::Recovering).await;
+                    // ——仅当本通道仍是当前胜者（R3-2c）
+                    if self.is_current() {
+                        self.shared.set_phase(SessionPhase::Recovering).await;
+                    }
                     return Err(e);
                 }
             }
@@ -1326,17 +1719,47 @@ impl Session {
     }
 }
 
+/// 并发 INIT 败方收敛（R3-3c）：从本地注册表采纳 canonical 会话——等待
+/// 本端 accept 侧把胜方 INIT 登记进注册表并装好通道，返回复用句柄
+/// （不重复 pump；发送面经 shared 解析当前代通道）。
+async fn adopt_session(
+    fabric: &Fabric,
+    canonical: [u8; 16],
+) -> Result<Session, FabricError> {
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        if let Some(shared) = fabric.inner.continuity_sessions.get(&canonical).await {
+            if let Some(chan) = shared.current_channel() {
+                return Ok(Session {
+                    shared,
+                    channel: std::sync::RwLock::new(chan),
+                    pump: std::sync::Mutex::new(None),
+                });
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FabricError::Session(SessionError::Connect(format!(
+                "canonical session {} not observed locally",
+                hex8(&canonical)
+            ))));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 会话注册表（provider 侧常驻）
 // ---------------------------------------------------------------------------
 
 /// SESSION_INIT 准入裁决结果（P0-2：幂等 + peer/token 绑定校验）。
 pub(crate) enum InitAdmission {
-    /// 准入（新会话，或同 sid+token 的幂等重发——返回既有会话）。
-    Admitted(Arc<SessionShared>),
-    /// 同 sid 但 peer 不符 → REJECT 0x06 POLICY_DENIED。
+    /// 准入：新会话（fresh=true），或同 sid+token 的幂等重发（fresh=false，
+    /// 返回既有会话）。
+    Admitted(Arc<SessionShared>, bool),
+    /// 同 sid 但 peer 不符 → REJECT 0x03 POLICY_DENIED（INIT 表）。
     PeerMismatch,
-    /// 同 sid 但 token 不符（伪造/竞态）→ REJECT 0x02 TOKEN_INVALID。
+    /// 同 sid 但 token 不符（伪造/竞态）→ REJECT 0x02 MALFORMED（INIT 表
+    /// ——数值与旧 TOKEN_INVALID 相同，语义按 §2.3.0 冻结表）。
     TokenMismatch,
 }
 
@@ -1351,9 +1774,9 @@ impl SessionRegistry {
     }
 
     /// SESSION_INIT 准入（P0-2）：
-    /// - 无此 sid → 登记新会话（绑定 peer_id + token）。
-    /// - 有此 sid 且 peer 一致且 token 与登记代一致 → 幂等 OK（重发既有会话
-    ///   ——client 重试用同一 sid/token，ghost 收敛）。
+    /// - 无此 sid → 登记新会话（绑定 peer_id + token；fresh=true）。
+    /// - 有此 sid 且 peer 一致且 token 与登记代一致 → 幂等 OK（fresh=false，
+    ///   重发既有会话——client 重试用同一 sid/token，ghost 收敛）。
     /// - peer 不符 → PeerMismatch；token 不符 → TokenMismatch。
     pub(crate) async fn admit_init(
         &self,
@@ -1370,11 +1793,11 @@ impl SessionRegistry {
             if !existing.init_token_is(&token) {
                 return InitAdmission::TokenMismatch;
             }
-            return InitAdmission::Admitted(existing.clone());
+            return InitAdmission::Admitted(existing.clone(), false);
         }
         let shared = SessionShared::new(session_id, token, peer_id, false, limits);
         map.insert(session_id, Arc::clone(&shared));
-        InitAdmission::Admitted(shared)
+        InitAdmission::Admitted(shared, true)
     }
 
     pub(crate) async fn get(&self, session_id: &[u8; 16]) -> Option<Arc<SessionShared>> {
@@ -1386,22 +1809,81 @@ impl SessionRegistry {
 // wire payload 编解码（本模块单一权威；集成测试经 pub 造帧注入）
 // ---------------------------------------------------------------------------
 
-/// SESSION_INIT payload：[ver u8][sid 16][token 16][generation u64]。
-pub fn encode_session_init(session_id: &[u8; 16], token: &[u8; 16], generation: u64) -> Vec<u8> {
+/// 本端对同 peer 的 INIT 发起登记（R3-3c：并发双 INIT 的全序裁决面）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InitCampaign {
+    pub session_id: [u8; 16],
+}
+
+/// per-peer 发起侧登记表（挂在 FabricInner；成功后保留作迟到交叉 INIT 的
+/// 收敛锚，失败/被取代时移除）。
+pub(crate) type CampaignMap = tokio::sync::Mutex<HashMap<String, InitCampaign>>;
+
+/// SESSION_INIT payload：[ver u8][sid 16][token 16][local_epoch u64]
+///（design §2.3.0——末域是 local_epoch=1，非 generation）。
+pub fn encode_session_init(session_id: &[u8; 16], token: &[u8; 16], local_epoch: u64) -> Vec<u8> {
     let mut p = Vec::with_capacity(41);
     p.push(PROTOCOL_VERSION);
     p.extend_from_slice(session_id);
     p.extend_from_slice(token);
+    put_u64(&mut p, local_epoch);
+    p
+}
+
+/// SESSION_INIT_OK payload：[accepted sid 16][accepted_epoch u64][generation u64]
+///（design §2.3.0 R4 全载荷——R3-3 闭合）。
+pub fn encode_session_init_ok(
+    session_id: &[u8; 16],
+    accepted_epoch: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(40);
+    p.extend_from_slice(session_id);
+    put_u64(&mut p, accepted_epoch);
     put_u64(&mut p, generation);
     p
 }
 
-/// SESSION_INIT_OK payload：[accepted sid 16][generation u64]。
-pub fn encode_session_init_ok(session_id: &[u8; 16], generation: u64) -> Vec<u8> {
-    let mut p = Vec::with_capacity(24);
-    p.extend_from_slice(session_id);
+/// 解析 SESSION_INIT_OK（严格长度；畸形 → None）。
+pub fn decode_session_init_ok(p: &[u8]) -> Option<([u8; 16], u64, u64)> {
+    // 与 encode 自洽：sid16 + epoch8 + generation8 = 32B
+    if p.len() != 32 {
+        return None;
+    }
+    let mut sid = [0u8; 16];
+    sid.copy_from_slice(&p[0..16]);
+    let accepted_epoch = get_u64(p, 16)?;
+    let generation = get_u64(p, 24)?;
+    Some((sid, accepted_epoch, generation))
+}
+
+/// SESSION_INIT_REJECT payload：[reason u8][canonical sid 16]
+/// [canonical_epoch u64][generation u64]（design §2.3.0 R4 全载荷——R3-3
+/// 闭合；header.session_id = 被拒方自己的 id，canonical 三元组只在 payload）。
+pub fn encode_session_init_reject(
+    reason: u8,
+    canonical_session_id: &[u8; 16],
+    canonical_epoch: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(41);
+    p.push(reason);
+    p.extend_from_slice(canonical_session_id);
+    put_u64(&mut p, canonical_epoch);
     put_u64(&mut p, generation);
     p
+}
+
+/// 解析 SESSION_INIT_REJECT（严格长度；畸形 → None；canonical 可为全零）。
+pub fn decode_session_init_reject(p: &[u8]) -> Option<(u8, [u8; 16], u64, u64)> {
+    if p.len() != 41 {
+        return None;
+    }
+    let mut canonical = [0u8; 16];
+    canonical.copy_from_slice(&p[1..17]);
+    let canonical_epoch = get_u64(p, 17)?;
+    let generation = get_u64(p, 25)?;
+    Some((p[0], canonical, canonical_epoch, generation))
 }
 
 /// RESUME_INIT payload：
@@ -1523,12 +2005,6 @@ pub fn encode_resume_reject(reason: u8) -> Vec<u8> {
     vec![reason]
 }
 
-/// SESSION_INIT_REJECT payload：[reason u8]（P0-2——复用 RESUME reason 表：
-/// 0x02 TOKEN_INVALID / 0x06 POLICY_DENIED；硬化轮裁定，见模块注释）。
-pub fn encode_session_init_reject(reason: u8) -> Vec<u8> {
-    vec![reason]
-}
-
 // ---------------------------------------------------------------------------
 // 建立与恢复入口
 // ---------------------------------------------------------------------------
@@ -1549,14 +2025,21 @@ fn entropy_err() -> FabricError {
     FabricError::Session(SessionError::Connect("entropy unavailable".into()))
 }
 
-fn mk_session(shared: Arc<SessionShared>, send: TransportSend, recv: TransportRecv) -> Session {
-    let channel = SessionChannel::new(Arc::clone(&shared), send, recv);
+/// 由已装通道组装会话句柄（pump 启动）。IfVacant 被拒 → None（调用方
+/// 半关传输并按「被存活通道取代」处理）。
+fn mk_session(
+    shared: Arc<SessionShared>,
+    send: TransportSend,
+    recv: TransportRecv,
+    policy: InstallPolicy,
+) -> Option<Session> {
+    let channel = SessionChannel::install(&shared, send, recv, policy)?;
     let pump = channel.spawn_pump();
-    Session {
+    Some(Session {
         shared,
-        channel: std::sync::RwLock::new(Arc::clone(&channel)),
+        channel: std::sync::RwLock::new(channel),
         pump: std::sync::Mutex::new(Some(pump)),
-    }
+    })
 }
 
 /// 收敛期错误分类：传输类（winner 收敛杀流/拨号竞速）可重试；
@@ -1573,6 +2056,8 @@ const CONVERGENCE_BACKOFF: std::time::Duration = std::time::Duration::from_milli
 /// client：建立新会话（收敛感知——传输竞速失败自动换新流重试；拒绝不重试）。
 /// P0-2：session_id/token **重试循环外一次生成**、各 attempt 复用——重试
 /// 对 provider 幂等（同 sid+token → OK 重发既有会话），ghost 会话不再累积。
+/// R3-3c：发起侧登记（continuity_campaigns）——双端并发 INIT 的全序裁决面；
+/// 成功后保留（迟到交叉 INIT 的收敛锚），最终失败移除。
 pub async fn open_session(
     fabric: &Fabric,
     peer_id: &str,
@@ -1580,11 +2065,20 @@ pub async fn open_session(
 ) -> Result<Session, FabricError> {
     let session_id = rand_16().ok_or_else(entropy_err)?;
     let token = rand_16().ok_or_else(entropy_err)?;
+    fabric.inner.continuity_campaigns.lock().await.insert(
+        peer_id.to_string(),
+        InitCampaign {
+            session_id,
+        },
+    );
     let mut last: Option<FabricError> = None;
     for _ in 0..CONVERGENCE_RETRY {
         match open_session_attempt(fabric, peer_id, opts, session_id, token).await {
             Ok(s) => return Ok(s),
-            Err(TryAgain::Definitive(e)) => return Err(e),
+            Err(TryAgain::Definitive(e)) => {
+                cleanup_campaign(fabric, peer_id, session_id).await;
+                return Err(e);
+            }
             Err(TryAgain::Transport(e)) => {
                 // 首建会话与对端接受侧并发拨号：winner 收敛可能关闭本流所绑
                 // 连接（Phase 1 t4 实证形态）——重开新流重试（sid/token 复用）
@@ -1593,7 +2087,19 @@ pub async fn open_session(
             }
         }
     }
+    cleanup_campaign(fabric, peer_id, session_id).await;
     Err(last.expect("至少一次尝试"))
+}
+
+/// 移除本 campaign 登记（仅当仍指向自己的 sid——防误删并发的新 campaign）。
+async fn cleanup_campaign(fabric: &Fabric, peer_id: &str, session_id: [u8; 16]) {
+    let mut map = fabric.inner.continuity_campaigns.lock().await;
+    if map
+        .get(peer_id)
+        .is_some_and(|c| c.session_id == session_id)
+    {
+        map.remove(peer_id);
+    }
 }
 
 async fn open_session_attempt(
@@ -1644,22 +2150,69 @@ async fn open_session_attempt(
     );
     match resp.frame_type {
         FrameType::SessionInitOk => {
+            // R3-3：全载荷解析 + 回显校验（header/payload sid 一致性）
+            let Some((echo_sid, _accepted_epoch, _generation)) =
+                decode_session_init_ok(&resp.payload)
+            else {
+                return Err(TryAgain::Definitive(FabricError::Session(
+                    SessionError::Connect("malformed SESSION_INIT_OK".into()),
+                )));
+            };
+            if echo_sid != session_id {
+                return Err(TryAgain::Definitive(FabricError::Session(
+                    SessionError::Connect("SESSION_INIT_OK sid mismatch".into()),
+                )));
+            }
             let shared =
                 SessionShared::new(session_id, token, peer_id.to_string(), true, opts.limits);
             shared.set_phase(SessionPhase::Active).await;
             let (send, recv) = transport.into_split();
-            Ok(mk_session(shared, send, recv))
+            // 新会话无既有通道，Force 安装恒成功
+            mk_session(shared, send, recv, InstallPolicy::Force)
+                .ok_or_else(|| TryAgain::Transport(channel_superseded_err()))
         }
-        FrameType::SessionInitReject => Err(TryAgain::Definitive(
-            FabricError::Session(SessionError::Connect(format!(
-                "session init rejected: reason={}",
-                resp.payload.first().copied().unwrap_or(0)
-            ))),
-        )),
+        FrameType::SessionInitReject => {
+            // R3-3c：并发双 INIT 败方收敛——canonical 三元组指向对端胜方
+            // 会话，从本地注册表采纳（不产生双会话并存）。
+            if let Some((_reason, canonical, _epoch, _gen)) =
+                decode_session_init_reject(&resp.payload)
+            {
+                if canonical != [0u8; 16] && canonical != session_id {
+                    strace!(
+                        "open lost race, adopting canonical {}",
+                        hex8(&canonical)
+                    );
+                    // 收敛锚更新为 canonical（自身 campaign 撤回语义）
+                    fabric.inner.continuity_campaigns.lock().await.insert(
+                        peer_id.to_string(),
+                        InitCampaign {
+                            session_id: canonical,
+                        },
+                    );
+                    let session = adopt_session(fabric, canonical)
+                        .await
+                        .map_err(TryAgain::Definitive)?;
+                    return Ok(session);
+                }
+            }
+            Err(TryAgain::Definitive(FabricError::Session(
+                SessionError::Connect(format!(
+                    "session init rejected: reason={}",
+                    resp.payload.first().copied().unwrap_or(0)
+                )),
+            )))
+        }
         other => Err(TryAgain::Definitive(FabricError::Session(
             SessionError::Connect(format!("unexpected frame {other:?}")),
         ))),
     }
+}
+
+/// mk_session IfVacant 被拒时的统一错误（传输被存活胜者通道取代）。
+fn channel_superseded_err() -> FabricError {
+    FabricError::Session(SessionError::Connect(
+        "transport superseded by live channel".into(),
+    ))
 }
 
 /// provider：接受入站会话流（首帧分派 SESSION_INIT / RESUME_INIT）。
@@ -1728,7 +2281,7 @@ async fn accept_session_init(
         .admit_init(sid, token, peer_id.to_string(), opts.limits)
         .await
     {
-        InitAdmission::Admitted(shared) => shared,
+        InitAdmission::Admitted(shared, _is_new) => shared,
         InitAdmission::PeerMismatch => {
             // 同 sid 绑定其它 peer：策略拒绝（REJECT 0x06）
             transport
@@ -1741,6 +2294,9 @@ async fn accept_session_init(
                     byte_offset: 0,
                     payload: Bytes::from(encode_session_init_reject(
                         reject_reason::POLICY_DENIED,
+                        &[0u8; 16],
+                        0,
+                        0,
                     )),
                 })
                 .await
@@ -1761,6 +2317,9 @@ async fn accept_session_init(
                     byte_offset: 0,
                     payload: Bytes::from(encode_session_init_reject(
                         reject_reason::TOKEN_INVALID,
+                        &[0u8; 16],
+                        0,
+                        0,
                     )),
                 })
                 .await
@@ -1778,13 +2337,16 @@ async fn accept_session_init(
             stream_id: 0,
             direction: Direction::ProviderToClient,
             byte_offset: 0,
-            payload: Bytes::from(encode_session_init_ok(&sid, 1)),
+            payload: Bytes::from(encode_session_init_ok(&sid, transport.epoch, 1)),
         })
         .await
         .map_err(map_transport_err)?;
     shared.set_phase(SessionPhase::Active).await;
     let (send, recv) = transport.into_split();
-    Ok(mk_session(shared, send, recv))
+    // fresh INIT 与幂等重发同途：后到传输即 client 实际使用的传输——Force
+    // 接管（owner 递增，旧泵经 R3-2c 不误置 Recovering）
+    Ok(mk_session(shared, send, recv, InstallPolicy::Force)
+        .expect("Force 安装恒成功"))
 }
 
 /// provider：RESUME_INIT → **原子裁决+轮换**（`try_rotate`——validate 与
@@ -1836,11 +2398,11 @@ async fn accept_resume(
             "resume rejected: REQUEST_STATE_LOST".into(),
         )));
     };
-    // P0-1：原子裁决+轮换（新 token 在临界区外生成——fail-closed 前置）
+    // R3-1：原子裁决（单锁：nonce 幂等 + token 窗口——previous 可用性判定
+    // 在锁内由 pending 推导，Codex 指出的锁外相位窗口不复存在）
     let new_token = rand_16().ok_or_else(entropy_err)?;
-    let allow_previous = shared.phase().await != SessionPhase::Active;
-    let Some((new_generation, new_token)) =
-        shared.try_rotate(parsed.local_generation, &parsed.token, new_token, allow_previous)
+    let Some((new_generation, new_token, _resent)) =
+        shared.decide_resume(parsed.nonce, parsed.local_generation, &parsed.token, new_token)
     else {
         transport
             .send(&reject(reject_reason::TOKEN_INVALID))
@@ -1850,6 +2412,9 @@ async fn accept_resume(
             "resume rejected: TOKEN_INVALID".into(),
         )));
     };
+    // barrier 测试钩子（R3-1）：轮换完成、OK 未发/Active 未置位窗口——
+    // 测试在此注入并发第二 RESUME 验证单胜与幂等（生产零开销）
+    shared.resume_gate.wait().await;
     transport
         .send(&Frame {
             frame_type: FrameType::ResumeOk,
@@ -1868,7 +2433,8 @@ async fn accept_resume(
     // 任务经 channel 发送——恢复握手里不再有大数据量同步发送，与对端的
     // 反向重放并发进行（QUIC 流控互等死锁闭合）。
     let (send, recv) = transport.into_split();
-    let session = mk_session(Arc::clone(&shared), send, recv);
+    let session = mk_session(Arc::clone(&shared), send, recv, InstallPolicy::Force)
+        .expect("fresh RESUME 轮换 Force 安装恒成功");
     {
         let replay_shared = Arc::clone(&shared);
         let replay_chan = session.channel();
@@ -1916,8 +2482,10 @@ async fn accept_resume(
 /// 重连竞速期传输失败自动重试；RESUME_REJECT 为终局（phase → Dead）。
 pub async fn resume_session(fabric: &Fabric, session: &Session) -> Result<(), FabricError> {
     let mut last: Option<FabricError> = None;
+    // R3-1：nonce 每 campaign 一次（重试复用——provider 侧幂等缓存的匹配键）
+    let nonce = rand_16().ok_or_else(entropy_err)?;
     for _ in 0..CONVERGENCE_RETRY {
-        match resume_attempt(fabric, session).await {
+        match resume_attempt(fabric, session, nonce).await {
             Ok(()) => return Ok(()),
             Err(TryAgain::Definitive(e)) => return Err(e),
             Err(TryAgain::Transport(e)) => {
@@ -1929,7 +2497,11 @@ pub async fn resume_session(fabric: &Fabric, session: &Session) -> Result<(), Fa
     Err(last.expect("至少一次尝试"))
 }
 
-async fn resume_attempt(fabric: &Fabric, session: &Session) -> Result<(), TryAgain> {
+async fn resume_attempt(
+    fabric: &Fabric,
+    session: &Session,
+    nonce: [u8; 16],
+) -> Result<(), TryAgain> {
     let peer = session.shared.peer_id.clone();
     // 迟到响应竞态判定基线（P0-1d）：本 attempt 期间的 generation
     let gen_before = session.shared.current_generation();
@@ -1953,7 +2525,6 @@ async fn resume_attempt(fabric: &Fabric, session: &Session) -> Result<(), TryAga
         .await
         .map_err(TryAgain::Transport)?;
     let (generation, token) = session.shared.current_token();
-    let nonce = rand_16().ok_or_else(|| TryAgain::Definitive(entropy_err()))?;
     let payload = encode_resume_init(
         generation,
         generation,
@@ -1989,7 +2560,10 @@ async fn resume_attempt(fabric: &Fabric, session: &Session) -> Result<(), TryAga
             // OPEN/DATA/FIN 重发经 channel 与接收并发——双向大 replay 不在
             // 握手路径互等（QUIC 流控死锁闭合）。
             let (send, recv) = transport.into_split();
-            let chan = SessionChannel::new(Arc::clone(&session.shared), send, recv);
+            let chan = session
+                .shared
+                .install_channel(send, recv, InstallPolicy::Force)
+                .expect("client 恢复轮换接管恒成功");
             session.install_channel(Arc::clone(&chan));
             session.shared.set_phase(SessionPhase::Active).await;
             // 重发 OPEN（幂等归并，不占数据 offset 空间）
@@ -2074,6 +2648,21 @@ mod tests {
             direction: Direction::ClientToProvider,
             byte_offset: off,
             payload: Bytes::copy_from_slice(data),
+        }
+    }
+
+    /// 合法入站 OPEN（client 奇数流 → provider；R3-4 闸门前置fixture）。
+    fn open_frame(sid: [u8; 16], stream: u64) -> Frame {
+        Frame {
+            frame_type: FrameType::Open,
+            flags: frame::flags::START,
+            session_id: sid,
+            stream_id: stream,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from(format!(
+                "{{\"requestId\":\"{stream}\",\"idempotencyKey\":\"k{stream}\"}}"
+            )),
         }
     }
 
@@ -2308,6 +2897,8 @@ mod tests {
         let chunk = Bytes::from(vec![0xAB; 1024]);
         let off = sender.record_send(1, &chunk).await.unwrap();
         assert_eq!(off, 0);
+        // R3-4b：入站流先 OPEN 预占（未见流的 DATA 违规丢弃）
+        receiver.handle_frame(&open_frame([1u8; 16], 1)).await;
         // 模拟 wire：DATA 到达接收端
         let ack0 = receiver
             .handle_frame(&data_frame([1u8; 16], 1, 0, &chunk))
@@ -2380,7 +2971,8 @@ mod tests {
         assert!(out.reply.is_none() && out.new_open.is_none(), "无副作用");
         assert_eq!(shared.stale_frames(), 1);
         assert_eq!(shared.deliver_queue_bytes(1).await, 0, "不交付");
-        // 正确 session_id 正常处理
+        // 正确 session_id 正常处理（R3-4b：先 OPEN 预占再 DATA）
+        shared.handle_frame(&open_frame([1u8; 16], 1)).await;
         shared
             .handle_frame(&data_frame([1u8; 16], 1, 0, b"good"))
             .await;
@@ -2402,12 +2994,18 @@ mod tests {
         shared
             .handle_frame(&data_frame([1u8; 16], 1, 0, b"data"))
             .await;
+        // decide_resume（R3-1）：previous 凭据仅经 nonce 绑定 pending 可用；
+        // 确认后 pending 与 previous 同锁清除——裸 previous 凭据恒拒绝
         assert!(
-            shared.try_rotate(1, &[2u8; 16], [4u8; 16], true).is_none(),
-            "首次成功交付后 previous 凭据失效"
+            shared
+                .decide_resume([9u8; 16], 1, &[2u8; 16], [4u8; 16])
+                .is_none(),
+            "首次成功交付后 previous 凭据失效（无 nonce 缓存路径）"
         );
         assert!(
-            shared.try_rotate(2, &[3u8; 16], [5u8; 16], true).is_some(),
+            shared
+                .decide_resume([9u8; 16], 2, &[3u8; 16], [5u8; 16])
+                .is_some(),
             "current 不受影响"
         );
     }
@@ -2481,7 +3079,7 @@ mod tests {
             .admit_init([7u8; 16], [1u8; 16], "peer-a".into(), lim)
             .await
         {
-            InitAdmission::Admitted(s) => s,
+            InitAdmission::Admitted(s, _) => s,
             _ => panic!("首登记必须准入"),
         };
         // 幂等：同 sid + 同 token + 同 peer → 同一会话（ghost 收敛）
@@ -2489,7 +3087,9 @@ mod tests {
             .admit_init([7u8; 16], [1u8; 16], "peer-a".into(), lim)
             .await
         {
-            InitAdmission::Admitted(s2) => assert!(Arc::ptr_eq(&s1, &s2), "幂等重发返回既有会话"),
+            InitAdmission::Admitted(s2, _) => {
+                assert!(Arc::ptr_eq(&s1, &s2), "幂等重发返回既有会话")
+            }
             _ => panic!("幂等重发必须准入"),
         }
         // token 不符（伪造/竞态）
@@ -2516,14 +3116,16 @@ mod tests {
     #[tokio::test]
     async fn duplicate_and_overlap_semantics() {
         // 协议语义（网络无关）：重复帧不重复交付；overlap 不一致 → RESET。
-        // ACK 值 = commit point（应用消费水位——P0-3）。
+        // ACK 值 = commit point（应用消费水位——P0-3）。接收方 = provider
+        // 侧（C2P 数据面合法——R3-4c direction 闸门）。
         let shared = SessionShared::new(
             [1u8; 16],
             [2u8; 16],
             "peer".into(),
-            true,
+            false,
             JournalLimits::default(),
         );
+        shared.handle_frame(&open_frame([1u8; 16], 1)).await;
         let sid = [1u8; 16];
         let f = |off: u64, data: &[u8]| Frame {
             frame_type: FrameType::Data,
