@@ -55,6 +55,8 @@ pub struct FabricOptions {
     pub http_proxy: Option<Either<String, HttpProxyUrl>>,
     /// join 总时限（毫秒）；缺省 30000；值域 [1000, 600000]，越界构造 reject
     pub join_timeout_ms: Option<f64>,
+    /// 本端 QUIC 绑定地址（host:port；e2e 组网需要固定端口对拨时使用）
+    pub bind_addr: Option<String>,
 }
 
 /// invite 逃生阀选项（D3）。
@@ -198,7 +200,7 @@ fn take_options(
             secret: SecretInjection::Default,
             http_proxy: to_http_proxy_config(opts.http_proxy.clone())?,
             join_timeout_ms: to_join_timeout_ms(opts.join_timeout_ms)?,
-            bind_addr: None,
+            bind_addr: opts.bind_addr.clone(),
             relay_tls_trust: RelayTlsTrust::PlatformRoot,
         })
     };
@@ -215,7 +217,7 @@ fn take_options(
     }
 }
 
-fn link_status_str(s: LinkStatus) -> &'static str {
+pub(crate) fn link_status_str(s: LinkStatus) -> &'static str {
     match s {
         LinkStatus::Direct => "direct",
         LinkStatus::Relay => "relay",
@@ -224,7 +226,7 @@ fn link_status_str(s: LinkStatus) -> &'static str {
 }
 
 /// 稳定错误码前缀映射（error-matrix 冻结集合）。
-fn fabric_err(e: dweb_fabric::FabricError) -> Error {
+pub(crate) fn fabric_err(e: dweb_fabric::FabricError) -> Error {
     use dweb_fabric::FabricError as E;
     let prefixed = |p: &str| Error::new(Status::GenericFailure, format!("[{p}] {e}"));
     match &e {
@@ -567,6 +569,69 @@ impl Fabric {
         let callbacks = self.event_callbacks.clone();
         callbacks.blocking_lock().push((id as u64, callback));
         id
+    }
+
+    /// continuity：与对端建立逻辑会话（design §3.3 唯一创建入口）。
+    /// 返回 SessionHandle——内建 auto-resume 驱动（断线续传对 JS 透明）。
+    #[napi]
+    pub async fn open_session(&self, peer_id: String) -> Result<crate::session::SessionHandle> {
+        let session = dweb_fabric::continuity::session::open_session(
+            &self.inner,
+            &peer_id,
+            dweb_fabric::continuity::session::SessionOptions::default(),
+        )
+        .await
+        .map_err(crate::session::session_err)?;
+        Ok(crate::session::SessionHandle::new(session, self.inner.clone()))
+    }
+
+    /// continuity：对端连接状态快照（design §3.1；Phase 1 task 2.3 补课投影）。
+    /// snapshot 优先于事件；epoch/stateSeq 为 bigint。
+    #[napi]
+    pub async fn continuity_snapshot(
+        &self,
+        peer_id: String,
+    ) -> Result<crate::session::ConnectionStateSnapshotJs> {
+        let s = self
+            .inner
+            .continuity_snapshot(&peer_id)
+            .await
+            .map_err(crate::session::session_err)?;
+        Ok(s.into())
+    }
+
+    /// continuity：注入连接死亡（故障注入面——驱动恢复语义验证；非生产用途）。
+    #[napi]
+    pub async fn continuity_reset(&self, peer_id: String) -> Result<()> {
+        self.inner
+            .continuity_reset(&peer_id)
+            .await
+            .map_err(crate::session::session_err)
+    }
+
+    /// 添加对端直连地址提示（e2e 组网：固定端口对拨）。
+    #[napi]
+    pub async fn add_known_addr(&self, endpoint_id: String, addr: String) -> Result<()> {
+        self.inner
+            .add_known_addr(&endpoint_id, addr)
+            .await
+            .map_err(fabric_err)
+    }
+
+    /// serveHttp：provider 侧 HTTP 引擎（design §3.4）。
+    /// handler 为 TSFN JSON 事件回调（native 桥形态）；§3.4 规范签名
+    /// （HttpHandler 类型面）见 /http 子路径胶水。
+    #[napi]
+    pub async fn serve_http(
+        &self,
+        peer_id: String,
+        handler: ThreadsafeFunction<String>,
+    ) -> Result<crate::http::HttpServerJs> {
+        Ok(crate::http::HttpServerJs::start(
+            self.inner.clone(),
+            peer_id,
+            handler,
+        ))
     }
 
     /// 注销事件回调（on 返回的 id）。

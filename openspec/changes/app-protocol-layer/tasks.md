@@ -73,12 +73,25 @@
 
 ## Phase 3：HTTP/WS Rust 引擎 + SDK subpath + ai-fly 接线
 
-- [ ] 4.1 HTTP/WS 引擎（Rust）：serveHttp/fetchHttp、SSE 投影、WS upgrade
+- [x] 4.1 HTTP/WS 引擎（Rust）：serveHttp/fetchHttp、SSE 投影、WS upgrade
       隧道（边界/分片/close 冻结）
-- [ ] 4.2 `@jixo/opendweb-client-sdk` exports map（. /net /net/internals
+      —— b6e8cb2：http.rs（OPEN 全量元数据 + 响应首行 meta 投影；断线桥接
+      record-once + 定 offset 裸帧重发；WS keep_open 字节隧道）；通道连续性
+      （shared.current_channel Weak + Session 强引用锚——断线窗口 panic 实证
+      修复）；tests/continuity_http.rs 3/3 ×3（SSE 断线续传字节级精确+exec==1、
+      WS 101 隧道、POST 往返+journal 释放）
+- [x] 4.2 `@jixo/opendweb-client-sdk` exports map（. /net /net/internals
       /http /http/internals；internals 标注 semver 宽松）+ SessionHandle/
       LogicalStream/OpenStreamMeta TS 类型面 + npm pack 验证 + 五子路径
       import/require/类型三层实测
+      —— SessionHandle（state/onState/close/journalBytes + **auto-resume 驱动**：
+      Recovering→resume、90s 恢复窗口强制、Dead/Closed 终局退出——SSE 断线续传
+      对 JS 透明）；fetchHttp（pull-first bodyNext 直驱内核 recv，无桥内缓冲；
+      禁 Blocking TSFN/无界队列红线未触碰）；serveHttp（TSFN 仅信号 +
+      resolveRequest/rejectRequest 回流 + 有界 mpsc cap16）；continuitySnapshot
+      透传（Phase 1 task 2.3 补课）；exports 五子路径 + d.ts + fix-dts 精确回收
+      改造；21/21 测试（SSE 透明续传 e2e + exports 三层）+ typecheck + pack 13
+      文件；偏差如实入档（AbortController/流式 body/WS 整消息 Phase 4）
 - [ ] 4.3 （可选）TS 逃生舱参考实现（基于 /net/internals）作文档示例
 - [ ] 4.4 ai-fly 迁移 change：ProviderConnection 删除第二套重连竞速、
       frames/mux 退役、AUTH/catalog 消费 Session 状态

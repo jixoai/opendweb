@@ -70,6 +70,11 @@ pub struct RequestBody {
 }
 
 impl RequestBody {
+    /// 会话共享核（N-API 桥终态竞速/观测用，task 4.2）。
+    pub fn shared(&self) -> &Arc<SessionShared> {
+        &self.shared
+    }
+
     pub async fn recv(&self) -> Result<Bytes, FabricError> {
         self.shared
             .recv(self.stream_id)

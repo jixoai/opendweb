@@ -509,6 +509,21 @@ impl SessionShared {
             .unwrap_or(0)
     }
 
+    /// 观测面：活跃逻辑流数（N-API SessionStateSnapshot 投影，task 4.2）。
+    pub async fn stream_count(&self) -> usize {
+        self.streams.lock().await.len()
+    }
+
+    /// 观测面：全部流 journal 持有字节总和（会话级 journalBytes）。
+    pub async fn journal_bytes_total(&self) -> usize {
+        self.streams
+            .lock()
+            .await
+            .values()
+            .map(|c| c.journal.held_bytes())
+            .sum()
+    }
+
     /// client 侧 OPEN 重发清单。
     async fn open_resend_list(&self) -> Vec<(u64, String)> {
         self.stream_keys
@@ -956,6 +971,15 @@ impl Session {
     /// 断线恢复：等传输层 Ready → RESUME 握手 → 重放/重发 → 换通道续跑。
     pub async fn resume(&self, fabric: &Fabric) -> Result<(), FabricError> {
         resume_session(fabric, self).await
+    }
+
+    /// 显式关闭（Shutdown 语义第一步，SDK task 4.2）：置 Closed + 终止 pump。
+    /// 发送面此后经当前代通道解析失败/死通道报错；终局对端由超时暴露。
+    pub async fn close(&self) {
+        if let Some(old) = self.pump.lock().unwrap().take() {
+            old.abort();
+        }
+        self.shared.set_phase(SessionPhase::Closed).await;
     }
 
     fn install_channel(&self, channel: Arc<SessionChannel>) {

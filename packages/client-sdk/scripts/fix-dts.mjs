@@ -16,7 +16,11 @@
 // 8.2：注入的 RelayStatusJs 携带 activeUrl: string | null。
 // R2 P1-5：relay-options-union 对 NAPI 尾部未知导出 fail-loud（不静默丢弃）；
 // inject-event-types 对已注入但模板过期的块整块刷新。
-// 意图登记：[2026-08-29] hardening-backlog 6/9.3（C0.2 契约的生成侧唯一实现）。
+// app-protocol-layer 4.2（2026-09-16）：napi 尾部新增 continuity 导出
+// （SessionHandle/HttpServerJs/HttpClientResponseJs/快照/Header/FetchHttpInit）
+// ——relay-options-union 从「截断到尾」改为「精确回收 RelayOptions+
+// RelayStatusJs 两块、保留其余尾部」；新增 onstate-signature 变换
+// （SessionHandle.onState 包装为取消订阅函数，与 on() 同构）。
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,12 +123,14 @@ const TAIL_MARK = "/**\n * relay 配置（判别联合的 napi 投影）";
  * 1. dedupe-normalize        —— 历史重复块归一（napi 块 + 注入头去重）
  * 2. tsfn-callback-void      —— TSFN error-first 回调 any → void
  * 3. on-signature            —— on()：字符串回调 → 类型化事件对象；返回取消订阅函数
- * 4. inject-event-types      —— FabricEventJs + RelayStatusJs（含 activeUrl）注入头
- * 5. http-proxy-alias        —— 6.1/6.2：httpProxy → HttpProxyOptions；删 HttpProxyUrl
- * 6. relay-options-union     —— RelayOptions 宽松 interface → 契约判别联合（唯一声明）
- * 7. relay-status-promise    —— index.js 包装 relayStatus 为 async → Promise
- * 8. inject-proxy-alias      —— HttpProxyOptions alias + deriveErrorCode 声明注入
- * 9. truncate-residual-napi  —— 终截断：写入前保证 NAPI 标记唯一（脏输入兜底）
+ * 4. onstate-signature       —— 4.2：SessionHandle.onState 同构改写（快照回调 + 取消订阅）
+ * 5. inject-event-types      —— FabricEventJs + RelayStatusJs（含 activeUrl）注入头
+ * 6. http-proxy-alias        —— 6.1/6.2：httpProxy → HttpProxyOptions；删 HttpProxyUrl
+ * 7. relay-options-union     —— RelayOptions/RelayStatusJs napi 块精确回收 → 契约判别联合
+ *                               （4.2 起 NAPI 尾部有 continuity 导出——保留其余尾部）
+ * 8. relay-status-promise    —— index.js 包装 relayStatus 为 async → Promise
+ * 9. inject-proxy-alias      —— HttpProxyOptions alias + deriveErrorCode 声明注入
+ * 10. truncate-residual-napi —— 终截断：写入前保证 NAPI 标记唯一（脏输入兜底）
  */
 const TRANSFORMS = [
   {
@@ -171,6 +177,25 @@ const TRANSFORMS = [
     },
   },
   {
+    name: "onstate-signature",
+    // 4.2：index.js 包装 SessionHandle.onState（JSON 字符串回调 → 快照对象；
+    // 返回取消订阅函数）。原生形态经 tsfn-callback-void 已是 => void。
+    apply(s) {
+      return replaceOnce(
+        s,
+        "onState(callback: ((err: Error | null, arg: string) => void)): number",
+        "onState(callback: (state: SessionStateSnapshotJs) => void): () => void",
+        "onstate-signature",
+      );
+    },
+    assertInvariant(s) {
+      return (
+        count(s, "onState(callback: (state: SessionStateSnapshotJs) => void): () => void") === 1 &&
+        count(s, "offState(id: number): void") === 1
+      );
+    },
+  },
+  {
     name: "inject-event-types",
     // 已注入但模板演进（如注释修正）时整块刷新：块范围 = HEAD_MARK 起至
     // NAPI 标记前（注入头永远位于 napi 生成块之前）；不存在则前置注入。
@@ -212,34 +237,66 @@ const TRANSFORMS = [
   },
   {
     name: "relay-options-union",
-    // 唯一声明（P1-1，确定性重写）：删除 napi 生成的宽松尾部（RelayOptions +
-    // RelayStatusJs 投影）后重写为契约形态。R2 P1-5：TAIL_MARK 之后的所有
-    // 顶层声明逐一核对——全部是已知残留才整区回收重写；出现任何未知导出即
-    // fail-loud（NAPI 未来新增导出绝不静默丢弃，需人工将其纳入契约后重跑）。
+    // 唯一声明（P1-1，确定性重写）：精确回收 napi 生成的 RelayOptions +
+    // RelayStatusJs 两块 interface，原位替换为契约判别联合。4.2 起 NAPI 尾部
+    // 还有 continuity 导出（SessionStateSnapshotJs 等）——必须保留。
+    // 区间内出现 RelayOptions/RelayStatusJs 之外的任何顶层声明即 fail-loud
+    // （napi 输出格式变化时拒绝盲改）；区间缺失任一已知块同样拒绝。
     apply(s) {
       if (count(s, TAIL_MARK) > 1) {
         throw new Error(`fix-dts[relay-options-union]: 尾部标记出现 ${count(s, TAIL_MARK)} 处（预期 ≤1）`);
       }
       const tailStart = s.indexOf(TAIL_MARK);
       if (tailStart < 0) return s; // 已是契约形态（重跑）
-      const KNOWN_RESIDUAL = new Set(["RelayOptions", "RelayStatusJs"]);
-      const declRe = /\nexport\s+(?:interface|type|class|const|function|declare\s+\w+)\s+(\w+)/g;
-      const unknown = [];
-      for (let m = declRe.exec(s); m !== null; m = declRe.exec(s)) {
-        if (m.index > tailStart && !KNOWN_RESIDUAL.has(m[1])) {
-          unknown.push(m[1]);
+      const ifaceStart = s.indexOf("export interface RelayStatusJs", tailStart);
+      if (ifaceStart < 0) {
+        throw new Error("fix-dts[relay-options-union]: RelayStatusJs 接口未找到（napi 输出形态变化）");
+      }
+      // 花括号配平扫描找 RelayStatusJs 块结束
+      let depth = 0;
+      let end = -1;
+      for (let i = s.indexOf("{", ifaceStart); i < s.length; i++) {
+        if (s[i] === "{") depth++;
+        else if (s[i] === "}") {
+          depth--;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
         }
       }
-      if (unknown.length > 0) {
+      if (end < 0) {
+        throw new Error("fix-dts[relay-options-union]: RelayStatusJs 块未配平（拒绝盲改）");
+      }
+      let cutEnd = end + 1;
+      if (s[cutEnd] === "\n") cutEnd++;
+      const region = s.slice(tailStart, cutEnd);
+      const declRe = /\nexport\s+(?:interface|type|class|const|function|declare\s+\w+)\s+(\w+)/g;
+      const found = new Set();
+      for (let m = declRe.exec(region); m !== null; m = declRe.exec(region)) {
+        found.add(m[1]);
+      }
+      for (const name of found) {
+        if (name !== "RelayOptions" && name !== "RelayStatusJs") {
+          throw new Error(
+            `fix-dts[relay-options-union]: 回收区间出现未知导出 ${name}` +
+              "（区间形态变化，拒绝盲改；新导出应保留在尾部——检查 TAIL_MARK/块边界逻辑）",
+          );
+        }
+      }
+      if (!found.has("RelayOptions") || !found.has("RelayStatusJs")) {
         throw new Error(
-          `fix-dts[relay-options-union]: NAPI 尾部出现未知导出 [${unknown.join(", ")}]` +
-            "——契约变换未覆盖，拒绝静默丢弃（R2 P1-5），需人工将其纳入契约后重跑",
+          "fix-dts[relay-options-union]: 回收区间缺少预期的 RelayOptions/RelayStatusJs（napi 输出形态变化）",
         );
       }
-      return s.slice(0, tailStart) + RELAY_OPTIONS_UNION.trimEnd() + "\n";
+      return s.slice(0, tailStart) + RELAY_OPTIONS_UNION.trimEnd() + "\n" + s.slice(cutEnd);
     },
     assertInvariant(s) {
-      return count(s, "export type RelayOptions") === 1 && count(s, "export interface RelayOptions") === 0 && !s.includes(TAIL_MARK);
+      return (
+        count(s, "export type RelayOptions") === 1 &&
+        count(s, "export interface RelayOptions") === 0 &&
+        !s.includes(TAIL_MARK)
+      );
     },
   },
   {

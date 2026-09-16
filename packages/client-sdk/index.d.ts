@@ -94,6 +94,26 @@ export declare class Fabric {
    * 返回句柄 id；off(id) 注销（index.js 包装为取消订阅函数）。
    */
   on(callback: (event: FabricEventJs) => void): () => void
+  /**
+   * continuity：与对端建立逻辑会话（design §3.3 唯一创建入口）。
+   * 返回 SessionHandle——内建 auto-resume 驱动（断线续传对 JS 透明）。
+   */
+  openSession(peerId: string): Promise<SessionHandle>
+  /**
+   * continuity：对端连接状态快照（design §3.1；Phase 1 task 2.3 补课投影）。
+   * snapshot 优先于事件；epoch/stateSeq 为 bigint。
+   */
+  continuitySnapshot(peerId: string): Promise<ConnectionStateSnapshotJs>
+  /** continuity：注入连接死亡（故障注入面——驱动恢复语义验证；非生产用途）。 */
+  continuityReset(peerId: string): Promise<void>
+  /** 添加对端直连地址提示（e2e 组网：固定端口对拨）。 */
+  addKnownAddr(endpointId: string, addr: string): Promise<void>
+  /**
+   * serveHttp：provider 侧 HTTP 引擎（design §3.4）。
+   * handler 为 TSFN JSON 事件回调（native 桥形态）；§3.4 规范签名
+   * （HttpHandler 类型面）见 /http 子路径胶水。
+   */
+  serveHttp(peerId: string, handler: ((err: Error | null, arg: string) => void)): Promise<HttpServerJs>
   /** 注销事件回调（on 返回的 id）。 */
   off(id: number): void
   /**
@@ -102,6 +122,56 @@ export declare class Fabric {
    * abort）；并发晚到调用等待同一完成通知后返回（返回即"无后续事件"）。
    */
   shutdown(): Promise<void>
+}
+
+/**
+ * fetchHttp 响应：status/headers/streamId + bodyNext（pull-first）。
+ * http/index.js 胶水另注入 [Symbol.asyncIterator]（§3.4 body AsyncIterable 投影）。
+ */
+export declare class HttpClientResponseJs {
+  get status(): number
+  get headers(): Array<HeaderJs>
+  /** 逻辑流 id（/http/internals 观测面；幂等键关联）。 */
+  get streamId(): number
+  /**
+   * 拉取下一块 body（EOF = null）。pull-first：无桥内缓冲——JS 消费速度即
+   * 内核 delivered 队列排空速度。并发调用经公平 Mutex 串行（offset 序保持）；
+   * 会话 Dead/Closed 时有界失败。
+   */
+  bodyNext(): Promise<Buffer | null>
+  /**
+   * WS 隧道（keepOpen 请求专用）：client→provider 方向继续写。
+   * 整消息边界 ABI（WsMessage，§3.4）归 Phase 4——本面是字节隧道级，如实标注。
+   */
+  sendTunnel(data: Buffer): Promise<void>
+}
+
+/**
+ * serveHttp 返回句柄：close() 停引擎循环 + 未决 handler 以取消结算。
+ * 引擎 accept 循环与 per-connection dispatch 任务由内核承接；close 后残留
+ * dispatch 由 wait_active 有界（30s）退出。
+ */
+export declare class HttpServerJs {
+  /** 服务对端（观测）。 */
+  get peerId(): string
+  /** 是否已关闭（观测）。 */
+  get closed(): boolean
+  /** （内部面 /http/internals）未决 handler 请求数（在途观测）。 */
+  get pendingRequestCount(): number
+  /**
+   * （内部面）JS handler 正常返回：status（100..=599 整数）/headers/bodyChunks
+   * （静态数组；流式供给由引擎有界背压承接）。
+   */
+  resolveRequest(requestId: number, status: number, headers?: Array<HeaderJs> | undefined | null, bodyChunks?: Array<Buffer> | undefined | null): void
+  /** （内部面）JS handler 抛错/拒绝：引擎按未发头前失败处置（500）。 */
+  rejectRequest(requestId: number, message: string): void
+  /** （内部面）请求体拉取（pull-first；EOF = null；unknown id / 会话终态 → 错误）。 */
+  requestBodyNext(requestId: number): Promise<Buffer | null>
+  /**
+   * 关闭（幂等）：停引擎循环 + 未决 handler 以取消结算 + 清 body 注册表。
+   * 已 dispatch 流的引擎侧收尾由内核 wait_active 有界（30s）退出。
+   */
+  close(): Promise<void>
 }
 
 /**
@@ -115,6 +185,59 @@ export declare class SecretSeedHandle {
   get endpointId(): string
   /** 是否仍持有种子（未被消费）。 */
   get available(): boolean
+}
+
+/**
+ * continuity 会话句柄（design §3.3；唯一创建入口 Fabric.openSession）。
+ * 内建 auto-resume 驱动——断线续传对 JS 透明；close() 走 Session 层
+ * Shutdown 语义（置 Closed + abort pump + 停驱动）。
+ */
+export declare class SessionHandle {
+  /** 对端 EndpointId（z32） */
+  get peerId(): string
+  /** 会话 id（hex，128bit） */
+  get sessionId(): string
+  /** 会话状态快照（§3.2 对齐子集；snapshot 优先——onState 只承载跳变）。 */
+  state(): Promise<SessionStateSnapshotJs>
+  /**
+   * 订阅状态变化（native 返回回调 id；index.js 包装为取消订阅函数；
+   * payload 为 §3.2 快照同构 JSON）。
+   */
+  onState(callback: (state: SessionStateSnapshotJs) => void): () => void
+  /** 注销状态回调（onState 返回的 id）。 */
+  offState(id: number): void
+  /** 显式关闭（幂等）：置 Closed + abort pump + 停 auto-resume 驱动。 */
+  close(): Promise<void>
+  /**
+   * （内部面 /net/internals）单流 journal 持有字节（观测；streamId 来自
+   * 响应/内部面的逻辑流 id）。
+   */
+  journalBytes(streamId: number): Promise<number>
+  /**
+   * fetchHttp：发起 HTTP 请求（§3.4；本阶段静态 body 分块；响应 body 为
+   * pull-first——bodyNext() 逐块拉取，EOF = null）。§3.4 规范签名（自由
+   * 函数形态）见 /http 子路径胶水。
+   */
+  fetchHttp(init: FetchHttpInit): Promise<HttpClientResponseJs>
+}
+
+/**
+ * continuity 连接状态快照（design §3.1；Phase 1 task 2.3 补课投影）。
+ * epoch/stateSeq 按 napi 习惯映射为 number（工作区 napi 特性集为 napi4——
+ * BigInt 需 napi6；f64 精确到 2^53，epoch/seq 单调计数远不及）。
+ */
+export interface ConnectionStateSnapshotJs {
+  peerId: string
+  /** "disconnected" | "connecting" | "handshaking" | "ready" | "closing" */
+  phase: string
+  /** 当前已采纳连接代次；0 = 尚无 */
+  epoch: number
+  /** 快照单调序号（跳变检测） */
+  stateSeq: number
+  /** "direct" | "relay" | "unknown" */
+  path: string
+  changedAtMs: number
+  reason?: string
 }
 
 /** Fabric 构造配置 */
@@ -131,6 +254,24 @@ export interface FabricOptions {
   httpProxy?: HttpProxyOptions
   /** join 总时限（毫秒）；缺省 30000；值域 [1000, 600000]，越界构造 reject */
   joinTimeoutMs?: number
+  /** 本端 QUIC 绑定地址（host:port；e2e 组网需要固定端口对拨时使用） */
+  bindAddr?: string
+}
+
+/** fetchHttp 请求初始化（本阶段静态 body 分块；AsyncIterable body 后续 phase）。 */
+export interface FetchHttpInit {
+  method: string
+  path: string
+  headers?: Array<HeaderJs>
+  body?: Array<Buffer>
+  /** WS 隧道模式：不半关请求方向（101 后双向持续；配合 sendTunnel）。 */
+  keepOpen?: boolean
+}
+
+/** HTTP 头（数组形态保重复项，§3.4）。 */
+export interface HeaderJs {
+  name: string
+  value: string
 }
 
 
@@ -161,3 +302,19 @@ export type RelayOptions =
   | { mode?: 'n0' }
   | { mode: 'disabled' }
   | { mode: 'custom'; urls: [string, ...string[]] }
+
+/**
+ * 会话状态快照（design §3.2 对齐子集）。
+ * activeEpoch/lastAckAtMs/deadlineAtMs：内核观测未实现，本阶段不投影
+ * （不冒充）——随 Phase 4 记账面（task 5.2）补齐。
+ */
+export interface SessionStateSnapshotJs {
+  peerId: string
+  /** 会话 id（hex，128bit → 32 字符） */
+  sessionId: string
+  /** "negotiating" | "active" | "recovering" | "dead" | "closed" */
+  phase: string
+  streamCount: number
+  /** 全部流 journal 持有字节总和（发送侧反压水位观测） */
+  journalBytes: number
+}

@@ -108,6 +108,87 @@ async function probe(fabric: Fabric): Promise<void> {
 const code: string | null = deriveErrorCode("[relay-offline] connection lost");
 void code;
 
+// ---- app-protocol-layer 4.2：continuity 面（root d.ts + 五子路径类型）----------------
+
+import type {
+  ConnectionStateSnapshotJs,
+  SessionStateSnapshotJs,
+} from "../index.js";
+import type {
+  Header,
+  HttpHandler,
+  HttpHandlerRequest,
+  HttpHandlerResponse,
+  HttpRequestInit,
+  HttpServer,
+  WsMessage,
+  WebSocketChannel,
+} from "../http/index.js";
+import type { LogicalStream, OpenStreamMeta } from "../net/index.js";
+import { fetchHttp, serveHttp } from "../http/index.js";
+import type { SessionHandle } from "../index.js";
+
+// 会话/连接快照字段收窄（§3.2/§3.1 对齐子集）
+const sessionSnap: SessionStateSnapshotJs = {
+  peerId: "peer-z32",
+  sessionId: "ab".repeat(16),
+  phase: "active",
+  streamCount: 1,
+  journalBytes: 0,
+};
+const connSnap: ConnectionStateSnapshotJs = {
+  peerId: "peer-z32",
+  phase: "ready",
+  epoch: 1,
+  stateSeq: 2,
+  path: "direct",
+  changedAtMs: 0,
+};
+void sessionSnap;
+void connSnap;
+
+// /net 前瞻类型（runtime 未实现——类型面先行）
+const meta: OpenStreamMeta = { idempotencyKey: "k".repeat(22), method: "POST", path: "/x" };
+declare const logical: LogicalStream;
+void meta;
+void logical.streamId;
+
+// /http：fetchHttp / serveHttp 签名与 body AsyncIterable
+const header: Header = { name: "content-type", value: "application/json" };
+const init: HttpRequestInit = {
+  method: "POST",
+  path: "/echo",
+  headers: [header],
+  body: [new Uint8Array(3)],
+  keepOpen: false,
+};
+declare const session: SessionHandle;
+
+async function httpRoundtrip(): Promise<void> {
+  const resp = await fetchHttp(session, init);
+  const first: Buffer | null = await resp.bodyNext();
+  void first;
+  for await (const chunk of resp) {
+    void chunk;
+  }
+  const handler: HttpHandler = async (req: HttpHandlerRequest) => {
+    const bodyChunk: Buffer | null = await req.bodyNext();
+    void bodyChunk;
+    const out: HttpHandlerResponse = { status: 200, headers: [header], bodyChunks: [new Uint8Array(1)] };
+    return out;
+  };
+  const server: HttpServer = await serveHttp(/* fabric */ null as never, "peer", handler);
+  await server.close("done");
+}
+
+void httpRoundtrip;
+
+// /http WS 类型占位（runtime 归 Phase 4——类型面先行，不冒充）
+const wsMsg: WsMessage = { kind: "text", data: "hi" };
+declare const wsChan: WebSocketChannel;
+void wsMsg;
+void wsChan.messages;
+
 // ---- activeUrl 契约硬断言（8.2，POST_INTEGRATION 门控）----------------------------
 
 /** T 携带 activeUrl: string | null 才为 true */

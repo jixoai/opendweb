@@ -5,6 +5,28 @@
   "license": "MIT OR Apache-2.0",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    },
+    "./net": {
+      "types": "./net/index.d.ts",
+      "default": "./net/index.js"
+    },
+    "./net/internals": {
+      "types": "./net/internals.d.ts",
+      "default": "./net/internals.js"
+    },
+    "./http": {
+      "types": "./http/index.d.ts",
+      "default": "./http/index.js"
+    },
+    "./http/internals": {
+      "types": "./http/internals.d.ts",
+      "default": "./http/internals.js"
+    }
+  },
   "napi": {
     "binaryName": "dweb",
     "targets": [
@@ -13,7 +35,7 @@
   },
   "scripts": {
     "build": "napi build --platform --release --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
-    "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js",
+    "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
     "test": "npm run test:types && node --test --test-force-exit test/*.test.mjs",
     "test:types": "tsc --noEmit -p test/tsconfig.fixture.json",
     "typecheck": "tsc --noEmit",
@@ -28,6 +50,8 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "net",
+    "http",
     "dweb.darwin-arm64.node",
     "dweb.win32-x64.node"
   ],

@@ -99,4 +99,20 @@ if (typeof nativeRelayStatus === "function") {
   };
 }
 
+// continuity 面（app-protocol-layer 4.2）：SessionHandle.onState 原生返回回调
+// id，offState(id) 注销——包装为取消订阅函数（与 Fabric.on 同构）。状态事件
+// 以 JSON 字符串投递（沿用 TSFN 对象转换不稳定规避约定），此处还原为快照对象。
+const NativeSessionHandle = Native.SessionHandle;
+if (NativeSessionHandle && typeof NativeSessionHandle.prototype.onState === "function") {
+  const nativeOnState = NativeSessionHandle.prototype.onState;
+  const nativeOffState = NativeSessionHandle.prototype.offState;
+  NativeSessionHandle.prototype.onState = function onStateWrapped(callback) {
+    const id = nativeOnState.call(this, (err, json) => {
+      if (err) return;
+      callback(JSON.parse(json));
+    });
+    return () => nativeOffState.call(this, id);
+  };
+}
+
 module.exports = Native;
