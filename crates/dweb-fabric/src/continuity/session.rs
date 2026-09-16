@@ -161,9 +161,14 @@ pub struct SessionShared {
     /// client 侧流→幂等键（恢复轮重发 OPEN 用；OPEN 不入 journal——
     /// 不占数据 offset 空间，靠对端幂等归合）。
     stream_keys: tokio::sync::Mutex<HashMap<u64, String>>,
+    /// OPEN 原始 payload（HTTP 引擎的元数据面；跨连接存活）。
+    open_metas: tokio::sync::Mutex<HashMap<u64, Bytes>>,
     /// 交付队列（stream_id → 有序字节），应用侧 recv 消费。
     delivered: tokio::sync::Mutex<HashMap<u64, VecDeque<Bytes>>>,
     delivered_notify: tokio::sync::Notify,
+    /// 当前代通道（Weak 注册——SessionChannel::new 时自登记；恢复轮换通道
+    /// 后引擎经 shared 统一解析当前代，provider 侧跨 Session 实例存活）。
+    current_channel: std::sync::RwLock<Option<std::sync::Weak<SessionChannel>>>,
     limits: JournalLimits,
 }
 
@@ -186,10 +191,21 @@ impl SessionShared {
             requests: tokio::sync::Mutex::new(HashMap::new()),
             idem_index: tokio::sync::Mutex::new(HashMap::new()),
             stream_keys: tokio::sync::Mutex::new(HashMap::new()),
+            open_metas: tokio::sync::Mutex::new(HashMap::new()),
             delivered: tokio::sync::Mutex::new(HashMap::new()),
             delivered_notify: tokio::sync::Notify::new(),
+            current_channel: std::sync::RwLock::new(None),
             limits,
         })
+    }
+
+    /// 当前代通道（构造后由 SessionChannel::new 登记；始终有效）。
+    pub fn current_channel(&self) -> Option<Arc<SessionChannel>> {
+        self.current_channel
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|w| w.upgrade())
     }
 
     fn token_valid(&self, generation: u64, token: &[u8]) -> bool {
@@ -305,7 +321,7 @@ impl SessionShared {
     }
 
     /// 记录发送段（journal 前置闸门——上限即背压面；未 ACK 时内存有界）。
-    async fn record_send(&self, stream_id: u64, payload: &Bytes) -> Result<u64, FabricError> {
+    pub(crate) async fn record_send(&self, stream_id: u64, payload: &Bytes) -> Result<u64, FabricError> {
         let mut streams = self.streams.lock().await;
         let ctx = streams
             .entry(stream_id)
@@ -316,8 +332,7 @@ impl SessionShared {
     }
 
     /// 处理一帧（收侧核心：去重/交付/ACK 生成/journal 释放）。
-    /// 返回需立即回发的控制帧（ACK/RESET）。
-    async fn handle_frame(&self, f: &Frame) -> Option<Frame> {
+    async fn handle_frame(&self, f: &Frame) -> FrameOutcome {
         match f.frame_type {
             FrameType::Data => {
                 let mut streams = self.streams.lock().await;
@@ -338,28 +353,40 @@ impl SessionShared {
                         q.entry(f.stream_id).or_default().push_back(payload);
                         drop(q);
                         self.delivered_notify.notify_waiters();
-                        Some(ack)
+                        FrameOutcome {
+                            reply: Some(ack),
+                            new_open: None,
+                        }
                     }
                     Ok(SegmentAction::Duplicate) => {
                         // 幂等丢弃；仍回 ACK（对端可能未收到上次 ACK）
-                        Some(mk_ack(
+                        FrameOutcome {
+                            reply: Some(mk_ack(
+                                self.session_id,
+                                f.stream_id,
+                                f.direction,
+                                ctx.recv.ack_offset(),
+                            )),
+                            new_open: None,
+                        }
+                    }
+                    Ok(SegmentAction::Buffered) => FrameOutcome {
+                        reply: Some(mk_ack(
                             self.session_id,
                             f.stream_id,
                             f.direction,
                             ctx.recv.ack_offset(),
-                        ))
-                    }
-                    Ok(SegmentAction::Buffered) => Some(mk_ack(
-                        self.session_id,
-                        f.stream_id,
-                        f.direction,
-                        ctx.recv.ack_offset(),
-                    )),
+                        )),
+                        new_open: None,
+                    },
                     Ok(SegmentAction::OverlapMismatch { .. }) | Err(_) => {
                         // 内容不一致 / gap 溢出 → 流 RESET(PROTOCOL_ERROR)：
                         // 回发对端 + 本地终结（双端流死，不交付脏数据）
                         ctx.remote_final = Some(ctx.recv.expected_offset());
-                        Some(mk_reset(self.session_id, f.stream_id))
+                        FrameOutcome {
+                            reply: Some(mk_reset(self.session_id, f.stream_id)),
+                            new_open: None,
+                        }
                     }
                 }
             }
@@ -371,7 +398,10 @@ impl SessionShared {
                         ctx.journal.advance_ack(f.byte_offset);
                     }
                 }
-                None
+                FrameOutcome {
+                    reply: None,
+                    new_open: None,
+                }
             }
             FrameType::Fin => {
                 let mut streams = self.streams.lock().await;
@@ -381,12 +411,24 @@ impl SessionShared {
                 ctx.remote_final = Some(f.byte_offset + f.payload.len() as u64);
                 drop(streams);
                 self.delivered_notify.notify_waiters();
-                None
+                FrameOutcome {
+                    reply: None,
+                    new_open: None,
+                }
             }
             FrameType::Open => {
                 let idem = parse_idem_key(&f.payload);
-                self.on_open(f.stream_id, &idem).await;
-                None
+                let (stream_id, is_new) = self.on_open(f.stream_id, &idem).await;
+                if is_new {
+                    self.open_metas
+                        .lock()
+                        .await
+                        .insert(stream_id, f.payload.clone());
+                }
+                FrameOutcome {
+                    reply: None,
+                    new_open: is_new.then_some(stream_id),
+                }
             }
             FrameType::Reset => {
                 let mut streams = self.streams.lock().await;
@@ -395,10 +437,21 @@ impl SessionShared {
                 }
                 drop(streams);
                 self.delivered_notify.notify_waiters();
-                None
+                FrameOutcome {
+                    reply: None,
+                    new_open: None,
+                }
             }
-            _ => None,
+            _ => FrameOutcome {
+                reply: None,
+                new_open: None,
+            },
         }
+    }
+
+    /// OPEN 元数据（原始 JSON payload；HTTP 引擎解析 method/path/headers）。
+    pub async fn open_meta(&self, stream_id: u64) -> Option<Bytes> {
+        self.open_metas.lock().await.get(&stream_id).cloned()
     }
 
     /// 流水位摘要（RESUME_INIT 携带；recv_ack = 本端接收进度 = 对端发送
@@ -473,6 +526,14 @@ pub struct StreamSummary {
     pub recv_ack: u64,
     pub send_next: u64,
     pub final_sent: Option<u64>,
+}
+
+/// 帧处理结果：reply = 需立即回发的控制帧（ACK/RESET）；
+/// new_open = 本次新建的逻辑流 id（重复 OPEN 幂等归并时为 None——
+/// 供 channel 级 arrivals 队列消费，防恢复轮重复 dispatch）。
+pub(crate) struct FrameOutcome {
+    pub reply: Option<Frame>,
+    pub new_open: Option<u64>,
 }
 
 fn mk_ack(sid: [u8; 16], stream: u64, data_direction: Direction, offset: u64) -> Frame {
@@ -595,15 +656,28 @@ pub struct SessionChannel {
     shared: Arc<SessionShared>,
     send: tokio::sync::Mutex<TransportSend>,
     recv: tokio::sync::Mutex<TransportRecv>,
+    /// 本连接周期内新到达的逻辑流（provider 引擎的接受面）。挂 channel 而
+    /// 非 shared：恢复轮新 channel 新任务接管新流，旧任务随死通道自然退出
+    /// ——跨代不抢流（§3.3 恢复语义的实现基础）。
+    arrivals: tokio::sync::Mutex<std::collections::VecDeque<u64>>,
+    arrivals_notify: tokio::sync::Notify,
+    /// pump 退出即置位（通道终结——arrivals 排空后 next_incoming 返回 None）。
+    dead: std::sync::atomic::AtomicBool,
 }
 
 impl SessionChannel {
     fn new(shared: Arc<SessionShared>, send: TransportSend, recv: TransportRecv) -> Arc<Self> {
-        Arc::new(Self {
-            shared,
+        let chan = Arc::new(Self {
+            shared: Arc::clone(&shared),
             send: tokio::sync::Mutex::new(send),
             recv: tokio::sync::Mutex::new(recv),
-        })
+            arrivals: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+            arrivals_notify: tokio::sync::Notify::new(),
+            dead: std::sync::atomic::AtomicBool::new(false),
+        });
+        // 当前代自登记（Weak——通道生命周期由强引用者持有，无环）
+        *shared.current_channel.write().unwrap() = Some(Arc::downgrade(&chan));
+        chan
     }
 
     pub fn shared(&self) -> &Arc<SessionShared> {
@@ -658,6 +732,24 @@ impl SessionChannel {
         let open_json = format!(
             "{{\"requestId\":\"{stream_id}\",\"idempotencyKey\":\"{idem_key}\"}}"
         );
+        self.send_open(stream_id, idem_key, Bytes::from(open_json)).await?;
+        Ok(stream_id)
+    }
+
+    /// 开新逻辑流（OPEN payload 全量由调用方给出——HTTP 引擎携带 §2.4
+    /// 元数据；payload 原样上 wire，requestId 由调用方自定）。
+    pub async fn open_stream_raw(&self, idem_key: &str, payload: Bytes) -> Result<u64, FabricError> {
+        let stream_id = self.shared.alloc_stream_id();
+        self.send_open(stream_id, idem_key, payload).await?;
+        Ok(stream_id)
+    }
+
+    async fn send_open(
+        &self,
+        stream_id: u64,
+        idem_key: &str,
+        payload: Bytes,
+    ) -> Result<(), FabricError> {
         self.shared
             .streams
             .lock()
@@ -676,10 +768,9 @@ impl SessionChannel {
             stream_id,
             direction: self.shared.send_direction(),
             byte_offset: 0,
-            payload: Bytes::from(open_json),
+            payload,
         })
-        .await?;
-        Ok(stream_id)
+        .await
     }
 
     pub async fn recv(&self, stream_id: u64) -> Result<Bytes, FabricError> {
@@ -689,9 +780,34 @@ impl SessionChannel {
             .map_err(|e| FabricError::Session(e))
     }
 
+    /// 等待下一个新到达的逻辑流（provider 引擎接受面；None = 通道终结：
+    /// pump 已退出且 arrivals 排空）。
+    pub async fn next_incoming(&self) -> Option<u64> {
+        loop {
+            if let Some(id) = self.arrivals.lock().await.pop_front() {
+                return Some(id);
+            }
+            if self.dead.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.arrivals_notify.notified(),
+            )
+            .await;
+        }
+    }
+
     /// 会话泵：独占收半边——收帧 → 语义处理 → 控制帧立即回发。
-    /// 连接死亡（Ended/Io）→ Recovering 并返回（恢复由 resume 驱动）。
+    /// 连接死亡（Ended/Io）→ Recovering + dead 置位并返回（恢复由 resume 驱动）。
     async fn pump(self: Arc<Self>) -> Result<(), FabricError> {
+        let out = self.pump_inner().await;
+        self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.arrivals_notify.notify_waiters();
+        out
+    }
+
+    async fn pump_inner(self: &Arc<Self>) -> Result<(), FabricError> {
         loop {
             let f = {
                 let mut recv = self.recv.lock().await;
@@ -707,7 +823,12 @@ impl SessionChannel {
                     }
                 }
             };
-            if let Some(ctrl) = self.shared.handle_frame(&f).await {
+            let outcome = self.shared.handle_frame(&f).await;
+            if let Some(stream_id) = outcome.new_open {
+                self.arrivals.lock().await.push_back(stream_id);
+                self.arrivals_notify.notify_waiters();
+            }
+            if let Some(ctrl) = outcome.reply {
                 if let Err(e) = self.send_frame(&ctrl).await {
                     // 连接死亡同样进入 Recovering（recv 侧未必再被轮到）
                     self.shared.set_phase(SessionPhase::Recovering).await;
@@ -737,7 +858,9 @@ impl SessionChannel {
 }
 
 /// 会话句柄（双端同形；client 驱动建立/恢复，provider 经 accept 获得）。
-/// channel 经 RwLock 可在 &self 上被 resume 更换（恢复轮换通道不夺句柄）。
+/// 发送面优先经 shared 解析**当前代**通道（provider 侧恢复轮是新 Session
+/// 实例，旧句柄发送自动切到新通道）；断线窗口（pump 已退、Weak 失效）回落
+/// 本体强引用锚——最近代通道在会话存续期内不悬空。
 pub struct Session {
     shared: Arc<SessionShared>,
     channel: std::sync::RwLock<Arc<SessionChannel>>,
@@ -749,8 +872,11 @@ impl Session {
         &self.shared
     }
 
-    /// 当前通道（发送面；断线恢复后由 resume 更换）。
+    /// 当前代通道（发送面；恢复轮换通道后自动指向新代）。
     pub fn channel(&self) -> Arc<SessionChannel> {
+        if let Some(c) = self.shared.current_channel() {
+            return c;
+        }
         Arc::clone(&self.channel.read().unwrap())
     }
 
@@ -762,12 +888,53 @@ impl Session {
         self.channel().send_data(stream_id, payload).await
     }
 
+    /// 记录发送段（journal 一次；引擎断线重发用——定 offset 裸帧重发由
+    /// [`Session::send_data_at`] 承接，对端 RecvWindow 去重闭合）。
+    pub async fn prepare_send(
+        &self,
+        stream_id: u64,
+        payload: &Bytes,
+    ) -> Result<u64, FabricError> {
+        self.shared.record_send(stream_id, payload).await
+    }
+
+    /// 以已记录的 offset 裸发 DATA 帧（不重复 record；重发幂等）。
+    pub async fn send_data_at(
+        &self,
+        stream_id: u64,
+        offset: u64,
+        payload: Bytes,
+    ) -> Result<(), FabricError> {
+        self.channel()
+            .send_frame(&Frame {
+                frame_type: FrameType::Data,
+                flags: 0,
+                session_id: self.shared.session_id,
+                stream_id,
+                direction: self.shared.send_direction(),
+                byte_offset: offset,
+                payload,
+            })
+            .await
+    }
+
     pub async fn finish(&self, stream_id: u64) -> Result<(), FabricError> {
         self.channel().finish(stream_id).await
     }
 
     pub async fn recv(&self, stream_id: u64) -> Result<Bytes, FabricError> {
         self.channel().recv(stream_id).await
+    }
+
+    /// provider 引擎接受面：等待下一个新到达的逻辑流（None = 当前通道终结；
+    /// 恢复后经新 Session/channel 继续）。
+    pub async fn next_incoming(&self) -> Option<u64> {
+        self.channel().next_incoming().await
+    }
+
+    /// OPEN 元数据（原始 JSON payload；HTTP 引擎解析）。
+    pub async fn open_meta(&self, stream_id: u64) -> Option<Bytes> {
+        self.shared.open_meta(stream_id).await
     }
 
     pub async fn phase(&self) -> SessionPhase {
@@ -1003,7 +1170,7 @@ fn mk_session(shared: Arc<SessionShared>, send: TransportSend, recv: TransportRe
     let pump = channel.spawn_pump();
     Session {
         shared,
-        channel: std::sync::RwLock::new(channel),
+        channel: std::sync::RwLock::new(Arc::clone(&channel)),
         pump: std::sync::Mutex::new(Some(pump)),
     }
 }
@@ -1547,11 +1714,19 @@ mod tests {
             byte_offset: off,
             payload: Bytes::copy_from_slice(data),
         };
-        let ack = shared.handle_frame(&f(0, b"AAAA")).await.expect("deliver→ack");
+        let ack = shared
+            .handle_frame(&f(0, b"AAAA"))
+            .await
+            .reply
+            .expect("deliver→ack");
         assert_eq!(ack.frame_type, FrameType::Ack);
         assert_eq!(ack.byte_offset, 4);
         // 精确重复：不重复交付（ACK 回发幂等）
-        let ack2 = shared.handle_frame(&f(0, b"AAAA")).await.expect("dup→ack");
+        let ack2 = shared
+            .handle_frame(&f(0, b"AAAA"))
+            .await
+            .reply
+            .expect("dup→ack");
         assert_eq!(ack2.frame_type, FrameType::Ack);
         assert_eq!(ack2.byte_offset, 4);
         // 交付恰好一份
@@ -1560,6 +1735,7 @@ mod tests {
         let rst = shared
             .handle_frame(&f(0, b"XXXX"))
             .await
+            .reply
             .expect("mismatch→reset");
         assert_eq!(rst.frame_type, FrameType::Reset);
         // RESET 后流终结

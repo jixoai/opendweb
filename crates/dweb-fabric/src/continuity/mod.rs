@@ -10,6 +10,7 @@
 //! 设计文档：openspec/changes/app-protocol-layer/design.md。
 
 pub mod frame;
+pub mod http;
 pub mod manager;
 pub mod model;
 pub mod session;
