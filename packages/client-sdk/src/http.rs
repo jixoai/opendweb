@@ -369,10 +369,9 @@ impl HttpServerJs {
             let _ = tx.send(Ok(out));
             Ok(())
         } else {
-            Err(Error::new(
-                Status::GenericFailure,
-                format!("[session] unknown request id {id}"),
-            ))
+            // §3.4 late completion：close 后/已结算的晚到结算只丢弃（幂等），
+            // 不抛错——防 server.close 后 unhandledRejection
+            Ok(())
         }
     }
 
@@ -385,10 +384,8 @@ impl HttpServerJs {
             let _ = tx.send(Err(message));
             Ok(())
         } else {
-            Err(Error::new(
-                Status::GenericFailure,
-                format!("[session] unknown request id {id}"),
-            ))
+            // 同 resolve_request：晚到拒绝幂等丢弃（§3.4 late completion）
+            Ok(())
         }
     }
 
