@@ -544,36 +544,92 @@ ai-fly 的 AUTH、目录刷新和 provider policy 仍在 `ProviderConnection`/`P
 （Fabric 工厂级方法）；`SessionHandle` 自身**不含** openSession。幂等语义：
 active/recovering → 返回既有句柄；dead/closed → 新建会话（新 sessionId/token）。
 
-### 3.4 Rust↔N-API HTTP/WS handler ABI（R3 补草案，Phase 3 冻结前定稿）
+### 3.4 Rust↔N-API HTTP/WS handler ABI（Codex 1.8 评审重写版——pull-first）
 
-**执行位置**：HTTP 解析/分帧/SSE 投影在 Rust 引擎；`serveHttp(handler)` 的
-handler **在 TS 执行**（产品策略层）。跨界契约：
+**执行位置**：HTTP 解析/分帧/SSE 投影/WS 重组在 Rust 引擎；`serveHttp(handler)`
+的 handler 在 TS 执行。**桥接总原则（评审结论）**：TSFN 只做「信号」不做
+「数据队列」；body 一律 pull-first；禁止 `ThreadsafeFunctionCallMode::Blocking`。
 
-**请求侧（Rust → TS）**：
-- Rust 解析出 `{method, path, headers, body}`；header 限额（候选值，Phase 0
-  冻结）：≤64 头 / 键 ≤1KiB / 值 ≤8KiB，超限 431。
-- body 桥接为 JS `AsyncIterable<Uint8Array>`：napi thread-safe function 推送
-  chunk；**背压同源**——JS 消费速度经水位反馈到 continuity 层，与 ACK commit
-  point 共用一套反压（不新增第二套窗口语义）。
-- 请求携带 `AbortSignal` 形态的取消句柄：Rust 侧 RESET/连接死亡/对端 abort
-  → JS signal 触发 + body 迭代器以固定错误终结。
+**body 双向桥（pull-first）**：
+- Rust 侧每请求体/响应体一条**有界 `tokio::mpsc`**（容量 = 水位，与
+  continuity journal 上限同源标定）；JS `AsyncIterator.next()` 触发一次 pull
+  （经 TSFN NonBlocking 信号，返回状态必须检查），Rust 只有拿到 mpsc permit
+  才发送下一块——**JS 消费速度 = ACK commit point** 由 permit 机制天然成立。
+- 统一 `commit()` 点推进 ACK（数据进入 JS 有界输出队列并确认写入后）。
+- body 迭代器 `return()`（提前终止）映射对端 FIN/本地取消；`throw()` 不由
+  用户调用（协议错误经 reject 传播）。
 
-**响应侧（TS → Rust）**：
-- handler 返回 `{status, headers, body?: AsyncIterable<Uint8Array>}`（或
-  Promise 同形）；status 域 200–599。
-- JS 端 body 迭代 → Rust 写 DATA 帧；发送窗口满 → `next()` 阻塞（自然背压）。
-- handler 抛错 / signal 中止 → 映射 `RESET`（固定 reason 码，不泄内容）；
-  已发头后抛错 → 流以 RESET 终结（不静默截断为 200）。
+**取消（AbortSignal 双向适配器）**：
+- 不使用 napi 内部 AbortSignal（AsyncTask 专用、Rc 非跨线程）。每请求在 JS
+  侧创建 `AbortController`，其 `signal` 交给 handler；controller 的 `abort()`
+  注册进一个经 TSFN 可调用的 JS 端注册表——Rust 侧 RESET/连接死亡/对端取消
+  时触发。JS→Rust 取消经 native handle（`cancel()` 方法）。
 
-**生命周期与安全**：
-- thread-safe function 在引擎/session shutdown 时 drain；in-flight 回调以
-  取消信号收敛，**不得阻塞 shutdown**、不得跨界 panic（固定错误码 + 本地日志）。
-- 回调重入：同一 stream 的 body 推送串行化；并发回调仅来自不同 stream。
-- WS：upgrade 后 message 以「整条消息」为单位跨界（分片重组归 Rust），
-  message boundary 语义见 §2.4 与 spec。
+**生命周期（shutdown 定序，评审冻结）**：
+```text
+closing = true → 拒新 stream/request → cancel 全部 CancellationToken →
+close body mpsc（pending next 以 CANCELLED 结算）→ abort/release TSFN →
+有界 native drain → shutdown complete
+```
+- 用户 handler Promise **不被无限等待**：取消后丢弃其结果，late completion
+  仅日志、不得再触碰 native state（防幽灵回调——`pump.abort()` 不撤销已排队
+  TSFN 调用，此既有事实不得外推为新 ABI 的保证）。
 
-**测试面（N-API 黑盒，Phase 3 门禁）**：取消竞速、双向背压、handler 抛错
-映射、shutdown drain、跨界异常不 panic、大消息分片重组、SSE 长流中途取消。
+**WS 通道 ABI（整消息边界冻结）**：
+```ts
+export type WsMessage =
+  | { kind: "text"; data: string }
+  | { kind: "binary"; data: Uint8Array };
+export interface WebSocketChannel {
+  readonly messages: AsyncIterable<WsMessage>;
+  send(message: WsMessage): Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+}
+```
+错误码冻结：`WS_MESSAGE_TOO_LARGE` / `WS_INVALID_UTF8` / `WS_CLOSED`；
+最大消息尺寸候选 1 MiB（Phase 0 冻结数值）。分片重组全在 Rust。
+
+**HTTP 类型面（headers 保重复项）**：
+```ts
+export interface Header { name: string; value: string }   // 数组形态，非 Record
+export interface HttpRequest {
+  method: string; path: string;
+  headers: readonly Header[];
+  body: AsyncIterable<Uint8Array>;
+  signal: AbortSignal;
+}
+export interface HttpResponse {
+  status: number;              // 200–599
+  headers: readonly Header[];
+  body?: AsyncIterable<Uint8Array>;
+}
+export type HttpHandler = (request: HttpRequest) =>
+  HttpResponse | PromiseLike<HttpResponse>;
+export interface HttpServer { close(reason?: string): Promise<void> }
+export function serveHttp(session: SessionHandle, handler: HttpHandler,
+  options?: { signal?: AbortSignal }): HttpServer;
+export function fetchHttp(session: SessionHandle, request: HttpRequestInit,
+  options?: { signal?: AbortSignal }): Promise<HttpResponse>;
+```
+- header 限额（候选，Phase 0 冻结）：≤64 头 / 键 ≤1KiB / 值 ≤8KiB，超限 431。
+- 已发头后 handler/body 失败 → 流以 RESET 终结（不静默截断为 200）；内部
+  错误码 → JS Error/DOMException 的映射表在实现时冻结（语义：取消 →
+  AbortError；对端终结/协议错 → TypeError 族；超时 → TimeoutError）。
+
+**`/http` 稳定面** = 上述类型与 serveHttp/fetchHttp；`/http/internals` 暴露
+native request id、puller、frame/offset 观测（semver 宽松）。
+
+**实现缺口清单（评审列出，Phase 3 前置）**：typed handler dispatch、双向
+body puller、有界 mpsc/credit/commit bridge、native stream handle 终态状态机、
+AbortController adapter、handler task registry、WS message channel、
+package.json exports map 与 d.ts（当前均不存在）。
+
+**风险核对单（实现与评审逐项对照）**：JS 慢消费者队列无限增长 / Blocking
+TSFN 卡死 / next() 并发破坏 offset 序 / 用户 Promise 永不 resolve 的 drain
+泄漏 / AbortSignal listener 泄漏 / napi_closing / Buffer 跨异步边界生命期 /
+handler throw 误判 fatal / WS 大消息内存峰值 / Rust 与 TS header 限额不一致 /
+shutdown 后幽灵回调 / 错误消息泄露 peer/路径/上游信息。
+
 
 ## 4. iroh 1.1 特性查证清单
 
