@@ -191,7 +191,10 @@ pub async fn fetch_http(
     init: HttpRequestInit,
 ) -> Result<HttpClientResponse, FabricError> {
     let channel = session.channel();
-    let idem = hex16(&super::session::rand_16());
+    let idem = hex16(
+        &super::session::rand_16()
+            .ok_or_else(|| HttpEngineError("entropy unavailable".into()))?,
+    );
     let body_len: usize = init.body.iter().map(|b| b.len()).sum();
     // OPEN payload = §2.4 元数据全量（requestId 在 open_stream_raw 内由流 id 决定）
     let meta = json!({

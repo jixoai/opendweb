@@ -102,6 +102,20 @@ pub struct TransportRecv {
     pending: std::collections::VecDeque<Frame>,
 }
 
+/// pending-drain 收帧核心（`TransportRecv::recv` 的可测内部面——Phase 2
+/// 硬化：背靠背帧合并读盘的逐帧交付路径直接可测，无需构造 iroh 流）：
+/// 喂入一次读盘 chunk → framer 解帧 → 全量入 pending 队列。
+pub(crate) fn drain_framed(
+    framer: &mut StreamFramer,
+    pending: &mut std::collections::VecDeque<Frame>,
+    chunk: &[u8],
+) -> Result<(), FrameError> {
+    for f in framer.feed(chunk)? {
+        pending.push_back(f);
+    }
+    Ok(())
+}
+
 impl TransportRecv {
     /// 阻塞收一帧（EOF/错误 → Ended/Io）。
     pub async fn recv(&mut self) -> Result<Frame, TransportError> {
@@ -116,9 +130,7 @@ impl TransportRecv {
                 .await
                 .map_err(|e| TransportError::Io(format!("{e}")))?;
             let Some(n) = n else { return Err(TransportError::Ended) };
-            for f in self.framer.feed(&chunk[..n])? {
-                self.pending.push_back(f);
-            }
+            drain_framed(&mut self.framer, &mut self.pending, &chunk[..n])?;
             // 帧未齐：继续读
         }
     }
@@ -250,7 +262,8 @@ mod tests {
     }
 
     /// 背靠背帧合并读盘不得丢帧（Phase 2 会话层实证缺陷的回归钉）：
-    /// OPEN+DATA+FIN 一次喂入 → recv 逐帧交付三帧全数到达。
+    /// OPEN+DATA+FIN 一次喂入 → drain_framed（TransportRecv::recv 的真实
+    /// 路径核心）逐帧交付三帧全数到达；chunk 撕裂（多段喂入）同理。
     #[test]
     fn recv_batch_delivers_all_frames_in_order() {
         let open = Frame {
@@ -277,15 +290,25 @@ mod tests {
         open.encode(&mut wire).unwrap();
         data.encode(&mut wire).unwrap();
         fin.encode(&mut wire).unwrap();
-        // 与 TransportRecv::recv 相同的 pending 语义：一次 feed 全量入队逐帧交付
+        // 真实路径形态：drain_framed（单次读盘全量喂入）
         let mut fr = StreamFramer::new();
         let mut pending = std::collections::VecDeque::new();
-        for f in fr.feed(&wire[..]).unwrap() {
-            pending.push_back(f);
-        }
+        drain_framed(&mut fr, &mut pending, &wire[..]).unwrap();
         assert_eq!(pending.len(), 3, "三帧全数解出");
         assert_eq!(pending.pop_front().unwrap().frame_type, FrameType::Open);
         assert_eq!(pending.pop_front().unwrap().payload, data.payload);
         assert_eq!(pending.pop_front().unwrap().frame_type, FrameType::Fin);
+        // chunk 撕裂形态：任意切分点多段喂入，帧数与内容不增不减
+        let mut fr2 = StreamFramer::new();
+        let mut pending2 = std::collections::VecDeque::new();
+        for cut in [0usize, 7, 60, 103, wire.len()].windows(2) {
+            drain_framed(&mut fr2, &mut pending2, &wire[cut[0]..cut[1]]).unwrap();
+        }
+        assert_eq!(pending2.len(), 3, "撕裂读盘不丢帧不重帧");
+        let types: Vec<_> = pending2.iter().map(|f| f.frame_type).collect();
+        assert_eq!(
+            types,
+            vec![FrameType::Open, FrameType::Data, FrameType::Fin]
+        );
     }
 }

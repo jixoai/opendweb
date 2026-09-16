@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::session::{
-    self, reject_reason, encode_resume_init, RequestState, SessionOptions,
+    self, encode_session_init, reject_reason, encode_resume_init, RequestState,
+    SessionOptions,
 };
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
@@ -453,5 +454,341 @@ async fn session_multi_stream_resume_interleaved() {
     let small_got = drain_stream(&client, s3, "small").await;
     assert_eq!(big_got, big_expected, "大流恢复后字节级精确");
     assert_eq!(small_got, small_expected, "小流恢复后字节级精确");
+    provider.abort();
+}
+
+/// s6（硬化 P0-1）：并发双 RESUME 同 token——恰一个 RESUME_OK、一个
+/// TOKEN_INVALID（try_rotate 原子裁决 + Active 期 previous 闸门）。
+#[tokio::test]
+async fn session_concurrent_double_resume_single_winner() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let provider = tokio::spawn(async move {
+        loop {
+            let _ = session::accept_any(&b, &a_id, opts).await;
+        }
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let (token_gen, token) = client.shared().debug_current_token();
+    let sid = client.shared().session_id;
+
+    // 双 raw transport 并发注入同 (generation, token) 的 RESUME
+    let send_resume = |mut t: dweb_fabric::continuity::ContinuityTransport| async move {
+        t.send(&Frame {
+            frame_type: FrameType::ResumeInit,
+            flags: 0,
+            session_id: sid,
+            stream_id: 0,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from(encode_resume_init(token_gen, token_gen, &[0u8; 16], &token, &[])),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), t.recv())
+            .await
+            .expect("resume 响应有界")
+            .unwrap()
+    };
+    let t1 = a.continuity_open_transport(&b_id).await.unwrap();
+    let t2 = a.continuity_open_transport(&b_id).await.unwrap();
+    let (r1, r2) = tokio::join!(send_resume(t1), send_resume(t2));
+    let mut oks = 0usize;
+    let mut token_invalid = 0usize;
+    for r in [r1, r2] {
+        match r.frame_type {
+            FrameType::ResumeOk => oks += 1,
+            FrameType::ResumeReject => {
+                assert_eq!(
+                    r.payload.first().copied().unwrap_or(0),
+                    reject_reason::TOKEN_INVALID,
+                    "拒绝原因必须是 TOKEN_INVALID"
+                );
+                token_invalid += 1;
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(oks, 1, "并发双 RESUME 恰一胜出");
+    assert_eq!(token_invalid, 1, "败者必须 TOKEN_INVALID（不装双 channel）");
+    provider.abort();
+}
+
+/// s7（硬化 P0-2）：SESSION_INIT 幂等（同 sid+token 重发 OK——ghost 收敛）；
+/// 同 sid 伪造 token → REJECT 0x02。
+#[tokio::test]
+async fn session_init_idempotent_and_token_gate() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let provider = tokio::spawn(async move {
+        loop {
+            let _ = session::accept_any(&b, &a_id, opts).await;
+        }
+    });
+
+    let sid = [0x42u8; 16];
+    let token = [0x11u8; 16];
+    let send_init = |tok: [u8; 16]| {
+        let a = &a;
+        let b_id = b_id.clone();
+        async move {
+            let mut raw = a.continuity_open_transport(&b_id).await.unwrap();
+            raw.send(&Frame {
+                frame_type: FrameType::SessionInit,
+                flags: 0,
+                session_id: sid,
+                stream_id: 0,
+                direction: Direction::ClientToProvider,
+                byte_offset: 0,
+                payload: Bytes::from(encode_session_init(&sid, &tok, 1)),
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), raw.recv())
+                .await
+                .expect("init 响应有界")
+                .unwrap()
+        }
+    };
+    // 首登记 → OK
+    assert_eq!(send_init(token).await.frame_type, FrameType::SessionInitOk);
+    // 幂等重发（client 重试同 sid/token）→ OK（不产生 ghost）
+    assert_eq!(
+        send_init(token).await.frame_type,
+        FrameType::SessionInitOk,
+        "同 sid+token 重发必须幂等 OK"
+    );
+    // 伪造 token → REJECT 0x02 TOKEN_INVALID
+    let resp = send_init([0xEEu8; 16]).await;
+    assert_eq!(resp.frame_type, FrameType::SessionInitReject);
+    assert_eq!(resp.payload[0], reject_reason::TOKEN_INVALID);
+    provider.abort();
+}
+
+/// s8（硬化 P0-3）：慢消费者反压——不 recv 时发送端 journal 封顶、record
+/// Err；开始消费后 ACK（commit point）推进释放。
+#[tokio::test]
+async fn session_slow_consumer_backpressure_then_release() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions {
+        limits: {
+            let mut l = dweb_fabric::continuity::model::JournalLimits::default();
+            l.max_stream_bytes = 128 * 1024;
+            l.max_session_bytes = 256 * 1024;
+            l
+        },
+    };
+    let cap_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let flag = Arc::clone(&cap_hit);
+    let provider = tokio::spawn(async move {
+        let session = session::accept_any(&b, &a_id, opts)
+            .await
+            .expect("accept");
+        session.mark_started(1).await;
+        let mut sent = Vec::new();
+        for i in 0..16u32 {
+            let chunk = Bytes::from(vec![(0x40 + i) as u8; 16 * 1024]);
+            if session.send_data(1, chunk.clone()).await.is_err() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                break; // journal 封顶：反压终态（内存有界）
+            }
+            sent.extend_from_slice(&chunk);
+        }
+        session.finish(1).await.unwrap();
+        session.mark_completed(1).await;
+        (session, sent)
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let s = client.open_stream("slow").await.unwrap();
+    client.send_data(s, Bytes::from_static(b"req")).await.unwrap();
+    client.finish(s).await.unwrap();
+
+    // 慢消费者：不 recv——发送端必须封顶（有界），本端交付队列涨满
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !cap_hit.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "发送端未封顶");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.shared().deliver_queue_bytes(s).await < 8 * 16 * 1024 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "交付队列未涨满：{}",
+            client.shared().deliver_queue_bytes(s).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(client.shared().committed_offset(s).await, 0, "未消费");
+
+    // 开始消费：字节精确 + ACK（commit point）释放发送端 journal
+    let (provider_session, sent) = provider.await.unwrap();
+    let got = drain_stream(&client, s, "slow").await;
+    assert_eq!(got, sent, "慢消费者消费路径字节精确");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while provider_session.shared().journal_held_bytes(1).await > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "消费后 ACK 未释放 journal：{}",
+            provider_session.shared().journal_held_bytes(1).await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// s9（硬化 P1-5）：双向大 replay（两侧各 1MiB 未 ack 数据）断线恢复不
+/// 悬挂（先装通道后重放，pump 并发排水）+ 字节精确。
+#[tokio::test]
+async fn session_bidir_big_replay_no_deadlock() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    const CHUNK: usize = 16 * 1024;
+    const N: usize = 64; // 1 MiB each way
+
+    let req_chunks: Vec<Bytes> = (0..N)
+        .map(|i| Bytes::from(vec![(i % 251) as u8 + 1; CHUNK]))
+        .collect();
+    let resp_chunks: Vec<Bytes> = (0..N)
+        .map(|i| Bytes::from(vec![((i + 77) % 251) as u8 + 1; CHUNK]))
+        .collect();
+    let resp_expected: Vec<u8> = resp_chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let req_expected: Vec<u8> = req_chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let resp_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let sent_flag = Arc::clone(&resp_sent);
+    let done_flag = Arc::clone(&provider_done);
+    let req_exp = req_expected.clone();
+    let provider = tokio::spawn(async move {
+        loop {
+            let Ok(session) = session::accept_any(&b, &a_id, opts).await else {
+                continue;
+            };
+            match wait_request(&session, 1, "big-replay").await {
+                RequestState::Started | RequestState::Completed => {
+                    // 恢复轮：不重执行；排空请求方向并校验字节精确
+                    let mut got = Vec::new();
+                    loop {
+                        match tokio::time::timeout(Duration::from_secs(15), session.recv(1)).await {
+                            Ok(Ok(c)) => got.extend_from_slice(&c),
+                            Ok(Err(_)) => break,
+                            Err(_) => panic!("恢复轮请求排空超时（已收 {}B）", got.len()),
+                        }
+                    }
+                    assert_eq!(got, req_exp, "请求方向恢复后字节精确");
+                    done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {
+                    // 首轮：不消费请求（保持 client journal 未 ack）——先发响应
+                    session.mark_started(1).await;
+                    for c in &resp_chunks {
+                        session.send_data(1, c.clone()).await.unwrap();
+                    }
+                    session.finish(1).await.unwrap();
+                    session.mark_completed(1).await;
+                    sent_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let s = client.open_stream("big").await.unwrap();
+    for c in &req_chunks {
+        client.send_data(s, c.clone()).await.unwrap();
+    }
+    client.finish(s).await.unwrap();
+
+    // 双向未 ack 就绪：响应全部到达本端队列 + provider 已发完
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while client.shared().deliver_queue_bytes(s).await < N * CHUNK
+        || !resp_sent.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "双向未 ack 数据未就绪：queue={}B sent={}",
+            client.shared().deliver_queue_bytes(s).await,
+            resp_sent.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 慢消费者观测面：1MiB 未消费 > 256KiB 软上限
+    assert!(client.shared().deliver_queue_over_cap(s).await);
+
+    // 断线 + 恢复（有界 30s——修复前双向同步重放在 QUIC 流控上互等死锁）
+    a.continuity_reset(&b_id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), client.resume(&a))
+        .await
+        .expect("大 replay 恢复不悬挂")
+        .expect("resume 成功");
+
+    // 双向字节精确收尾
+    let got = drain_stream(&client, s, "big-replay").await;
+    assert_eq!(got, resp_expected, "响应方向恢复后字节精确");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !provider_done.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(tokio::time::Instant::now() < deadline, "provider 未完成校验");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    provider.abort();
+}
+
+/// s10（硬化 P0-1c）：client resume single-flight——并发调用恰一执行者，
+/// 双双 Ok、终态 Active、数据面继续可用。
+#[tokio::test]
+async fn session_resume_single_flight() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let provider = tokio::spawn(async move {
+        loop {
+            let Ok(session) = session::accept_any(&b, &a_id, opts).await else {
+                continue;
+            };
+            match wait_request(&session, 1, "single-flight").await {
+                RequestState::Started | RequestState::Completed => {}
+                _ => {
+                    let _ = session.recv(1).await;
+                    session.mark_started(1).await;
+                    session.send_data(1, Bytes::from_static(b"pong")).await.unwrap();
+                    session.finish(1).await.unwrap();
+                    session.mark_completed(1).await;
+                }
+            }
+        }
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let s = client.open_stream("sf").await.unwrap();
+    client.send_data(s, Bytes::from_static(b"ping")).await.unwrap();
+    client.finish(s).await.unwrap();
+    assert_eq!(client.recv(s).await.unwrap(), Bytes::from_static(b"pong"));
+
+    // 并发双 resume：single-flight 恰一执行者，两者都 Ok 返回
+    a.continuity_reset(&b_id).await.unwrap();
+    let (r1, r2) = tokio::join!(client.resume(&a), client.resume(&a));
+    assert!(r1.is_ok() && r2.is_ok(), "并发 resume 双双 Ok：{r1:?} {r2:?}");
+    // 终态收敛 Active + 数据面继续
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.phase().await != session::SessionPhase::Active {
+        assert!(tokio::time::Instant::now() < deadline, "未收敛 Active");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    client.send_data(s, Bytes::from_static(b"again")).await.unwrap();
+    client.finish(s).await.unwrap();
     provider.abort();
 }

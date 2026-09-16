@@ -3,9 +3,12 @@
 //! 纯函数模型 + property 式不变量测试。Phase 2 实现以本模型为单一语义权威。
 //!
 //! 模型→实现的映射注记：
-//! - RecvWindow 为校验重放保留了**全量已交付历史**（模型层内存不受限）；
-//!   生产实现改为**有界校验窗口**（最近 N KiB 明文或逐段摘要链），语义同为
-//!   「offset < expected 的段做逐字节一致性校验，一致则丢弃、不一致 RESET」。
+//! - RecvWindow 的重放校验历史为**有界滑动窗口**（最近 [`HISTORY_CAP`] 字节，
+//!   Phase 2 硬化：全量保留在生产不可接受）。落入视界内的重叠段做逐字节
+//!   一致性校验（一致丢弃 / 不一致 RESET）；offset 低于视界下沿的重叠段
+//!   **无法逐字节校验**——按重复丢弃并计数 `unverifiable_duplicates`
+//!   （该区间必然 ≤ expected，即已入交付队列/已消费，丢弃无损）。
+//! - delivered_bytes 记账为**累计计数器**（非 history.len()——history 已裁剪）。
 //! - StreamJournal 的 acked_offset 允许落在段中间（协议真值）；journal 只按
 //!   **整段**释放内存，跨 ack 边界的段保留整段——重放整段、接收端按 §2.7
 //!   重叠规则去重，两侧语义闭合。
@@ -13,6 +16,9 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+
+/// 重放校验历史上限（有界滑动窗口；Phase 2 硬化）。
+pub const HISTORY_CAP: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // 接收窗口（§2.7 去重规则）
@@ -24,8 +30,14 @@ pub struct RecvWindow {
     expected_offset: u64,
     /// gap buffer：乱序提前到达的段（offset -> payload）；容量有界。
     gaps: BTreeMap<u64, Bytes>,
-    /// 已交付字节历史（模型层全量保留；生产为有界校验窗口）。
+    /// 校验历史（有界滑动窗口：覆盖 [history_start, expected_offset)）。
     history: Vec<u8>,
+    /// history[0] 对应的流 offset。
+    history_start: u64,
+    /// 累计交付字节（记账计数器——history 裁剪后仍是全量真值）。
+    delivered_total: u64,
+    /// 低于校验视界、无法逐字节校验而按重复丢弃的段计数。
+    unverifiable_duplicates: u64,
 }
 
 /// 段处置结果。
@@ -54,6 +66,9 @@ impl RecvWindow {
             expected_offset: 0,
             gaps: BTreeMap::new(),
             history: Vec::new(),
+            history_start: 0,
+            delivered_total: 0,
+            unverifiable_duplicates: 0,
         }
     }
 
@@ -67,7 +82,17 @@ impl RecvWindow {
     }
 
     pub fn delivered_bytes(&self) -> u64 {
-        self.history.len() as u64
+        self.delivered_total
+    }
+
+    /// 校验视界下沿（history 覆盖 [history_start, expected_offset)）。
+    pub fn history_start(&self) -> u64 {
+        self.history_start
+    }
+
+    /// 低于校验视界、按重复丢弃的段计数（观测面）。
+    pub fn unverifiable_duplicates(&self) -> u64 {
+        self.unverifiable_duplicates
     }
 
     /// SACK 区间投影（gap buffer 的 (start, end_exclusive) 列表，升序合并）。
@@ -84,9 +109,11 @@ impl RecvWindow {
     }
 
     /// 喂入一段 (offset, payload)。
-    /// - offset < expected：重叠/重复——对 [offset, min(end, expected)) 与历史
-    ///   逐字节校验；一致且 end <= expected → Duplicate；一致但跨界 → 交付后缀；
-    ///   不一致 → OverlapMismatch。
+    /// - offset < expected：重叠/重复——对 [max(offset, history_start),
+    ///   min(end, expected)) 与历史逐字节校验；一致且 end <= expected →
+    ///   Duplicate；一致但跨界 → 交付后缀；不一致 → OverlapMismatch。
+    ///   offset < history_start 的重叠区**无法逐字节校验**——按重复丢弃并
+    ///   计数（该区间 ≤ expected 即已交付，丢弃无损）。
     /// - offset == expected：顺序交付，随后吸干 gap 前缀。
     /// - offset > expected：入 gap buffer（容量有界）。
     pub fn feed(
@@ -98,23 +125,33 @@ impl RecvWindow {
         let end = offset + payload.len() as u64;
         if offset < self.expected_offset {
             let overlap_end = end.min(self.expected_offset);
-            let overlap = overlap_end - offset;
-            let hist_start = offset as usize;
-            let hist_slice = self
-                .history
-                .get(hist_start..hist_start + overlap as usize)
-                .expect("history 必须覆盖 expected 之前的全部区间（drain 记账不变量）");
-            if hist_slice != &payload[..overlap as usize] {
-                return Ok(SegmentAction::OverlapMismatch {
-                    expected: self.expected_offset,
-                    got: offset,
-                });
+            if offset < self.history_start {
+                // 低于校验视界：无法逐字节校验，按重复丢弃记账
+                self.unverifiable_duplicates += 1;
+            }
+            // 视界内的可校验区：[max(offset, history_start), overlap_end)
+            let verify_start = offset.max(self.history_start);
+            if verify_start < overlap_end {
+                let hs = (verify_start - self.history_start) as usize;
+                let he = (overlap_end - self.history_start) as usize;
+                let hist_slice = self.history.get(hs..he).expect(
+                    "history 必须覆盖 [history_start, expected) 区间（append 记账不变量）",
+                );
+                let ps = (verify_start - offset) as usize;
+                let pe = ps + (overlap_end - verify_start) as usize;
+                if hist_slice != &payload[ps..pe] {
+                    return Ok(SegmentAction::OverlapMismatch {
+                        expected: self.expected_offset,
+                        got: offset,
+                    });
+                }
             }
             if end <= self.expected_offset {
                 return Ok(SegmentAction::Duplicate);
             }
-            // 一致前缀 + 跨界后缀：交付后缀（连同吸干的 gap 段）
-            let mut out: Vec<u8> = payload.slice(overlap as usize..).to_vec();
+            // 一致前缀（或视界外跳过前缀）+ 跨界后缀：交付后缀（连同吸干的 gap 段）
+            let skip = (self.expected_offset - offset) as usize;
+            let mut out: Vec<u8> = payload.slice(skip..).to_vec();
             let tail_len = out.len();
             self.append_delivered(&Bytes::from(out.clone()));
             self.expected_offset = end;
@@ -141,6 +178,13 @@ impl RecvWindow {
 
     fn append_delivered(&mut self, bytes: &Bytes) {
         self.history.extend_from_slice(bytes);
+        self.delivered_total += bytes.len() as u64;
+        // 有界滑动窗口：只保留最近 HISTORY_CAP 字节
+        if self.history.len() > HISTORY_CAP {
+            let excess = self.history.len() - HISTORY_CAP;
+            self.history.drain(0..excess);
+            self.history_start += excess as u64;
+        }
     }
 
     /// 吸干 gap 前缀，返回被吸干的字节拼接（供 feed 一并交付调用方）。
@@ -189,6 +233,12 @@ pub enum JournalError {
     SegmentCap(usize),
     #[error("journal stream byte cap exceeded: {held} + {incoming} > {cap}")]
     StreamBytesCap {
+        held: usize,
+        incoming: usize,
+        cap: usize,
+    },
+    #[error("journal session byte cap exceeded: {held} + {incoming} > {cap}")]
+    SessionBytesCap {
         held: usize,
         incoming: usize,
         cap: usize,
@@ -375,6 +425,65 @@ mod tests {
             w.feed(10 + i * 10, b(1, 5), 4).unwrap();
         }
         assert!(w.feed(100, b(1, 5), 4).is_err());
+    }
+
+    /// 有界校验历史：窗口只保留最近 HISTORY_CAP 字节。
+    #[test]
+    fn recv_history_bounded_sliding_window() {
+        let mut w = RecvWindow::new();
+        let total = HISTORY_CAP + 4096;
+        // 单段交付 total 字节（一段超窗口也允许——按总量裁剪）
+        w.feed(0, b(7, total), 8).unwrap();
+        assert_eq!(w.delivered_bytes(), total as u64);
+        assert_eq!(w.history.len(), HISTORY_CAP);
+        assert_eq!(w.history_start, (total - HISTORY_CAP) as u64);
+        assert_eq!(w.expected_offset(), total as u64);
+        // 视界内重叠：逐字节校验仍生效
+        let in_view = (total - 100) as u64;
+        assert_eq!(
+            w.feed(in_view, Bytes::from(vec![7u8; 100]), 8).unwrap(),
+            SegmentAction::Duplicate
+        );
+        // 视界内重叠：内容不一致仍 RESET
+        let mut bad = vec![7u8; 100];
+        bad[0] ^= 0xFF;
+        assert!(matches!(
+            w.feed(in_view, Bytes::from(bad), 8).unwrap(),
+            SegmentAction::OverlapMismatch { .. }
+        ));
+    }
+
+    /// 视界外重放：无法逐字节校验 → 按重复丢弃 + 计数；跨界后缀仍交付。
+    #[test]
+    fn recv_ancient_replay_discards_and_counts() {
+        let mut w = RecvWindow::new();
+        // 交付 3 段 × 32KiB：history 保留最后 64KiB（段 2+段 3）
+        for i in 0..3u64 {
+            w.feed(i * 32768, b((i + 1) as u8, 32768), 8).unwrap();
+        }
+        assert_eq!(w.history_start, 32768);
+        // 完全低于视界的重放段：丢弃 + unverifiable 计数
+        assert_eq!(w.unverifiable_duplicates(), 0);
+        assert_eq!(
+            w.feed(0, b(1, 32768), 8).unwrap(),
+            SegmentAction::Duplicate
+        );
+        assert_eq!(w.unverifiable_duplicates(), 1);
+        assert_eq!(w.delivered_bytes(), 3 * 32768);
+        // 跨界段（前缀低于视界、中间与历史一致、后缀是新数据）：跳过前缀交付后缀
+        let straddle = {
+            let mut v = vec![0xFFu8; 8]; // [32760, 32768) 低于视界（内容不参与校验）
+            v.extend_from_slice(&[2u8; 32768]); // 与 history 一致
+            v.extend_from_slice(&[3u8; 32768]); // 与 history 一致
+            v.extend_from_slice(&[9u8; 8]); // [98304, 98312) 新数据
+            Bytes::from(v)
+        };
+        assert_eq!(
+            w.feed(32760, straddle, 8).unwrap(),
+            SegmentAction::Deliver(b(9, 8))
+        );
+        assert_eq!(w.unverifiable_duplicates(), 2);
+        assert_eq!(w.expected_offset(), 98312);
     }
 
     /// property 式不变量：随机段序 + 重复投递，交付流恒为原始流的连续前缀；
