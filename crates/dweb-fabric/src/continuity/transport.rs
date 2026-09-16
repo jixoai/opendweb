@@ -67,12 +67,68 @@ impl StreamFramer {
     }
 }
 
+/// 发送半边（[`ContinuityTransport::into_split`] 产物）。
+/// 会话层将收发半边分别加锁——收帧等待与数据发送互不阻塞（design §5）。
+pub struct TransportSend {
+    pub epoch: u64,
+    send: iroh::endpoint::SendStream,
+}
+
+impl TransportSend {
+    pub async fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
+        let mut buf = BytesMut::with_capacity(super::frame::HEADER_LEN + frame.payload.len());
+        frame.encode(&mut buf)?;
+        self.send
+            .write_all(&buf)
+            .await
+            .map_err(|e| TransportError::Io(format!("{e}")))?;
+        Ok(())
+    }
+
+    /// 优雅半关（发送侧 FIN）。
+    pub fn finish(&mut self) -> Result<(), TransportError> {
+        self.send
+            .finish()
+            .map_err(|e| TransportError::Io(format!("{e}")))
+    }
+}
+
+/// 接收半边（framer 增量状态随半边走；同批多帧入 pending 队列逐帧交付——
+/// 背靠背帧合并读盘时不得丢帧）。
+pub struct TransportRecv {
+    pub epoch: u64,
+    recv: iroh::endpoint::RecvStream,
+    framer: StreamFramer,
+    pending: std::collections::VecDeque<Frame>,
+}
+
+impl TransportRecv {
+    /// 阻塞收一帧（EOF/错误 → Ended/Io）。
+    pub async fn recv(&mut self) -> Result<Frame, TransportError> {
+        loop {
+            if let Some(f) = self.pending.pop_front() {
+                return Ok(f);
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            let n = self
+                .recv
+                .read(&mut chunk)
+                .await
+                .map_err(|e| TransportError::Io(format!("{e}")))?;
+            let Some(n) = n else { return Err(TransportError::Ended) };
+            for f in self.framer.feed(&chunk[..n])? {
+                self.pending.push_back(f);
+            }
+            // 帧未齐：继续读
+        }
+    }
+}
+
 /// 一条已采纳连接上的 continuity 双向流。
 pub struct ContinuityTransport {
     pub epoch: u64,
-    send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
-    framer: StreamFramer,
+    send: TransportSend,
+    recv: TransportRecv,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,40 +151,16 @@ impl ContinuityTransport {
             .open_bi()
             .await
             .map_err(|e| TransportError::Io(format!("{e}")))?;
-        Ok(Self {
-            epoch,
-            send,
-            recv,
-            framer: StreamFramer::new(),
-        })
+        Ok(Self::from_parts(send, recv, epoch))
     }
 
     pub async fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
-        let mut buf = BytesMut::with_capacity(super::frame::HEADER_LEN + frame.payload.len());
-        frame.encode(&mut buf)?;
-        self.send
-            .write_all(&buf)
-            .await
-            .map_err(|e| TransportError::Io(format!("{e}")))?;
-        Ok(())
+        self.send.send(frame).await
     }
 
     /// 阻塞收一帧（EOF/错误 → Ended/Io）。
     pub async fn recv(&mut self) -> Result<Frame, TransportError> {
-        loop {
-            let mut chunk = [0u8; 16 * 1024];
-            let n = self
-                .recv
-                .read(&mut chunk)
-                .await
-                .map_err(|e| TransportError::Io(format!("{e}")))?;
-            let Some(n) = n else { return Err(TransportError::Ended) };
-            let frames = self.framer.feed(&chunk[..n])?;
-            if let Some(f) = frames.into_iter().next() {
-                return Ok(f);
-            }
-            // 帧未齐：继续读
-        }
+        self.recv.recv().await
     }
 
     /// 由已建立的 (send, recv) 组装（接受侧入口）。
@@ -139,17 +171,27 @@ impl ContinuityTransport {
     ) -> Self {
         Self {
             epoch,
-            send,
-            recv,
-            framer: StreamFramer::new(),
+            send: TransportSend {
+                epoch,
+                send,
+            },
+            recv: TransportRecv {
+                epoch,
+                recv,
+                framer: StreamFramer::new(),
+                pending: std::collections::VecDeque::new(),
+            },
         }
+    }
+
+    /// 拆分收发半边（会话层分别加锁）。
+    pub fn into_split(self) -> (TransportSend, TransportRecv) {
+        (self.send, self.recv)
     }
 
     /// 优雅半关（发送侧 FIN）。
     pub fn finish(&mut self) -> Result<(), TransportError> {
-        self.send
-            .finish()
-            .map_err(|e| TransportError::Io(format!("{e}")))
+        self.send.finish()
     }
 }
 
@@ -205,5 +247,45 @@ mod tests {
         wire[0] = b'Q'; // 坏 magic
         let mut fr = StreamFramer::new();
         assert!(fr.feed(&wire).is_err());
+    }
+
+    /// 背靠背帧合并读盘不得丢帧（Phase 2 会话层实证缺陷的回归钉）：
+    /// OPEN+DATA+FIN 一次喂入 → recv 逐帧交付三帧全数到达。
+    #[test]
+    fn recv_batch_delivers_all_frames_in_order() {
+        let open = Frame {
+            frame_type: crate::continuity::frame::FrameType::Open,
+            flags: crate::continuity::frame::flags::START,
+            session_id: [5u8; 16],
+            stream_id: 9,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: bytes::Bytes::from_static(b"{\"requestId\":\"9\"}"),
+        };
+        let data = data_frame(0, b"ping");
+        let fin = Frame {
+            frame_type: crate::continuity::frame::FrameType::Fin,
+            flags: crate::continuity::frame::flags::END,
+            session_id: [5u8; 16],
+            stream_id: 9,
+            direction: Direction::ClientToProvider,
+            byte_offset: 4,
+            payload: bytes::Bytes::new(),
+        };
+        // 三帧编码进同一缓冲——模拟 QUIC 单次读盘合并
+        let mut wire = BytesMut::new();
+        open.encode(&mut wire).unwrap();
+        data.encode(&mut wire).unwrap();
+        fin.encode(&mut wire).unwrap();
+        // 与 TransportRecv::recv 相同的 pending 语义：一次 feed 全量入队逐帧交付
+        let mut fr = StreamFramer::new();
+        let mut pending = std::collections::VecDeque::new();
+        for f in fr.feed(&wire[..]).unwrap() {
+            pending.push_back(f);
+        }
+        assert_eq!(pending.len(), 3, "三帧全数解出");
+        assert_eq!(pending.pop_front().unwrap().frame_type, FrameType::Open);
+        assert_eq!(pending.pop_front().unwrap().payload, data.payload);
+        assert_eq!(pending.pop_front().unwrap().frame_type, FrameType::Fin);
     }
 }

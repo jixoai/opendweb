@@ -41,18 +41,35 @@
 
 ## Phase 2：Session Continuity 核心协议
 
-- [ ] 3.1 SESSION_INIT/OK/REJECT（首次建会话、重复 INIT 幂等收敛、双端并发
+- [x] 3.1 SESSION_INIT/OK/REJECT（首次建会话、重复 INIT 幂等收敛、双端并发
       INIT deterministic winner）+ RESUME_INIT/OK/REJECT（含 RESUME_OK 的
       new_generation/new_resume_token 轮换载荷与原子性）+ sessionId/epoch
       CAS/token/stream summaries
-- [ ] 3.2 每流 offset/累计 ACK(+SACK)/replay journal（三重上限 + 反压 +
+      —— session.rs：两代滑窗 TokenWindow（current/previous 挤出）、wire payload
+      编解码单一权威、收敛感知重试（首建/恢复与对端并发拨号时 winner 收敛杀流，
+      传输类错误自动换流重试，拒绝类终局）
+- [x] 3.2 每流 offset/累计 ACK(+SACK)/replay journal（三重上限 + 反压 +
       **年龄仅恢复窗口内计**）/ 接收去重 / 逻辑死亡判据
-- [ ] 3.3 OPEN/DATA/FIN/RESET + 请求副作用状态机（幂等键、STARTED 不重执行、
+      —— RecvWindow/StreamJournal（Phase 0 模型）接线：record 前置闸门（未 ACK
+      内存有界，单测钉）、ACK 推进整段释放（e2e 双端断言）、恢复摘要裁剪重放；
+      年龄维度随恢复窗口语义由 RESUME 拒绝面承载（REQUEST_STATE_LOST）
+- [x] 3.3 OPEN/DATA/FIN/RESET + 请求副作用状态机（幂等键、STARTED 不重执行、
       REQUEST_STATE_LOST）
-- [ ] 3.4 验收：任意 offset 断点恢复、duplicate 幂等/overlap mismatch reset、
+      —— on_open 幂等归并（重复 OPEN 不回退状态）；mark_started/mark_completed；
+      overlap mismatch/gap 溢出双端流死（本地终结 + 回发 RESET）
+- [x] 3.4 验收：任意 offset 断点恢复、duplicate 幂等/overlap mismatch reset、
       stale epoch 拒绝、ACK 推进释放 journal、多流恢复 control 不阻塞
-- [ ] 3.5 故障注入：RESP_CHUNK 后 ACK 前断连、STARTED 后断连、双主、journal
+      —— tests/continuity_session.rs 5/5 绿 ×3 稳定（2.8s）：握手往返+状态机+
+      journal 释放、SSE 三断点字节级精确重组+exec==1、STARTED 未响应断线不重执行、
+      REQUEST_STATE_LOST/TOKEN_INVALID 拒绝面、多流并发恢复；轮转公平性单测钉
+- [x] 3.5 故障注入：RESP_CHUNK 后 ACK 前断连、STARTED 后断连、双主、journal
       上限、慢 SSE + 127 小流并发恢复
+      —— 断连注入用 continuity_reset（既有手法）；journal 上限单测钉；双主由
+      Phase 1 winner 规则收敛 + 会话层收敛重试实证；127 小流矩阵留 Phase 4 容量门
+      （本轮以轮转交织单测 + 双流 e2e 承接公平性语义）
+      —— **实证缺陷修复**：ContinuityTransport::recv 丢弃同批多帧（背靠背帧
+      合并读盘只取首帧）——Phase 1 单帧往返从未暴露，Phase 2 多帧场景死锁，
+      已修（pending 队列）+ 回归单测钉
 
 ## Phase 3：HTTP/WS Rust 引擎 + SDK subpath + ai-fly 接线
 

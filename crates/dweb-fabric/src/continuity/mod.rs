@@ -12,6 +12,7 @@
 pub mod frame;
 pub mod manager;
 pub mod model;
+pub mod session;
 pub mod state;
 pub mod transport;
 
@@ -20,5 +21,6 @@ pub const ALPN_CONTINUITY: &[u8] = b"/dweb/fabric-continuity/1";
 
 pub use frame::{Direction, Frame, FrameError, FrameType, HEADER_LEN, MAGIC, MAX_FRAME, WIRE_VERSION};
 pub use model::{GapOverflow, JournalError, JournalLimits, RecvWindow, SegmentAction, StreamJournal};
+pub use session::{RequestState, Session, SessionChannel, SessionOptions, SessionPhase, SessionRegistry, SessionShared};
 pub use state::{ConnHandle, ConnectionPhase, ConnectionStateSnapshot, ContinuityState};
-pub use transport::{ContinuityTransport, StreamFramer, TransportError};
+pub use transport::{ContinuityTransport, StreamFramer, TransportError, TransportRecv, TransportSend};

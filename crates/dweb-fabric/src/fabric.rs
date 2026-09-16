@@ -828,6 +828,9 @@ pub struct FabricInner {
     pub(crate) continuity: crate::continuity::ContinuityState,
     /// continuity 拨号 single-flight（per-peer）。
     pub(crate) continuity_dialing: crate::continuity::manager::DialingGuard,
+    /// continuity 会话注册表（app-protocol-layer Phase 2）：provider 侧常驻
+    /// （跨连接存活；进程重启即丢——RESUME 统一 REQUEST_STATE_LOST）。
+    pub(crate) continuity_sessions: crate::continuity::session::SessionRegistry,
 }
 
 impl FabricInner {
@@ -1512,6 +1515,7 @@ impl Fabric {
             reconnect_tx: reconnect_tx.clone(),
             continuity: crate::continuity::ContinuityState::new(),
             continuity_dialing: crate::continuity::manager::DialingGuard::default(),
+            continuity_sessions: crate::continuity::session::SessionRegistry::new(),
             reconnect_manager_task: std::sync::Mutex::new(None),
             accept_loop_task: std::sync::Mutex::new(None),
             shutdown_done: tokio::sync::watch::channel(false).0,
