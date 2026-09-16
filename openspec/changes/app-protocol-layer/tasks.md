@@ -19,9 +19,14 @@
       control stream 不被阻塞）
 - [x] 1.7 每项 probe 产出存档：源码路径+版本、命令、原始输出、判定、对协议
       草案的影响；未过查证不冻结 timeout/token 派生方案
-- [ ] 1.8 Rust↔N-API HTTP/WS handler ABI 定稿（R3 补草案 design.md §3.4：
+- [x] 1.8 Rust↔N-API HTTP/WS handler ABI 定稿（R3 补草案 design.md §3.4：
       handler TS 执行、body 流桥接、背压与 ACK 同源、取消/shutdown drain、
       跨界异常不 panic）——含 ABI 评审
+
+<!-- Codex 1.8 确认轮遗留（Phase 0/3 实现冻结项，不阻塞）：
+     WS 1MiB 与 header 限值落定；registry 字段形态（streamId→CancellationToken/task/TSFN/pull state
+     + AbortSignal listener 移除时机）；请求体/响应体双向 permit→next→commit 精确时序；
+     HttpRequestInit 与内部错误码映射表。 -->
 
 ## Phase 1：Rust 连接状态面与 raw continuity transport
 
