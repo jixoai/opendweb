@@ -4,7 +4,7 @@
 
 服务端 SHALL 运行 iroh relay（`iroh-relay` crate 的 server feature）：接受客户端的 relay 协议连接，端口拓扑 MUST 明确可配置——HTTP(S) 端口（relay 控制与 WebSocket 桥接）与 QUIC/UDP 端口分开配置。无 TLS 的本地/内网部署 SHALL 可用（明文 HTTP relay），生产部署的 TLS 终结职责 MUST 在文档中写明（反代终结 TCP/WS；QUIC 数据面需要原生证书或明确降级说明）。relay MUST NOT 能解密端到端会话内容。
 
-服务端 SHALL 实现基于 access mode 的 relay 访问控制（见"Server 访问策略"）：默认 `open` 模式行为与无访问控制一致（AllowAll）；`restricted` 模式下每条客户端接入 MUST 通过 capability 验证链（见"relay capability 验证"）后才被注册。relay 仍不是 fabric 成员授权点：fabric 成员资格判定全部在端侧 roster；本访问控制仅限制 Server 基础设施的使用，其授权边界为 design.md §0 的 A(S) 形式化定义（经 relay 通信的端点恒属于授权接入集合）。客户端 SHALL 能通过配置将本服务端指定为自定义 relay（含按 relay 携带 capability 凭证）并完成经 relay 的组网。
+服务端 SHALL 实现基于 access mode 的 relay 访问控制（见"Server 访问策略"）：默认 `open` 模式行为与无访问控制一致（AllowAll）；`restricted` 模式下每条客户端接入 MUST 通过 capability 验证链（见"relay capability 验证"）后才被注册。relay 仍不是 fabric 成员授权点：fabric 成员资格判定全部在端侧 roster；本访问控制仅限制 Server 基础设施的使用，其在 `restricted` 模式下的授权边界为 design.md §0 的形式化定义（经 relay 通信的端点属于 A(S)，callback 模式下另加 webhook 动态放行集合 A_cb(S)；`open` 模式不设此边界）。客户端 SHALL 能通过配置将本服务端指定为自定义 relay（含按 relay 携带 capability 凭证）并完成经 relay 的组网。
 
 #### Scenario: 硬 NAT 双方经自托管 relay 组网
 
@@ -73,9 +73,9 @@
 - **WHEN** registry 中有 (fabric_A, root_X)，而 capability 的 (fabric_id, issuer) 为 (fabric_B, root_X)
 - **THEN** 接入被拒（`dweb/unknown-owner`）
 
-### Requirement: relay capability 验证（L1 密码学层）
+### Requirement: relay capability 验证（L1 密码学完整性 + L1b 票有效性底线）
 
-`restricted` 模式下，relay 的每条客户端接入 MUST 先通过 L1 本地密码学验证（不可绕过、不可插拔、无网络调用，fail-closed 顺序执行，仅当出示了 capability 时）：长度门（≤1KiB）与 base64url 字符集白名单 → `dwebr1.` 格式与字段形状校验 → caps 位图无未知保留位 → issuer Ed25519 验签（域分隔 `dweb/relay-cap/v1`）→ server_id == 本服务端 ServerId → 时间校验（`now >= expires_at` 拒绝；`issued_at` 容忍 120s 时钟偏移；`issued_at <= expires_at`；TTL 验证侧统一上限 180 天）→ recipient == iroh-relay 握手认证的 endpoint_id。L1 全过后进入 L2 策略决策（"Server 访问策略"/"动态策略回调" requirements）。验证 MUST 在接入注册前完成，L1 计算成本为 O(1) + 单次验签。capability 是身份绑定凭证而非纯 bearer：仅持有令牌串而无对应私钥者在 relay 面与 rendezvous announce 面 MUST 被拒绝。
+`restricted` 模式下，relay 的每条客户端接入若出示 capability，MUST 先通过不可绕过、不可插拔（与 policy provider 无关）的两级验证：**L1 密码学完整性**（本地、无网络调用，fail-closed 顺序执行）：长度门（≤1KiB）与 base64url 字符集白名单 → `dwebr1.` 格式与字段形状校验 → caps 位图无未知保留位 → issuer Ed25519 验签（域分隔 `dweb/relay-cap/v1`）→ server_id == 本服务端 ServerId → 时间校验（`now >= expires_at` 拒绝；`issued_at` 容忍 120s 时钟偏移；`issued_at <= expires_at`；TTL 验证侧统一上限 180 天）→ recipient == iroh-relay 握手认证的 endpoint_id。**L1b 票有效性底线**：(fabric_id, issuer) ∈ owner registry 活跃集合 → caps 含当前操作所需位（relay 接入需 RELAY）。两级验证均须在接入注册前完成、在任何策略 provider 决策（含 callback webhook）之前完成——策略层只能收紧不能放宽（无效票据 MUST 在到达 webhook 前被拒）。L1 计算成本为 O(1) + 单次验签。capability 是身份绑定凭证而非纯 bearer：仅持有令牌串而无对应私钥者在 relay 面与 rendezvous announce 面 MUST 被拒绝。
 
 #### Scenario: 窃取令牌串不可用（relay 面）
 
@@ -109,7 +109,7 @@
 
 ### Requirement: 动态策略回调（callback policy provider）
 
-`restricted` 模式且 `policy = "callback"` 时，L2 准入决策 MUST 经 HTTP webhook 外部化：Server 以 Bearer `callback_token` POST 已验证的 AuthContext（event ∈ relay.connect/rendezvous.announce/rendezvous.resolve/relay.disconnect；endpoint_id 为握手认证身份；capability 为 L1 验签后的结构化投影，不含令牌原文/签名；connection_id 关联生命周期）到 `callback_url`，按 200 响应的 `allow` 布尔值决定准入。fail-closed 恒定：非 200 / 超时（`callback_timeout_ms`，配置上限 2000ms）/ 响应解析失败 MUST 拒绝并返回 `dweb/policy-unavailable`（此行为 MUST NOT 可配置为宽松）。自定义拒绝 `reason` MUST 校验 `dweb/` 前缀，非法值替换为 `dweb/policy-denied`。决策结果 MUST 按 (endpoint_id, capability 内容哈希, event) 缓存，TTL 取响应携带值与 `callback_cache_ttl_ms`（默认 30s、上限 60s）的较小者。webhook 无法豁免 L1：伪造/转借/过期的 capability 在密码学层已拒。无 capability 的接入（AuthContext.capability == null）交给 webhook 裁决（admin 可实现基于 EndpointId 的动态准入名单）。
+`restricted` 模式且 `policy = "callback"` 时，relay 接入的 L2 准入决策 MUST 经 HTTP webhook 外部化。**事件范围仅 relay 面**（event ∈ relay.connect / relay.disconnect）；rendezvous 不接入 callback（其 HTTP 面无握手身份，动态策略另立 change，本 change rendezvous 维持静态 ACL）。webhook 请求以 Bearer `callback_token` POST 已验证的 AuthContext（endpoint_id 为握手认证身份；capability 为已过 L1+L1b 的有效票结构化投影，不含令牌原文/签名；connection_id 关联生命周期）到 `callback_url`，请求/响应体 ≤4KiB，按 200 响应的 `allow` 布尔值决定准入。**webhook MUST NOT 能豁免 L1/L1b**：无效票据（含缺所需 caps 位、未注册 owner）在到达 webhook 前已被拒。无 capability 的接入交给 webhook 裁决，其可达集合为独立定义的动态名单边界 A_cb(S)（admin 自担责任；webhook 对无票端点一律拒绝时 A_cb(S) 为空、行为与 static 一致）。fail-closed 恒定不可配置宽松：非 200 / 3xx 重定向 / 超时（默认与硬上限均 2000ms）/ 响应解析失败 / 缺 `allow` 或非布尔 / body 超限 / 并发超限 → 拒绝并返回 `dweb/policy-unavailable`（deny 结果同样入缓存）。**并发防护**：per-key singleflight、全局并发上限（默认 64）、每来源在途上限（默认 16）、有界等待队列（默认 256，队满即拒）。**缓存**：键 = (registry_generation, endpoint_id, BLAKE3(capability canonical 投影), event)；registry 变更即 generation+1 并清空全部缓存；TTL = min(响应 `cache_ttl_s`（非法值按 0 不缓存）, `callback_cache_ttl_ms` 上限 60s)；缓存仅作用于新连接准入，不作为存量连接撤销机制。**传输边界**：生产强制 https（`allow_loopback_callback` 显式豁免 loopback）；解析后拒绝私网（RFC1918/ULA）/link-local/云 metadata 网段；不跟随重定向；callback_token 日志全程脱敏。**reason 语法**：`dweb/[a-z0-9][a-z0-9._-]{0,63}`，非法值（含控制字符/非 ASCII/超长/空）替换为 `dweb/policy-denied`。**relay.disconnect 为 best-effort 观察通知**：fire-and-forget、不重试、允许丢失，MUST NOT 作为配额或撤销依据。callback 配置（url/token）缺失或非法时启动 fail-fast。
 
 #### Scenario: webhook 允许即接入
 
@@ -123,28 +123,43 @@
 
 #### Scenario: 非法 reason 被替换
 
-- **WHEN** webhook 返回 allow=false 且 reason 不带 dweb/ 前缀
+- **WHEN** webhook 返回的 reason 含控制字符/非 ASCII/超长/不合 slug 语法
 - **THEN** 接入被拒，reason 替换为 `dweb/policy-denied`
+
+#### Scenario: 无效票据不触发 webhook（L1/L1b 不豁免）
+
+- **WHEN** 端点出示缺 RELAY 位、或 issuer 未注册、或签名/时间/recipient 任一不过的 capability，policy=callback
+- **THEN** 接入被拒（对应 `dweb/caps-missing-relay` / `dweb/unknown-owner` / L1 对应 reason），webhook 未被调用
 
 #### Scenario: webhook 失联 fail-closed
 
-- **WHEN** callback_url 不可达或超时（≤2000ms）
+- **WHEN** callback_url 不可达、返回非 200/3xx、超时（≤2000ms）、响应缺 allow 字段或 body 超限
 - **THEN** 接入被拒（`dweb/policy-unavailable`），deny 结果同样进入缓存
 
-#### Scenario: 无票端点经 webhook 准入
+#### Scenario: 无票端点经 webhook 准入（A_cb(S) 动态名单）
 
 - **WHEN** 端点未携带 capability，webhook 对该 endpoint_id 返回 allow=true
-- **THEN** 接入成功（动态名单语义）；L1 不受影响——出示伪造票据仍被密码学层拒绝
+- **THEN** 接入成功（A_cb(S) 边界内）；出示伪造票据的端点仍被密码学层拒绝
+
+#### Scenario: registry 变更即时清缓存
+
+- **WHEN** owner 被 unregister 后，同键接入在缓存 TTL 未到期时再次发生
+- **THEN** 缓存已被 generation+1 失效，产生新回调，其票据因 L1b 被拒（`dweb/unknown-owner`）
+
+#### Scenario: 并发风暴防护
+
+- **WHEN** 同键并发 miss 或全局/来源并发超限、等待队列耗尽
+- **THEN** 同键仅发一次回调（singleflight）；超限请求被拒（`dweb/policy-unavailable`），relay executor 不被拖垮
+
+#### Scenario: SSRF 边界
+
+- **WHEN** callback_url 指向私网/link-local/metadata 地址或返回重定向，且未设置 loopback 豁免
+- **THEN** 按失联处理（`dweb/policy-unavailable`）；不跟随重定向、不发送 token 到其它 origin
 
 #### Scenario: disconnect 生命周期事件
 
 - **WHEN** 一条已准入连接断开
-- **THEN** Server 向 webhook 发送 relay.disconnect 事件（fire-and-forget，不阻塞不重试），携带对应 connection_id
-
-#### Scenario: 缓存 TTL 生效
-
-- **WHEN** 同一 (endpoint_id, capability, event) 在缓存 TTL 内再次接入
-- **THEN** 不产生新的 webhook 调用，决策沿用缓存结果
+- **THEN** Server 向 webhook 发送 relay.disconnect 事件（best-effort，不阻塞不重试），携带对应 connection_id；事件丢失不影响准入与撤销语义
 
 #### Scenario: Visitor 无法为授权集合外端点提供中继
 

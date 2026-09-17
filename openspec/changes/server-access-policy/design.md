@@ -37,6 +37,10 @@ R2 P0-N1 修正）：
       ConnectedClient，§1.1 F6）。
   R3. e ∈ A(S) 与 A(S) 内其它端点经 relay 互连 —— 是否属于「参与授权
       Owner 名下的连接」是产品语义裁决，见 §0.1。
+  R4.（callback 模式附加）经 webhook 无票放行的端点构成第二可达集合
+      A_cb(S)（§8.5），可达边界读作 A(S) ∪ A_cb(S)；A_cb(S) 由
+      admin 自担（Owner 裁决的"动态门槛"表达），static 模式下
+      A_cb(S) = ∅。
 ```
 
 ### 0.1 R3 的产品语义裁决（Owner 已确认）
@@ -426,18 +430,19 @@ E1: relay 握手认证的 endpoint_id == iroh endpoint TLS id == fabric Endpoint
     其绑定手段见 §8.4（R1 P0-5 修复）。
 ```
 
-### 8.2 on_connect 验证链（L1 密码学 + L2 策略两段式）
+### 8.2 on_connect 验证链（L1 密码学 + L1b 票有效性底线 + L2 策略）
 
 > Owner 裁决（2026-09-17）要求"使用门槛动态可配置 + 自定义 hook/callback"。
-> 验证链相应拆为两段：**L1 本地密码学验证**（防伪造，恒定成本，不可插拔）
-> 与 **L2 准入策略决策**（门槛，可插拔 provider——静态 registry 或动态
-> callback hook，见 §8.5）。static policy 下两段合流后的行为与 R2 版
-> 十步链完全一致（向后一致）。
+> 验证链拆为三层：**L1 密码学完整性**与 **L1b 票有效性底线**（两者合计 =
+> "有效票据"，对出示票据的接入**恒定执行、任何 provider 不可绕过**——
+> R3 P0-B1 修复：callback 只能在底线之上收紧，不能升级低权限票）；
+> **L2 准入策略**（门槛，可插拔 provider，见 §8.5）。static policy 下
+> 行为与 R2 版十步链完全一致（向后一致）。
 
 ```
 ClientRequest { endpoint_id(已认证), auth_token() }
   │
-  ▼ L1 密码学验证（本地，无网络调用；出示了 capability 才执行）
+  ▼ L1 密码学完整性（本地，无网络调用；出示了 capability 才执行）
   ┌────────────────────────────────────────────────────────────────┐
   │ C1 长度门（≤1KiB）+ base64url 白名单 ──► DENY "dweb/malformed-capability" │
   │ C2 解析 dwebr1. + 字段形状校验 ────────► DENY "dweb/malformed-capability" │
@@ -449,24 +454,38 @@ ClientRequest { endpoint_id(已认证), auth_token() }
   │    ──────────────────────────────────► DENY "dweb/capability-expired"    │
   │ C7 recipient ≠ endpoint_id ───────────► DENY "dweb/not-recipient"（E1）  │
   └────────────────────────────────────────────────────────────────┘
-  L1 全过 → AuthContext { endpoint_id, capability: Some(VerifiedCap), op }
-  token 缺失 → 跳过 L1 → AuthContext { capability: None, op }
+  ▼ L1b 票有效性底线（有票才执行；不可插拔——static/callback 共享）
+  ┌────────────────────────────────────────────────────────────────┐
+  │ B1 (fabric_id, issuer) ∉ registry ─────► DENY "dweb/unknown-owner"        │
+  │ B2 caps 不含 op 所需位（relay→RELAY）──► DENY "dweb/caps-missing-relay"   │
+  └────────────────────────────────────────────────────────────────┘
+  有效票 → AuthContext { endpoint_id, capability: Some(VerifiedCap) }
+  无票 → AuthContext { capability: None }（跳过 L1/L1b）
   │
   ▼ L2 策略决策（PolicyProvider::decide(AuthContext)，见 §8.5）
   ┌────────────────────────────────────────────────────────────────┐
-  │ StaticRegistryProvider（默认）：                                 │
+  │ StaticRegistryProvider（默认，policy=static）：                   │
   │   capability == None ──────────────────► DENY "dweb/no-capability"        │
-  │   (fabric_id, issuer) ∉ registry ──────► DENY "dweb/unknown-owner"        │
-  │   caps 不含 op 所需位（relay→RELAY 等）► DENY "dweb/caps-missing-relay"   │
+  │   有效票 ─────────────────────────────► ALLOW                          │
   │ CallbackProvider（policy=callback）：                            │
-  │   POST webhook（§8.5 协议）→ allow / deny(reason)              │
-  │   超时/失联/非法响应 ──────────────────► DENY "dweb/policy-unavailable"   │
+  │   POST webhook（§8.5 协议）→ allow / deny(reason)；              │
+  │   webhook 无法豁免 L1/L1b（无效票在到达 webhook 前已拒）；        │
+  │   无票端点交 webhook 裁决（identity 动态名单，A_cb(S)，§8.5）；   │
+  │   超时/失联/非法响应/并发超限 ────────► DENY "dweb/policy-unavailable"   │
   └────────────────────────────────────────────────────────────────┘
   ▼ ALLOW（connection 注册；on_disconnect 释放计数）
 ```
 
 deny reason 经 iroh-relay 握手协议原样回传客户端
 （handshake.rs:487-503），SDK 透出为 relay 接入诊断事件。
+
+**"不可绕过"的适用边界（R3 P1-A1 修正）**：以上顺序在 iroh-relay stock
+装配路径（`Server::spawn` → HTTP WS 握手 → `authorize_with` →
+`Clients::register`，http_server.rs:868-898、handshake.rs:480-505）成立；
+iroh-relay 的 `Clients::register`/`authorize_if` 是公开 embedder API，
+本项目 dweb-server 只经 `Server::spawn` 装配（relay.rs:41-43），集成测试
+须断言不出现绕路装配。该不变量属"本项目装配边界"，不是对 iroh-relay
+crate 整体 API 的绝对声明。
 
 ### 8.3 「参与 Owner 的连接」vs「主动使用 relay」（需求 §C 核心问题）
 
@@ -517,82 +536,103 @@ HTTP 面没有 iroh 握手身份，E1 不可用。按操作的信息敏感度分
   future-work 可评估）。caps 要求 RDZ_RESOLVE。
 - open 模式：announce/resolve 维持现状（签名 announce / 匿名 resolve）。
 
-### 8.5 可插拔策略层：PolicyProvider 与动态 callback hook（Owner 2026-09-17 裁决）
+### 8.5 可插拔策略层：PolicyProvider 与动态 callback hook（Owner 2026-09-17 裁决；R3 修订）
 
 **动机**（Owner 原文）：私有化部署的 Server「只服务于自家的业务，而不是
 被别人拿去滥用」，且这个使用门槛要**动态可配置**——「围绕这套密钥系统
 去实现动态的授权：通过自定义 hook/callback 来实现动态能力」。
 
-**架构**：L2 决策点抽象为 provider trait，准入语义可插拔：
+**架构**：L2 决策点抽象为 provider trait：
 
 ```
 trait PolicyProvider: Send + Sync {
     async fn decide(&self, ctx: AuthContext) -> Access;
 }
 AuthContext { endpoint_id（握手认证身份）,
-              capability: Option<VerifiedCap>（L1 已验签的票，含
-                fabric_id/issuer/caps/issued_at/expires_at 明文投影）,
-              op: RelayConnect | RdzAnnounce | RdzResolve }
+              capability: Option<VerifiedCap>（已过 L1+L1b 的有效票投影，
+                含 fabric_id/issuer/caps/issued_at/expires_at） }
 
 内置两个 provider：
   StaticRegistryProvider（policy = "static"，默认）
-    · 语义 = R2 版十步链的 L2 部分（registry 二元组 + 所需 caps 位）
-    · 数据源：owners.jsonl（§11.2），支持文件重载
+    · 无票必拒（dweb/no-capability）；有效票放行
+    · 票有效性判定（registry/caps）在 L1b 恒定层，见 §8.2
   CallbackProvider（policy = "callback"）
-    · 数据源：外部 webhook（admin 的业务系统）——授权决策完全外部化、
-      动态化：实时授予/吊销/限流策略均由业务侧实现，Server 无需重启
-      或改配置文件
+    · webhook 动态准入：实时授予/吊销/限流由业务侧实现，Server 免重启
 ```
 
-**CallbackProvider webhook 协议**（Server → admin 回调端点）：
+**两条不可逾越的边界（R3 P0-B1 修复）**：
+
+1. **callback 只能收紧，不能放宽**：出示票据的接入必须先过 L1+L1b
+   （密码学完整性 + registry 二元组 + 所需 caps 位）。缺 RELAY 位的票、
+   未注册 owner 的票在到达 webhook 前已被拒——webhook 永远收不到
+   "无效票"的决策请求，也无法升级它们。
+2. **无票准入是独立语义**：capability == None 的端点交 webhook 裁决，
+   由此产生的可达集合记作 **A_cb(S) = { e | webhook 曾对 e 返回
+   allow 且在缓存有效期内 }**，与 A(S)（§0）**并列定义、互不混淆**：
+   A(S) 是"注册 Owner 票据体系"的授权边界（static 模式的唯一边界）；
+   A_cb(S) 是 admin 经 webhook 自担的动态名单边界（callback 模式的
+   附加边界）。§0 的"集合外零可达"在 callback 模式下相应读作
+   "A(S) ∪ A_cb(S) 之外零可达"。admin 对 A_cb(S) 的成员选择负全责
+   （审计与配额边界见下）。若 webhook 对无票端点一律返回 deny，
+   A_cb(S) = ∅，行为与 static 完全一致。
+
+**CallbackProvider webhook 协议**（Server → admin 回调端点；
+**本 change 事件范围仅 relay 面**——R3 P0-B2 修复：rendezvous 是独立
+HTTP 路由（rendezvous.rs:124-201），announce 身份 = 请求体签名者、
+resolve 无请求方身份，与 relay 的握手身份不同构，其动态策略留独立
+change；本 change rendezvous 维持静态 ACL（L1+L1b+caps 位））：
 
 ```
 POST {callback_url}
-Authorization: Bearer {callback_token}        # server→hook 方向鉴权
-Content-Type: application/json
-请求体（全部来自 L1 已验证事实，不含令牌原文/签名）：
+Authorization: Bearer {callback_token}
+Content-Type: application/json；请求体 ≤4KiB；响应体 ≤4KiB
+事件：event = "relay.connect" | "relay.disconnect"
+请求体（relay.connect）：
 {
-  "event": "relay.connect",          # relay.connect | rendezvous.announce
-                                     # | rendezvous.resolve（预留扩展位）
-  "endpoint_id": "<z-base-32>",      # 握手认证身份
-  "capability": null | {             # L1 验签通过的结构化投影
-    "fabric_id": "<hex>", "issuer": "<z-base-32>",
-    "caps": ["relay", "rdz_announce"], "issued_at_ms": 0, "expires_at_ms": 0
-  },
-  "connection_id": "<opaque>"        # 关联 on_disconnect 生命周期事件
+  "event": "relay.connect",
+  "endpoint_id": "<z-base-32>",
+  "capability": null | { "fabric_id": "<hex>", "issuer": "<z-base-32>",
+    "caps": ["relay"], "issued_at_ms": 0, "expires_at_ms": 0 },
+  "connection_id": "<opaque>"
 }
 响应（HTTP 200，JSON）：
-  { "allow": true }
-  { "allow": false, "reason": "dweb/<custom>" }   # 自定义 reason 须 dweb/
-                                                  # 前缀；非法前缀替换为
-                                                  # dweb/policy-denied
-fail-closed 语义（恒定，不可配置为宽松）：
-  非 200 / 超时（callback_timeout_ms，默认 2000ms）/ 响应解析失败
-    → DENY "dweb/policy-unavailable"
-缓存（性能与动态性的折中）：
-  按 (endpoint_id, capability 内容哈希, event) 缓存决策结果；
-  TTL = min(响应携带 cache_ttl_s（可选）, callback_cache_ttl_ms 默认
-  30s / 上限 60s)；缓存内不重复回调；显式 deny 也缓存（防回调风暴）。
+  { "allow": true, "cache_ttl_s": 30 }          # cache_ttl_s 可选
+  { "allow": false, "reason": "dweb/<slug>" }   # 语法冻结见下
 ```
 
-**设计边界**：
+**协议卫生（R3 P1-B3..B7 修复，全部为协议约束而非实现细节）**：
 
-1. **L1 不可绕过**：callback 只能决定"这张验签过的票/这个认证过的身份
-   是否被允许"，不能豁免密码学验证——伪造/转借/过期票在 L1 已死，
-   webhook 无法复活它们。密码学层与策略层职责严格分离。
-2. **callback 可以放行无票端点**（capability == None 交给 hook 裁决）：
-   这是刻意的动态能力——admin 的业务系统可基于 EndpointId 直接维护
-   准入名单（比如自家设备的 identity 注册表），capability 链成为可选
-   增强。是否允许无票准入由 admin 的 webhook 逻辑自决，Server 不预设。
-3. **webhook 属 admin 信任域**：callback_token 泄露 = 策略面泄露（不
-   影响密码学层）；建议 TLS 端点。挂载点在 restricted 模式内（open
-   模式无 L2 调用）。
-4. **生命周期联动**：on_disconnect 触发
-   `event: "relay.disconnect"`（fire-and-forget，不阻塞、不失败重试），
-   供业务侧维护在线状态/并发计数。
-5. **资源保护**：webhook 调用发生在 on_connect 关键路径上，超时上限
-   硬编码 ≤2s；缓存 TTL 收敛回调速率；连接注册在决策返回之后
-   （失败不占用 client 槽位）。
+- **fail-closed 恒定不可配置**：非 200 / 超时（默认 2000ms，硬上限
+  2000ms）/ 响应解析失败 / 缺 `allow` 字段 / `allow` 非布尔 / body
+  超限 → DENY `dweb/policy-unavailable`（deny 结果同样入缓存）。
+- **并发防护**：per-key singleflight（同键并发 miss 只发一次回调）；
+  全局并发上限（默认 64）+ 每来源在途上限（默认 16）+ 有界等待队列
+  （默认 256，队满即 DENY `dweb/policy-unavailable`）——防回调风暴
+  耗尽 relay executor（client_rx 限流在连接注册后的数据面，保护不到
+  此处）。
+- **缓存冻结**：键 = (registry_generation, endpoint_id,
+  BLAKE3(capability canonical 投影), event)；registry 变更（文件重载/
+  unregister）即 generation+1 并清空全部缓存（撤销即时生效窗口 =
+  0）；TTL = min(响应 cache_ttl_s, callback_cache_ttl_ms 配置，上限
+  60s)；cache_ttl_s 非法值（负数/浮点/超 60）按 0 处理（不缓存）。
+  缓存仅作用于**新连接准入**，不作为存量连接撤销机制（§13）。
+- **传输与 SSRF 边界**：生产强制 `https://`（`--allow-loopback-callback`
+  显式豁免本机 loopback 供开发）；解析后地址拒绝私网（RFC1918/ULA）、
+  link-local、云 metadata 网段（豁免开关同上）；**不跟随重定向**
+  （3xx 一律按失联处理，防 token 跨 origin 泄露）；callback_token
+  仅从配置/secret 读取，日志与 tracing 全程脱敏。
+- **reason 语法冻结**：`dweb/[a-z0-9][a-z0-9._-]{0,63}`（ASCII slug，
+  拒绝控制字符/非 ASCII/超长/空）；非法值一律替换为
+  `dweb/policy-denied`（防日志注入与 deny 帧污染）。
+- **relay.disconnect 为 best-effort 观察通知**：fire-and-forget、
+  不阻塞、不重试、允许丢失（进程重启即丢）；**不可作为配额或撤销
+  依据**（配额依赖它则必须由业务侧自建可重放/幂等的事件通道——
+  非 Server 承诺）；其 callback 亦受同一并发/超时上限约束，超限
+  直接丢弃。
+
+**webhook 属 admin 信任域**：callback_token 泄露 = 策略面泄露（不
+影响密码学层）；挂载点在 restricted 模式内（open 模式无 L2 调用）。
+callback 配置（url/token）缺失或非法时启动 fail-fast。
 
 ---
 
@@ -638,18 +678,27 @@ A10 QAD（iroh-relay ServerConfig.quic）旁路
     └› 实为地址发现服务（§2.4，R1 P1 正名），无 AccessControl。本 change
         spec 冻结：restricted 模式 MUST fail-fast 拒绝启用 QAD bind——
         理由是未授权地址探测/隐私泄漏面，而非转发旁路 ✅
-A11 callback webhook 面（policy=callback 时新增）
-    ├► 攻击者直连 webhook 端点伪造响应 ──► webhook 由 admin 鉴权
-    │   （Bearer callback_token）+ 部署于 admin 信任域（内网/TLS）✅
-    ├► webhook 不可达/超时拖垮接入 ──► fail-closed（dweb/policy-unavailable）
-    │   + 超时硬上限 2s + 决策缓存收敛回调速率 ✅
-    ├► webhook 成为 DoS 放大器（恶意连接风暴→回调风暴）──► 缓存 TTL
-    │   （含 deny 缓存）+ client_rx 限流前置 ✅
-    ├► 恶意/被入侵的 webhook 放行任意端点 ──▶ admin 信任域内风险，明示：
-    │   密码学层（L1）不受影响，伪造票仍被拒；被放行范围仅限"真实持有
-    │   自己身份私钥的端点" ⚠(admin 信任域，与 registry 文件同级)
-    └► response 注入恶意 reason ──► reason 白名单（dweb/ 前缀强制，
-        非法替换 dweb/policy-denied），无执行面 ✅
+A11 callback webhook 面（policy=callback 时新增；R3 修订）
+    ├► 攻击者直连 webhook 端点伪造响应 ──► Bearer callback_token +
+    │   admin 信任域 + SSRF 边界（私网/metadata 网段拒绝、不跟随
+    │   重定向、HTTPS 强制）✅
+    ├► webhook 不可达/超时拖垮接入 ──► fail-closed
+    │   （dweb/policy-unavailable）+ 超时硬上限 2s + 缓存 ✅
+    ├► 回调风暴（并发 miss 洪泛）──► per-key singleflight + 全局/来源
+    │   并发上限 + 有界队列（队满即拒）✅
+    ├► 低权限票被 webhook"升级"（缺 RELAY 位/未注册 owner）──►
+    │   L1b 底线不可绕过：无效票到达 webhook 前已拒 ✅
+    ├► 恶意/被入侵 webhook 放行任意无票端点 ──▶ admin 信任域内风险，
+    │   明示为 A_cb(S) 独立边界（§0 R4/§8.5）：密码学层不受影响；
+    │   被放行者仅限"真实持有自己身份私钥的端点"且受
+    │   registry_generation 缓存失效与配额约束 ⚠(admin 责任，与
+    │   registry 文件同级)
+    ├► 撤销后缓存残留放行 ──► registry generation 入缓存键（registry
+    │   变更清缓存）；A_cb(S) 名单撤销的残留窗口 = cache_ttl ≤60s，
+    │   明示接受 ✅
+    └► response 注入恶意 reason/日志注入 ──► reason 语法冻结
+        （dweb/[a-z0-9][a-z0-9._-]{0,63}，非法替换
+        dweb/policy-denied）✅
 ```
 
 ---
@@ -729,11 +778,15 @@ capability ≤ 90d、bootstrap ≤ invite expires（§7.3）
   config: [server.access]
            mode = "open" | "restricted"
            policy = "static" | "callback"          # L2 provider 选择，默认 static
-           owners_file = "…"                        # static policy 数据源
-           callback_url = "https://…"               # callback policy 必填
+           owners_file = "…"                        # 票据有效性底线（L1b）数据源
+           callback_url = "https://…"               # callback policy 必填（见 SSRF 边界）
            callback_token = "…"                     # Bearer（server→hook 鉴权）
            callback_timeout_ms = 2000               # 硬上限 2000
            callback_cache_ttl_ms = 30000            # 上限 60000
+           callback_max_concurrency = 64            # 全局在途上限
+           callback_per_source = 16                 # 每来源在途上限
+           callback_queue = 256                     # 有界等待队列（队满即拒）
+           allow_loopback_callback = false          # loopback webhook 豁免（开发）
            limits.client_rx = …                     # 透传 iroh-relay
 registry 载入：启动读全量 jsonl 归并活跃集合（只读快照 Arc 供验证链）；
   Phase 1 支持文件重载（SIGHUP/mtime），Phase 3 admin API。
@@ -997,3 +1050,18 @@ payload 布局（全部整数大端 BE）：
 | P2 遗留 | 长度 242B/331 字符错误；F6 引用错位 | 修正 210B/287 字符 + 域前缀 18B 说明；F6 引用精确化 | §11.1、F6 |
 
 （R2 复核表之后见上节"Owner 裁决与需求扩展"。）
+
+### R3 复核（6.1/10）问题 → 处置对照
+
+| 编号 | 问题 | 处置 | 落点 |
+|---|---|---|---|
+| P0-B1 | callback 可绕过 capability 最小权限/A(S) | registry+caps 提升为 **L1b 票有效性底线**（不可插拔，webhook 无法升级低权限票/未注册票）；无票准入显式化为 **A_cb(S)** 独立边界（admin 自担，static 下为空） | §8.2、§8.5、§0 R4 |
+| P0-B2 | rendezvous callback 身份上下文不成立 | callback 事件范围收窄为 relay.connect/disconnect；rendezvous 维持静态 ACL，动态化留独立 change | §8.5 |
+| P1-A1 | "唯一注册路径"绝对化 | 限定为 stock 装配边界（Server::spawn→authorize_with→register），集成断言不绕路 | §8.2 末段 |
+| P1-B3 | 超时+缓存不足以防并发风暴 | singleflight + 全局/来源并发上限 + 有界队列（队满即拒） | §8.5、spec |
+| P1-B4 | 缓存 TOCTOU/陈旧窗口/无 schema | 键冻结（registry_generation + BLAKE3 canonical）、cache_ttl_s 有界整数（非法=0 不缓存）、registry 变更清缓存 | §8.5、spec |
+| P1-B5 | SSRF/重定向/token 暴露未冻结 | HTTPS 强制+loopback 豁免开关、私网/metadata 网段拒绝、不跟随重定向、body ≤4KiB、token 脱敏 | §8.5、spec |
+| P1-B6 | reason 仅前缀检查 | 语法冻结 `dweb/[a-z0-9][a-z0-9._-]{0,63}`，非法替换 policy-denied | §8.5、spec |
+| P1-B7 | disconnect 一致性边界不足 | 明示 best-effort 观察通知，不可作配额/撤销依据 | §8.5、spec |
+| C | spec 负例矩阵不足 | 重写 callback requirement：11 scenario（无效票不触发 webhook/registry 清缓存/并发风暴/SSRF/非法 reason 等） | spec |
+| 遗漏5 | spec.md:7 A(S) 缺 restricted 限定 | 措辞修正（restricted 下 A(S)∪A_cb(S)；open 不设边界） | spec |

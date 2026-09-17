@@ -59,15 +59,17 @@ capability 令牌、relay/rendezvous 的授权执行点。且必须以"三个独
    caps 位图 | issued_at | expires_at`，域分隔 `dweb/relay-cap/v1`。经 iroh relay
    既有 auth_token 通道（Bearer/query）传递。签发最小化：Visitor 附发默认
    仅 RELAY 位，RDZ_* 由 Owner 显式勾选。
-5. **Relay 授权执行点（L1 密码学 + L2 可插拔策略两段式）**：
-   实现 `AccessControl::on_connect`——L1 本地密码学验证（格式/长度门 →
-   caps 保留位 → Ed25519 验签 → server_id → 时间三重校验 →
-   recipient == 握手认证 EndpointId；不可绕过、不可插拔）；L2 准入策略
-   经 PolicyProvider 可插拔——**static registry**（默认，(fabric_id,
-   issuer) 二元组 + 所需 caps 位）或 **callback hook**（Owner 2026-09-17
-   需求扩展：使用门槛动态可配置——webhook 由 admin 业务系统实时
-   授予/吊销/限流，fail-closed，决策缓存）。任一失败即 deny
-   （结构化 `dweb/*` reason 回传客户端）。
+5. **Relay 授权执行点（L1 密码学 + L1b 票有效性底线 + L2 可插拔策略）**：
+   实现 `AccessControl::on_connect` 三层验证——L1 密码学完整性（格式/
+   长度门 → caps 保留位 → Ed25519 验签 → server_id → 时间三重校验 →
+   recipient == 握手认证 EndpointId）与 L1b 票有效性底线（(fabric_id,
+   issuer) 二元组 ∈ registry + 所需 caps 位）均**不可插拔不可绕过**
+   （任何 provider 之前执行）；L2 准入策略经 PolicyProvider 可插拔——
+   **static registry**（默认）或 **callback hook**（Owner 2026-09-17
+   需求扩展：relay 接入的动态准入 webhook，admin 业务系统实时授予/
+   吊销/限流；只能收紧不能放宽；无票准入构成 admin 自担的独立边界
+   A_cb(S)；fail-closed + singleflight + 缓存 + SSRF/reason 卫生）。
+   任一失败即 deny（结构化 `dweb/*` reason 回传客户端）。
 6. **Rendezvous ACL**：`restricted` 模式下 announce 要求 capability 且
    **recipient == announce 签名 EndpointId**（既有签名即 PoP，零成本绑定）；
    resolve 要求 capability 但为 **bearer-only**（明示降级：无 HTTP 面身份

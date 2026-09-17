@@ -25,11 +25,19 @@
        TTL≤180d、recipient==握手 id）+ L2 StaticRegistryProvider
        （(fabric_id,issuer) 二元组 + op 所需 caps 位）；on_disconnect；
        open 模式走 AllowAll 快路径
-- [ ] 1.5b CallbackProvider（policy=callback）：webhook 客户端（Bearer
-       callback_token、超时硬上限 2s、fire-and-forget disconnect 事件）、
-       决策缓存（(endpoint_id, capability 哈希, event) 键、TTL≤60s）、
-       fail-closed（dweb/policy-unavailable）、reason 白名单（dweb/ 前缀，
-       非法替换 dweb/policy-denied）、callback 配置缺失启动 fail-fast
+- [ ] 1.5b CallbackProvider（policy=callback，事件仅 relay.connect/
+       disconnect）：webhook 客户端（Bearer callback_token、超时硬上限
+       2s、请求/响应 body ≤4KiB、best-effort disconnect 事件）、L1b 底线
+       前置（无效票不触发 webhook）、决策缓存（registry_generation +
+       endpoint_id + BLAKE3(canonical 投影) + event 键；TTL≤60s，非法
+       cache_ttl_s=0；registry 变更清缓存）、并发防护（singleflight +
+       全局 64/来源 16/队列 256，队满即 policy-unavailable）、fail-closed
+       （非 200/3xx/超时/解析失败/body 超限）、reason 语法
+       dweb/[a-z0-9][a-z0-9._-]{0,63}（非法替换 dweb/policy-denied）、
+       SSRF 边界（HTTPS 强制 + allow_loopback_callback 豁免 + 私网/
+       link-local/metadata 网段拒绝 + 不跟随重定向 + token 日志脱敏）、
+       callback 配置缺失/非法启动 fail-fast、stock 装配断言
+       （Server::spawn 路径唯一，不绕 authorize_with/register）
 - [ ] 1.6 rendezvous ACL：announce（caps 校验 + recipient==签名
        EndpointId 绑定）/ resolve（bearer-only，caps 校验）；open 模式
        现状路径零变化
@@ -40,10 +48,15 @@
 - [ ] 1.9 集成测试：验证链矩阵（每个 deny reason 独立用例：no-capability/
        malformed/caps-unsupported/bad-signature/unknown-owner/wrong-server/
        capability-expired 含等值边界与超 TTL/not-recipient/caps-missing-relay/
-       policy-unavailable）、callback provider 用例（allow/deny+自定义
-       reason/非法 reason 替换/超时 fail-closed/缓存 TTL/无票准入/
-       disconnect 事件）、open/restricted 行为对比、重启持久化、
-       unregister 阻断新连接、client_rx 限流正交性、QAD fail-fast
+       policy-unavailable）、callback 负例矩阵（无效票不触发 webhook：
+       缺 RELAY 位/未注册 owner/L1 各失败分支 + 断言零回调；HTTP 401/403/
+       500/非 JSON/缺 allow/非布尔/超大 body/读超时与 2000ms 边界；缓存键
+       隔离（endpoint/capability/event 变化不命中）+ TTL=0/超限/负数 +
+       registry 变更清缓存；singleflight 并发 miss + 全局/来源上限 +
+       队列耗尽；SSRF（私网/重定向/token 不外泄）+ reason CR/LF/超长/
+       Unicode；disconnect 重复/乱序/多连接）、open/restricted 行为对比、
+       重启持久化、unregister 阻断新连接、client_rx 限流正交性、
+       QAD fail-fast
 
 ## Phase 2 — fabric/SDK capability 流通
 
