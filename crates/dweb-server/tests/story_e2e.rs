@@ -389,7 +389,7 @@ async fn restricted_story_s1_to_s8() {
     let relay_url_s = format!("http://{relay_addr}");
     story(&format!(
         "S1 admin 部署完成：restricted server @ {relay_addr}（server_id={}…）",
-        &hex::encode(&server_id[..4])
+        hex::encode(&server_id[..4])
     ));
 
     // S2 Owner A：open（root）→ 自签 own capability → 经 restricted relay 上线
