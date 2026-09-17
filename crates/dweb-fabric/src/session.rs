@@ -3,8 +3,8 @@
 
 use crate::identity::EndpointId;
 use crate::protocol::{
-    FabricId, InviteToken, InviteV2Token, RelayCapV1, SignedFact, TOKEN2_PREFIX, random_bytes,
-    redeem_challenge_bytes, MEMBER_CAPS, MEMBER_CAP_TTL_MS,
+    FabricId, InviteToken, InviteV2Token, MEMBER_CAP_TTL_MS, MEMBER_CAPS, RelayCapV1, SignedFact,
+    TOKEN2_PREFIX, random_bytes, redeem_challenge_bytes,
 };
 use crate::roster::Roster;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -610,9 +610,7 @@ pub async fn handle_redeem_as_issuer_gated(
         let token_v1 = if v2 {
             None
         } else {
-            Some(
-                InviteToken::decode(&token_str).map_err(|e| silent(e.to_string()))?,
-            )
+            Some(InviteToken::decode(&token_str).map_err(|e| silent(e.to_string()))?)
         };
         let token_v2 = if v2 {
             Some(InviteV2Token::decode(&token_str).map_err(|e| silent(e.to_string()))?)
@@ -660,7 +658,9 @@ pub async fn handle_redeem_as_issuer_gated(
             let mut r = roster.lock().await;
             // 过期判断取当前时间，而非任务开始时的快照
             let verified = match (&token_v1, &token_v2) {
-                (Some(token), None) => r.redeem_verify(token, &redeemer, &challenge, &sig, now_ms()),
+                (Some(token), None) => {
+                    r.redeem_verify(token, &redeemer, &challenge, &sig, now_ms())
+                }
                 (None, Some(token)) => {
                     r.redeem_verify_v2(token, &redeemer, &challenge, &sig, now_ms())
                 }
@@ -869,7 +869,9 @@ fn parse_ok2_caps(tail: &[u8], redeemer: &EndpointId) -> Result<Ok2Caps, String>
         let url_len = u16::from_be_bytes([tail[off], tail[off + 1]]) as usize;
         off += 2;
         if url_len > OK2_ITEM_BYTES_MAX {
-            return bad(format!("OK2 cap item {i} url exceeds {OK2_ITEM_BYTES_MAX}B"));
+            return bad(format!(
+                "OK2 cap item {i} url exceeds {OK2_ITEM_BYTES_MAX}B"
+            ));
         }
         if tail.len() < off + url_len {
             return bad(format!("OK2 cap item {i} url bytes truncated"));
@@ -883,12 +885,16 @@ fn parse_ok2_caps(tail: &[u8], redeemer: &EndpointId) -> Result<Ok2Caps, String>
         };
         off += url_len;
         if tail.len() < off + 2 {
-            return bad(format!("OK2 cap item {i} capability length prefix truncated"));
+            return bad(format!(
+                "OK2 cap item {i} capability length prefix truncated"
+            ));
         }
         let cap_len = u16::from_be_bytes([tail[off], tail[off + 1]]) as usize;
         off += 2;
         if cap_len > OK2_ITEM_BYTES_MAX {
-            return bad(format!("OK2 cap item {i} capability exceeds {OK2_ITEM_BYTES_MAX}B"));
+            return bad(format!(
+                "OK2 cap item {i} capability exceeds {OK2_ITEM_BYTES_MAX}B"
+            ));
         }
         if tail.len() < off + cap_len {
             return bad(format!("OK2 cap item {i} capability bytes truncated"));
@@ -1056,9 +1062,7 @@ pub async fn redeem_v2_as_joiner(
                     relay_caps: Vec::new(),
                     skipped: Ok2Caps::default(),
                 })
-                .map_err(|e| {
-                    RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))
-                }),
+                .map_err(|e| RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))),
             frame_type::REDEEM_ERR => {
                 let records = redeem_err::decode_records(&payload).map_err(|v| {
                     RedeemError::Unstructured(format!("redeem error frame violated wire: {v}"))
@@ -1326,14 +1330,13 @@ mod redeem_err_tests {
     }
 }
 
-
 // ==== REDEEM_OK2 capability 附发段测试（server-access-policy 附录 A2） ============
 
 #[cfg(test)]
 mod ok2_tests {
     use super::*;
     use crate::identity::NodeIdentity;
-    use crate::protocol::{FabricId, RelayCapV1, CAP_KNOWN_MASK};
+    use crate::protocol::{CAP_KNOWN_MASK, FabricId, RelayCapV1};
 
     fn now_ms() -> u64 {
         std::time::SystemTime::now()
@@ -1343,7 +1346,11 @@ mod ok2_tests {
     }
 
     /// 对 redeemer 现签一条合法 capability（recipient 绑定测试夹具）。
-    fn cap_for(signer: &NodeIdentity, recipient: &crate::identity::EndpointId, expires: u64) -> String {
+    fn cap_for(
+        signer: &NodeIdentity,
+        recipient: &crate::identity::EndpointId,
+        expires: u64,
+    ) -> String {
         RelayCapV1::sign_and_encode(
             signer.secret_key(),
             &FabricId::from_name("ok2-fabric"),
@@ -1363,7 +1370,10 @@ mod ok2_tests {
         let cap_a = cap_for(&root, &member.endpoint_id(), now_ms() + 60_000);
         let caps = vec![
             ("https://relay-a.example".to_owned(), cap_a.clone()),
-            ("https://relay-b.example".to_owned(), "dwebr1.Ignored".to_owned()),
+            (
+                "https://relay-b.example".to_owned(),
+                "dwebr1.Ignored".to_owned(),
+            ),
         ];
         let wire = encode_ok2_cap_segment(&caps);
         // 布局冻结：u32 BE count + [u16 url_len + url + u16 cap_len + cap]
@@ -1389,7 +1399,10 @@ mod ok2_tests {
         let items = vec![
             ("https://first.example".to_owned(), good.clone()),
             // 串格式非法（非良构 dwebr1.）→ 跳过计数
-            ("https://bad.example".to_owned(), "not-a-capability".to_owned()),
+            (
+                "https://bad.example".to_owned(),
+                "not-a-capability".to_owned(),
+            ),
             // recipient != redeemer → 跳过计数
             ("https://other.example".to_owned(), not_mine),
             // 重复 url：首条为准（后到丢弃计数；两条都是合法串）
@@ -1462,12 +1475,7 @@ mod ok2_tests {
             // r2 不在 invite 内 → 不附发
         ];
         // invite 剩余 1h（< 90d）→ TTL 取 invite 剩余
-        let caps = minter.mint_for(
-            &member.endpoint_id(),
-            now + 3_600_000,
-            &invite_relays,
-            now,
-        );
+        let caps = minter.mint_for(&member.endpoint_id(), now + 3_600_000, &invite_relays, now);
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].0, "https://r1.example");
         let parsed = RelayCapV1::decode(&caps[0].1).unwrap();

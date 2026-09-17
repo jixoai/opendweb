@@ -1236,8 +1236,7 @@ impl InviteV2 {
         let fabric_id = FabricId(bytes[16..48].try_into().expect("slice len 32"));
         let invite_id = bytes[48..64].try_into().expect("slice len 16");
         let issuer = key_from_bytes(&bytes[64..96])?;
-        let expires_at_ms =
-            u64::from_be_bytes(bytes[96..104].try_into().expect("slice len 8"));
+        let expires_at_ms = u64::from_be_bytes(bytes[96..104].try_into().expect("slice len 8"));
         let recipient = key_from_bytes(&bytes[104..136])?;
         let mut off = INVITE2_FIXED_LEN;
         let relay_count = bytes[off] as usize;
@@ -1290,8 +1289,7 @@ impl InviteV2 {
                 let parsed = RelayCapV1::decode(&cap)?;
                 if parsed.recipient != recipient {
                     return Err(quarantine(
-                        "relay capability recipient does not match the invite recipient"
-                            .to_owned(),
+                        "relay capability recipient does not match the invite recipient".to_owned(),
                     ));
                 }
                 if parsed.expires_at > expires_at_ms {
@@ -1340,9 +1338,7 @@ impl InviteV2 {
                     if bytes.len() < off + 16 + 2 {
                         return Err(trunc(&format!("direct addr {i} v6 bytes")));
                     }
-                    let octets: [u8; 16] = bytes[off..off + 16]
-                        .try_into()
-                        .expect("slice len 16");
+                    let octets: [u8; 16] = bytes[off..off + 16].try_into().expect("slice len 16");
                     off += 16;
                     let port = u16::from_be_bytes([bytes[off], bytes[off + 1]]);
                     off += 2;
@@ -1410,9 +1406,9 @@ impl InviteV2Token {
     /// 全验；v1 串交由 [`InviteToken::decode`]，本函数对 `dweb1.` 前缀报
     /// Quarantine）。
     pub fn decode(s: &str) -> Result<Self, ProtocolError> {
-        let b64 = s.strip_prefix(TOKEN2_PREFIX).ok_or_else(|| {
-            quarantine(format!("token does not start with {TOKEN2_PREFIX:?}"))
-        })?;
+        let b64 = s
+            .strip_prefix(TOKEN2_PREFIX)
+            .ok_or_else(|| quarantine(format!("token does not start with {TOKEN2_PREFIX:?}")))?;
         let payload = URL_SAFE_NO_PAD
             .decode(b64)
             .map_err(|e| quarantine(format!("token base64 decoding failed: {e}")))?;
@@ -2061,16 +2057,24 @@ mod tests {
         // recipient：dalek SigningKey::from_bytes(&[4u8;32]) 的公钥——
         // 由 iroh SecretKey::from_bytes 同种子派生，两栈逐字节一致。
         let recipient = SecretKey::from_bytes(&[4u8; 32]).public();
-        (fabric_id, server_id, recipient, CAP_KNOWN_MASK, 1_800_000_000_000, 1_800_003_600_000)
+        (
+            fabric_id,
+            server_id,
+            recipient,
+            CAP_KNOWN_MASK,
+            1_800_000_000_000,
+            1_800_003_600_000,
+        )
     }
 
     #[test]
     fn relay_cap_roundtrip_and_frozen_shape() {
         let signer = SecretKey::from_bytes(&[1u8; 32]);
         let (fabric_id, server_id, recipient, caps, issued, expires) = cross_crate_inputs();
-        let token =
-            RelayCapV1::sign_and_encode(&signer, &fabric_id, &server_id, &recipient, caps, issued, expires)
-                .unwrap();
+        let token = RelayCapV1::sign_and_encode(
+            &signer, &fabric_id, &server_id, &recipient, caps, issued, expires,
+        )
+        .unwrap();
         // 形状冻结（design §11.1）：287 字符 = "dwebr1."(7) + base64url(280)
         assert_eq!(token.len(), RELAY_CAP_TOKEN_LEN);
         assert_eq!(RELAY_CAP_TOKEN_LEN, 287);
@@ -2091,9 +2095,10 @@ mod tests {
         // 相等的串——Ed25519 确定性签名 + 同 canonical/域前缀下二者必然一致。
         let signer = SecretKey::from_bytes(&[1u8; 32]);
         let (fabric_id, server_id, recipient, caps, issued, expires) = cross_crate_inputs();
-        let token =
-            RelayCapV1::sign_and_encode(&signer, &fabric_id, &server_id, &recipient, caps, issued, expires)
-                .unwrap();
+        let token = RelayCapV1::sign_and_encode(
+            &signer, &fabric_id, &server_id, &recipient, caps, issued, expires,
+        )
+        .unwrap();
         assert_eq!(token, crate::CROSS_CRATE_CAP_VECTOR);
     }
 
@@ -2102,51 +2107,63 @@ mod tests {
         let signer = SecretKey::from_bytes(&[1u8; 32]);
         let (fabric_id, server_id, recipient, caps, issued, expires) = cross_crate_inputs();
         // 保留位
-        assert!(RelayCapV1::sign_and_encode(
-            &signer, &fabric_id, &server_id, &recipient, caps | 0x40, issued, expires
-        )
-        .is_err());
+        assert!(
+            RelayCapV1::sign_and_encode(
+                &signer,
+                &fabric_id,
+                &server_id,
+                &recipient,
+                caps | 0x40,
+                issued,
+                expires
+            )
+            .is_err()
+        );
         // TTL 超 180d（恰 180d+1ms；180d 整在 token_shape 语义内合法）
-        assert!(RelayCapV1::sign_and_encode(
-            &signer,
-            &fabric_id,
-            &server_id,
-            &recipient,
-            caps,
-            issued,
-            issued + RELAY_CAP_MAX_TTL_MS + 1,
-        )
-        .is_err());
+        assert!(
+            RelayCapV1::sign_and_encode(
+                &signer,
+                &fabric_id,
+                &server_id,
+                &recipient,
+                caps,
+                issued,
+                issued + RELAY_CAP_MAX_TTL_MS + 1,
+            )
+            .is_err()
+        );
         // issued_at > expires_at
-        assert!(RelayCapV1::sign_and_encode(
-            &signer, &fabric_id, &server_id, &recipient, caps, expires, issued
-        )
-        .is_err());
+        assert!(
+            RelayCapV1::sign_and_encode(
+                &signer, &fabric_id, &server_id, &recipient, caps, expires, issued
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn relay_cap_decode_rejects_malformed() {
         let signer = SecretKey::from_bytes(&[1u8; 32]);
         let (fabric_id, server_id, recipient, caps, issued, expires) = cross_crate_inputs();
-        let token =
-            RelayCapV1::sign_and_encode(&signer, &fabric_id, &server_id, &recipient, caps, issued, expires)
-                .unwrap();
+        let token = RelayCapV1::sign_and_encode(
+            &signer, &fabric_id, &server_id, &recipient, caps, issued, expires,
+        )
+        .unwrap();
         // 坏前缀 / 空串 / 截断 / 加 pad / 超长
         assert!(RelayCapV1::decode("dwebr2.aaaa").is_err());
         assert!(RelayCapV1::decode("").is_err());
         assert!(RelayCapV1::decode(&token[..token.len() - 1]).is_err());
         assert!(RelayCapV1::decode(&format!("{token}=")).is_err());
-        assert!(RelayCapV1::decode(&format!("{RELAY_CAP_TOKEN_PREFIX}{}", "A".repeat(2048))).is_err());
+        assert!(
+            RelayCapV1::decode(&format!("{RELAY_CAP_TOKEN_PREFIX}{}", "A".repeat(2048))).is_err()
+        );
         // 篡改 caps 保留位（改 wire 129 字节后重编码——非 dwebr1. 字符集仍合法，
         // 但 decode 的保留位门拒绝）
         let payload = token.strip_prefix(RELAY_CAP_TOKEN_PREFIX).unwrap();
         let mut wire = [0u8; 210];
         URL_SAFE_NO_PAD.decode_slice(payload, &mut wire).unwrap();
         wire[129] = 0xFF;
-        let tampered = format!(
-            "{RELAY_CAP_TOKEN_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(wire)
-        );
+        let tampered = format!("{RELAY_CAP_TOKEN_PREFIX}{}", URL_SAFE_NO_PAD.encode(wire));
         assert!(RelayCapV1::decode(&tampered).is_err());
     }
 
@@ -2244,17 +2261,28 @@ mod tests {
         off += 1;
         assert_eq!(b[off], 4, "IPv4 family tag");
         assert_eq!(&b[off + 1..off + 5], &[192, 168, 1, 10]);
-        assert_eq!(u16::from_be_bytes(b[off + 5..off + 7].try_into().unwrap()), 53210);
+        assert_eq!(
+            u16::from_be_bytes(b[off + 5..off + 7].try_into().unwrap()),
+            53210
+        );
         off += 7;
         assert_eq!(b[off], 6, "IPv6 family tag");
-        assert_eq!(&b[off + 1..off + 17], &[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!(u16::from_be_bytes(b[off + 17..off + 19].try_into().unwrap()), 443);
+        assert_eq!(
+            &b[off + 1..off + 17],
+            &[0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            u16::from_be_bytes(b[off + 17..off + 19].try_into().unwrap()),
+            443
+        );
         assert_eq!(b.len(), off + 19);
         // issuer 签名可验证（域分隔输入 = canonical bytes）
-        assert!(invite
-            .issuer
-            .verify(&b, &issuer.secret_key().sign(&b))
-            .is_ok());
+        assert!(
+            invite
+                .issuer
+                .verify(&b, &issuer.secret_key().sign(&b))
+                .is_ok()
+        );
     }
 
     /// decode 期一致性负例：capability recipient ≠ 令牌 recipient / capability
@@ -2288,7 +2316,10 @@ mod tests {
             invite.expires_at_ms + 1,
         )
         .unwrap();
-        for (name, cap) in [("wrong-recipient", wrong_recipient_cap), ("late-expiry", late_cap)] {
+        for (name, cap) in [
+            ("wrong-recipient", wrong_recipient_cap),
+            ("late-expiry", late_cap),
+        ] {
             // 重拼 relay[0] 条目（其余字节与合法 base 一致）
             let mut bytes = Vec::new();
             bytes.extend_from_slice(&base[..137]);

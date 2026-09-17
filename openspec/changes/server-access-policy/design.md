@@ -837,13 +837,35 @@ Limits（R1 P1 修正）：仅接线 iroh-relay 1.1.0 **已实现**的
 ```
 Rust:  RelayConfig::Custom(Vec<String>)              # 旧，保留
    +   RelayConfig::CustomWithCaps(Vec<RelayEntry>)  # 新
-        RelayEntry { url: String, capability: Option<String> }
-       → 构造 RelayMap 时 url+token 成对注入（iroh RelayMap 条目级 token）
+        RelayEntry { url: String,
+                      server_id: Option<[u8;32]>,    # restricted relay 的 ServerId
+                      token: Option<String> }        # 现成 capability 串（手工/测试）
+       → 构造 RelayMap 时 url+token 成对注入（iroh RelayMap 条目级 token，
+         共享句柄热注入——运行期兑换/自签后即时生效）
 napi:  RelayOptions { mode, urls?: string[] }        # 旧，保留
    +   RelayOptions { mode, relays?: { url, token? }[] }   # 新可选字段
 invite v2：见附录 A（唯一 wire 权威）
 REDEEM_OK2：见 §12（新帧类型，不触碰旧 payload 语义）
 ```
+
+实现期裁定（Phase2-A，44e9e36）：
+
+1. **server_id 来源 = 配置显式转交**：ServerId 只在 admin 注册 owner 时
+   产生（server 侧事实），fabric 无法从 URL 推导；owner 配置
+   RelayEntry.server_id 后，root 签发链完全本地可验。
+2. **静态 token 不嵌入 invite**：v2 内嵌凭证一律由 server_id 现签
+   （recipient 绑定只有现签才能由本机保证）；静态 token 仅本地注入。
+3. **v2 触发条件 = relay 配置任一条目带 server_id**（无 restricted 条目
+   的 CustomWithCaps 维持 v1，行为零变化）。
+4. **v2 直连地址 = 二进制 SocketAddr 编码**（u8 family + addr + u16
+   port）；v1 字符串形态不动。
+5. **"活快照优先"在 v2 列表的落法**：active 条目稳定提前、其余按配置序。
+6. **N0Default/Disabled 模式无 token 注入面**：iroh 上游预设内部构造
+   RelayMap 不暴露共享句柄——受限 relay 部署的节点必须以
+   Custom/CustomWithCaps 配置（拨号候选合并仍恒生效）。
+7. **成员长期凭证持久化**：`<data_dir>/relay.caps.json`
+   （[{url, capability}]，0600 原子写，按 url upsert；Fabric::open
+   加载并热注入）。
 
 ---
 

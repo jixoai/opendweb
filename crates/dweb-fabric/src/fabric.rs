@@ -34,6 +34,7 @@ pub enum RelayConfig {
 /// - `token`：现成的 `dwebr1.` 串（手工/测试用——如 admin 预铸后转交），
 ///   直接注入本地 RelayMap，不参与 invite 签发（v1 无凭证位、v2 凭证
 ///   由 server_id 现签保证 recipient 绑定）。
+///
 /// 两者可同时给出（token 优先生效于本地注入，server_id 供签发）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayEntry {
@@ -463,11 +464,10 @@ fn store_relay_caps(
         .iter()
         .map(|(url, cap)| serde_json::json!({ "url": url, "capability": cap }))
         .collect();
-    let json =
-        serde_json::to_string_pretty(&items).map_err(|e| FabricError::RelayCapsStore {
-            path: path.clone(),
-            reason: format!("encode failed: {e}"),
-        })?;
+    let json = serde_json::to_string_pretty(&items).map_err(|e| FabricError::RelayCapsStore {
+        path: path.clone(),
+        reason: format!("encode failed: {e}"),
+    })?;
     let mut tmp = std::ffi::OsString::from(path.as_os_str());
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -502,10 +502,7 @@ fn store_relay_caps(
 }
 
 /// 内存态 upsert：同 url 覆盖、新 url 追加（保序）。
-fn upsert_relay_caps(
-    store: &mut Vec<(String, String)>,
-    incoming: &[(String, String)],
-) -> bool {
+fn upsert_relay_caps(store: &mut Vec<(String, String)>, incoming: &[(String, String)]) -> bool {
     let mut changed = false;
     for (url, cap) in incoming {
         match store.iter_mut().find(|(u, _)| u == url) {
@@ -633,9 +630,7 @@ fn invite_relay_url(relay: &RelayConfig, snapshot: &RelayStatusSnapshot) -> Stri
             RelayConfig::Custom(urls) => urls.clone(),
             RelayConfig::N0Default => n0_default_urls(),
             RelayConfig::Disabled => Vec::new(),
-            RelayConfig::CustomWithCaps(entries) => {
-                entries.iter().map(|e| e.url.clone()).collect()
-            }
+            RelayConfig::CustomWithCaps(entries) => entries.iter().map(|e| e.url.clone()).collect(),
         };
         // 命中配置原样串（规范化键比较）；不命中（不应发生）时仍用在线事实
         return candidates
@@ -723,7 +718,10 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     // Closing——快照订阅者可观测收尾态）
     inner
         .continuity
-        .close_all(crate::continuity::state::ConnectionPhase::Closing, "shutdown")
+        .close_all(
+            crate::continuity::state::ConnectionPhase::Closing,
+            "shutdown",
+        )
         .await;
     inner.endpoint.close().await;
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
@@ -2170,13 +2168,12 @@ impl Fabric {
                         expires_at,
                     )
                 });
-                let capability =
-                    capability.transpose().map_err(|e| {
-                        FabricError::Session(SessionError::Connect(format!(
-                            "bootstrap capability mint failed for {}: {e}",
-                            entry.url
-                        )))
-                    })?;
+                let capability = capability.transpose().map_err(|e| {
+                    FabricError::Session(SessionError::Connect(format!(
+                        "bootstrap capability mint failed for {}: {e}",
+                        entry.url
+                    )))
+                })?;
                 Ok(crate::protocol::InviteRelayV2 {
                     url: entry.url.clone(),
                     capability,
@@ -2444,12 +2441,8 @@ impl Fabric {
         }
         // 4：学习 issuer 可达信息（relay 列表 + 直连地址，有界 HB 3.1）
         {
-            let mut learned: Vec<String> = token
-                .invite
-                .relays
-                .iter()
-                .map(|r| r.url.clone())
-                .collect();
+            let mut learned: Vec<String> =
+                token.invite.relays.iter().map(|r| r.url.clone()).collect();
             learned.extend(token.invite.direct_addrs.iter().map(|a| a.to_string()));
             self.inner
                 .known_addrs
@@ -2486,11 +2479,7 @@ impl Fabric {
             .invite
             .relays
             .iter()
-            .filter_map(|r| {
-                r.capability
-                    .as_ref()
-                    .map(|c| (r.url.clone(), c.clone()))
-            })
+            .filter_map(|r| r.capability.as_ref().map(|c| (r.url.clone(), c.clone())))
             .collect();
         if let Some(map) = &self.inner.relay_map {
             inject_relay_tokens(map, &bootstrap);
@@ -2540,18 +2529,16 @@ impl Fabric {
                 let reason = e.to_string();
                 // 探针适用条件同 v1 probe_applies：relay-only 令牌（无直连
                 // 地址）且无代理——直连路径存在时 relay 探针不构成归因依据
-                let probe_applies =
-                    !first_relay.is_empty() && token.invite.direct_addrs.is_empty();
-                if probe_applies && self.inner.proxy_is_none {
-                    if !run_relay_probe(&first_relay).await {
-                        return Err(FabricError::Join {
-                            code: JoinErrorCode::RelayOffline,
-                            message: format!(
-                                "configured relay(es) are unreachable; check the server or \
+                let probe_applies = !first_relay.is_empty() && token.invite.direct_addrs.is_empty();
+                if probe_applies && self.inner.proxy_is_none && !run_relay_probe(&first_relay).await
+                {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::RelayOffline,
+                        message: format!(
+                            "configured relay(es) are unreachable; check the server or \
                                  network (connect error: {reason})"
-                            ),
-                        });
-                    }
+                        ),
+                    });
                 }
                 Err(FabricError::Join {
                     code: JoinErrorCode::DialFailed,
@@ -3397,9 +3384,7 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
                             let restricted = match &inner2.relay {
                                 RelayConfig::CustomWithCaps(entries) => entries
                                     .iter()
-                                    .filter_map(|e| {
-                                        e.server_id.map(|sid| (e.url.clone(), sid))
-                                    })
+                                    .filter_map(|e| e.server_id.map(|sid| (e.url.clone(), sid)))
                                     .collect(),
                                 _ => Vec::new(),
                             };
@@ -3495,7 +3480,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-
     // ==== server-access-policy Phase 2（tasks 2.1/2.2/2.3） ======================
 
     fn relay_entry(url: &str, server_id: Option<[u8; 32]>, token: Option<&str>) -> RelayEntry {
@@ -3529,7 +3513,11 @@ mod tests {
         let fabric_id = a.inner.roster.lock().await.fabric_id();
         let b_id = NodeIdentity::from_seed([0x22; 32]).endpoint_id();
         let token_str = a
-            .invite_with(60_000, Some(&endpoint_id_display(&b_id)), InviteOptions::default())
+            .invite_with(
+                60_000,
+                Some(&endpoint_id_display(&b_id)),
+                InviteOptions::default(),
+            )
             .await
             .unwrap();
         assert!(token_str.starts_with("dweb2."), "restricted 配置必须签 v2");
@@ -3542,7 +3530,11 @@ mod tests {
         let parsed = crate::protocol::RelayCapV1::decode(cap).unwrap();
         assert_eq!(parsed.recipient, b_id);
         assert_eq!(parsed.server_id, [0xA1; 32]);
-        assert_eq!(parsed.caps, crate::protocol::MEMBER_CAPS, "§7.2 默认仅 RELAY");
+        assert_eq!(
+            parsed.caps,
+            crate::protocol::MEMBER_CAPS,
+            "§7.2 默认仅 RELAY"
+        );
         assert!(parsed.expires_at <= token.invite.expires_at_ms);
         // 非 restricted 条目无凭证
         assert!(token.invite.relays[1].capability.is_none());
@@ -3551,7 +3543,10 @@ mod tests {
     #[tokio::test]
     async fn invite_v2_requires_recipient() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = caps_cfg(dir.path(), vec![relay_entry("https://r.example", Some([1; 32]), None)]);
+        let cfg = caps_cfg(
+            dir.path(),
+            vec![relay_entry("https://r.example", Some([1; 32]), None)],
+        );
         let a = Fabric::create_root(cfg).await.unwrap();
         match a.invite(60_000, None).await {
             Err(FabricError::InviteV2RequiresRecipient) => {}
@@ -3608,7 +3603,14 @@ mod tests {
         let dir_b = tempfile::tempdir().unwrap();
         let fid = a.fabric_id_hex().await;
         let b = Fabric::attach(
-            caps_cfg(dir_b.path(), vec![relay_entry("https://relay-a.example", Some([0xA1; 32]), None)]),
+            caps_cfg(
+                dir_b.path(),
+                vec![relay_entry(
+                    "https://relay-a.example",
+                    Some([0xA1; 32]),
+                    None,
+                )],
+            ),
             &fid,
         )
         .await
@@ -3622,9 +3624,12 @@ mod tests {
     #[test]
     fn relay_caps_store_roundtrip_and_upsert() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_relay_caps(dir.path()).unwrap().is_empty(), "缺文件 = 空");
+        assert!(
+            load_relay_caps(dir.path()).unwrap().is_empty(),
+            "缺文件 = 空"
+        );
         let t1 = crate::protocol::RelayCapV1::sign_and_encode(
-            &NodeIdentity::from_seed([1; 32]).secret_key(),
+            NodeIdentity::from_seed([1; 32]).secret_key(),
             &crate::protocol::FabricId::from_name("f"),
             &[2; 32],
             &NodeIdentity::from_seed([3; 32]).endpoint_id(),
@@ -3634,7 +3639,7 @@ mod tests {
         )
         .unwrap();
         let t2 = crate::protocol::RelayCapV1::sign_and_encode(
-            &NodeIdentity::from_seed([1; 32]).secret_key(),
+            NodeIdentity::from_seed([1; 32]).secret_key(),
             &crate::protocol::FabricId::from_name("f"),
             &[2; 32],
             &NodeIdentity::from_seed([3; 32]).endpoint_id(),
@@ -3658,10 +3663,16 @@ mod tests {
         );
         // 内存 upsert 语义与文件一致
         let mut mem = vec![("https://a.example".to_owned(), t1)];
-        assert!(upsert_relay_caps(&mut mem, &[("https://a.example".to_owned(), t2.clone())]));
+        assert!(upsert_relay_caps(
+            &mut mem,
+            &[("https://a.example".to_owned(), t2.clone())]
+        ));
         assert_eq!(mem.len(), 1);
         assert_eq!(mem[0].1, t2);
-        assert!(!upsert_relay_caps(&mut mem, &[("https://a.example".to_owned(), t2.clone())]));
+        assert!(!upsert_relay_caps(
+            &mut mem,
+            &[("https://a.example".to_owned(), t2.clone())]
+        ));
         // 损坏文件 → 显式错误（不静默吞 bearer 凭证）
         std::fs::write(relay_caps_path(dir.path()), b"not json").unwrap();
         assert!(matches!(
@@ -3741,7 +3752,10 @@ mod tests {
                 message,
             }) => {
                 assert!(message.contains("upgrade"), "含升级指引: {message}");
-                assert_eq!(JoinErrorCode::UnsupportedInviteVersion.kebab(), "unsupported-invite-version");
+                assert_eq!(
+                    JoinErrorCode::UnsupportedInviteVersion.kebab(),
+                    "unsupported-invite-version"
+                );
             }
             other => panic!("expected ninth code, got {other:?}"),
         }
@@ -3754,11 +3768,7 @@ mod tests {
             relay_entry("https://r1.example", Some([1; 32]), None),
             relay_entry("https://r2.example", None, None),
         ]);
-        let addr = Fabric::merge_dial_candidates(
-            &id,
-            &["127.0.0.1:9999".to_owned()],
-            &relay,
-        );
+        let addr = Fabric::merge_dial_candidates(&id, &["127.0.0.1:9999".to_owned()], &relay);
         let urls: Vec<String> = addr
             .addrs
             .iter()

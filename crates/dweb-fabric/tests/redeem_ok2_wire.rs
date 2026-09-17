@@ -76,7 +76,9 @@ async fn spawn_issuer(
     let identity = root.clone();
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
-            let Ok(conn) = incoming.accept() else { continue };
+            let Ok(conn) = incoming.accept() else {
+                continue;
+            };
             let Ok(conn) = conn.await else { continue };
             let roster3 = roster2.clone();
             let identity = identity.clone();
@@ -111,9 +113,7 @@ async fn spawn_issuer(
 
 /// 攻击者 issuer：完整舞步但不验证 PoP，最终帧由测试指定（joiner 侧 OK2
 /// 解析语义的注入面）。
-async fn spawn_attacker_issuer(
-    final_frame: (u8, Vec<u8>),
-) -> Endpoint {
+async fn spawn_attacker_issuer(final_frame: (u8, Vec<u8>)) -> Endpoint {
     let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(RelayMode::Disabled)
         .secret_key(NodeIdentity::generate().secret_key().clone())
@@ -124,7 +124,9 @@ async fn spawn_attacker_issuer(
     let ep = endpoint.clone();
     tokio::spawn(async move {
         while let Some(incoming) = ep.accept().await {
-            let Ok(conn) = incoming.accept() else { continue };
+            let Ok(conn) = incoming.accept() else {
+                continue;
+            };
             let Ok(conn) = conn.await else { continue };
             let frame = final_frame.clone();
             tokio::spawn(async move {
@@ -133,12 +135,8 @@ async fn spawn_attacker_issuer(
                 };
                 // 读 INTENT / PROOF，回 CHALLENGE，最终回注帧
                 let _ = session::read_frame(&mut recv, session::MAX_REDEEM_FRAME).await;
-                let _ = session::write_frame(
-                    &mut send,
-                    frame_type::REDEEM_CHALLENGE,
-                    &[0u8; 32],
-                )
-                .await;
+                let _ =
+                    session::write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &[0u8; 32]).await;
                 let _ = session::read_frame(&mut recv, session::MAX_REDEEM_FRAME).await;
                 let _ = session::write_frame(&mut send, frame.0, &frame.1).await;
                 let _ = send.finish();
@@ -175,8 +173,7 @@ async fn client_endpoint(redeemer: &NodeIdentity) -> Endpoint {
 async fn v2_redeem_returns_ok2_with_member_caps() {
     let root = NodeIdentity::from_seed([0x11; 32]);
     let redeemer = NodeIdentity::from_seed([0x21; 32]);
-    let (issuer, roster, _dir) =
-        spawn_issuer(&root, vec![(RELAY_URL.to_owned(), SERVER_ID)]).await;
+    let (issuer, roster, _dir) = spawn_issuer(&root, vec![(RELAY_URL.to_owned(), SERVER_ID)]).await;
     let mut r = roster.lock().await;
     let ttl = 3_600_000u64; // 1h < 90d → TTL = invite 剩余
     let now = now_ms();
@@ -199,10 +196,12 @@ async fn v2_redeem_returns_ok2_with_member_caps() {
     conn.close(0u32.into(), b"done");
     // 名册：genesis + grant(redeemer)
     assert!(receipt.facts.len() >= 2, "genesis + grant");
-    assert!(receipt
-        .facts
-        .iter()
-        .any(|f| f.fact.subject == redeemer.endpoint_id()));
+    assert!(
+        receipt
+            .facts
+            .iter()
+            .any(|f| f.fact.subject == redeemer.endpoint_id())
+    );
     // 附发 capability
     assert_eq!(receipt.relay_caps.len(), 1);
     assert_eq!(receipt.relay_caps[0].0, RELAY_URL);
@@ -221,8 +220,7 @@ async fn v2_redeem_returns_ok2_with_member_caps() {
 async fn v1_redeem_still_returns_plain_ok() {
     let root = NodeIdentity::from_seed([0x31; 32]);
     let redeemer = NodeIdentity::from_seed([0x32; 32]);
-    let (issuer, roster, _dir) =
-        spawn_issuer(&root, vec![(RELAY_URL.to_owned(), SERVER_ID)]).await;
+    let (issuer, roster, _dir) = spawn_issuer(&root, vec![(RELAY_URL.to_owned(), SERVER_ID)]).await;
     let token = roster
         .lock()
         .await
@@ -351,7 +349,10 @@ async fn ok2_joiner_rejects_whole_frame_violations() {
         }),
         (
             "non-http url",
-            session::encode_ok2_cap_segment(&[("ftp://x.example".to_owned(), "dwebr1.x".to_owned())]),
+            session::encode_ok2_cap_segment(&[(
+                "ftp://x.example".to_owned(),
+                "dwebr1.x".to_owned(),
+            )]),
         ),
     ] {
         let mut payload = (0u32).to_be_bytes().to_vec();
@@ -397,8 +398,7 @@ fn cert_der_to_pem(der: &[u8]) -> Vec<u8> {
 }
 
 async fn spawn_local_relay() -> (String, Vec<u8>, iroh_relay::server::Server) {
-    let (certs, server_config) =
-        iroh_relay::server::testing::self_signed_tls_certs_and_config();
+    let (certs, server_config) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
     let der = certs[0].as_ref().to_vec();
     let tls = iroh_relay::server::TlsConfig::new(
         (std::net::Ipv4Addr::LOCALHOST, 0),
@@ -457,12 +457,9 @@ async fn fabric_v2_join_persists_member_caps_and_reloads() {
     );
 
     let fabric_id = a.fabric_id_hex().await;
-    let b = Fabric::attach(
-        e2e_cfg(&dir_b, &relay_url, &cert, None),
-        &fabric_id,
-    )
-    .await
-    .unwrap();
+    let b = Fabric::attach(e2e_cfg(&dir_b, &relay_url, &cert, None), &fabric_id)
+        .await
+        .unwrap();
 
     // v2 邀请（recipient 预绑定）
     let token = a
@@ -482,7 +479,10 @@ async fn fabric_v2_join_persists_member_caps_and_reloads() {
     let caps_file = dir_b.path().join("relay.caps.json");
     assert!(caps_file.exists(), "relay.caps.json 落盘");
     let persisted = std::fs::read_to_string(&caps_file).unwrap();
-    assert!(persisted.contains(&relay_url), "文件含 relay url: {persisted}");
+    assert!(
+        persisted.contains(&relay_url),
+        "文件含 relay url: {persisted}"
+    );
     let map_token = b.relay_map_token(&relay_url).expect("热注入生效");
     let parsed = RelayCapV1::decode(&map_token).unwrap();
     assert_eq!(
