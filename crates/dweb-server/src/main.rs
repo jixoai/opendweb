@@ -6,9 +6,10 @@
 //! 公网入口，services.json 按条目跳过 Host 派生（厂商中立的反代适配层）。
 //! 访问控制（server-access-policy Phase 1）：`--access-mode` / `--data-dir` /
 //! `--owners-file` / `--allow-loopback-callback` 与 `owners` 子命令；restricted
-//! 模式构造 AccessGate 装入 relay on_connect 验证链（tasks 1.5/1.5b 接线），
-//! registry mtime 轮询热重载，DWEB_RELAY_CLIENT_RX 限流透传（task 1.7），
-//! services.json 发布 server_id（task 1.8）。rendezvous ACL 是下一棒（task 1.6）。
+//! 模式构造 AccessGate 装入 relay on_connect 验证链与 rendezvous 静态 ACL
+//! （tasks 1.5/1.5b/1.6 接线），registry mtime 轮询热重载，
+//! DWEB_RELAY_CLIENT_RX 限流透传（task 1.7），services.json 发布 server_id
+//! （task 1.8）。
 
 mod access;
 mod relay;
@@ -334,7 +335,7 @@ async fn main() -> Result<()> {
 
     // restricted：构造验证链聚合器并挂 registry 热重载看护（mtime 轮询 5s；
     // open 模式 relay 走 AllowAll 快路径，无需 gate/看护）
-    let gate = match access_cfg.mode {
+    let (relay_gate, rdz_gate) = match access_cfg.mode {
         access::config::AccessMode::Restricted => {
             let gate = match access::gate::AccessGate::new(
                 *identity.server_id().as_bytes(),
@@ -359,9 +360,25 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&owners),
                 Some(std::sync::Arc::clone(&gate)),
             );
-            Some(gate)
+            // rendezvous gate（task 1.6）：恒 Static 策略——design §8.5 R3
+            // P0-B2 冻结 rendezvous 不接 callback（其 HTTP 面无握手身份，
+            // 动态策略另立 change）；共享同一 registry/server_id（L1/L1b
+            // 同一套验证器，registry 热重载经 Arc 共享生效）
+            let rdz = match access::gate::AccessGate::new(
+                *identity.server_id().as_bytes(),
+                std::sync::Arc::clone(&owners),
+                access::config::PolicyConfig::Static,
+            ) {
+                Ok(g) => std::sync::Arc::new(g),
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            tracing::info!("rendezvous access control enabled (static ACL: announce/resolve)");
+            (Some(gate), Some(rdz))
         }
-        access::config::AccessMode::Open => None,
+        access::config::AccessMode::Open => (None, None),
     };
 
     let relay_bind_addr = match relay_bind(&cli) {
@@ -387,7 +404,7 @@ async fn main() -> Result<()> {
         relay_enabled(&cli),
         relay_bind_addr,
         env_addr("DWEB_RELAY_QUIC_BIND"),
-        gate,
+        relay_gate,
         client_rx,
     )
     .await?;
@@ -421,7 +438,7 @@ async fn main() -> Result<()> {
         server_id: identity.server_id().to_string(),
     });
 
-    let app = rendezvous::router().merge(services::router(info));
+    let app = rendezvous::router_with_access(rdz_gate).merge(services::router(info));
     let http = axum::serve(listener, app);
     tokio::select! {
         res = http => res?,

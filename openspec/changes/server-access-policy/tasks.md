@@ -6,26 +6,30 @@
 
 ## Phase 1 — Server 独立可测（dweb-server crate 内闭环）
 
-- [ ] 1.1 server identity：`<data_dir>/server.key` load-or-create（0600、
+- [x] 1.1 server identity：`<data_dir>/server.key` load-or-create（0600、
        tmp+fsync+rename 原子写、幂等）；ServerId 派生
-- [ ] 1.2 owner registry：owners.jsonl append-only 写入/启动归并/活跃集合
+- [x] 1.2 owner registry：owners.jsonl append-only 写入/启动归并/活跃集合
        只读快照；register/unregister CLI 子命令（含 root 公钥 PoP 卫生
        校验工具）；SIGHUP/mtime 文件重载
 - [ ] 1.3 配置面：`--access-mode`/`--data-dir`/`--owners-file`（CLI）、
        `DWEB_ACCESS_MODE`/`DWEB_DATA_DIR`/`DWEB_OWNERS_FILE`（env）、
        `[server.access]`（config.toml）；fail-fast 校验（restricted+QAD
        bind 拒绝启动；restricted+空 registry 启动告警）
-- [ ] 1.4 RelayCapV1：canonical 编解码（域分隔 `dweb/relay-cap/v1`）、
+       （第一棒已交付 CLI/env/fail-fast 全量；config.toml `[server.access]`
+       层全仓库未接线——Phase 1 收尾时经核对显式遗留，随后续配置面接线补齐）
+- [x] 1.4 RelayCapV1：canonical 编解码（域分隔 `dweb/relay-cap/v1`）、
        `dwebr1.` 串格式、caps 位图（未知位拒绝）、≤1KiB 长度门与
        base64url 白名单；编码长度测试冻结（≈242B canonical+sig /
        ≈331 字符串）
-- [ ] 1.5 AccessControl 实现：on_connect 两段式验证链——L1 密码学
+       （实现勘定：canonical 146B + sig 64B = wire 210B，串 287 字符，
+       见 cap.rs token_shape_frozen）
+- [x] 1.5 AccessControl 实现：on_connect 两段式验证链——L1 密码学
        （C1-C7：格式/长度/字符集门、caps 保留位、Ed25519 验签、
        server_id、时间三重校验 now>=expires_at + CLOCK_SKEW 120s +
        TTL≤180d、recipient==握手 id）+ L2 StaticRegistryProvider
        （(fabric_id,issuer) 二元组 + op 所需 caps 位）；on_disconnect；
        open 模式走 AllowAll 快路径
-- [ ] 1.5b CallbackProvider（policy=callback，事件仅 relay.connect/
+- [x] 1.5b CallbackProvider（policy=callback，事件仅 relay.connect/
        disconnect）：webhook 客户端（Bearer callback_token、超时硬上限
        2s、请求/响应 body ≤4KiB、disconnect payload 冻结
        {event,endpoint_id,connection_id} 无 capability、每 connection
@@ -44,14 +48,16 @@
        重定向 + token 日志脱敏）、callback 配置缺失/非法启动 fail-fast、
        stock 装配断言（Server::spawn 路径唯一，不绕 authorize_with/
        register）
-- [ ] 1.6 rendezvous ACL：announce（caps 校验 + recipient==签名
+       （实现勘定：缓存键投影为 113B 原文直键（单射），无 BLAKE3 摘要
+       ——R5 实现期裁定，见 design 附录 B）
+- [x] 1.6 rendezvous ACL：announce（caps 校验 + recipient==签名
        EndpointId 绑定）/ resolve（bearer-only，caps 校验）；open 模式
        现状路径零变化
-- [ ] 1.7 iroh-relay Limits 接线：仅 `client_rx`（上游已实现）；连接数
+- [x] 1.7 iroh-relay Limits 接线：仅 `client_rx`（上游已实现）；连接数
        限额不承诺（上游 accept_conn_* 未实现）
-- [ ] 1.8 services.json 增量：`server_id` 字段（字段只增；
+- [x] 1.8 services.json 增量：`server_id` 字段（字段只增；
        packages/server-binary 字段断言测试同步更新）
-- [ ] 1.9 集成测试：验证链矩阵（每个 deny reason 独立用例：no-capability/
+- [x] 1.9 集成测试：验证链矩阵（每个 deny reason 独立用例：no-capability/
        malformed/caps-unsupported/bad-signature/unknown-owner/wrong-server/
        capability-expired 含等值边界与超 TTL/not-recipient/caps-missing-relay/
        policy-unavailable）、callback 负例矩阵（无效票不触发 webhook：
@@ -63,6 +69,12 @@
        Unicode；disconnect 重复/乱序/多连接）、open/restricted 行为对比、
        重启持久化、unregister 阻断新连接、client_rx 限流正交性、
        QAD fail-fast
+       （形态勘定：单测层（gate/callback/cap/relay/rendezvous 模块内
+       127 用例）覆盖全 reason 矩阵与 callback 负例；tests/
+       server_access_e2e.rs 黑盒矩阵 e1-e13 覆盖真 iroh relay/客户端
+       端到端：连接成功/各 deny reason 经握手协议回传/重启持久化/
+       unregister 热重载/callback 三态/QAD/空 registry 双语义/
+       client_rx 正交/rendezvous 网关 ACL）
 
 ## Phase 2 — fabric/SDK capability 流通
 

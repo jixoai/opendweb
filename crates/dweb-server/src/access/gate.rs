@@ -1,6 +1,7 @@
-//! AccessGate：验证链执行点聚合（task 1.5 + 1.5b，需求来源 2026-09-17；
-//! design §8.2 C0/L1/L1b/L2 验证链全图 + spec「relay capability 验证」/
-//! 「动态策略回调」全部 Scenario）。
+//! AccessGate：验证链执行点聚合（task 1.5 + 1.5b + 1.6，需求来源
+//! 2026-09-17；design §8.2 C0/L1/L1b/L2 验证链全图 + §8.4 rendezvous
+//! 授权 + spec「relay capability 验证」/「动态策略回调」/「rendezvous
+//! 访问控制」全部 Scenario）。
 //!
 //! 纯逻辑聚合层——输入为已抽取的原始请求要素（GateInput），输出
 //! Allow / Deny(reason)。iroh-relay 装配（RelayAccessControl，relay.rs）只
@@ -22,7 +23,7 @@
 //! open 模式不构造本类型（relay 装配 AllowAll 快路径零开销）。
 
 use crate::access::callback::CallbackProvider;
-use crate::access::cap::{self, CAP_RELAY, CapDeny, RelayCap};
+use crate::access::cap::{self, CAP_RDZ_ANNOUNCE, CAP_RDZ_RESOLVE, CAP_RELAY, CapDeny, RelayCap};
 use crate::access::config::PolicyConfig;
 use crate::access::registry::{OwnerRegistry, RegistrySnapshot};
 use std::borrow::Cow;
@@ -30,11 +31,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 待验证操作面（L1b B2 的 caps 位选择）。rendezvous announce/resolve 的
-/// Op 变体与其 caps 位是下一棒（task 1.6）接入。
+/// Op 变体随 task 1.6 接入（design §8.4：按 HTTP 面能力分别设计）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// relay 客户端接入（所需位 = CAP_RELAY）
+    /// relay 客户端接入（所需位 = CAP_RELAY；C7 绑定握手 id）
     RelayConnect,
+    /// rendezvous announce 登记（所需位 = CAP_RDZ_ANNOUNCE；C7 绑定
+    /// announce 载荷签名的 EndpointId——design §8.4 零成本 PoP）
+    RdzAnnounce,
+    /// rendezvous resolve 解析（所需位 = CAP_RDZ_RESOLVE；bearer-only
+    /// 明示降级——C7 不适用，无握手身份，design §8.4 / R4 P1-7）
+    RdzResolve,
 }
 
 impl Op {
@@ -42,14 +49,26 @@ impl Op {
     fn required_cap(self) -> u8 {
         match self {
             Self::RelayConnect => CAP_RELAY,
+            Self::RdzAnnounce => CAP_RDZ_ANNOUNCE,
+            Self::RdzResolve => CAP_RDZ_RESOLVE,
         }
     }
 
-    /// 缺位 deny reason（wire 冻结：relay 面为 caps-missing-relay）
+    /// 缺位 deny reason（wire 冻结：relay 面为 caps-missing-relay；
+    /// rendezvous 面为 caps-missing-rdz-announce/rdz-resolve，
+    /// 与 caps-missing-relay 同构生成）
     fn missing_reason(self) -> &'static str {
         match self {
             Self::RelayConnect => "dweb/caps-missing-relay",
+            Self::RdzAnnounce => "dweb/caps-missing-rdz-announce",
+            Self::RdzResolve => "dweb/caps-missing-rdz-resolve",
         }
+    }
+
+    /// C7（recipient 绑定）是否适用本操作面。resolve 无握手身份
+    /// （design §8.4 R4 P1-7）：bearer-only，仅验密码学有效性。
+    fn checks_recipient(self) -> bool {
+        !matches!(self, Self::RdzResolve)
     }
 }
 
@@ -57,14 +76,20 @@ impl Op {
 /// payload 关联生命周期）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateInput {
-    /// iroh-relay 握手认证身份（E1：与 capability.recipient 绑定）
+    /// 请求方身份（E1 绑定语义按 op 分面，design §8.4）：
+    /// - RelayConnect：iroh-relay 握手认证身份（C7 recipient 绑定）
+    /// - RdzAnnounce：announce 载荷中签名的 EndpointId（签名私钥即 PoP，
+    ///   C7 绑定 = capability.recipient == 签名者，窃取 token 者无法
+    ///   以他人身份登记）
+    /// - RdzResolve：本字段不参与 C7（bearer-only，无握手身份）
     pub endpoint_id: [u8; 32],
     /// 原始 Authorization header 值（未归一化；非 UTF-8 由执行点 lossy
     /// 转换——U+FFFD 恒不过 dwebr1./base64url 白名单，必落 malformed）
     pub auth_header: Option<String>,
     /// `?token=` query 原始值（无 Bearer 前缀）
     pub query_token: Option<String>,
-    /// iroh-relay ConnectionId（webhook payload 的 opaque 关联键）
+    /// iroh-relay ConnectionId（webhook payload 的 opaque 关联键；
+    /// rendezvous HTTP 面无 ConnectionId，传 0）
     pub connection_id: u64,
     pub op: Op,
 }
@@ -142,8 +167,16 @@ impl AccessGate {
                         ));
                     }
                 };
+                // C7 recipient 绑定按 op 分面（design §8.4 / R4 P1-7）：
+                // relay/announce 面绑定请求方身份（握手 id / 签名 EndpointId）；
+                // resolve 面无握手身份——bearer-only 明示降级，传 cap.recipient
+                // 自洽通过（仅验密码学有效性，capability 泄露即可用直至 TTL）
+                let recipient_for_check: &[u8; 32] = match input.op.checks_recipient() {
+                    true => &input.endpoint_id,
+                    false => &parsed.recipient,
+                };
                 if let Err(e) =
-                    cap::verify_l1(&parsed, &self.server_id, &input.endpoint_id, now_ms())
+                    cap::verify_l1(&parsed, &self.server_id, recipient_for_check, now_ms())
                 {
                     return GateDecision::Deny(Cow::Borrowed(e.reason()));
                 }
@@ -600,6 +633,112 @@ mod tests {
             .unregister(&f.fabric_id, &f.issuer_key())
             .unwrap();
         assert_eq!(deny_reason(gate.decide(&input).await), "dweb/unknown-owner");
+    }
+
+    // ---- rendezvous Op（task 1.6，design §8.4：announce 绑定 / resolve bearer-only）----
+
+    /// L1b B2：rdz 两面的缺位 slug（与 caps-missing-relay 同构生成）
+    #[tokio::test]
+    async fn rdz_ops_caps_missing_slugs() {
+        let (f, gate) = Fixture::new();
+        let now = now_ms();
+        // announce 面：票仅含 RDZ_RESOLVE → caps-missing-rdz-announce
+        let token = f.token(CAP_RDZ_RESOLVE, now, now + TTL);
+        let input = GateInput {
+            endpoint_id: f.recipient,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzAnnounce,
+        };
+        let d = gate.decide(&input).await;
+        assert_eq!(deny_reason(d), "dweb/caps-missing-rdz-announce");
+    }
+
+    #[tokio::test]
+    async fn rdz_ops_caps_missing_slugs_resolve() {
+        let (f, gate) = Fixture::new();
+        let now = now_ms();
+        // resolve 面：票仅含 RDZ_ANNOUNCE → caps-missing-rdz-resolve
+        // （GateInput.op 换面——endpoint_id 字段对 resolve 的 C7 无意义，
+        // 这里传 recipient 保持其余链路恒定）
+        let token = f.token(CAP_RDZ_ANNOUNCE, now, now + TTL);
+        let input = GateInput {
+            endpoint_id: f.recipient,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzResolve,
+        };
+        let d = gate.decide(&input).await;
+        assert_eq!(deny_reason(d), "dweb/caps-missing-rdz-resolve");
+    }
+
+    /// announce 面 C7 绑定（零成本 PoP）：cap.recipient ≠ 签名 EndpointId
+    /// → not-recipient（窃取 token 者无对应私钥无法 announce 任意身份）
+    #[tokio::test]
+    async fn rdz_announce_binds_recipient_to_signed_endpoint() {
+        let (f, gate) = Fixture::new();
+        let now = now_ms();
+        let signed_by_other = [0x55; 32];
+        let token = f.token(CAP_RDZ_ANNOUNCE, now, now + TTL);
+        let input = GateInput {
+            endpoint_id: signed_by_other,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzAnnounce,
+        };
+        let d = gate.decide(&input).await;
+        assert_eq!(deny_reason(d), "dweb/not-recipient");
+        // recipient == 签名者 → 过 C7（后续链路放行）
+        let input = GateInput {
+            endpoint_id: f.recipient,
+            auth_header: Some(format!(
+                "Bearer {}",
+                f.token(CAP_RDZ_ANNOUNCE, now, now + TTL)
+            )),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzAnnounce,
+        };
+        assert_eq!(gate.decide(&input).await, GateDecision::Allow);
+    }
+
+    /// resolve 面 bearer-only（design §8.4 / R4 P1-7）：无握手身份，
+    /// C7 不适用——recipient 与请求身份无关联（自洽通过），仅验密码学
+    /// 有效性；static L2 对有效票放行
+    #[tokio::test]
+    async fn rdz_resolve_bearer_only_skips_c7() {
+        let (f, gate) = Fixture::new();
+        let now = now_ms();
+        let token = f.token(CAP_RDZ_RESOLVE, now, now + TTL);
+        // 任意「请求方身份」（这里取解析目标 id，与 recipient 无关）
+        let unrelated_target = [0x77; 32];
+        let input = GateInput {
+            endpoint_id: unrelated_target,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzResolve,
+        };
+        assert_eq!(gate.decide(&input).await, GateDecision::Allow);
+        // 对照：同票换 relay 面 op → C7 生效（unrelated_target ≠ recipient）
+        let input = GateInput {
+            op: Op::RelayConnect,
+            ..input
+        };
+        let d = gate.decide(&input).await;
+        assert_eq!(deny_reason(d), "dweb/not-recipient");
+        // 无票 resolve 在 static 策略下仍拒（no-capability）
+        let input = GateInput {
+            auth_header: None,
+            query_token: None,
+            op: Op::RdzResolve,
+            ..input
+        };
+        let d = gate.decide(&input).await;
+        assert_eq!(deny_reason(d), "dweb/no-capability");
     }
 
     #[tokio::test]

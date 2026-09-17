@@ -972,6 +972,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "iroh",
  "iroh-base",
  "iroh-relay",
  "nix",

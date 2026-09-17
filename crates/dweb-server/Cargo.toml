@@ -41,3 +41,6 @@ webpki-roots = "1"
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# task 1.9 e2e：真 iroh 客户端（Endpoint 全量形态 + dns::DnsResolver）。
+# workspace 已锁定 =1.1.0（dweb-fabric 同源），无新增外部语义。
+iroh = { workspace = true }
