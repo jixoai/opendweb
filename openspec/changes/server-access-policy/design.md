@@ -400,6 +400,13 @@ CapsV1（u8 位图，预留至 32 bit）
 - future work（不在本 change）：`peer_scope`（目标端点集合摘要）/
   `max_peers` 字段作为 capability 可选扩展，为更强配对语义预留——
   需要时再评估 relay 侧 enforcement 的 hook 改造成本。
+  （Phase3-C 评估结论〔2026-09-18，task 3.3〕：**维持封存**——
+  enforcement 需要 relay per-dst hook（iroh-relay 1.1.0 无此面，F6），
+  即 §0.1 已否决的 fork 路径，成本/收益不成立。重开门槛：产品需要
+  per-pair 边界（连 Visitor 互连也要禁止）**且**端侧 fabric 同步收紧
+  非全连通——两层语义一致才值得动。预留位：CapsV1 bit3..7 reserved
+  不占用（占用需令牌版本 bump）；RelayCapV1 扩展走 v2 令牌（`dwebr2.`
+  前缀，与 invite v2 同版本隔离策略），不破坏 210B wire 冻结（§11.1）。）
 - expires 已在令牌内；maxConnections/per-owner 配额 Phase 3 钩子（§13）。
 
 ### 7.3 生命周期
@@ -415,6 +422,39 @@ Visitor member:     REDEEM_OK2 附发（TTL 建议 ≤90d/硬上限 180d，绑 r
                     存量连接断连语义见 §13 撤销窗口）③ caps 位不匹配
                     ④ 出示者 ≠ recipient
 ```
+
+### 7.4 member capability 续期协议化评估（Phase3-C，task 3.3，2026-09-18）
+
+**结论：维持现状（Owner 经 regular 会话重发 invite/capability），
+不引入 RENEW 协议帧；Phase 4 观察期后按重开条件再议。**
+
+依据：
+
+1. **现有链路已覆盖续期的全部功能面**（无硬缺口）：
+   - member capability 由 REDEEM_OK2 附发（TTL ≤90d、绑 redeemer），
+     持久化于 `<data_dir>/relay.caps.json`（0600 原子写、按 url upsert、
+     Fabric::open 加载热注入——fabric.rs RELAY_CAPS_FILE 既有链路）；
+   - root own capability 每次启动重签（`ensure_relay_capabilities()`，
+     Ed25519 确定性幂等）——root 侧**不存在**续期问题；
+   - 续期动作 = Owner 对成员重发 v2 invite（dweb2. 内嵌 bootstrap
+     capability）或经 regular 会话直发 member capability——载体现成；
+   - 到期可观测：票过期经 relay deny reason `dweb/capability-expired`
+     回传，SDK 侧 relay 状态/事件透出（Phase2-B 诊断面）——客户端
+     知道该找 Owner 续，Owner 侧无静默失效面。
+2. **RENEW 帧的成本不成比例**：新帧对（RENEW_INTENT/RENEW_OK）+
+   member 侧过期跟踪状态机 + Owner 侧审批策略 + 错误码与 wire 冻结/
+   兼容矩阵负担（附录 A2 同量级）；而 RENEW 的语义本质只是「请 Owner
+   重签一张票」——密码学上没有新信息，纯协议便利。Server 不参与签发
+   （§6.2 收窄原则），RENEW 只能走 member↔owner，该路径 regular 会话
+   已存在。
+3. **运维节奏**：TTL 90d 下每成员每 Server 季度一次重发；本 change 的
+   目标场景（自托管小团队）人工/脚本化重发成本可忽略。过早协议化会把
+   审批策略（谁可自动续、续多长）锁进 wire 冻结，反而丧失策略灵活性。
+4. **重开条件（Phase 4 观察项）**：成员规模使重发成为高频操作（批量
+   续期工具先于协议——CLI/脚本重发即可满足）、或出现无人值守长生命
+   周期客户端（Owner 长期不在线无法重发）的真实需求时，以独立 change
+   评估 RENEW 或签发侧 TTL 滑窗策略（现 90d/180d 上限已为滑窗留有
+   余量）。
 
 ---
 

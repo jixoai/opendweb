@@ -77,7 +77,51 @@ ssh gaubee-cloud '/tmp/dweb-server-sap owners --data-dir /tmp/opendweb-sap-verif
   unregister <fabric_id> <root_pubkey>'
 #    再跑 scripts/sap-verify.sh 的第 5 步 → Owner 上线失败（deny）即为生效
 #    （验完重新 register 恢复）
+
+# 5) admin API：见下一节 curl 示例（DWEB_ADMIN_TOKEN 启动时设置才有 /admin/*）
 ```
+
+## admin API（Phase 3 运维面，task 3.1/3.2/3.2b）
+
+服务以 `DWEB_ADMIN_TOKEN=<secret>` 启动时，gateway 挂载 `/admin/*`
+（Bearer 鉴权；**不设置该 env = 路由不存在**，404 零暴露）。全部
+curl 以走查部署为例（`GW=http://39.107.213.167:18787`，
+`AUTH='Authorization: Bearer sap-verify-admin'`——sap-verify.sh 部署的
+演示 token，teardown 即回收）：
+
+```bash
+# 注册 owner（即时生效——无热重载窗口；回执 receipt_sig 可用
+# services.json 的 server_id 独立验签审计）
+curl -s -X POST "$GW/admin/owners" -H "$AUTH" -H 'content-type: application/json' \
+  -d '{"fabric_id_hex":"<64hex>","root_hex":"<64hex>"}'
+
+# 列表（活跃集合 + generation）
+curl -s "$GW/admin/owners" -H "$AUTH"
+
+# 运行态：mode/policy/generation/配额/per-endpoint 在线表/
+# per-owner 连接计数/callback 缓存条目
+curl -s "$GW/admin/status" -H "$AUTH" | python3 -m json.tool
+
+# 注销——即时全灭：新连接立刻 unknown-owner，**存量连接一并断开**
+# （响应 kicked_endpoints/kicked_connections = 实际踢掉的端点/连接数；
+#   对照：CLI/文件路径的 unregister 不踢存量，只拦新连接）
+curl -s -X DELETE "$GW/admin/owners/<fabric_id_hex>/<root_hex>" -H "$AUTH"
+```
+
+### per-owner 连接配额（task 3.2）
+
+`DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER=<n>`（默认无上限）限制单个
+owner（fabric 维度）名下的**票接入** relay 连接数；超限新连接 deny
+`dweb/owner-quota-exceeded`（经握手回传，SDK 可见）。无票 A_cb 接入
+（callback 模式）与 rendezvous 请求不占名额；断连/被踢即时释放。
+`/admin/status` 的 `per_owner_connections` 即实时计数投影。
+
+### 撤销入口的语义分层（哪条路踢存量）
+
+| 撤销入口 | 新连接 | 存量连接 |
+|---|---|---|
+| admin API `DELETE /admin/owners` | 即时拒 | **即时断开**（kicked 计数回执） |
+| CLI / owners.jsonl 文件（mtime 热重载 ≤5s） | 拒（热重载窗口后） | 不断开，靠 TTL/自然断连收敛 |
 
 ## 边界场景对照表（哪些边界已被哪些测试钉死）
 
@@ -99,9 +143,12 @@ ssh gaubee-cloud '/tmp/dweb-server-sap owners --data-dir /tmp/opendweb-sap-verif
 | QAD 地址发现旁路 | restricted+QUIC bind 组合启动即拒（e2e e10） |
 | 进程重启（ServerId 稳定 / 成员凭证重载） | e2e e7 + 故事 S8 |
 | 撤销后的窗口期 | 设计明示：TTL 是撤销传播上界（relay.caps.json member cap ≤90d） |
+| admin API 未授权（错/缺 token）与未挂载面 | e2e e14（401 / 未配 DWEB_ADMIN_TOKEN = 404） |
+| owner 配额满（per-owner 连接上限） | e2e e15（owner-quota-exceeded 经握手回传） |
+| admin 注销踢存量（kicked 计数 + 在线表清零） | e2e e16（对照：文件路径不踢，e8） |
 
-完整矩阵：`crates/dweb-server/tests/server_access_e2e.rs`（14 例）、
-`story_e2e.rs`（S1-S8）、`access/*.rs` 单测 128、fabric 侧 165 + OK2 6 例、
+完整矩阵：`crates/dweb-server/tests/server_access_e2e.rs`（17 例）、
+`story_e2e.rs`（S1-S8）、`access/*.rs` 单测 140、fabric 侧 165 + OK2 6 例、
 SDK `relay-relays.test.mjs`。全量绿门：
 
 ```bash

@@ -27,6 +27,36 @@
 #
 # 注意：本编排不向宿主发布任何端口（无 ports:，仅 expose:）——
 # 暴露面完全收敛到隧道；本机 LAN 直连请单独发布 8787/3340。
+#
+# ── restricted 模式（server-access-policy Phase 1-3，按需启用）──────────
+# 默认 open（无门槛，与既有部署零行为差异）。要只服务自家业务时解开注释：
+#
+#   DWEB_ACCESS_MODE: "restricted"          # 访问门槛总开关
+#   DWEB_ADMIN_TOKEN: "<openssl rand -hex 32>"
+#     # admin API（/admin/* owners CRUD + status + unregister 踢存量）；
+#     # 不设置 = admin 路由不挂载（404 零暴露）；经隧道发布时务必只绑
+#     # 内网路径或加访问控制
+#   DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER: "16"
+#     # per-owner 在线连接上限（默认无上限）；超限 deny
+#     # dweb/owner-quota-exceeded
+#
+# owner 注册三入口（同一 owners.jsonl source of truth）：
+#   1) CLI:      docker exec <容器> dweb-server owners register <fabric_id> <root_hex>
+#   2) 文件:     挂载 data 目录改 owners.jsonl（mtime 热重载 ≤5s；不踢存量）
+#   3) admin API: curl -X POST .../admin/owners（即时生效；DELETE 注销会
+#                即时断开该 owner 名下全部存量 relay 连接——task 3.2b）
+#
+# 其余 [server.access] 面（config.toml [server.access] 同名 camelCase 或 env）：
+#   DWEB_OWNERS_FILE / DWEB_DATA_DIR                # 注册表与 server.key 路径
+#   DWEB_ACCESS_POLICY=callback + DWEB_CALLBACK_URL/TOKEN
+#     # 动态准入 webhook（业务系统实时 allow/deny；fail-closed 2s 超时、
+#     # 缓存 60s、SSRF 防护见 design §8.5；容器内网 URL 需 --allow-loopback-callback）
+#   DWEB_CALLBACK_TIMEOUT_MS / CACHE_TTL_MS / MAX_CONCURRENCY /
+#   DWEB_CALLBACK_PER_SOURCE / DWEB_CALLBACK_QUEUE  # webhook 卫生参数
+#   DWEB_RELAY_CLIENT_RX                            # 每客户端字节率限流
+# 完整语义：openspec/changes/server-access-policy/design.md §11.2 与
+# WALKTHROUGH.md「admin API」一节。
+# ────────────────────────────────────────────────────────────────────
 
 services:
   dweb:
@@ -38,6 +68,10 @@ services:
       DWEB_PUBLIC_RELAY_URL: ${DWEB_PUBLIC_RELAY_URL:?set to your public relay URL (same host for single-domain topology)}
       # 派生条目（未覆盖时）采信 X-Forwarded-Proto；覆盖条目不受影响
       DWEB_TRUST_PROXY: "1"
+      # ── restricted 模式（见文件头注释块；解开即启用）──
+      # DWEB_ACCESS_MODE: "restricted"
+      # DWEB_ADMIN_TOKEN: "change-me-openssl-rand-hex-32"
+      # DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER: "16"
     expose:
       - "8787"
       - "3340"

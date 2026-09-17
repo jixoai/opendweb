@@ -152,7 +152,29 @@
         kicked_endpoints/kicked_connections；语义边界——admin API 注销是
         即时全灭，文件热重载路径不踢存量（§13 勘定）；e2e e16 钉死
         kicked 计数 + 在线表清零 + 同票 deny 全链）
-- [ ] 3.3 member capability 续期协议化评估（RENEW 消息 vs regular 会话
+- [x] 3.3 member capability 续期协议化评估（RENEW 消息 vs regular 会话
        重发的 MVP 语义固化）；`peer_scope` capability 扩展评估
-- [ ] 3.4 多平台矩阵（darwin-arm64/windows-x64）与 Docker/compose
+       （Phase3-C 结论：续期**维持现状**——relay.caps.json 持久化 +
+       invite/capability 重发已覆盖全部功能面，RENEW 帧的成本不成比例
+       （新帧对+状态机+wire 冻结 vs 「请 Owner 重签一张票」的纯便利），
+       90d TTL 下季度级重发成本可忽略；Phase 4 观察项与重开条件见
+       design §7.4。peer_scope **维持封存**——enforcement 需 relay
+       per-dst hook（F6 无此面 = §0.1 已否决的 fork 路径）；重开门槛 =
+       产品需要 per-pair 边界且端侧 fabric 同步收紧非全连通；预留位
+       CapsV1 bit3..7 不占用、扩展走 v2 令牌，见 design §7.2）
+- [x] 3.4 多平台矩阵（darwin-arm64/windows-x64）与 Docker/compose
        配置文档更新
+       （Phase3-C 平台矩阵〔2026-09-18 实跑，本机交叉编译 + 测试套件〕：
+       | 平台 | 产物 | 编译证据 | 运行证据 |
+       |---|---|---|---|
+       | darwin-arm64 | dweb-server + SDK .node | mbx build -j 2 -p dweb-server -q ✓ | mbx test 全绿（140 单测 + 17 e2e + 1 story）|
+       | linux-x86_64-musl | dweb-server 静态 ELF | cargo zigbuild --release ✓（merge 后复跑，53.9s）| 云端 sap-verify S1-S8 已实证（Phase2 走查；Docker 交付主路径）|
+       | windows-x64 | dweb-server.exe + SDK dll | mingw 交叉全过：server build:win 同链 ✓（PE32+ 1m42s）/ SDK build:win 编译段 ✓（PE32+ DLL 1m50s；LIBNODE_PATH 本机在位，产物 cp 段因 client-sdk 工作区归并行会话未执行）| CI windows job 门禁（packaging/windows-ci spec）|
+       server 三平台编译面全绿；SDK windows 交叉可用性确认。
+       Docker/compose：compose.yaml 补 restricted 模式 env 注释块
+       （DWEB_ACCESS_MODE/DWEB_ADMIN_TOKEN/DWEB_RELAY_MAX_CONNECTIONS_
+       PER_OWNER + [server.access] 全集指引，只增注释不改构建逻辑）；
+       WALKTHROUGH.md 新增 admin API 一节（curl 四例 + 配额说明 +
+       撤销入口语义分层表）+ 边界对照表补 3 行（admin 401/404、配额满、
+       踢存量）+ 用例计数勘正（e2e 17 / 单测 140）；sap-verify.sh 云端
+       部署附带 DWEB_ADMIN_TOKEN 演示值（admin curl 走查可用））

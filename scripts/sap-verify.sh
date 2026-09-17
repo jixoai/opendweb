@@ -55,11 +55,13 @@ echo "== [3/5] 云端部署（restricted @ $GW_PORT/${RELAY_PORT}，隔离目录
 if curl -s --max-time 5 "http://$IP:$GW_PORT/healthz" >/dev/null 2>&1; then
   echo "云端 server 已在运行（跳过部署；重建请先 --teardown-only）"
 else
+  # DWEB_ADMIN_TOKEN：走查演示值（WALKTHROUGH admin API 一节的 curl 直接
+  # 可用；临时部署 + --teardown-only 即回收，非生产凭证）
   $SCP -q "$BIN" "$CLOUD_HOST:$CLOUD_BIN" 2>/dev/null
   $SSH "chmod +x $CLOUD_BIN && mkdir -p $CLOUD_DIR/data && \
     $CLOUD_BIN owners --data-dir $CLOUD_DIR/data register $FABRIC_ID $ROOT_PK && \
     cd $CLOUD_DIR && DWEB_ACCESS_MODE=restricted DWEB_DATA_DIR=$CLOUD_DIR/data \
-    nohup $CLOUD_BIN --gateway 0.0.0.0:$GW_PORT --relay 0.0.0.0:$RELAY_PORT > server.log 2>&1 & \
+    DWEB_ADMIN_TOKEN=sap-verify-admin nohup $CLOUD_BIN --gateway 0.0.0.0:$GW_PORT --relay 0.0.0.0:$RELAY_PORT > server.log 2>&1 & \
     sleep 2; curl -s --max-time 3 http://127.0.0.1:$GW_PORT/healthz" 2>/dev/null | grep -v -i warning
 fi
 
