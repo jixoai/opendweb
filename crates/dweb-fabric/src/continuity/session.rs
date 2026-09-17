@@ -1284,7 +1284,7 @@ impl SessionShared {
                     GAP_BYTE_CAP,
                 );
                 match action {
-                    Ok(SegmentAction::Deliver(payload)) => {
+                    Ok(SegmentAction::Deliver(segments)) => {
                         // P0-3 commit point：ACK 只携带应用消费水位
                         // （committed_offset——DATA 入队不推进）
                         let ack = mk_ack(self.session_id, sid, f.direction, ctx.committed_offset);
@@ -1292,7 +1292,10 @@ impl SessionShared {
                             ctx.last_acked_offset = ctx.committed_offset;
                         }
                         drop(streams);
-                        let queued_len = payload.len();
+                        // 按段入队（§3.4 分块边界不变量）：一批到达的段各占一条
+                        // 交付队列项——消费端 bodyNext 逐段返回。字节上限按整批
+                        // 记账（原子到达，整批拒绝语义与单段一致）。
+                        let queued_len: usize = segments.iter().map(|s| s.len()).sum();
                         let mut q = self.delivered.lock().await;
                         let session_bytes: usize = q.values().map(|queue| queue.bytes).sum();
                         let stream_bytes = q.get(&sid).map(|queue| queue.bytes).unwrap_or(0);
@@ -1317,7 +1320,9 @@ impl SessionShared {
                             };
                         }
                         let dq = q.entry(sid).or_default();
-                        dq.frames.push_back(payload);
+                        for segment in segments {
+                            dq.frames.push_back(segment);
+                        }
                         dq.bytes += queued_len;
                         drop(q);
                         self.delivered_notify.notify_waiters();

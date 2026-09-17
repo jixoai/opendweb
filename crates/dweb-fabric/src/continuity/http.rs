@@ -247,7 +247,9 @@ pub async fn fetch_http(
         .unwrap_or(std::time::Duration::from_secs(30));
     let head_timeout_err =
         || FabricError::Session(SessionError::Connect("response head timeout".into()));
-    let reset_stream = |channel: &crate::continuity::session::SessionChannel| {
+    // RESET 为 best-effort 有界发送：通道已死时对端同样终结该流（取消目的已
+    // 达）；发送本身不得反过来悬挂超时路径。
+    let reset_stream = async {
         let frame = crate::continuity::Frame {
             frame_type: crate::continuity::FrameType::Reset,
             flags: 0,
@@ -257,20 +259,23 @@ pub async fn fetch_http(
             byte_offset: 0,
             payload: Bytes::new(),
         };
-        // best-effort：通道已死时取消目的已达（对端同样终结该流）
-        let _ = channel.send_frame(&frame);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            channel.send_frame(&frame),
+        )
+        .await;
     };
     let mut buf: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + head_timeout;
     let (status, headers, rest) = loop {
         if tokio::time::Instant::now() >= deadline {
-            reset_stream(&channel);
+            reset_stream.await;
             return Err(head_timeout_err());
         }
         let chunk = match tokio::time::timeout(head_timeout, channel.recv(stream_id)).await {
             Ok(r) => r?,
             Err(_) => {
-                reset_stream(&channel);
+                reset_stream.await;
                 return Err(head_timeout_err());
             }
         };
@@ -456,6 +461,11 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
             }
             if let Some(mut body) = resp.body {
                 loop {
+                    // 注册唤醒面之前先查标志——Notify 不保留通知，select 订阅
+                    // 前到达的 RESET 已置 peer_reset（只查标志即可命中）。
+                    if shared.peer_reset(stream_id).await {
+                        return; // 止付并丢弃接收器（供给面随 Drop 关闭）
+                    }
                     let chunk = tokio::select! {
                         c = body.recv() => match c {
                             Some(c) => c,
@@ -464,10 +474,7 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                         // 对端 RESET 即时唤醒（挂起中的响应流——handler 无后续
                         // write 时 body.recv() 永不返回，止付必须事件驱动）
                         _ = shared.reset_notify.notified() => {
-                            if shared.peer_reset(stream_id).await {
-                                return; // 止付并丢弃接收器（供给面随 Drop 关闭）
-                            }
-                            continue; // 假唤醒（他流 RESET）：回到 body.recv()
+                            continue; // 回到循环头复查 peer_reset
                         }
                     };
                     // 对端 RESET（per-request cancel）：止付并丢弃接收器——

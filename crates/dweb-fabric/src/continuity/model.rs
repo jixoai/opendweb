@@ -46,8 +46,10 @@ pub struct RecvWindow {
 /// 段处置结果。
 #[derive(Debug, PartialEq, Eq)]
 pub enum SegmentAction {
-    /// 顺序到达（或重叠段的后缀）：交付增量字节。
-    Deliver(Bytes),
+    /// 顺序到达（或重叠段的后缀）+ 触发吸干的 gap 段：**按段交付**——每个
+    /// 元素是一条原始 DATA 帧载荷（§3.4 分块边界不变量：一次 write 分块 =
+    /// 一条 DATA 帧 = fetch 侧 bodyNext 一次返回；带内协议据此判定最终分块）。
+    Deliver(Vec<Bytes>),
     /// 完全重复：丢弃（重叠范围逐字节校验一致）。
     Duplicate,
     /// 乱序：入 gap buffer，待中间段补齐。
@@ -191,20 +193,19 @@ impl RecvWindow {
             }
             // 一致前缀（或视界外跳过前缀）+ 跨界后缀：交付后缀（连同吸干的 gap 段）
             let skip = (self.expected_offset - offset) as usize;
-            let mut out: Vec<u8> = payload.slice(skip..).to_vec();
-            let tail_len = out.len();
-            self.append_delivered(&Bytes::from(out.clone()));
+            let suffix = Bytes::from(payload.slice(skip..).to_vec());
+            self.append_delivered(&suffix);
             self.expected_offset = end;
-            out.extend_from_slice(&self.drain_gaps());
-            debug_assert_eq!(out.len() - tail_len, (self.expected_offset - end) as usize);
-            return Ok(SegmentAction::Deliver(Bytes::from(out)));
+            let mut out = vec![suffix];
+            out.extend(self.drain_gaps());
+            return Ok(SegmentAction::Deliver(out));
         }
         if offset == self.expected_offset {
-            let mut out: Vec<u8> = payload.to_vec();
+            let mut out = vec![payload.clone()];
             self.append_delivered(&payload);
             self.expected_offset = end;
-            out.extend_from_slice(&self.drain_gaps());
-            return Ok(SegmentAction::Deliver(Bytes::from(out)));
+            out.extend(self.drain_gaps());
+            return Ok(SegmentAction::Deliver(out));
         }
         if let Some(existing) = self.gaps.get(&offset) {
             if existing == &payload {
@@ -249,9 +250,10 @@ impl RecvWindow {
         }
     }
 
-    /// 吸干 gap 前缀，返回被吸干的字节拼接（供 feed 一并交付调用方）。
-    fn drain_gaps(&mut self) -> Bytes {
-        let mut drained: Vec<u8> = Vec::new();
+    /// 吸干 gap 前缀，按段返回被吸干的载荷（§3.4 分块边界不变量——每段独立
+    /// 交付，不与触发段或彼此拼接）。
+    fn drain_gaps(&mut self) -> Vec<Bytes> {
+        let mut drained: Vec<Bytes> = Vec::new();
         while let Some((&off, payload)) = self.gaps.first_key_value() {
             if off != self.expected_offset {
                 break;
@@ -260,10 +262,10 @@ impl RecvWindow {
             self.gaps.remove(&off);
             self.gap_bytes = self.gap_bytes.saturating_sub(payload.len());
             self.append_delivered(&payload);
-            drained.extend_from_slice(&payload);
             self.expected_offset += payload.len() as u64;
+            drained.push(payload);
         }
-        Bytes::from(drained)
+        drained
     }
 }
 
@@ -425,12 +427,12 @@ mod tests {
         let mut w = RecvWindow::new();
         assert_eq!(
             w.feed(0, b(1, 10), 8).unwrap(),
-            SegmentAction::Deliver(b(1, 10))
+            SegmentAction::Deliver(vec![b(1, 10)])
         );
         assert_eq!(w.feed(0, b(1, 10), 8).unwrap(), SegmentAction::Duplicate);
         assert_eq!(
             w.feed(10, b(2, 5), 8).unwrap(),
-            SegmentAction::Deliver(b(2, 5))
+            SegmentAction::Deliver(vec![b(2, 5)])
         );
         assert_eq!(w.expected_offset(), 15);
         assert_eq!(w.delivered_bytes(), 15);
@@ -468,7 +470,10 @@ mod tests {
                 .chain(vec![3u8; 5])
                 .collect::<Vec<_>>(),
         );
-        assert_eq!(w.feed(5, seg, 8).unwrap(), SegmentAction::Deliver(b(3, 5)));
+        assert_eq!(
+            w.feed(5, seg, 8).unwrap(),
+            SegmentAction::Deliver(vec![b(3, 5)])
+        );
         assert_eq!(w.expected_offset(), 15);
     }
 
@@ -477,13 +482,11 @@ mod tests {
         let mut w = RecvWindow::new();
         assert_eq!(w.feed(10, b(2, 5), 8).unwrap(), SegmentAction::Buffered);
         assert_eq!(w.sack_ranges(), vec![(10, 15)]);
-        // 顺序段交付时连同吸干的 gap 段一并返回（拼接体）
-        let mut expect = Vec::new();
-        expect.extend_from_slice(&b(1, 10));
-        expect.extend_from_slice(&b(2, 5));
+        // 顺序段交付时连同吸干的 gap 段一并返回——按段（§3.4 分块边界
+        // 不变量）：触发段与各吸干段各占一个元素，不拼接
         assert_eq!(
             w.feed(0, b(1, 10), 8).unwrap(),
-            SegmentAction::Deliver(Bytes::from(expect))
+            SegmentAction::Deliver(vec![b(1, 10), b(2, 5)])
         );
         assert_eq!(w.expected_offset(), 15);
         assert!(w.sack_ranges().is_empty());
@@ -569,7 +572,7 @@ mod tests {
         };
         assert_eq!(
             w.feed(32760, straddle, 8).unwrap(),
-            SegmentAction::Deliver(b(9, 8))
+            SegmentAction::Deliver(vec![b(9, 8)])
         );
         assert_eq!(w.unverifiable_duplicates(), 2);
         assert_eq!(w.expected_offset(), 98312);
@@ -609,7 +612,11 @@ mod tests {
             }
             for (o, p) in ops {
                 match w.feed(o, p, 64).unwrap() {
-                    SegmentAction::Deliver(t) => delivered_log.extend_from_slice(&t),
+                    SegmentAction::Deliver(segments) => {
+                        for seg in segments {
+                            delivered_log.extend_from_slice(&seg)
+                        }
+                    }
                     SegmentAction::Duplicate | SegmentAction::Buffered => {}
                     SegmentAction::OverlapMismatch { .. } => {
                         panic!("一致重放不得 mismatch")

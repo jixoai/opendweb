@@ -388,3 +388,83 @@ async fn http_reset_wakes_idle_response_dispatch() {
     }
     provider.abort();
 }
+
+/// h5：head 超时实际发出并投递 RESET（P0 回归——async send future 曾在同步
+/// 闭包中被构造即丢弃，RESET 从未上线）。证明链：client head 超时 → provider
+/// 流置 peer_reset → 迟到的 handler 响应被 dispatch 循环头拦截（body 接收器
+/// 即刻 Drop → sender.reserve() 报错），响应头永不回送。
+#[tokio::test]
+async fn http_head_timeout_sends_reset_to_provider() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let probe = std::sync::Arc::new(tokio::sync::Mutex::new(
+        None::<tokio::sync::mpsc::Sender<Bytes>>,
+    ));
+    let handler_done = std::sync::Arc::new(tokio::sync::Notify::new());
+    let p = std::sync::Arc::clone(&probe);
+    let done = std::sync::Arc::clone(&handler_done);
+    let h = handler(move |_req: HttpRequest| {
+        let p = std::sync::Arc::clone(&p);
+        let done = std::sync::Arc::clone(&done);
+        Box::pin(async move {
+            // 慢头：迟于 client 的 head_timeout（300ms）
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let (tx, rx) = body_channel(4);
+            *p.lock().await = Some(tx);
+            done.notify_waiters();
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut init = HttpRequestInit::get("/slow-head");
+    init.head_timeout = Some(Duration::from_millis(300));
+    let err = match tokio::time::timeout(Duration::from_secs(10), fetch_http(&client, init)).await {
+        Ok(Err(e)) => e,
+        Ok(Ok(_resp)) => panic!("head timeout 必须报错"),
+        Err(_) => panic!("fetch 超时"),
+    };
+    assert!(
+        err.to_string().contains("head timeout"),
+        "unexpected error: {err}"
+    );
+
+    // 等 handler 完成（响应就绪）——dispatch 循环头应因 peer_reset 直接止付
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let maybe_tx = probe.lock().await.clone();
+        let Some(tx) = maybe_tx else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "handler 未完成（响应未就绪）"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        // reserve 探测：接收器存活恒成功；RESET 已处理则立刻报错
+        match tokio::time::timeout(Duration::from_millis(500), tx.reserve()).await {
+            Ok(Err(_)) => break, // RESET 已投递并止付（P0 闭合）
+            Ok(Ok(permit)) => {
+                drop(permit);
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "RESET 未投递：迟到响应未被 peer_reset 拦截"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => panic!("reserve 探测不应超时"),
+        }
+    }
+    let _ = handler_done;
+    provider.abort();
+}
