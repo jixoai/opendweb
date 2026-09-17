@@ -641,4 +641,32 @@ mod tests {
         );
         assert_eq!(CapDeny::NotRecipient.reason(), "dweb/not-recipient");
     }
+
+    /// 跨 crate 冻结向量（server-access-policy Phase 2，task 2.3）：
+    /// 同一输入在 dweb-server（本处，dalek SigningKey）与 dweb-fabric
+    /// （iroh SecretKey 同种子）两条**独立实现**上必须产出逐字节相等的
+    /// `dwebr1.` 串。fabric 侧 `protocol::tests::relay_cap_cross_crate_vector`
+    /// 硬编码同一串——任一侧 canonical 布局/域前缀/编码漂移都会在各自
+    /// 测试中爆红（Ed25519 确定性签名下两侧输出必然一致）。
+    /// 固定输入：issuer=SigningKey([1;32])、server_id=[2;32]、fabric_id=[3;32]、
+    /// recipient=SigningKey([4;32]) 的公钥（跨 crate 向量取两端类型都能表示
+    /// 的值——fabric 侧 recipient 是 EndpointId 真实曲线点，非任意 32B）、
+    /// caps=CAP_KNOWN_MASK、issued=NOW、expires=NOW+TTL。
+    #[test]
+    fn cross_crate_vector_frozen() {
+        let f = Fixture::new();
+        let recipient: [u8; 32] = SigningKey::from_bytes(&[4u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let token = sign_and_encode(
+            &f.issuer,
+            &f.fabric_id,
+            &f.server_id,
+            &recipient,
+            CAP_KNOWN_MASK,
+            NOW,
+            NOW + TTL,
+        );
+        assert_eq!(token, "dwebr1.AQMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXMqTrBcFGHBx1nuDx_8O_oEI6OxFMFdddyaHkzPb2r58BwAAAaMYXFAAAAABoxiTPoDKl8Nfr0zIfv5h5qDsMVtPs9G5afdFkgIsPxzjf50TA8kUtCXBkblcrYsEAzRO7TUzDx5Mm2kAOM7aVZ6FaV8J");
+    }
 }
