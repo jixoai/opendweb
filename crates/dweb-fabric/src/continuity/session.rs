@@ -90,6 +90,11 @@ pub const MAX_ACTIVE_STREAMS: usize = 128;
 /// 是 QUIC 实现不及时响应取消的最终有界兜底。
 const SEND_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+/// Tombstone LRU capacity. 1024 revoked session ids bounds churn memory while
+/// retaining a large enough recent window for delayed resume retries;
+/// eviction never reinstates a session, it only changes the fallback to the
+/// normal REQUEST_STATE_LOST path for an otherwise unknown id.
+const TOMBSTONE_CAP: usize = 1024;
 
 /// RESUME_REJECT reason（design §2.3 冻结表）。
 pub mod reject_reason {
@@ -440,6 +445,10 @@ pub struct SessionShared {
     /// barrier 测试钩子（R3-1；生产零开销）。
     #[doc(hidden)]
     pub resume_gate: ResumeGate,
+    /// Unit-test-only shortening for the otherwise six-second stop timeout.
+    /// Keeping it on the shared instance avoids a process-global test race.
+    #[cfg(test)]
+    stop_wait_timeout_ms: std::sync::atomic::AtomicU64,
     limits: JournalLimits,
 }
 
@@ -483,8 +492,37 @@ impl SessionShared {
             protocol_violation_count: std::sync::atomic::AtomicU64::new(0),
             resume_in_flight: std::sync::atomic::AtomicBool::new(false),
             resume_gate: ResumeGate::new(),
+            #[cfg(test)]
+            stop_wait_timeout_ms: std::sync::atomic::AtomicU64::new(0),
             limits,
         })
+    }
+
+    fn stop_wait_timeout(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            let millis = self
+                .stop_wait_timeout_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if millis != 0 {
+                return std::time::Duration::from_millis(millis);
+            }
+        }
+        STOP_WAIT_TIMEOUT
+    }
+
+    #[cfg(test)]
+    fn set_stop_wait_timeout_for_test(&self, timeout: std::time::Duration) {
+        self.stop_wait_timeout_ms.store(
+            timeout.as_millis().try_into().unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// The second phase of a provider-side RESUME. Call this only after the
+    /// candidate channel is installed and its RESUME_OK was sent successfully.
+    fn complete_resume_install(&self) {
+        self.set_phase_sync(SessionPhase::Active);
     }
 
     /// 当前代通道（经 ResumeCtl 解析——owner 单调，恢复轮换后指向新代；
@@ -559,7 +597,7 @@ impl SessionShared {
         }
         if let Some(chan) = old {
             chan.request_stop();
-            if tokio::time::timeout(STOP_WAIT_TIMEOUT, chan.wait_stopped())
+            if tokio::time::timeout(self.stop_wait_timeout(), chan.wait_stopped())
                 .await
                 .is_err()
             {
@@ -1052,6 +1090,16 @@ impl SessionShared {
         payload: &Bytes,
     ) -> Result<u64, FabricError> {
         let mut streams = self.streams.lock().await;
+        let Some(existing) = streams.get(&stream_id) else {
+            return Err(FabricError::Session(SessionError::Connect(format!(
+                "unknown stream id: {stream_id}"
+            ))));
+        };
+        if existing.final_sent.is_some() {
+            return Err(FabricError::Session(SessionError::Connect(format!(
+                "stream already finished: {stream_id}"
+            ))));
+        }
         let session_held: usize = streams.values().map(|c| c.journal.held_bytes()).sum();
         if session_held + payload.len() > self.limits.max_session_bytes {
             return Err(FabricError::Session(SessionError::Connect(
@@ -1072,12 +1120,34 @@ impl SessionShared {
                 self.limits.max_session_segments
             ))));
         }
-        let ctx = streams
-            .entry(stream_id)
-            .or_insert_with(|| StreamCtx::new(stream_id, self.limits));
-        ctx.journal
+        streams
+            .get_mut(&stream_id)
+            .expect("stream checked above")
+            .journal
             .record(payload.clone(), false)
             .map_err(|e| FabricError::Session(SessionError::Connect(format!("{e}"))))
+    }
+
+    /// 发送面流存在性闸门：DATA/FIN 只能作用于已由 OPEN 预占或由对端
+    /// OPEN 登记的逻辑流，禁止凭任意 stream id 隐式造状态。
+    async fn ensure_send_stream(&self, stream_id: u64) -> Result<(), FabricError> {
+        let streams = self.streams.lock().await;
+        match streams.get(&stream_id) {
+            Some(ctx) if ctx.final_sent.is_none() => Ok(()),
+            Some(_) => Err(FabricError::Session(SessionError::Connect(format!(
+                "stream already finished: {stream_id}"
+            )))),
+            None => Err(FabricError::Session(SessionError::Connect(format!(
+                "unknown stream id: {stream_id}"
+            )))),
+        }
+    }
+
+    /// OPEN 发送失败后的本地预占回滚。该流尚未被对端观察到，因此只需
+    /// 撤销发送侧的流上下文和 key 登记，后续 OPEN 仍可复用名额。
+    async fn rollback_send_open(&self, stream_id: u64) {
+        self.streams.lock().await.remove(&stream_id);
+        self.stream_keys.lock().await.remove(&stream_id);
     }
 
     /// P0-3d：活跃流名额预占（OPEN 前置闸门——超限拒绝；名额在流完全终结
@@ -1744,6 +1814,7 @@ impl SessionChannel {
 
     /// 发送数据（journal 前置闸门 → DATA 帧）。
     pub async fn send_data(&self, stream_id: u64, payload: Bytes) -> Result<(), FabricError> {
+        self.shared.ensure_send_stream(stream_id).await?;
         let offset = self.shared.record_send(stream_id, &payload).await?;
         self.send_frame(&Frame {
             frame_type: FrameType::Data,
@@ -1759,25 +1830,33 @@ impl SessionChannel {
 
     /// 半关（FIN；final offset = 已发送水位——恢复轮可重发）。
     pub async fn finish(&self, stream_id: u64) -> Result<(), FabricError> {
+        self.shared.ensure_send_stream(stream_id).await?;
         let final_offset = {
             let mut streams = self.shared.streams.lock().await;
-            let ctx = streams
-                .entry(stream_id)
-                .or_insert_with(|| StreamCtx::new(stream_id, self.shared.limits));
+            let ctx = streams.get_mut(&stream_id).expect("stream checked above");
             let f = ctx.journal.next_offset();
             ctx.final_sent = Some(f);
             f
         };
-        self.send_frame(&Frame {
-            frame_type: FrameType::Fin,
-            flags: frame::flags::END,
-            session_id: self.shared.session_id,
-            stream_id,
-            direction: self.shared.send_direction(),
-            byte_offset: final_offset,
-            payload: Bytes::new(),
-        })
-        .await
+        let result = self
+            .send_frame(&Frame {
+                frame_type: FrameType::Fin,
+                flags: frame::flags::END,
+                session_id: self.shared.session_id,
+                stream_id,
+                direction: self.shared.send_direction(),
+                byte_offset: final_offset,
+                payload: Bytes::new(),
+            })
+            .await;
+        if result.is_err() {
+            // FIN was only a local half-close declaration; make a failed send
+            // retryable rather than leaving the stream permanently reserved.
+            if let Some(ctx) = self.shared.streams.lock().await.get_mut(&stream_id) {
+                ctx.final_sent = None;
+            }
+        }
+        result
     }
 
     /// 开新逻辑流（OPEN 帧；幂等键供对端副作用归并）。
@@ -1815,16 +1894,21 @@ impl SessionChannel {
             .lock()
             .await
             .insert(stream_id, idem_key.to_string());
-        self.send_frame(&Frame {
-            frame_type: FrameType::Open,
-            flags: frame::flags::START,
-            session_id: self.shared.session_id,
-            stream_id,
-            direction: self.shared.send_direction(),
-            byte_offset: 0,
-            payload,
-        })
-        .await
+        let result = self
+            .send_frame(&Frame {
+                frame_type: FrameType::Open,
+                flags: frame::flags::START,
+                session_id: self.shared.session_id,
+                stream_id,
+                direction: self.shared.send_direction(),
+                byte_offset: 0,
+                payload,
+            })
+            .await;
+        if result.is_err() {
+            self.shared.rollback_send_open(stream_id).await;
+        }
+        result
     }
 
     pub async fn recv(&self, stream_id: u64) -> Result<Bytes, FabricError> {
@@ -2022,6 +2106,7 @@ impl Session {
         offset: u64,
         payload: Bytes,
     ) -> Result<(), FabricError> {
+        self.shared.ensure_send_stream(stream_id).await?;
         self.channel()
             .send_frame(&Frame {
                 frame_type: FrameType::Data,
@@ -2169,6 +2254,7 @@ struct RegistryState {
     /// terminal session 的撤销锚。新 sid 可复用该 peer；旧 sid 的 RESUME
     /// 明确返回 TOKEN_REVOKED，而不是把状态丢失误报 REQUEST_STATE_LOST。
     tombstones: HashMap<[u8; 16], SessionTombstone>,
+    tombstone_order: VecDeque<[u8; 16]>,
 }
 
 #[derive(Default)]
@@ -2185,6 +2271,33 @@ pub(crate) enum ResumeLookup {
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn insert_tombstone(state: &mut RegistryState, session_id: [u8; 16]) {
+        if state
+            .tombstones
+            .insert(session_id, SessionTombstone)
+            .is_some()
+        {
+            state.tombstone_order.retain(|sid| sid != &session_id);
+        }
+        state.tombstone_order.push_back(session_id);
+        while state.tombstone_order.len() > TOMBSTONE_CAP {
+            if let Some(evicted) = state.tombstone_order.pop_front() {
+                state.tombstones.remove(&evicted);
+            }
+        }
+    }
+
+    fn is_tombstoned(state: &mut RegistryState, session_id: &[u8; 16]) -> bool {
+        if !state.tombstones.contains_key(session_id) {
+            return false;
+        }
+        // A successful lookup refreshes recency so a recently retried revoked
+        // credential is less likely to lose its explicit TOKEN_REVOKED reason.
+        state.tombstone_order.retain(|sid| sid != session_id);
+        state.tombstone_order.push_back(*session_id);
+        true
     }
 
     fn reap_terminal(state: &mut RegistryState) {
@@ -2204,7 +2317,7 @@ impl SessionRegistry {
                 if state.peers.get(&entry.shared.peer_id) == Some(&sid) {
                     state.peers.remove(&entry.shared.peer_id);
                 }
-                state.tombstones.insert(sid, SessionTombstone);
+                Self::insert_tombstone(state, sid);
             }
         }
     }
@@ -2221,7 +2334,7 @@ impl SessionRegistry {
     ) -> InitAdmission {
         let mut state = self.inner.lock().await;
         Self::reap_terminal(&mut state);
-        if state.tombstones.contains_key(&session_id) {
+        if Self::is_tombstoned(&mut state, &session_id) {
             return InitAdmission::TokenRevoked;
         }
         if let Some(existing) = state.sessions.get(&session_id) {
@@ -2258,7 +2371,7 @@ impl SessionRegistry {
     ) -> InitAdmission {
         let mut state = self.inner.lock().await;
         Self::reap_terminal(&mut state);
-        if state.tombstones.contains_key(&session_id) {
+        if Self::is_tombstoned(&mut state, &session_id) {
             return InitAdmission::TokenRevoked;
         }
         if let Some(existing) = state.sessions.get(&session_id) {
@@ -2346,7 +2459,7 @@ impl SessionRegistry {
         // Explicit removal is still terminal: retain a revocation anchor so a
         // late INIT/RESUME for the superseded sid cannot recreate the ghost
         // session while a new sid for the same peer is admitted normally.
-        state.tombstones.insert(*session_id, SessionTombstone);
+        Self::insert_tombstone(&mut state, *session_id);
         if state.peers.get(&entry.shared.peer_id) == Some(session_id) {
             state.peers.remove(&entry.shared.peer_id);
         }
@@ -2367,7 +2480,7 @@ impl SessionRegistry {
         if let Some(entry) = state.sessions.get(session_id) {
             return ResumeLookup::Active(Arc::clone(&entry.shared));
         }
-        if state.tombstones.contains_key(session_id) {
+        if Self::is_tombstoned(&mut state, session_id) {
             ResumeLookup::Revoked
         } else {
             ResumeLookup::Missing
@@ -2439,6 +2552,9 @@ pub fn decode_session_init_ok(p: &[u8]) -> Option<([u8; 16], u64, u64)> {
     sid.copy_from_slice(&p[0..16]);
     let accepted_epoch = get_u64(p, 16)?;
     let generation = get_u64(p, 24)?;
+    if accepted_epoch == 0 || generation == 0 {
+        return None;
+    }
     Some((sid, accepted_epoch, generation))
 }
 
@@ -2932,14 +3048,14 @@ async fn open_session_attempt(
                     SessionError::Connect("SESSION_INIT_OK header sid mismatch".into()),
                 )));
             }
-            let Some((echo_sid, _accepted_epoch, _generation)) =
+            let Some((echo_sid, accepted_epoch, generation)) =
                 decode_session_init_ok(&resp.payload)
             else {
                 return Err(TryAgain::Definitive(FabricError::Session(
                     SessionError::Connect("malformed SESSION_INIT_OK".into()),
                 )));
             };
-            if echo_sid != session_id {
+            if echo_sid != session_id || accepted_epoch == 0 || generation == 0 {
                 return Err(TryAgain::Definitive(FabricError::Session(
                     SessionError::Connect("SESSION_INIT_OK sid mismatch".into()),
                 )));
@@ -3256,9 +3372,9 @@ async fn accept_session_init(
 }
 
 /// provider：RESUME_INIT → **原子裁决+轮换**（`try_rotate`——validate 与
-/// rotate 单临界区，P0-1）→ RESUME_OK → 摘要裁剪 journal → **先装通道
-/// （pump 并发排水）再后台重放**（P1-5：双向大 replay 不在握手路径上互等）
-/// → 重发 FIN → Active。
+/// rotate 单临界区，P0-1）→ 摘要裁剪 journal → **先装通道**（pump 并发
+/// 排水）→ 仅在安装成功后发送 RESUME_OK → 后台重放（P1-5：双向大 replay
+/// 不在握手路径上互等）→ 重发 FIN → Active。
 /// current/previous 均按精确 `(generation, token)` 匹配；同一 pending
 /// campaign 的重发走缓存，通道 owner 仍由 transition 串行收口。
 async fn accept_resume(
@@ -3377,28 +3493,25 @@ async fn accept_resume(
     // barrier 测试钩子（R3-1）：轮换完成、OK 未发/Active 未置位窗口——
     // 测试在此注入并发第二 RESUME 验证单胜与幂等（生产零开销）
     shared.resume_gate.wait().await;
-    transport
-        .send(&Frame {
-            frame_type: FrameType::ResumeOk,
-            flags: 0,
-            session_id: sid,
-            stream_id: 0,
-            direction: Direction::ProviderToClient,
-            byte_offset: 0,
-            payload: Bytes::from(encode_resume_ok_full(
-                &sid,
-                transport.epoch,
-                parsed.local_connection_epoch,
-                decision.result_generation,
-                &decision.result_token,
-                &shared.summaries().await,
-                0,
-            )),
-        })
-        .await
-        .map_err(map_transport_err)?;
     // 摘要裁剪：client 的 recv_ack = 本端 P→C 数据已被消费水位（commit point）
     shared.advance_journal_from_summary(&parsed.summaries).await;
+    let resume_ok = Frame {
+        frame_type: FrameType::ResumeOk,
+        flags: 0,
+        session_id: sid,
+        stream_id: 0,
+        direction: Direction::ProviderToClient,
+        byte_offset: 0,
+        payload: Bytes::from(encode_resume_ok_full(
+            &sid,
+            transport.epoch,
+            parsed.local_connection_epoch,
+            decision.result_generation,
+            &decision.result_token,
+            &shared.summaries().await,
+            0,
+        )),
+    };
     // P1-5：**先 split + 建通道（pump 立即排水对端重放/ACK）**，重放转后台
     // 任务经 channel 发送——恢复握手里不再有大数据量同步发送，与对端的
     // 反向重放并发进行（QUIC 流控互等死锁闭合）。
@@ -3418,6 +3531,20 @@ async fn accept_resume(
     )
     .await
     .ok_or_else(channel_superseded_err)?;
+    // Two-phase RESUME commit: the client must not observe RESUME_OK until the
+    // provider has installed the candidate channel. If installation failed,
+    // mk_session_with_expectation already half-closed the candidate transport;
+    // pending remains available for a same-nonce cached retry.
+    session
+        .channel()
+        .send_frame(&resume_ok)
+        .await
+        .map_err(|e| {
+            if shared.phase_sync() == SessionPhase::Active {
+                shared.set_phase_sync(SessionPhase::Recovering);
+            }
+            e
+        })?;
     {
         let replay_shared = Arc::clone(&shared);
         let replay_chan = session.channel();
@@ -3457,9 +3584,9 @@ async fn accept_resume(
             }
         });
     }
-    if !decision.cached {
-        shared.set_phase(SessionPhase::Active).await;
-    }
+    // Cached decisions are a successful second phase as well: once their
+    // candidate channel is installed and RESUME_OK is sent, provider is Active.
+    shared.complete_resume_install();
     Ok(session)
 }
 
@@ -3938,6 +4065,163 @@ mod tests {
         link.close().await;
     }
 
+    /// R6 P0/P1: an installation that times out while stopping the old channel
+    /// must not consume the pending decision. The same nonce can retry from
+    /// the cached decision after the old owner is gone, and only that completed
+    /// second phase makes the provider Active.
+    #[tokio::test]
+    async fn cached_resume_retries_after_stop_timeout_and_becomes_active() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA3u8; 16],
+            [0xB3u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        shared.set_stop_wait_timeout_for_test(std::time::Duration::from_millis(10));
+        shared.set_phase(SessionPhase::Recovering).await;
+
+        // Deliberately do not spawn this pump. It models a transport whose
+        // cancellation never reaches its receive task, exercising the actual
+        // stop-wait timeout branch in install_channel.
+        let (old_send, old_recv) = link.transport(1).await.into_split();
+        let old = shared
+            .install_channel(old_send, old_recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("old channel installs");
+        let first = shared
+            .decide_resume([7u8; 16], 1, &[0xB3u8; 16], [0xC3u8; 16])
+            .expect("first decision");
+        let (failed_send, failed_recv) = link.transport(2).await.into_split();
+        assert!(
+            shared
+                .install_channel(
+                    failed_send,
+                    failed_recv,
+                    InstallPolicy::Force,
+                    Some(first),
+                    None,
+                )
+                .await
+                .is_none(),
+            "stop timeout must reject the first candidate before RESUME_OK"
+        );
+        assert_eq!(shared.phase().await, SessionPhase::Recovering);
+
+        let cached = shared
+            .decide_resume([7u8; 16], 1, &[0xB3u8; 16], [0xD3u8; 16])
+            .expect("same nonce reuses pending decision");
+        assert!(cached.cached, "retry must use the cached result");
+        old.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+        old.stopped_notify.notify_waiters();
+
+        let (retry_send, retry_recv) = link.transport(3).await.into_split();
+        let retry = shared
+            .install_channel(
+                retry_send,
+                retry_recv,
+                InstallPolicy::IfVacant,
+                Some(cached),
+                None,
+            )
+            .await
+            .expect("cached retry installs after old channel is dead");
+        retry
+            .send_frame(&Frame {
+                frame_type: FrameType::ResumeOk,
+                flags: 0,
+                session_id: shared.session_id,
+                stream_id: 0,
+                direction: Direction::ProviderToClient,
+                byte_offset: 0,
+                payload: Bytes::new(),
+            })
+            .await
+            .expect("installed retry can send RESUME_OK");
+        shared.complete_resume_install();
+        assert_eq!(shared.phase().await, SessionPhase::Active);
+        assert_eq!(shared.debug_channel_owner(), 2, "retry owns new channel");
+
+        retry.request_stop();
+        link.close().await;
+    }
+
+    /// R6: a failed local OPEN must release the slot it reserved so subsequent
+    /// streams still get the full 128-stream budget.
+    #[tokio::test]
+    async fn failed_send_open_releases_reserved_stream_slot() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA4u8; 16],
+            [0xB4u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        for index in 0..(MAX_ACTIVE_STREAMS - 1) {
+            shared
+                .reserve_stream_slot(index as u64 * 2 + 1)
+                .await
+                .unwrap();
+        }
+        let (send, recv) = link.transport(1).await.into_split();
+        let channel = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        channel.request_stop();
+        assert!(
+            channel
+                .send_open(255, "failed-open", Bytes::from_static(b"{}"))
+                .await
+                .is_err(),
+            "stopped channel makes OPEN fail after reservation"
+        );
+        shared
+            .reserve_stream_slot(257)
+            .await
+            .expect("failed OPEN slot is reusable");
+        assert!(
+            !shared.stream_keys.lock().await.contains_key(&255),
+            "failed OPEN key registration rolls back"
+        );
+        link.close().await;
+    }
+
+    /// R6: DATA, explicit replay DATA, and FIN may not create a stream state
+    /// without an OPEN reservation.
+    #[tokio::test]
+    async fn send_paths_reject_unknown_stream_without_creating_state() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA5u8; 16],
+            [0xB5u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (send, recv) = link.transport(1).await.into_split();
+        let channel = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        assert!(channel
+            .send_data(99, Bytes::from_static(b"x"))
+            .await
+            .is_err());
+        assert!(channel.finish(99).await.is_err());
+        assert!(shared
+            .record_send(99, &Bytes::from_static(b"x"))
+            .await
+            .is_err());
+        assert!(
+            shared.streams.lock().await.is_empty(),
+            "unknown ids add no state"
+        );
+        link.close().await;
+    }
+
     /// P1-5 / R5：previous 清除后旧代凭据立即失效。
     #[test]
     fn token_window_clear_previous() {
@@ -3974,6 +4258,20 @@ mod tests {
         assert_eq!(parsed.summaries[1].final_sent, None);
         // 截断拒绝
         assert!(decode_resume_init(&p[..p.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn session_init_ok_rejects_zero_epoch_or_generation() {
+        let sid = [0xA6u8; 16];
+        assert!(decode_session_init_ok(&encode_session_init_ok(&sid, 1, 1)).is_some());
+        assert!(
+            decode_session_init_ok(&encode_session_init_ok(&sid, 0, 1)).is_none(),
+            "zero accepted epoch is malformed"
+        );
+        assert!(
+            decode_session_init_ok(&encode_session_init_ok(&sid, 1, 0)).is_none(),
+            "zero generation is malformed"
+        );
     }
 
     /// P1-6：36/37 字节 payload（token_len 域读取前置边界）不 panic、返回 None。
@@ -4030,6 +4328,8 @@ mod tests {
             l
         });
         let chunk = Bytes::from(vec![0u8; 32 * 1024]);
+        // R6-5：record_send 不再隐式建流——测试按生产序先预占（send_open 同路径）
+        shared.reserve_stream_slot(1).await.unwrap();
         assert!(shared.record_send(1, &chunk).await.is_ok());
         assert!(shared.record_send(1, &chunk).await.is_ok());
         assert_eq!(shared.journal_held_bytes(1).await, 64 * 1024);
@@ -4051,6 +4351,9 @@ mod tests {
             l
         });
         let half = Bytes::from(vec![0u8; 32 * 1024]);
+        for sid in [1u64, 3, 5] {
+            shared.reserve_stream_slot(sid).await.unwrap();
+        }
         shared.record_send(1, &half).await.unwrap();
         shared.record_send(3, &half).await.unwrap();
         // 64KiB 已满：新流（或既有流）1 字节即超 session 上限
@@ -4261,6 +4564,7 @@ mod tests {
             JournalLimits::default(),
         );
         let chunk = Bytes::from(vec![0xAB; 1024]);
+        sender.reserve_stream_slot(1).await.unwrap();
         let off = sender.record_send(1, &chunk).await.unwrap();
         assert_eq!(off, 0);
         // R3-4b：入站流先 OPEN 预占（未见流的 DATA 违规丢弃）
@@ -4308,6 +4612,7 @@ mod tests {
             JournalLimits::default(),
         );
         let chunk = Bytes::from(vec![0u8; 1000]);
+        shared.reserve_stream_slot(1).await.unwrap();
         shared.record_send(1, &chunk).await.unwrap();
         // 伪造：offset 超过 next_send_offset
         let forged = mk_ack([1u8; 16], 1, Direction::ClientToProvider, 999_999);
@@ -4530,6 +4835,37 @@ mod tests {
         ));
         assert!(reg.reusable_for_peer("peer-a").await.is_none());
         assert_eq!(shared.phase_sync(), SessionPhase::Dead);
+    }
+
+    /// R6: terminal-session churn is bounded. Once the LRU evicts the oldest
+    /// tombstone, a late RESUME falls through to Missing/REQUEST_STATE_LOST;
+    /// lookup never recreates a SessionShared from an evicted credential.
+    #[tokio::test]
+    async fn registry_tombstone_lru_evicts_to_missing_without_resurrection() {
+        let reg = SessionRegistry::new();
+        let limits = JournalLimits::default();
+        let first_sid = [0u8; 16];
+        for index in 0..=TOMBSTONE_CAP {
+            let mut sid = [0u8; 16];
+            sid[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let mut token = [0u8; 16];
+            token[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            let peer = format!("peer-{index}");
+            assert!(matches!(
+                reg.admit_init(sid, token, peer, limits).await,
+                InitAdmission::Admitted(_, true)
+            ));
+            reg.remove_if(&sid).await;
+        }
+        assert_eq!(reg.inner.lock().await.tombstones.len(), TOMBSTONE_CAP);
+        assert!(matches!(
+            reg.lookup_resume(&first_sid).await,
+            ResumeLookup::Missing
+        ));
+        assert!(
+            reg.get(&first_sid).await.is_none(),
+            "evicted credential lookup must not recreate a session"
+        );
     }
 
     #[tokio::test]
