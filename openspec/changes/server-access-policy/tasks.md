@@ -19,9 +19,17 @@
        `dwebr1.` 串格式、caps 位图（未知位拒绝）、≤1KiB 长度门与
        base64url 白名单；编码长度测试冻结（≈242B canonical+sig /
        ≈331 字符串）
-- [ ] 1.5 AccessControl 实现：on_connect 十步验证链（含 (fabric_id,issuer)
-       二元组、时间语义 now>=expires_at、CLOCK_SKEW 120s、TTL 上限
-       90d/180d）+ on_disconnect；open 模式走 AllowAll 快路径
+- [ ] 1.5 AccessControl 实现：on_connect 两段式验证链——L1 密码学
+       （C1-C7：格式/长度/字符集门、caps 保留位、Ed25519 验签、
+       server_id、时间三重校验 now>=expires_at + CLOCK_SKEW 120s +
+       TTL≤180d、recipient==握手 id）+ L2 StaticRegistryProvider
+       （(fabric_id,issuer) 二元组 + op 所需 caps 位）；on_disconnect；
+       open 模式走 AllowAll 快路径
+- [ ] 1.5b CallbackProvider（policy=callback）：webhook 客户端（Bearer
+       callback_token、超时硬上限 2s、fire-and-forget disconnect 事件）、
+       决策缓存（(endpoint_id, capability 哈希, event) 键、TTL≤60s）、
+       fail-closed（dweb/policy-unavailable）、reason 白名单（dweb/ 前缀，
+       非法替换 dweb/policy-denied）、callback 配置缺失启动 fail-fast
 - [ ] 1.6 rendezvous ACL：announce（caps 校验 + recipient==签名
        EndpointId 绑定）/ resolve（bearer-only，caps 校验）；open 模式
        现状路径零变化
@@ -31,9 +39,11 @@
        packages/server-binary 字段断言测试同步更新）
 - [ ] 1.9 集成测试：验证链矩阵（每个 deny reason 独立用例：no-capability/
        malformed/caps-unsupported/bad-signature/unknown-owner/wrong-server/
-       capability-expired 含等值边界与超 TTL/not-recipient/caps-missing-relay）、
-       open/restricted 行为对比、重启持久化、unregister 阻断新连接、
-       client_rx 限流正交性、QAD fail-fast
+       capability-expired 含等值边界与超 TTL/not-recipient/caps-missing-relay/
+       policy-unavailable）、callback provider 用例（allow/deny+自定义
+       reason/非法 reason 替换/超时 fail-closed/缓存 TTL/无票准入/
+       disconnect 事件）、open/restricted 行为对比、重启持久化、
+       unregister 阻断新连接、client_rx 限流正交性、QAD fail-fast
 
 ## Phase 2 — fabric/SDK capability 流通
 

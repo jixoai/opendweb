@@ -39,7 +39,7 @@ R2 P0-N1 修正）：
       Owner 名下的连接」是产品语义裁决，见 §0.1。
 ```
 
-### 0.1 R3 的产品语义裁决（设计推荐，待 Owner 最终确认）
+### 0.1 R3 的产品语义裁决（Owner 已确认）
 
 R1/R2 两轮 Codex 复核对"同 Owner 名下端点经 relay 互连"是否违反原始需求
 存在分歧，且该分歧**不是技术问题而是产品意图问题**，技术事实如下（两轮
@@ -55,22 +55,26 @@ R1/R2 两轮 Codex 复核对"同 Owner 名下端点经 relay 互连"是否违反
 
 由此只有两个自洽的产品语义可选：
 
-- **共享接入语义（本设计推荐，待 Owner 确认）**：授权单位是
+- **共享接入语义（Owner 2026-09-17 确认采纳）**：授权单位是
   "注册 Owner 签发的 capability"。Owner 名下端点（Owner 自身 + 其邀请的
   Visitor）共享本 Server 的 relay 接入资格，彼此可经 relay 互连。滥用
   边界 = A(S) 之外零可达（白嫖/冒充/为无关第三方中继全部阻断）；
   A(S) 内的资源消耗由 registry 移除（新连接即时拒）+ TTL + client_rx
-  限流 + Phase 3 per-owner 配额约束。
+  限流 + Phase 3 per-owner 配额约束。Owner 裁决原文意图：「我的目的只有
+  一个：当别人私有化部署了 OpenDWeb，我希望它只服务于自家的业务，而
+  不是被别人拿去滥用作为中继服务器，所以我需要有一个使用门槛。这个
+  使用门槛是可以动态配置的……围绕这套密钥系统去实现动态的授权：通过
+  自定义 hook/callback 来实现动态能力」——即：门槛 = Server 级准入；
+  动态性 = §8.5 的可插拔策略层（PolicyProvider + callback hook）。
 - **严格配对语义（否决）**：Visitor 仅可与 Owner 端点经 relay 通信。
   需要 fork iroh-relay 加 per-dst enforcement——成本高、偏离"纯调用
   上游"原则，且与 fabric 全连通模型（端侧本来允许 Visitor 互连直连）
   形成两层语义不一致。若未来产品确需，capability 已预留 peer_scope
   扩展位（§7.2），届时以独立 change 评估 fork。
 
-**裁决：本设计采用共享接入语义（推荐项；已向 Owner 提出裁决请求，
-最终确认前此条为设计推荐而非既成事实）。**若 Owner 否决，替代路径是
-严格配对语义 + vendored fork iroh-relay（成本见上），届时以独立 change
-重开。后续复核在 Owner 确认后不再将 R3 视为缺口。
+**裁决：Owner 已确认共享接入语义（2026-09-17）。**该裁决作为需求基线
+回写 requirements.md 注记，后续复核不再将 R3 视为缺口。严格配对语义
+（fork iroh-relay）路径封存；peer_scope 扩展位保留（§7.2）。
 
 R3 成立的支撑论证（保留备查）：
 
@@ -422,28 +426,42 @@ E1: relay 握手认证的 endpoint_id == iroh endpoint TLS id == fabric Endpoint
     其绑定手段见 §8.4（R1 P0-5 修复）。
 ```
 
-### 8.2 on_connect 验证链（fail-closed，按成本递增排序）
+### 8.2 on_connect 验证链（L1 密码学 + L2 策略两段式）
+
+> Owner 裁决（2026-09-17）要求"使用门槛动态可配置 + 自定义 hook/callback"。
+> 验证链相应拆为两段：**L1 本地密码学验证**（防伪造，恒定成本，不可插拔）
+> 与 **L2 准入策略决策**（门槛，可插拔 provider——静态 registry 或动态
+> callback hook，见 §8.5）。static policy 下两段合流后的行为与 R2 版
+> 十步链完全一致（向后一致）。
 
 ```
 ClientRequest { endpoint_id(已认证), auth_token() }
   │
-  1  token 缺失 ─────────────────────► DENY "dweb/no-capability"
-  2  长度门（≤1KiB）+ base64url 白名单► DENY "dweb/malformed-capability"
-  3  解析 dwebr1. + 字段形状校验 ────► DENY "dweb/malformed-capability"
-  4  caps 含未知保留位 ─────────────► DENY "dweb/caps-unsupported"
-  5  Ed25519 验签（issuer over 域分隔 canonical）► DENY "dweb/bad-signature"
-  6  (fabric_id, issuer) ∉ registry ─► DENY "dweb/unknown-owner"
-                                       （R1 P1：二元组匹配，防注册 root
-                                        为其它 fabric 签票）
-  7  server_id ≠ 本 ServerId ────────► DENY "dweb/wrong-server"
-  8  expires_at ≤ now（now >= expires_at 即拒，与 protocol.rs:770-774
-     语义一致）或 issued_at > now + CLOCK_SKEW（默认 120s）或
-     issued_at > expires_at 或 TTL > 180d（验证侧统一上限，无类别判定）
-     ────────────────────────────────► DENY "dweb/capability-expired"
-                                       （时间类失败统一此 reason，日志细分）
-  9  recipient ≠ endpoint_id ────────► DENY "dweb/not-recipient"  ← 防转借（E1）
-  10 caps 不含 RELAY ───────────────► DENY "dweb/caps-missing-relay"
+  ▼ L1 密码学验证（本地，无网络调用；出示了 capability 才执行）
+  ┌────────────────────────────────────────────────────────────────┐
+  │ C1 长度门（≤1KiB）+ base64url 白名单 ──► DENY "dweb/malformed-capability" │
+  │ C2 解析 dwebr1. + 字段形状校验 ────────► DENY "dweb/malformed-capability" │
+  │ C3 caps 含未知保留位 ─────────────────► DENY "dweb/caps-unsupported"     │
+  │ C4 Ed25519 验签（issuer over 域分隔）──► DENY "dweb/bad-signature"        │
+  │ C5 server_id ≠ 本 ServerId ───────────► DENY "dweb/wrong-server"          │
+  │ C6 时间三重校验：now >= expires_at 拒（同 protocol.rs:770-774 语义）      │
+  │    或 issued_at > now+120s 或 issued_at > expires_at 或 TTL > 180d        │
+  │    ──────────────────────────────────► DENY "dweb/capability-expired"    │
+  │ C7 recipient ≠ endpoint_id ───────────► DENY "dweb/not-recipient"（E1）  │
+  └────────────────────────────────────────────────────────────────┘
+  L1 全过 → AuthContext { endpoint_id, capability: Some(VerifiedCap), op }
+  token 缺失 → 跳过 L1 → AuthContext { capability: None, op }
   │
+  ▼ L2 策略决策（PolicyProvider::decide(AuthContext)，见 §8.5）
+  ┌────────────────────────────────────────────────────────────────┐
+  │ StaticRegistryProvider（默认）：                                 │
+  │   capability == None ──────────────────► DENY "dweb/no-capability"        │
+  │   (fabric_id, issuer) ∉ registry ──────► DENY "dweb/unknown-owner"        │
+  │   caps 不含 op 所需位（relay→RELAY 等）► DENY "dweb/caps-missing-relay"   │
+  │ CallbackProvider（policy=callback）：                            │
+  │   POST webhook（§8.5 协议）→ allow / deny(reason)              │
+  │   超时/失联/非法响应 ──────────────────► DENY "dweb/policy-unavailable"   │
+  └────────────────────────────────────────────────────────────────┘
   ▼ ALLOW（connection 注册；on_disconnect 释放计数）
 ```
 
@@ -499,6 +517,83 @@ HTTP 面没有 iroh 握手身份，E1 不可用。按操作的信息敏感度分
   future-work 可评估）。caps 要求 RDZ_RESOLVE。
 - open 模式：announce/resolve 维持现状（签名 announce / 匿名 resolve）。
 
+### 8.5 可插拔策略层：PolicyProvider 与动态 callback hook（Owner 2026-09-17 裁决）
+
+**动机**（Owner 原文）：私有化部署的 Server「只服务于自家的业务，而不是
+被别人拿去滥用」，且这个使用门槛要**动态可配置**——「围绕这套密钥系统
+去实现动态的授权：通过自定义 hook/callback 来实现动态能力」。
+
+**架构**：L2 决策点抽象为 provider trait，准入语义可插拔：
+
+```
+trait PolicyProvider: Send + Sync {
+    async fn decide(&self, ctx: AuthContext) -> Access;
+}
+AuthContext { endpoint_id（握手认证身份）,
+              capability: Option<VerifiedCap>（L1 已验签的票，含
+                fabric_id/issuer/caps/issued_at/expires_at 明文投影）,
+              op: RelayConnect | RdzAnnounce | RdzResolve }
+
+内置两个 provider：
+  StaticRegistryProvider（policy = "static"，默认）
+    · 语义 = R2 版十步链的 L2 部分（registry 二元组 + 所需 caps 位）
+    · 数据源：owners.jsonl（§11.2），支持文件重载
+  CallbackProvider（policy = "callback"）
+    · 数据源：外部 webhook（admin 的业务系统）——授权决策完全外部化、
+      动态化：实时授予/吊销/限流策略均由业务侧实现，Server 无需重启
+      或改配置文件
+```
+
+**CallbackProvider webhook 协议**（Server → admin 回调端点）：
+
+```
+POST {callback_url}
+Authorization: Bearer {callback_token}        # server→hook 方向鉴权
+Content-Type: application/json
+请求体（全部来自 L1 已验证事实，不含令牌原文/签名）：
+{
+  "event": "relay.connect",          # relay.connect | rendezvous.announce
+                                     # | rendezvous.resolve（预留扩展位）
+  "endpoint_id": "<z-base-32>",      # 握手认证身份
+  "capability": null | {             # L1 验签通过的结构化投影
+    "fabric_id": "<hex>", "issuer": "<z-base-32>",
+    "caps": ["relay", "rdz_announce"], "issued_at_ms": 0, "expires_at_ms": 0
+  },
+  "connection_id": "<opaque>"        # 关联 on_disconnect 生命周期事件
+}
+响应（HTTP 200，JSON）：
+  { "allow": true }
+  { "allow": false, "reason": "dweb/<custom>" }   # 自定义 reason 须 dweb/
+                                                  # 前缀；非法前缀替换为
+                                                  # dweb/policy-denied
+fail-closed 语义（恒定，不可配置为宽松）：
+  非 200 / 超时（callback_timeout_ms，默认 2000ms）/ 响应解析失败
+    → DENY "dweb/policy-unavailable"
+缓存（性能与动态性的折中）：
+  按 (endpoint_id, capability 内容哈希, event) 缓存决策结果；
+  TTL = min(响应携带 cache_ttl_s（可选）, callback_cache_ttl_ms 默认
+  30s / 上限 60s)；缓存内不重复回调；显式 deny 也缓存（防回调风暴）。
+```
+
+**设计边界**：
+
+1. **L1 不可绕过**：callback 只能决定"这张验签过的票/这个认证过的身份
+   是否被允许"，不能豁免密码学验证——伪造/转借/过期票在 L1 已死，
+   webhook 无法复活它们。密码学层与策略层职责严格分离。
+2. **callback 可以放行无票端点**（capability == None 交给 hook 裁决）：
+   这是刻意的动态能力——admin 的业务系统可基于 EndpointId 直接维护
+   准入名单（比如自家设备的 identity 注册表），capability 链成为可选
+   增强。是否允许无票准入由 admin 的 webhook 逻辑自决，Server 不预设。
+3. **webhook 属 admin 信任域**：callback_token 泄露 = 策略面泄露（不
+   影响密码学层）；建议 TLS 端点。挂载点在 restricted 模式内（open
+   模式无 L2 调用）。
+4. **生命周期联动**：on_disconnect 触发
+   `event: "relay.disconnect"`（fire-and-forget，不阻塞、不失败重试），
+   供业务侧维护在线状态/并发计数。
+5. **资源保护**：webhook 调用发生在 on_connect 关键路径上，超时上限
+   硬编码 ≤2s；缓存 TTL 收敛回调速率；连接注册在决策返回之后
+   （失败不占用 client 槽位）。
+
 ---
 
 ## 9. Visitor 反向滥用攻击路径分析（R1 复核后修订）
@@ -543,6 +638,18 @@ A10 QAD（iroh-relay ServerConfig.quic）旁路
     └› 实为地址发现服务（§2.4，R1 P1 正名），无 AccessControl。本 change
         spec 冻结：restricted 模式 MUST fail-fast 拒绝启用 QAD bind——
         理由是未授权地址探测/隐私泄漏面，而非转发旁路 ✅
+A11 callback webhook 面（policy=callback 时新增）
+    ├► 攻击者直连 webhook 端点伪造响应 ──► webhook 由 admin 鉴权
+    │   （Bearer callback_token）+ 部署于 admin 信任域（内网/TLS）✅
+    ├► webhook 不可达/超时拖垮接入 ──► fail-closed（dweb/policy-unavailable）
+    │   + 超时硬上限 2s + 决策缓存收敛回调速率 ✅
+    ├► webhook 成为 DoS 放大器（恶意连接风暴→回调风暴）──► 缓存 TTL
+    │   （含 deny 缓存）+ client_rx 限流前置 ✅
+    ├► 恶意/被入侵的 webhook 放行任意端点 ──▶ admin 信任域内风险，明示：
+    │   密码学层（L1）不受影响，伪造票仍被拒；被放行范围仅限"真实持有
+    │   自己身份私钥的端点" ⚠(admin 信任域，与 registry 文件同级)
+    └► response 注入恶意 reason ──► reason 白名单（dweb/ 前缀强制，
+        非法替换 dweb/policy-denied），无执行面 ✅
 ```
 
 ---
@@ -619,7 +726,15 @@ capability ≤ 90d、bootstrap ≤ invite expires（§7.3）
   CLI:   --access-mode <open|restricted>   --data-dir <path>
          --owners-file <path>              （dweb-server 新增，风格同 --gateway）
   env:   DWEB_ACCESS_MODE / DWEB_DATA_DIR / DWEB_OWNERS_FILE
-  config: [server.access] mode / owners_file / limits
+  config: [server.access]
+           mode = "open" | "restricted"
+           policy = "static" | "callback"          # L2 provider 选择，默认 static
+           owners_file = "…"                        # static policy 数据源
+           callback_url = "https://…"               # callback policy 必填
+           callback_token = "…"                     # Bearer（server→hook 鉴权）
+           callback_timeout_ms = 2000               # 硬上限 2000
+           callback_cache_ttl_ms = 30000            # 上限 60000
+           limits.client_rx = …                     # 透传 iroh-relay
 registry 载入：启动读全量 jsonl 归并活跃集合（只读快照 Arc 供验证链）；
   Phase 1 支持文件重载（SIGHUP/mtime），Phase 3 admin API。
 Limits（R1 P1 修正）：仅接线 iroh-relay 1.1.0 **已实现**的
@@ -858,7 +973,16 @@ payload 布局（全部整数大端 BE）：
 | P1 ×7 | fabric 二元组/时间语义/unregister/Limits/QAD/兼容措辞/wire 所有权/flag | 全部采纳（详见各节 R1 标注） | §8.2、§13、§11.2、§2.4、§14、§10、附录 A |
 | P2 ×2 | 引用精度/长度计算 | F3/F4 行号修正、caps 大小重算（当时数字有误，R2 表再次修正） | §1.1、§11.1 |
 
-### R2 复核（5.9/10）问题 → 处置对照
+### R2 复核后：Owner 裁决与需求扩展（2026-09-17）
+
+- **语义裁决**：共享接入语义获 Owner 确认（§0.1 定稿）——R1/R2 复核的
+  P0-1/P0-2/P0-N2 悬置项全部闭合。
+- **需求扩展（Owner 新输入）**：使用门槛须**动态可配置**，围绕密钥系统
+  经**自定义 hook/callback** 实现动态授权 → 新增 §8.5 可插拔策略层
+  （PolicyProvider：static registry / callback webhook），§8.2 验证链
+  重构为 L1（密码学，本地强制）+ L2（准入，可插拔）两段式，§9 新增
+  A11 webhook 攻击路径，§11.2 配置面扩展，spec 新增 callback
+  requirement。static policy 下行为与 R2 版完全一致（向后一致）。
 
 | 编号 | 问题 | 处置 | 落点 |
 |---|---|---|---|
@@ -871,3 +995,5 @@ payload 布局（全部整数大端 BE）：
 | P0-3 遗留 | OK2 端序/framing/上限未冻结 | 附录 A2 冻结 | 附录 A2 |
 | P0-4 遗留 | recipient 必填的 V1/V2 例外表述冲突 | 统一：V2 恒必填（与模式无关）、V1 维持现状 | §7.3、§9 A5、附录 A |
 | P2 遗留 | 长度 242B/331 字符错误；F6 引用错位 | 修正 210B/287 字符 + 域前缀 18B 说明；F6 引用精确化 | §11.1、F6 |
+
+（R2 复核表之后见上节"Owner 裁决与需求扩展"。）

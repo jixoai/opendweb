@@ -59,10 +59,14 @@ capability 令牌、relay/rendezvous 的授权执行点。且必须以"三个独
    caps 位图 | issued_at | expires_at`，域分隔 `dweb/relay-cap/v1`。经 iroh relay
    既有 auth_token 通道（Bearer/query）传递。签发最小化：Visitor 附发默认
    仅 RELAY 位，RDZ_* 由 Owner 显式勾选。
-5. **Relay 授权执行点**：实现 `AccessControl::on_connect` 十步验证链
-   （格式/长度门 → caps 保留位 → 验签 → **(fabric_id, issuer) 二元组** 查
-   registry → server_id → 时间校验（含时钟偏移容忍与 TTL 上限）→
-   recipient == 握手认证 EndpointId → caps 含 relay），任一失败即 deny
+5. **Relay 授权执行点（L1 密码学 + L2 可插拔策略两段式）**：
+   实现 `AccessControl::on_connect`——L1 本地密码学验证（格式/长度门 →
+   caps 保留位 → Ed25519 验签 → server_id → 时间三重校验 →
+   recipient == 握手认证 EndpointId；不可绕过、不可插拔）；L2 准入策略
+   经 PolicyProvider 可插拔——**static registry**（默认，(fabric_id,
+   issuer) 二元组 + 所需 caps 位）或 **callback hook**（Owner 2026-09-17
+   需求扩展：使用门槛动态可配置——webhook 由 admin 业务系统实时
+   授予/吊销/限流，fail-closed，决策缓存）。任一失败即 deny
    （结构化 `dweb/*` reason 回传客户端）。
 6. **Rendezvous ACL**：`restricted` 模式下 announce 要求 capability 且
    **recipient == announce 签名 EndpointId**（既有签名即 PoP，零成本绑定）；
