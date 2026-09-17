@@ -433,7 +433,16 @@ Visitor member:     REDEEM_OK2 附发（TTL 建议 ≤90d/硬上限 180d，绑 r
 1. **现有链路已覆盖续期的全部功能面**（无硬缺口）：
    - member capability 由 REDEEM_OK2 附发（TTL ≤90d、绑 redeemer），
      持久化于 `<data_dir>/relay.caps.json`（0600 原子写、按 url upsert、
-     Fabric::open 加载热注入——fabric.rs RELAY_CAPS_FILE 既有链路）；
+     Fabric::open 加载热注入——fabric.rs RELAY_CAPS_FILE 既有链路）。
+     **加载侧过期丢弃**（2026-09-18 云端走查实证加固，fabric.rs
+     `load_relay_caps`）：`now >= expires_at`（与 server L1 等值即拒同
+     语义）的条目在读取时直接丢弃、不再注入 RelayMap，文件在下次 store
+     的 read-merge-write 中惰性压实——残留过期票若在构造期注入，eager
+     relay 会话将持过期票握手被拒并进入 deny 退避，后续 join 的新
+     bootstrap 覆盖 RelayMap 也追不上退避窗口（回归：story_e2e S4 预置
+     过期 relay.caps.json，RED→GREEN 实证）。join_v2 同步加固：bootstrap
+     注入后清零 join 之前记录的 deny 形态 last_error，deadline 归因只
+     引用 join 窗口内的 deny；
    - root own capability 每次启动重签（`ensure_relay_capabilities()`，
      Ed25519 确定性幂等）——root 侧**不存在**续期问题；
    - 续期动作 = Owner 对成员重发 v2 invite（dweb2. 内嵌 bootstrap

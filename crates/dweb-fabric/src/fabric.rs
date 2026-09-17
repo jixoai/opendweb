@@ -408,7 +408,11 @@ fn relay_caps_path(data_dir: &std::path::Path) -> PathBuf {
 
 /// 读取持久化的 (url, capability) 列表；文件缺失 = 空（成员尚未兑换过）。
 /// capability 串形态在写入侧已校验（dwebr1. 良构），读取侧再验一次——
-/// 外部篡改/损坏按数据面错误上报，不静默吞掉。
+/// 外部篡改/损坏按数据面错误上报，不静默吞掉。已过期条目在读取侧丢弃
+/// （云端实证 2026-09-18：残留过期 member cap 在构造期注入 RelayMap，
+/// eager relay 会话以过期票握手被拒，后续 join 的 bootstrap 覆盖 map 也
+/// 追不上 deny 退避窗口——过期票对任何正确 server 都不可准入，加载侧
+/// 丢弃是确定性收敛；文件在下次 store 的 read-merge-write 中惰性压实）。
 fn load_relay_caps(data_dir: &std::path::Path) -> Result<Vec<(String, String)>, FabricError> {
     let path = relay_caps_path(data_dir);
     if !path.exists() {
@@ -438,11 +442,18 @@ fn load_relay_caps(data_dir: &std::path::Path) -> Result<Vec<(String, String)>, 
                 path: path.clone(),
                 reason: "corrupted (entry missing 'capability')".to_owned(),
             })?;
-        if crate::protocol::RelayCapV1::decode(cap).is_err() {
-            return Err(FabricError::RelayCapsStore {
-                path: path.clone(),
-                reason: format!("corrupted (entry capability is not a dwebr1. token for {url})"),
-            });
+        // 过期判定与 server 侧 L1 同语义（now >= expires_at 等值即拒）
+        match crate::protocol::RelayCapV1::decode(cap) {
+            Err(_) => {
+                return Err(FabricError::RelayCapsStore {
+                    path: path.clone(),
+                    reason: format!(
+                        "corrupted (entry capability is not a dwebr1. token for {url})"
+                    ),
+                });
+            }
+            Ok(decoded) if now_ms() >= decoded.expires_at => continue,
+            Ok(_) => {}
         }
         out.push((url.to_owned(), cap.to_owned()));
     }
@@ -2574,6 +2585,21 @@ impl Fabric {
         if let Some(map) = &self.inner.relay_map {
             inject_relay_tokens(map, &bootstrap);
         }
+        if !bootstrap.is_empty() {
+            // 新邀请语义：join 起点已用新 bootstrap 覆盖 RelayMap——构造期由
+            // 残留旧票握手记录的 deny 随之作废，清零避免 deadline 归因引用
+            // join 之前的 deny（云端实证：过期 member cap 的构造期 deny 让
+            // join 超时被误归因为 capability-expired；deny 只在 join 窗口内
+            // 由 watcher 重新记录，非 deny 形态的 last_error 不受影响）。
+            let mut snap = self.inner.relay_snapshot.lock().unwrap();
+            if snap
+                .last_error
+                .as_deref()
+                .is_some_and(|e| extract_deny_reason(e).is_some())
+            {
+                snap.last_error = None;
+            }
+        }
         // c1 同款：本地 relay 配置追加为拨号候选
         let addr = Self::with_local_relay_candidates(
             session::endpoint_addr_from_invite_v2(&token)?,
@@ -3732,14 +3758,17 @@ mod tests {
             load_relay_caps(dir.path()).unwrap().is_empty(),
             "缺文件 = 空"
         );
+        // 时间基用真实墙钟（load 侧丢弃已过期条目——过期语义由
+        // load_relay_caps_drops_expired_and_store_compacts 单独覆盖）
+        let now = now_ms();
         let t1 = crate::protocol::RelayCapV1::sign_and_encode(
             NodeIdentity::from_seed([1; 32]).secret_key(),
             &crate::protocol::FabricId::from_name("f"),
             &[2; 32],
             &NodeIdentity::from_seed([3; 32]).endpoint_id(),
             crate::protocol::MEMBER_CAPS,
-            1000,
-            1000 + 60_000,
+            now,
+            now + 60_000,
         )
         .unwrap();
         let t2 = crate::protocol::RelayCapV1::sign_and_encode(
@@ -3748,8 +3777,8 @@ mod tests {
             &[2; 32],
             &NodeIdentity::from_seed([3; 32]).endpoint_id(),
             crate::protocol::MEMBER_CAPS,
-            2000,
-            2000 + 60_000,
+            now + 1_000,
+            now + 61_000,
         )
         .unwrap();
         // 初始落盘 + 新 url 追加 + 同 url 覆盖
@@ -3831,6 +3860,71 @@ mod tests {
             .unwrap();
         assert!(plain.auth_token.is_none(), "空 token = 无凭证条目");
         assert_eq!(map.len(), 2, "不可解析 URL 跳过");
+    }
+
+    #[test]
+    fn load_relay_caps_drops_expired_and_store_compacts() {
+        // 云端实证回归：过期 member cap 残留在 relay.caps.json——加载侧必须
+        // 丢弃（构造期注入过期票 → eager relay 握手被拒 → join bootstrap
+        // 追不上 deny 退避）；良构未过期条目原样保留。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = NodeIdentity::from_seed([0xEE; 32]);
+        let fabric = crate::protocol::FabricId::from_name("caps-expiry");
+        let server = [0x5A; 32];
+        let now = now_ms();
+        let mint = |issued: u64, expires: u64| {
+            crate::protocol::RelayCapV1::sign_and_encode(
+                id.secret_key(),
+                &fabric,
+                &server,
+                &id.endpoint_id(),
+                crate::protocol::CAP_RELAY,
+                issued,
+                expires,
+            )
+            .expect("mint cap")
+        };
+        let expired = mint(now - 120_000, now - 60_000);
+        let valid = mint(now - 1_000, now + 600_000);
+        let path = dir.path().join(RELAY_CAPS_FILE);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!([
+                { "url": "http://127.0.0.1:9", "capability": expired },
+                { "url": "http://127.0.0.1:10", "capability": valid },
+            ]))
+            .unwrap(),
+        )
+        .expect("预置 caps 文件");
+        let loaded = load_relay_caps(dir.path()).expect("load");
+        assert_eq!(loaded.len(), 1, "过期条目丢弃、未过期保留: {loaded:?}");
+        assert_eq!(loaded[0].0, "http://127.0.0.1:10");
+        assert_eq!(loaded[0].1, valid);
+        // 等值边界与 server 侧 L1 同语义：now == expires_at 即过期
+        let boundary = mint(now - 1_000, now);
+        std::fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!([
+                { "url": "http://127.0.0.1:11", "capability": boundary },
+            ]))
+            .unwrap(),
+        )
+        .expect("预置边界 caps 文件");
+        assert!(
+            load_relay_caps(dir.path())
+                .expect("load boundary")
+                .is_empty(),
+            "now >= expires_at 等值即拒"
+        );
+        // 惰性压实：下次 store 的 read-merge-write 不再把过期条目写回
+        let fresh = mint(now, now + 300_000);
+        store_relay_caps(dir.path(), &[("http://127.0.0.1:10".to_owned(), fresh)]).expect("store");
+        let on_disk = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !on_disk.contains("127.0.0.1:11"),
+            "过期条目已压实: {on_disk}"
+        );
+        assert!(on_disk.contains("127.0.0.1:10"));
     }
 
     #[test]

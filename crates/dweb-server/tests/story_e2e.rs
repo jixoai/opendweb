@@ -451,6 +451,31 @@ async fn restricted_story_s1_to_s8() {
 
     // S4 Visitor B：attach → join（bootstrap 热注入 → restricted relay 拨号
     // → OK2 兑换 → member cap 持久化）
+    // 回归（云端实证 2026-09-18）：B 数据面残留上一次部署的过期 member
+    // capability——open 构造期注入 RelayMap 会让 eager relay 会话以过期票
+    // 握手被拒并进入 deny 退避，join 的 bootstrap 覆盖 map 也追不上退避
+    // 窗口。加载侧必须丢弃过期条目，新邀请 bootstrap 胜出。
+    {
+        let stale_now = now_ms();
+        let stale = RelayCapV1::sign_and_encode(
+            root_a.secret_key(),
+            &fabric_id,
+            &server_id,
+            &id_b,
+            dweb_fabric::protocol::CAP_RELAY,
+            stale_now - 120_000,
+            stale_now - 60_000,
+        )
+        .expect("铸过期 member cap（root 签、recipient=B，形态与 OK2 附发一致）");
+        std::fs::write(
+            dir_b.path().join("relay.caps.json"),
+            serde_json::to_string(&serde_json::json!([
+                { "url": relay_url_s, "capability": stale }
+            ]))
+            .unwrap(),
+        )
+        .expect("预置过期 member cap（模拟上次部署残留）");
+    }
     let b = Fabric::attach(
         story_cfg(&dir_b, &relay_url_s, None, seed_b),
         &hex::encode(fabric_id.as_bytes()),

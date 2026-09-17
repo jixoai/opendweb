@@ -173,6 +173,11 @@ callback 请求/响应协议与全部安全约束（超时 2s fail-closed、缓�
 - S2 上线失败 → owners.jsonl 的 fabric_id/root 与 prepare 输出一致？server.log 尾部有 deny reason
 - 想完全重来 → `scripts/sap-verify.sh --teardown-only && scripts/sap-verify.sh`
 - 云端日志 → `ssh gaubee-cloud 'tail -50 /tmp/opendweb-sap-verify/server.log'`
+- S4 join 报 `relay denied: dweb/capability-expired` 但新邀请刚签发 →
+  旧部署残留的过期 member capability（`<data_dir>/relay.caps.json`）。
+  2026-09-18 起加载侧自动丢弃过期条目（无需手工删除文件），过期票语义
+  与 server L1 一致（`now >= expires_at` 等值即拒）；文件在下次成功
+  join 落盘时惰性压实
 
 ## 相关文档
 

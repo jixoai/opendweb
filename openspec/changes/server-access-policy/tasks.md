@@ -178,3 +178,11 @@
        撤销入口语义分层表）+ 边界对照表补 3 行（admin 401/404、配额满、
        踢存量）+ 用例计数勘正（e2e 17 / 单测 140）；sap-verify.sh 云端
        部署附带 DWEB_ADMIN_TOKEN 演示值（admin curl 走查可用））
+- [x] 3.5 走查加固：残留过期 member capability 阻塞新邀请 join
+       （2026-09-18 云端 S4 实证：DialTimeout 误归因 capability-expired；
+       根因 = load_relay_caps 无过期过滤，构造期注入过期票 → eager relay
+       握手被拒 → deny 退避吃掉 join 窗口。修复 = 加载侧丢弃 now >=
+       expires_at 条目（与 server L1 同语义）+ join_v2 bootstrap 注入后
+       清零 join 前的 deny 记录；回归 = story_e2e S4 预置过期
+       relay.caps.json RED→GREEN + fabric 单测 load_relay_caps_drops_
+       expired_and_store_compacts；design §7.4 与 WALKTHROUGH 排查节同步）
