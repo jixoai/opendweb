@@ -24,17 +24,27 @@
 //!   `{op,fabric_id,root,ts,generation}` 的 Ed25519 签名，design §6.2 注册
 //!   回执可审计；响应自带全部被签字段，可对 services.json 公布的 ServerId
 //!   独立验签）
-//! - `DELETE /admin/owners/{fabric_id}/{root}` → 注销（同上，回执同构）
+//! - `DELETE /admin/owners/{fabric_id}/{root}` → 注销（同上，回执同构；
+//!   **task 3.2b 踢存量**：unregister 后对 gate 在线表反查该 fabric 名下
+//!   全部 endpoint，逐个 `Clients::disconnect(ep, None)`（iroh-relay
+//!   1.1.0 公开 API，异步 start_shutdown → OnDisconnectGuard drop → 配额
+//!   自动释放），响应附 `kicked_endpoints`/`kicked_connections` 计数）
 //! - `GET /admin/status` → `{mode, policy, generation,
 //!   max_connections_per_owner, active_connections（per endpoint 票接入
 //!   在线表，task 3.2）, per_owner_connections, cache_entries}`
+//!
+//! **断连语义边界（design §13 勘定）**：admin API 的 DELETE 是 admin 动作
+//! 的即时全灭（存量连接一并断开）；文件热重载路径（CLI owners unregister
+//! → mtime 看护 reload）**不踢存量**——维持 Phase 1 冻结的「新连接即时拒、
+//! 存量靠 TTL/重连收敛」语义。两条撤销入口的差异在此显式声明，不视为
+//! 不一致：API 是运维面强操作，文件是声明面最终一致。
 //!
 //! 热加载路径保留：owners.jsonl 仍是 source of truth——API 只经 registry
 //! 写入，mtime 看护随后的一次 reload 只会再 +1 generation（缓存键随
 //! generation 变化，正确性无损；admin 信任域内的冗余事件被日志吸收）。
 
 use crate::access::config::AccessMode;
-use crate::access::gate::AccessGate;
+use crate::access::gate::{AccessGate, OnlineView};
 use crate::access::identity::ServerIdentity;
 use crate::access::registry::{OwnerRegistry, parse_owner_hex};
 use axum::{
@@ -47,6 +57,8 @@ use axum::{
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use iroh_base::EndpointId;
+use iroh_relay::server::clients::Clients;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -58,24 +70,30 @@ const OP_UNREGISTER: u8 = 0x02;
 
 /// admin API 共享状态（main 在 DWEB_ADMIN_TOKEN 存在时构造并挂载）。
 /// `gate` = relay gate（restricted 模式；open 模式 None——无验证链即无
-/// 在线统计，status 如实投影为空集合）。
+/// 在线统计，status 如实投影为空集合）。`relay_clients` = iroh-relay
+/// 在线连接表句柄（task 3.2b 踢存量用；`Server::relay_service()` →
+/// `RelayService::clients()` 的 clone——relay 未启用时 None，此时
+/// unregister 仍即时阻断新连接，仅无法主动断存量）。
 #[derive(Clone)]
 pub struct AdminState {
     token: String,
     identity: Arc<ServerIdentity>,
     registry: Arc<OwnerRegistry>,
     gate: Option<Arc<AccessGate>>,
+    relay_clients: Option<Clients>,
     mode: AccessMode,
     policy: &'static str,
 }
 
 impl AdminState {
-    /// 构造（`policy` 取 "static"|"callback"，与启动日志同源标签）
+    /// 构造（`policy` 取 "static"|"callback"，与启动日志同源标签；
+    /// `relay_clients` 见结构体注释）
     pub fn new(
         token: String,
         identity: Arc<ServerIdentity>,
         registry: Arc<OwnerRegistry>,
         gate: Option<Arc<AccessGate>>,
+        relay_clients: Option<Clients>,
         mode: AccessMode,
         policy: &'static str,
     ) -> Self {
@@ -84,6 +102,7 @@ impl AdminState {
             identity,
             registry,
             gate,
+            relay_clients,
             mode,
             policy,
         }
@@ -198,7 +217,9 @@ struct RegisterOwnerBody {
 }
 
 /// 注册回执（全部被签字段随响应返回——客户端可对 services.json 的
-/// ServerId 独立验证 receipt_sig，无需其它带外信息）
+/// ServerId 独立验证 receipt_sig，无需其它带外信息）。
+/// `kicked_*` 仅 unregister 响应携带（task 3.2b 踢存量计数；register /
+/// open 模式 / relay 未启用时缺省不出现）。
 #[derive(Serialize)]
 struct Receipt {
     op: &'static str,
@@ -208,6 +229,13 @@ struct Receipt {
     generation: u64,
     /// base64url-nopad(64B)（Ed25519 over RECEIPT_DOMAIN || canonical）
     receipt_sig: String,
+    /// disconnect 命中并已下发 start_shutdown 的 endpoint 数
+    /// （unregister only；relay 在线表反查 × Clients::disconnect 返回 true）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kicked_endpoints: Option<usize>,
+    /// 被踢 endpoint 在线表视角的连接总数（unregister only）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kicked_connections: Option<usize>,
 }
 
 async fn register_owner(
@@ -231,9 +259,10 @@ async fn unregister_owner(
     apply_mutation(&state, OP_UNREGISTER, "unregister", fabric_id, root).map(Json)
 }
 
-/// 注册/注销共通：registry 变更 → callback 缓存失效 → 回执签名。
-/// registry 写入（jsonl append + fsync + 快照替换 + generation+1）全部由
-/// OwnerRegistry::mutate 承担——CLI / 文件重载 / admin API 三入口收敛。
+/// 注册/注销共通：registry 变更 → callback 缓存失效 → （注销）踢存量 →
+/// 回执签名。registry 写入（jsonl append + fsync + 快照替换 + generation+1）
+/// 全部由 OwnerRegistry::mutate 承担——CLI / 文件重载 / admin API 三入口
+/// 收敛。
 fn apply_mutation(
     state: &AdminState,
     op_code: u8,
@@ -251,6 +280,15 @@ fn apply_mutation(
     if let Some(gate) = &state.gate {
         gate.invalidate_callback_cache();
     }
+    // task 3.2b：注销即时踢存量（admin 动作的全灭语义；热重载路径不踢，
+    // 见模块注释）。先于快照读取——unregister 已把 owner 移出活跃集合，
+    // 但在线表只按 fabric 归属，不受 registry 快照影响。
+    let kicked = if op_code == OP_UNREGISTER {
+        let (endpoints, connections) = kick_existing_connections(state, &fabric_id);
+        (Some(endpoints), Some(connections))
+    } else {
+        (None, None)
+    };
     let generation = state.registry.snapshot().generation();
     let ts = now_ms();
     let sig = state.identity.sign(&receipt_canonical(
@@ -259,6 +297,8 @@ fn apply_mutation(
     tracing::info!(
         op = op_label,
         generation,
+        kicked_endpoints = kicked.0.unwrap_or(0),
+        kicked_connections = kicked.1.unwrap_or(0),
         "admin API: owner {} (fabric {}, root {})",
         op_label,
         hex::encode(fabric_id),
@@ -271,7 +311,50 @@ fn apply_mutation(
         ts,
         generation,
         receipt_sig: URL_SAFE_NO_PAD.encode(sig),
+        kicked_endpoints: kicked.0,
+        kicked_connections: kicked.1,
     })
+}
+
+/// 踢存量连接（task 3.2b，design §13 Phase3-A 评估结论的落地）：在线表
+/// 反查 fabric 名下全部 endpoint → 逐个 `Clients::disconnect(ep, None)`
+/// （iroh-relay 异步 start_shutdown；OnDisconnectGuard drop 触发 gate
+/// on_disconnect → per-owner 配额自动释放）。返回
+/// (disconnect 命中的 endpoint 数, 在线表视角被踢连接数)。
+///
+/// 粒度勘定：在线表按 fabric_id 归属（与 per-owner 配额同一维度）——同一
+/// fabric 注册了多个 root 时（非常规形态），注销其一也会全踢该 fabric
+/// 的存量；配额语义与此一致，不引入第二粒度。
+/// open 模式（gate None）/ relay 未启用（clients None）：零踢除、零副作用
+/// ——unregister 的「新连接即时拒」仍由 registry 快照保证。
+fn kick_existing_connections(state: &AdminState, fabric_id: &[u8; 32]) -> (usize, usize) {
+    let (Some(gate), Some(clients)) = (&state.gate, &state.relay_clients) else {
+        return (0, 0);
+    };
+    let mut kicked_endpoints = 0usize;
+    let mut kicked_connections = 0usize;
+    for endpoint in endpoints_of_fabric(&gate.online_view(), fabric_id) {
+        // 在线表条目源自握手认证身份（合法曲线点）；防御性跳过构造失败
+        let Ok(endpoint_id) = EndpointId::from_bytes(&endpoint.0) else {
+            continue;
+        };
+        // disconnect(ep, None)：该 endpoint 的全部连接（active+inactive）
+        if clients.disconnect(endpoint_id, None) {
+            kicked_endpoints += 1;
+            kicked_connections += endpoint.1;
+        }
+    }
+    (kicked_endpoints, kicked_connections)
+}
+
+/// 在线表反查（task 3.2b）：fabric 名下 (endpoint_id, connections) 清单
+/// （踢存量与 kicked 计数的公共映射层；单测在此层冻结）
+fn endpoints_of_fabric(view: &OnlineView, fabric_id: &[u8; 32]) -> Vec<([u8; 32], usize)> {
+    view.per_endpoint
+        .iter()
+        .filter(|e| e.fabric_id == *fabric_id)
+        .map(|e| (e.endpoint_id, e.connections))
+        .collect()
 }
 
 /// 回执 canonical（design §6.2 {op,fabric_id,root,ts,generation}；全大端）：
@@ -418,11 +501,22 @@ mod tests {
         }
 
         fn state(&self, gate: Option<Arc<AccessGate>>) -> AdminState {
+            self.state_with_relay(gate, None)
+        }
+
+        /// task 3.2b：可注入 iroh-relay Clients 句柄（None = relay 未启用
+        /// 形态；单测用 Clients::default() 模拟空在线连接表）
+        fn state_with_relay(
+            &self,
+            gate: Option<Arc<AccessGate>>,
+            relay_clients: Option<Clients>,
+        ) -> AdminState {
             AdminState {
                 token: TOKEN.to_string(),
                 identity: Arc::clone(&self.identity),
                 registry: Arc::clone(&self.registry),
                 gate,
+                relay_clients,
                 mode: AccessMode::Restricted,
                 policy: "static",
             }
@@ -526,6 +620,9 @@ mod tests {
         let ts = receipt["ts"].as_u64().unwrap();
         let generation = receipt["generation"].as_u64().unwrap();
         assert!(generation >= 1);
+        // register 回执不携带 kicked 字段（serde skip——wire 形态冻结）
+        assert!(receipt.get("kicked_endpoints").is_none());
+        assert!(receipt.get("kicked_connections").is_none());
 
         // 回执可验证：services.json 同源 ServerId 对 canonical 验签
         let sig_b64 = receipt["receipt_sig"].as_str().unwrap();
@@ -565,7 +662,8 @@ mod tests {
         let reloaded = OwnerRegistry::load(&path).unwrap();
         assert!(reloaded.snapshot().contains(&fabric, &root));
 
-        // 注销 → 列表空 + 回执同构可验
+        // 注销 → 列表空 + 回执同构可验 + kicked 字段恒在（open/无 relay
+        // 形态零踢除——字段存在性即 task 3.2b wire 形态断言）
         let res = app
             .clone()
             .oneshot(
@@ -583,6 +681,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let receipt = body_json(res).await;
         assert_eq!(receipt["op"], "unregister");
+        assert_eq!(receipt["kicked_endpoints"], 0);
+        assert_eq!(receipt["kicked_connections"], 0);
         let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
             .decode(receipt["receipt_sig"].as_str().unwrap())
             .unwrap()
@@ -713,5 +813,170 @@ mod tests {
         let body = body_json(res).await;
         assert_eq!(body["active_connections"].as_array().unwrap().len(), 0);
         assert_eq!(body["per_owner_connections"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- task 3.2b：unregister 踢存量（反查映射 + kicked 计数）----
+
+    /// 在线表登记一条票接入（同 gate decide 全链：L1/L1b/配额预约）。
+    /// recipient 必须是真实曲线点（kick 侧 EndpointId::from_bytes 会校验）
+    async fn occupy(gate: &AccessGate, f: &Fixture, seed: u8, connection_id: u64) -> [u8; 32] {
+        let recipient = *iroh_base::SecretKey::from_bytes(&[seed; 32])
+            .public()
+            .as_bytes();
+        let now = test_now_ms();
+        let token = sign_and_encode(
+            &f.issuer,
+            &f.fabric_id,
+            &f.server_id,
+            &recipient,
+            CAP_RELAY,
+            now,
+            now + 3_600_000,
+        );
+        let input = GateInput {
+            endpoint_id: recipient,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id,
+            op: Op::RelayConnect,
+        };
+        assert_eq!(
+            gate.decide(&input).await,
+            GateDecision::Allow,
+            "occupy 前置失败"
+        );
+        recipient
+    }
+
+    /// 反查映射（endpoints_of_fabric）：fabric 维度精确圈定 + 同 endpoint
+    /// 多连接聚合——这是踢存量与 kicked 计数的公共映射层
+    #[tokio::test]
+    async fn kick_reverse_lookup_maps_fabric_to_endpoints() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        // 第二 fabric 的 owner（映射隔离对照）
+        let issuer2 = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let fabric2 = [0x72; 32];
+        f.registry
+            .register(&fabric2, &issuer2.verifying_key().to_bytes())
+            .unwrap();
+        let gate = AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static).unwrap();
+
+        let ep1 = occupy(&gate, &f, 0xB1, 1).await;
+        occupy(&gate, &f, 0xB1, 2).await; // 同 endpoint 第二条连接
+        let ep2 = occupy(&gate, &f, 0xB2, 3).await;
+        // fabric2 的一条连接（不应出现在 fabric1 的反查结果里）
+        let now = test_now_ms();
+        let token2 = sign_and_encode(
+            &issuer2,
+            &fabric2,
+            &f.server_id,
+            &[0xB3; 32],
+            CAP_RELAY,
+            now,
+            now + 3_600_000,
+        );
+        let input2 = GateInput {
+            endpoint_id: [0xB3; 32],
+            auth_header: Some(format!("Bearer {token2}")),
+            query_token: None,
+            connection_id: 4,
+            op: Op::RelayConnect,
+        };
+        assert_eq!(gate.decide(&input2).await, GateDecision::Allow);
+
+        let mut hits = endpoints_of_fabric(&gate.online_view(), &f.fabric_id);
+        hits.sort();
+        assert_eq!(
+            hits,
+            vec![(ep1, 2), (ep2, 1)],
+            "fabric 反查：两个 endpoint（连接数聚合），fabric2 不混入"
+        );
+        // 未知 fabric → 空集
+        assert!(endpoints_of_fabric(&gate.online_view(), &[0x99; 32]).is_empty());
+    }
+
+    /// kicked 计数语义：Clients 表 miss（空句柄——单测无法构造真连接，
+    /// 用 Clients::default() 的空注册表模拟）时 disconnect 返回 false →
+    /// kicked 0/0（诚实计数，不把「已定位」谎报为「已踢」）；在线表不受
+    /// 假踢影响。gate/clients 任一缺失（open 模式 / relay 未启用）同样
+    /// 零副作用零 panic。真实命中路径由 e2e e16 黑盒钉死。
+    #[tokio::test]
+    async fn kick_counts_stay_honest_when_disconnect_misses() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static).unwrap(),
+        );
+        occupy(&gate, &f, 0xC1, 1).await;
+        occupy(&gate, &f, 0xC2, 2).await;
+        let view_before = gate.online_view();
+
+        // 空在线连接表（relay 侧无此 endpoint）→ kicked 0/0，在线表不变
+        let app = router(f.state_with_relay(Some(Arc::clone(&gate)), Some(Clients::default())));
+        let res = app
+            .oneshot(
+                Request::delete(format!(
+                    "/admin/owners/{}/{}",
+                    hex::encode(f.fabric_id),
+                    hex::encode(f.issuer_key())
+                ))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["op"], "unregister");
+        assert_eq!(receipt["kicked_endpoints"], 0, "disconnect miss 不计数");
+        assert_eq!(receipt["kicked_connections"], 0);
+        assert_eq!(
+            gate.online_view().per_endpoint.len(),
+            view_before.per_endpoint.len(),
+            "假踢不动在线表（释放只来自真 relay 断连）"
+        );
+
+        // re-register 后：clients None（relay 未启用形态）→ 同样 0/0 零副作用
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let app = router(f.state_with_relay(Some(Arc::clone(&gate)), None));
+        let res = app
+            .oneshot(
+                Request::delete(format!(
+                    "/admin/owners/{}/{}",
+                    hex::encode(f.fabric_id),
+                    hex::encode(f.issuer_key())
+                ))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["kicked_endpoints"], 0);
+        assert_eq!(receipt["kicked_connections"], 0);
+
+        // 对照：gate None（open 模式形态）不 panic、响应同构
+        let app = router(f.state_with_relay(None, Some(Clients::default())));
+        let res = app
+            .oneshot(
+                Request::delete(format!(
+                    "/admin/owners/{}/{}",
+                    hex::encode(f.fabric_id),
+                    hex::encode(f.issuer_key())
+                ))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["kicked_endpoints"], 0);
+        assert_eq!(receipt["kicked_connections"], 0);
     }
 }

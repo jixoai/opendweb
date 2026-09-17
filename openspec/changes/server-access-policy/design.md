@@ -915,15 +915,24 @@ SDK 配置面             RelayOptions 可选新字段                          
   - resolve bearer-only（A2'）：信息敏感度低 + 已比现状（完全匿名）严格
   - A3' 同 Owner 成员互连：§0 R3 语义裁决（fabric 全连通投影，非滥用）
   - A8 visitor 级撤销窗口 = TTL（Non-goal，明示）
-  - registry 移除 Owner 的存量连接：on_connect 只拦新连接，存量连接
-    保持至自然断开/重连（R1 P1 诚实化：Phase 1 语义为"新连接即时拒绝
-    + 存量靠 TTL/重连收敛"；主动断连钩子 Phase 3 评估——iroh-relay
-    Server 有 Clients 表，工程上可及，但非本 change 承诺。
+  - registry 移除 Owner 的存量连接：on_connect 只拦新连接；存量连接的
+    处置按撤销入口分裂（Phase3-B 勘定，2026-09-18）——
+    · **admin API DELETE /admin/owners**：即时全灭——unregister 后
+      gate 在线表反查该 fabric 名下全部 endpoint，逐个
+      `Clients::disconnect(ep, None)`（iroh-relay 公开 API，异步
+      start_shutdown → OnDisconnectGuard drop → per-owner 配额自动
+      释放），响应附 kicked_endpoints/kicked_connections 计数
+      （e2e e16 钉死）；
+    · **文件热重载路径**（CLI owners unregister → mtime 看护 reload）：
+      不踢存量——维持 Phase 1 冻结的「新连接即时拒 + 存量靠 TTL/重连
+      收敛」语义（e2e e8）。两条入口的差异是刻意的语义分层：API 是
+      运维面强操作，文件是声明面最终一致。
     Phase 3 评估结论〔2026-09-18，Phase3-A 实证〕：**可及且零 fork**——
     公开 API 链 `Server::relay_service()` → `RelayService::clients()` →
     `Clients::disconnect(endpoint_id, connection_id: Option)`（iroh-relay
     1.1.0 server.rs:261 / http_server.rs:949-955〔文档明示运行期踢连接〕/
-    clients.rs:181-207〔异步 start_shutdown〕）；实现列入下一棒 3.2b）
+    clients.rs:181-207〔异步 start_shutdown〕）；Phase3-B 已实现
+    （admin.rs kick_existing_connections）
   - 直连流量不经 Server，relay ACL 不适用（由 Q2/Q3 端侧门控守护）
 
 资源保护（DoS 面）

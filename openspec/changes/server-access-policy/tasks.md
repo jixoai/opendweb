@@ -143,7 +143,15 @@
         → Clients::disconnect(endpoint_id, connection_id: Option)（http_
         server.rs:949-955 文档明示运行期踢连接用途；clients.rs:181-207
         异步 start_shutdown），unregister 踢存量可零 fork 实现，列入
-        下一棒 3.2b；本棒按任务定义仅交付评估结论）
+        下一棒 3.2b；本棒按任务定义仅交付评估结论。
+        Phase3-B 实现（task 3.2b 落地）：main 在 relay::start 后取
+        relay_service().clients() clone 注入 AdminState；admin DELETE
+        /admin/owners 在 unregister 后 gate.online_view() 反查该 fabric
+        全部 endpoint，逐个 Clients::disconnect(ep, None)（异步
+        start_shutdown → OnDisconnectGuard drop → 配额自动释放），响应附
+        kicked_endpoints/kicked_connections；语义边界——admin API 注销是
+        即时全灭，文件热重载路径不踢存量（§13 勘定）；e2e e16 钉死
+        kicked 计数 + 在线表清零 + 同票 deny 全链）
 - [ ] 3.3 member capability 续期协议化评估（RENEW 消息 vs regular 会话
        重发的 MVP 语义固化）；`peer_scope` capability 扩展评估
 - [ ] 3.4 多平台矩阵（darwin-arm64/windows-x64）与 Docker/compose

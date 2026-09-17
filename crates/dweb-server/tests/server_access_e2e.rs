@@ -29,6 +29,10 @@
 //!   401/404 鉴权与未挂载面
 //! - e15 per-owner 连接配额：配额满新连接 deny（dweb/owner-quota-exceeded
 //!   经握手回传）+ 断连名额恢复 + /admin/status 在线投影
+//! - e16 admin unregister 踢存量（task 3.2b）：配额内多连接在线 →
+//!   DELETE /admin/owners → kicked 计数 + relay 在线表清零（OnDisconnectGuard
+//!   随真断连触发，配额自动释放）+ 同票新连接 unknown-owner（对照：文件
+//!   热重载路径不踢存量——e8）
 //!
 //! 进程纪律：Server guard Drop 恒 kill+wait（防孤儿 dweb-server——全局
 //! 规则：测试泄漏常驻进程是重大事故）；网络测试以 --gateway/--relay
@@ -1217,6 +1221,102 @@ async fn e15_owner_connection_quota_denies_and_restores() {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+// ---------- e16：admin unregister 踢存量连接（task 3.2b） ----------
+
+/// e2e 断言要点：
+/// 1. kicked 计数真实反映 relay 在线表反查（2 endpoint × 各 1 连接）
+/// 2. Clients::disconnect 的 start_shutdown 异步落地——OnDisconnectGuard
+///    drop 触发 gate on_disconnect，在线表/配额清零（poll /admin/status）
+/// 3. API 注销即时生效：同票新连接与被踢 endpoint 重连均 unknown-owner
+///    （无 e8 的 mtime 热重载等待窗口；对照语义：文件路径不踢存量）
+#[tokio::test]
+async fn e16_admin_unregister_kicks_existing_connections() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xE3);
+    owner.register(dir.path());
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "4"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 配额内多连接在线（两个全量 endpoint，各持 relay 常驻连接）
+    let a = SecretKey::generate();
+    let token_a = owner.token_for(&server_id, &a.public(), CAP_RELAY);
+    let ep_a = iroh_endpoint(relay, a, Some(token_a)).await;
+    await_online(&ep_a).await;
+    let b = SecretKey::generate();
+    let token_b = owner.token_for(&server_id, &b.public(), CAP_RELAY);
+    let ep_b = iroh_endpoint(relay, b.clone(), Some(token_b.clone())).await;
+    await_online(&ep_b).await;
+
+    // 前置：在线表 = 2 endpoints / 2 connections（同 owner 聚合）
+    let auth = ("authorization", "Bearer e2e-admin-token");
+    let (status, body) = http_request(server.gateway, "/admin/status", "GET", None, &[auth]).await;
+    assert_eq!(status, 200);
+    let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["active_connections"].as_array().unwrap().len(), 2);
+    assert_eq!(st["per_owner_connections"][0]["connections"], 2);
+
+    // DELETE owner → kicked 计数 + 回执同构
+    let (status, body) = http_request(
+        server.gateway,
+        &format!(
+            "/admin/owners/{}/{}",
+            hex::encode(owner.fabric_id),
+            hex::encode(owner.issuer.verifying_key().to_bytes())
+        ),
+        "DELETE",
+        None,
+        &[auth],
+    )
+    .await;
+    assert_eq!(status, 200, "admin unregister: {body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt["op"], "unregister");
+    assert_eq!(
+        receipt["kicked_endpoints"], 2,
+        "两个 endpoint 均被命中: {body}"
+    );
+    assert_eq!(receipt["kicked_connections"], 2);
+
+    // 存量连接断开落地：在线表清零（disconnect 异步 start_shutdown →
+    // 连接 actor 退出 → OnDisconnectGuard drop → on_disconnect 释放配额；
+    // poll 上限 15s——iroh-relay 断连传播时延与 e15 同量级）
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (status, body) =
+            http_request(server.gateway, "/admin/status", "GET", None, &[auth]).await;
+        assert_eq!(status, 200);
+        let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if st["active_connections"].as_array().unwrap().is_empty()
+            && st["per_owner_connections"].as_array().unwrap().is_empty()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "DELETE 后 15s 内在线表未清零（踢存量未生效）: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // 客户端侧持有到断连观察完成后再释放（连接已被服务端终结）
+    drop(ep_a);
+    drop(ep_b);
+
+    // 同票新连接 deny：API 注销即时生效（无热重载窗口）；被踢 endpoint
+    // 的同票重连同样 unknown-owner
+    let c = SecretKey::generate();
+    let token_c = owner.token_for(&server_id, &c.public(), CAP_RELAY);
+    let reason = expect_denied(relay, &c, Some(token_c)).await;
+    assert_eq!(reason, "dweb/unknown-owner");
+    let reason = expect_denied(relay, &b, Some(token_b)).await;
+    assert_eq!(reason, "dweb/unknown-owner");
 }
 
 fn base64url(bytes: [u8; 64]) -> String {

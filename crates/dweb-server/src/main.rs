@@ -11,7 +11,9 @@
 //! DWEB_RELAY_CLIENT_RX 限流透传（task 1.7），services.json 发布 server_id
 //! （task 1.8）。Phase 3 第一棒（tasks 3.1/3.2 前半）：DWEB_ADMIN_TOKEN
 //! 存在时挂 /admin/* 管理面（owners CRUD + 回执签名 + status）；
-//! DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER per-owner 连接配额。
+//! DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER per-owner 连接配额。第二棒
+//! （task 3.2b）：admin unregister 踢存量连接（relay Clients 句柄经
+//! AdminState 注入，unregister 反查在线表逐 endpoint disconnect）。
 
 mod access;
 mod relay;
@@ -411,11 +413,26 @@ async fn main() -> Result<()> {
     if let Some(bytes_per_second) = client_rx {
         tracing::info!("relay client_rx rate limit: {bytes_per_second} bytes/s");
     }
-    // admin API（task 3.1）：DWEB_ADMIN_TOKEN 存在才挂路由——未配置 =
-    // /admin/* 404 零暴露（静态 token 方案与 admin 信任域论证见 admin.rs
+    // admin API（task 3.1 + 3.2b）：DWEB_ADMIN_TOKEN 存在才挂路由——未配置
+    // = /admin/* 404 零暴露（静态 token 方案与 admin 信任域论证见 admin.rs
     // 模块注释）。registry/relay gate 以 Arc 共享：API 注册即时生效于
-    // 验证链（同进程同一 OwnerRegistry 快照替换）；先于 relay::start 构造
-    // （relay_gate 所有权随后移交 relay）。
+    // 验证链（同进程同一 OwnerRegistry 快照替换）。构造在 relay::start
+    // **之后**：task 3.2b 踢存量需要 relay 在线连接表句柄
+    // （Server::relay_service() → RelayService::clients()，iroh-relay 公开
+    // API 的 clone；relay 未启用则为 None——unregister 仍即时阻断新连接，
+    // 仅无法主动断存量）。
+    let relay = relay::start(
+        relay_enabled(&cli),
+        relay_bind_addr,
+        env_addr("DWEB_RELAY_QUIC_BIND"),
+        relay_gate.clone(),
+        client_rx,
+    )
+    .await?;
+    let relay_clients = relay
+        .as_ref()
+        .and_then(|server| server.relay_service())
+        .map(|service| service.clients().clone());
     let admin_router = std::env::var("DWEB_ADMIN_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
@@ -426,6 +443,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&identity),
                 std::sync::Arc::clone(&owners),
                 relay_gate.clone(),
+                relay_clients,
                 access_cfg.mode,
                 match access_cfg.policy {
                     access::config::PolicyConfig::Static => "static",
@@ -433,14 +451,6 @@ async fn main() -> Result<()> {
                 },
             ))
         });
-    let relay = relay::start(
-        relay_enabled(&cli),
-        relay_bind_addr,
-        env_addr("DWEB_RELAY_QUIC_BIND"),
-        relay_gate,
-        client_rx,
-    )
-    .await?;
 
     let bind = gateway_bind(&cli);
     let bind_addr: SocketAddr = bind
