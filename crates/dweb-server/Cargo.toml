@@ -44,3 +44,8 @@ tower = { version = "0.5", features = ["util"] }
 # task 1.9 e2e：真 iroh 客户端（Endpoint 全量形态 + dns::DnsResolver）。
 # workspace 已锁定 =1.1.0（dweb-fabric 同源），无新增外部语义。
 iroh = { workspace = true }
+# task 2.7 故事级 e2e：Fabric API（invite v2/join/relay capability 流通）
+# 对真 restricted server 二进制的全链路驱动。path 引用与 dweb-client-sdk
+# 同源；仅 dev 依赖——server 产物零增重。
+dweb-fabric = { path = "../dweb-fabric" }
+

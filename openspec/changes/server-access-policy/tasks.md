@@ -79,24 +79,42 @@
 
 ## Phase 2 — fabric/SDK capability 流通
 
-- [ ] 2.1 InviteV2 wire（附录 A）：编解码、recipient 必填校验、内嵌
+- [x] 2.1 InviteV2 wire（附录 A）：编解码、recipient 必填校验、内嵌
        capability 一致性（recipient==invite.recipient、TTL≤invite.expires）、
        旧客户端 unsupported-invite-version 错误码
-- [ ] 2.2 dweb-fabric RelayConfig 扩展：`CustomWithCaps(Vec<RelayEntry>)`，
+       （Phase2-A 44e9e36）
+- [x] 2.2 dweb-fabric RelayConfig 扩展：`CustomWithCaps(Vec<RelayEntry>)`，
        per-relay capability 注入 RelayMap（iroh 条目级 token）；旧
        `Custom(Vec<String>)` 保留
-- [ ] 2.3 root 自签：Fabric 配置 restricted relay 时本地生成 own
+       （Phase2-A 44e9e36；RelayEntry{url, server_id?, token?}，
+       server_id=restricted 条目标记 + root 自签锚点）
+- [x] 2.3 root 自签：Fabric 配置 restricted relay 时本地生成 own
        capability（caps 全位、TTL≤180d）
-- [ ] 2.4 REDEEM_OK2 帧（0x15）：v2 令牌版本信号触发；payload = 名册
+       （Phase2-A 44e9e36；`ensure_relay_capabilities()`——own 不持久化，
+       每次启动重签（Ed25519 确定性幂等））
+- [x] 2.4 REDEEM_OK2 帧（0x15）：v2 令牌版本信号触发；payload = 名册
        dump + u32 前缀 capability 附发段（绑 redeemer，TTL≤90d）；v1
        令牌一律回旧 REDEEM_OK（兼容测试冻结）
-- [ ] 2.5 napi SDK：RelayOptions 可选 `relays: {url, token?}[]`（双字段
+       （Phase2-A 44e9e36；tests/redeem_ok2_wire.rs 6 用例）
+- [x] 2.5 napi SDK：RelayOptions 可选 `relays: {url, token?}[]`（双字段
        冲突显式报错）；relay 接入 `dweb/*` deny reason 透出为诊断事件
-- [ ] 2.6 fabric/roster、fabric/session、sdk/node delta 随实现更新
+       （Phase2-B：relays 条目增补 `serverId?`（hex64 构造期校验，root
+       自签配置位——spec delta 已回写）；joinWithToken 按前缀分派 v1/v2
+       precheck（v2 一步加入修复）；ensureRelayCapabilities 投影 SDK 面；
+       deny reason 透出 = relay 状态 lastError + relay-offline 事件
+       （sanitize 结构化例外）+ join/connect 拨号错误 message 附注）
+- [x] 2.6 fabric/roster、fabric/session、sdk/node delta 随实现更新
        （初稿已产出，实现偏差回写 spec）
-- [ ] 2.7 端到端：restricted server 上 invite v2→join（经 relay 拨号）→
+       （Phase2-B：sdk/node delta 回写 server_id 增补 + 透出通道裁定；
+       roster/session delta 无偏差——44e9e36 已核对）
+- [x] 2.7 端到端：restricted server 上 invite v2→join（经 relay 拨号）→
        直连→relay fallback 全链路；老 SDK 连 restricted server 的可预期
        失败验证；老 SDK 解析 v2 invite 的错误路径验证
+       （Phase2-B：tests/story_e2e.rs 单故事函数承载 S1-S8——admin 部署/
+       root 自签上线/v2 邀请/经 restricted relay join+member cap 持久化/
+       通信回程/越权矩阵（no-capability + not-recipient×2）/v1 旧形态
+       可预期失败（deny reason 双诊断面）+ v1-only 解析 dweb2. 第九码/
+       重启恢复再通信）
 
 ## Phase 3 — 运营面（另行排期）
 
