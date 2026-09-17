@@ -16,9 +16,9 @@
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, Header, HttpEngineError,
-    HttpHandler, HttpRequest as KernelHttpRequest, HttpRequestInit as KernelHttpRequestInit,
-    HttpResponse as KernelHttpResponse, RequestBody,
+    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, CancelOutcome, Header,
+    HttpEngineError, HttpHandler, HttpRequest as KernelHttpRequest,
+    HttpRequestInit as KernelHttpRequestInit, HttpResponse as KernelHttpResponse, RequestBody,
 };
 use dweb_fabric::continuity::session::{Session, SessionOptions, SessionPhase, SessionShared};
 use dweb_fabric::Fabric as RustFabric;
@@ -239,10 +239,21 @@ type BoxHttpFuture = std::pin::Pin<
 /// pending/bodies 注册表容量 = 活跃请求数；server.close() 时未决请求全部以
 /// 取消结算（§3.4 shutdown：用户 Promise 不被无限等待，late completion 仅丢弃）。
 /// TSFN 不 Clone（napi 3.12）——经 Arc 共享进 dispatch future。
+/// per-request 生命周期观测旗（watcher 置位）：cancelled = 对端取消事件；
+/// closed = 流终裁（完成/取消——内核此后不再消费 write）。
+/// 注意不得以保留 mpsc Sender 的方式观测通道状态——探针 sender 会让
+/// dispatch 的 body.recv() 永不 EOF、FIN 无法发出（0.6.0 实证回归）。
+pub(crate) struct RequestFlags {
+    pub cancelled: std::sync::atomic::AtomicBool,
+    pub closed: std::sync::atomic::AtomicBool,
+}
+
 pub(crate) struct HandlerBridge {
     tsfn: Arc<ThreadsafeFunction<String>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<HandlerOutcome, String>>>>>,
     bodies: Arc<Mutex<HashMap<u64, RequestBody>>>,
+    /// per-request 生命周期旗（watcher 置位；StreamWriterJs 观测用）。
+    cancels: Arc<Mutex<HashMap<u64, Arc<RequestFlags>>>>,
     next_request_id: std::sync::atomic::AtomicU64,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -253,6 +264,7 @@ impl HandlerBridge {
             tsfn: Arc::new(tsfn),
             pending: Arc::new(Mutex::new(HashMap::new())),
             bodies: Arc::new(Mutex::new(HashMap::new())),
+            cancels: Arc::new(Mutex::new(HashMap::new())),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -264,6 +276,7 @@ impl HttpHandler for HandlerBridge {
         let tsfn = Arc::clone(&self.tsfn);
         let pending = Arc::clone(&self.pending);
         let bodies = Arc::clone(&self.bodies);
+        let cancels = Arc::clone(&self.cancels);
         let closed = Arc::clone(&self.closed);
         let request_id = self
             .next_request_id
@@ -275,10 +288,49 @@ impl HttpHandler for HandlerBridge {
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(request_id, tx);
             bodies.lock().await.insert(request_id, request.body.clone());
+            // per-request 取消 watcher：终裁 Cancelled → 置 cancelled + 发
+            // TSFN cancel 事件（best-effort 信号；write 错误仍是真相面）；
+            // 任一终裁 → 置 closed（内核此后不再消费 write）。watcher 生命
+            // 周期 = 内核流生命周期，正常完成零残留。
+            let flags = Arc::new(RequestFlags {
+                cancelled: std::sync::atomic::AtomicBool::new(false),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            });
+            cancels.lock().await.insert(request_id, Arc::clone(&flags));
+            {
+                let tsfn = Arc::clone(&tsfn);
+                let cancels = Arc::clone(&cancels);
+                let flags = Arc::clone(&flags);
+                let cancel = request.cancel.clone();
+                let rid = request_id;
+                tokio::spawn(async move {
+                    let outcome = cancel.wait().await;
+                    flags
+                        .closed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if outcome == CancelOutcome::Cancelled {
+                        flags
+                            .cancelled
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        let ev = serde_json::json!({
+                            "type": "cancel",
+                            "requestId": rid,
+                        });
+                        // NonBlocking 信号语义：队列满/运行时关闭即丢弃
+                        // （返回状态检查——不悬挂 watcher 出口）
+                        let _ = tsfn.call(
+                            Ok(ev.to_string()),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
+                    cancels.lock().await.remove(&rid);
+                });
+            }
             let event = serde_json::json!({
                 "type": "request",
                 "requestId": request_id,
                 "streamId": request.stream_id,
+                "sessionId": request.cancel.session_id_hex(),
                 "method": request.method,
                 "path": request.path,
                 "headers": request.headers.iter()
@@ -294,6 +346,7 @@ impl HttpHandler for HandlerBridge {
             if call_status != napi::Status::Ok {
                 pending.lock().await.remove(&request_id);
                 bodies.lock().await.remove(&request_id);
+                cancels.lock().await.remove(&request_id);
                 return Err(HttpEngineError(format!(
                     "handler signal failed: {call_status:?}"
                 )));
@@ -460,8 +513,24 @@ impl HttpServerJs {
             body: brx,
         };
         let _ = tx.send(Ok(out));
+        // 生命周期观测旗（watcher 终裁置位；pending 存续期间 entry 必在——
+        // watcher 仅于流终裁后移除）。writer 不得另持 mpsc sender 探针——
+        // 那会让 dispatch 的 body.recv() 永不 EOF（FIN 发不出）。
+        let flags = self
+            .bridge
+            .cancels
+            .blocking_lock()
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| {
+                Arc::new(RequestFlags {
+                    cancelled: std::sync::atomic::AtomicBool::new(false),
+                    closed: std::sync::atomic::AtomicBool::new(false),
+                })
+            });
         Ok(Some(StreamWriterJs {
             tx: std::sync::Mutex::new(Some(btx)),
+            flags,
         }))
     }
 
@@ -537,17 +606,37 @@ impl HttpServerJs {
 /// 流式响应写句柄（respondStreaming 返回）：write 逐块供给（有界通道背压
 /// ——消费速度传导到内核发送面）；finish 半关（EOF）。对端 RESET/引擎丢弃
 /// 时 write 报错——调用方据此提前收敛上游（本地断开 → 上游关闭链路）。
+/// 三态观测（0.6.0 三拆，正交）：
+/// - finished：本地已调用 finish()（半关意图）
+/// - cancelled：对端取消事件已触发本请求（watcher 旗）
+/// - closed：底层投递通道已关（内核不再消费后续 write）
+/// getter 为观测面；write 的错误返回仍为取消/关闭的真相面。
 #[napi]
 pub struct StreamWriterJs {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+    flags: Arc<RequestFlags>,
 }
 
 #[napi]
 impl StreamWriterJs {
-    /// 是否已 finish（幂等面；对端关闭经 write 的错误暴露）。
+    /// 是否已 finish（本地半关意图，幂等面）。
     #[napi(getter)]
     pub fn finished(&self) -> bool {
         self.tx.lock().unwrap().is_none()
+    }
+
+    /// 对端取消（RESET/会话终态遗弃）是否已触发本请求（事件驱动观测）。
+    #[napi(getter)]
+    pub fn cancelled(&self) -> bool {
+        self.flags
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 底层投递通道是否已关（内核停止消费——完成/放弃/取消后均翻转）。
+    #[napi(getter)]
+    pub fn closed(&self) -> bool {
+        self.flags.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// 写入一块 body（背压：通道满即等待——内核发送面/对端消费速度传导）。

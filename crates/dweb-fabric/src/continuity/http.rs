@@ -91,6 +91,73 @@ impl RequestBody {
             }
         }
     }
+
+    /// 取消观察句柄（与请求体同生命周期；N-API 桥 watcher 用）。
+    pub fn cancel(&self) -> RequestCancel {
+        RequestCancel::new(Arc::clone(&self.shared), self.stream_id)
+    }
+
+    /// 所属逻辑会话 id（授权隔离键）。
+    pub fn session_id(&self) -> [u8; 16] {
+        self.shared.session_id
+    }
+}
+
+/// 请求取消终裁结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// 对端 RESET / 会话终态遗弃：上游应尽快收敛（未消费副作用止损）。
+    Cancelled,
+    /// 请求已正常完成（FIN 送达且 dispatch 标记 Completed）：非取消。
+    Completed,
+}
+
+/// 请求取消观察句柄：挂起等「对端不再需要本请求」。
+/// 事件驱动（peer_reset 持久标志 + reset_notify 唤醒 + request_state/phase
+/// 终裁）；phase 终态无专属唤醒面，以有界轮询佐餐（终态出口保证退出）。
+#[derive(Clone)]
+pub struct RequestCancel {
+    shared: Arc<SessionShared>,
+    stream_id: u64,
+}
+
+impl RequestCancel {
+    fn new(shared: Arc<SessionShared>, stream_id: u64) -> Self {
+        Self { shared, stream_id }
+    }
+
+    /// 会话 id（hex；授权隔离键——同 peer 异 session 不共享，spec §3.2）。
+    pub fn session_id_hex(&self) -> String {
+        self.shared.session_id.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 挂起等待终裁。取消复查在完成复查之前——FIN 与 RESET 竞速时宁可
+    /// 多发一次取消（对已结束请求的 signal abort 幂等无害）也不漏发
+    /// （漏发 = 挂起任务永不停止）。Notify 不保留通知：标志复查兜底
+    /// 注册窗口。
+    pub async fn wait(&self) -> CancelOutcome {
+        loop {
+            if self.shared.peer_reset(self.stream_id).await {
+                return CancelOutcome::Cancelled;
+            }
+            if matches!(
+                self.shared.request_state(self.stream_id).await,
+                Some(RequestState::Completed)
+            ) {
+                return CancelOutcome::Completed;
+            }
+            match self.shared.phase().await {
+                super::session::SessionPhase::Dead | super::session::SessionPhase::Closed => {
+                    return CancelOutcome::Cancelled;
+                }
+                _ => {}
+            }
+            tokio::select! {
+                _ = self.shared.reset_notify.notified() => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => continue,
+            }
+        }
+    }
 }
 
 /// handler 收到的请求（§3.4 Rust 形态）。
@@ -100,6 +167,10 @@ pub struct HttpRequest {
     pub headers: Vec<Header>,
     pub body: RequestBody,
     pub stream_id: u64,
+    /// 所属逻辑会话（授权隔离键；内核本地协商事实，非 wire 字段）。
+    pub session_id: [u8; 16],
+    /// 取消观察句柄（挂起 handler 的秒停通路）。
+    pub cancel: RequestCancel,
 }
 
 /// handler 返回的响应；body 为 mpsc 流（SSE 长流逐块供给；None = 无 body）。
@@ -441,6 +512,8 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
             stream_id,
         },
         stream_id,
+        session_id: shared.session_id,
+        cancel: RequestCancel::new(Arc::clone(shared), stream_id),
     };
     // 上游执行开始（副作用闸门：此后断线恢复不重入 dispatch）
     shared.mark_started(stream_id).await;

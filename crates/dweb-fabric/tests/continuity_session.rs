@@ -730,6 +730,109 @@ async fn session_resume_cached_duplicate_does_not_change_owner() {
     provider.abort();
 }
 
+/// s6b（0.6.0 加固）：中途废弃的 RESUME 尝试 × 异 nonce 恢复。第一次
+/// RESUME（nonce N1）发出后立即杀传输（客户端放弃——候选流死在协议的
+/// 任意阶段：决策前/gated/安装后 OK 发送失败），第二次 RESUME 携异 nonce
+/// N2 + previous 凭据必须干净成功且 provider 回到 Active。
+/// 不变量钉（失败路径与跨 nonce 状态机的交叉面；具体停驻阶段由竞态决定，
+/// 各分支——未决策/已决策未安装/安装后发送失败——均须满足本断言）。
+#[tokio::test]
+async fn session_abandoned_resume_then_cross_nonce_recovers() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    // provider 侧 shared 经首 accept 交接（同 sid 注册表条目跨 resume 存活——
+    // phase 断言必须落在 provider 侧实例上：Active 由 accept_resume 置位）
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let provider = tokio::spawn(async move {
+        let initial = session::accept_any(&b, &a_id, opts)
+            .await
+            .expect("initial accept");
+        let shared = initial.shared().clone();
+        ready_tx.send(shared).unwrap_or_else(|_| panic!("handoff"));
+        loop {
+            let _ = session::accept_any(&b, &a_id, opts).await;
+        }
+    });
+
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let (generation, token) = client.shared().debug_current_token();
+    let sid = client.shared().session_id;
+    let shared = ready_rx.await.expect("provider shared handoff");
+
+    // —— 第一次 RESUME（nonce N1）：帧发出后立即杀传输（放弃尝试） ——
+    let t1 = a.continuity_open_transport(&b_id).await.unwrap();
+    {
+        let mut t = t1;
+        t.send(&Frame {
+            frame_type: FrameType::ResumeInit,
+            flags: 0,
+            session_id: sid,
+            stream_id: 0,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from(encode_resume_init(
+                generation,
+                generation,
+                &[0xA1u8; 16],
+                &token,
+                &[],
+            )),
+        })
+        .await
+        .expect("N1 帧发出");
+    } // drop(t1)：杀候选流（对端在途处理死于任意阶段）
+
+    // —— 第二次 RESUME：异 nonce N2 + previous 凭据（客户端仍持旧 token） ——
+    // 注意保活 t2：RESUME_OK 到达后 transport 即恢复后通道本体——drop 会让
+    // 泵立即判定 Ended 正确置回 Recovering（断言前不得拆线）。
+    let mut t2 = a.continuity_open_transport(&b_id).await.unwrap();
+    t2.send(&Frame {
+        frame_type: FrameType::ResumeInit,
+        flags: 0,
+        session_id: sid,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(encode_resume_init(
+            generation,
+            generation,
+            &[0xB2u8; 16],
+            &token,
+            &[],
+        )),
+    })
+    .await
+    .expect("N2 帧发出");
+    let r2 = tokio::time::timeout(Duration::from_secs(10), t2.recv())
+        .await
+        .expect("resume 响应有界")
+        .expect("recv ok");
+    assert_eq!(r2.frame_type, FrameType::ResumeOk, "异 nonce 恢复必须成功");
+    let (ok_gen, _ok_token) = decode_resume_ok(&r2.payload).expect("OK 可解析");
+    assert!(
+        ok_gen > generation,
+        "轮换代际前进（N1 已消耗一次轮换亦可，不得回退）"
+    );
+    // provider 侧最终回到 Active（N1 弃线造成的 Recovering 被覆盖）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let phase = shared.phase().await;
+        if phase == session::SessionPhase::Active {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "二轮成功后 provider 必须回到 Active（当前 {phase:?}）"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    drop(t2);
+    provider.abort();
+}
+
 /// s7（硬化 P0-2）：SESSION_INIT 幂等（同 sid+token 重发 OK——ghost 收敛）；
 /// 同 sid 伪造 token → REJECT 0x02。
 #[tokio::test]
@@ -782,6 +885,52 @@ async fn session_init_idempotent_and_token_gate() {
     assert_eq!(resp.frame_type, FrameType::SessionInitReject);
     assert_eq!(resp.payload[0], init_reason::MALFORMED);
     provider.abort();
+}
+
+/// P0-4b：零 sid / 零 token / 零 epoch 的 identity 字段守卫——长度与版本
+/// 合法但身份字段全零时同样必须 REJECT(MALFORMED)（0.6.0 补钉：该守卫臂
+/// 此前无负例）。
+#[tokio::test]
+async fn session_init_zero_identity_rejects_malformed() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let provider = tokio::spawn(async move { session::accept_any(&b, &a_id, opts).await });
+
+    // 41 字节合法长度 + 正确版本，但 sid/token 全零、epoch 0
+    let sid = [0u8; 16];
+    let mut payload = Vec::with_capacity(41);
+    payload.push(session::PROTOCOL_VERSION);
+    payload.extend_from_slice(&[0u8; 16]); // zero sid
+    payload.extend_from_slice(&[0u8; 16]); // zero token
+    payload.extend_from_slice(&0u64.to_be_bytes()); // zero epoch
+    let mut raw = a.continuity_open_transport(&b_id).await.unwrap();
+    raw.send(&Frame {
+        frame_type: FrameType::SessionInit,
+        flags: 0,
+        session_id: sid,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(payload),
+    })
+    .await
+    .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(10), raw.recv())
+        .await
+        .expect("zero-identity INIT response 有界")
+        .unwrap();
+    assert_eq!(response.frame_type, FrameType::SessionInitReject);
+    assert_eq!(response.payload.first(), Some(&init_reason::MALFORMED));
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), provider)
+            .await
+            .expect("zero-identity provider task 有界")
+            .expect("provider task")
+            .is_err(),
+        "零身份字段应拒绝接纳而非建立 session"
+    );
 }
 
 /// P0-4：畸形 SESSION_INIT 必须在 wire 上回 INIT_REJECT(MALFORMED)，不能静默

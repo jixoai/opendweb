@@ -248,10 +248,19 @@ export declare class SessionHandle {
  * 流式响应写句柄（respondStreaming 返回）：write 逐块供给（有界通道背压
  * ——消费速度传导到内核发送面）；finish 半关（EOF）。对端 RESET/引擎丢弃
  * 时 write 报错——调用方据此提前收敛上游（本地断开 → 上游关闭链路）。
+ * 三态观测（0.6.0 三拆，正交）：
+ * - finished：本地已调用 finish()（半关意图）
+ * - cancelled：对端取消事件已触发本请求（watcher 旗）
+ * - closed：底层投递通道已关（内核不再消费后续 write）
+ * getter 为观测面；write 的错误返回仍为取消/关闭的真相面。
  */
 export declare class StreamWriterJs {
-  /** 是否已 finish（幂等面；对端关闭经 write 的错误暴露）。 */
+  /** 是否已 finish（本地半关意图，幂等面）。 */
   get finished(): boolean
+  /** 对端取消（RESET/会话终态遗弃）是否已触发本请求（事件驱动观测）。 */
+  get cancelled(): boolean
+  /** 底层投递通道是否已关（内核停止消费——完成/放弃/取消后均翻转）。 */
+  get closed(): boolean
   /**
    * 写入一块 body（背压：通道满即等待——内核发送面/对端消费速度传导）。
    * finish 后写、或对端已取消（RESET/引擎丢弃）→ 错误。

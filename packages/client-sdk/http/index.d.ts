@@ -20,6 +20,8 @@ export interface HttpRequestInit {
   body?: Array<Uint8Array> | null;
   /** WS 隧道模式：不半关请求方向（101 后双向持续；配合 sendTunnel） */
   keepOpen?: boolean;
+  /** 响应头等待上限毫秒（默认 30000；超时发 RESET 清理 provider 在途请求） */
+  headTimeoutMs?: number;
 }
 
 /**
@@ -36,19 +38,51 @@ export declare function fetchHttp(
   request: HttpRequestInit,
 ): Promise<HttpClientResponse>;
 
+/** 流式响应写句柄（respondStreaming 返回；三态观测正交，0.6.0 三拆） */
+export interface StreamWriterHandle {
+  /** 写入一块 body（有界通道背压；finish 后写或通道已死 → reject） */
+  write(chunk: Uint8Array): Promise<void>;
+  /** 半关（EOF；幂等） */
+  finish(): void;
+  /** 本地已调用 finish()（半关意图） */
+  readonly finished: boolean;
+  /** 对端取消事件已触发本请求（事件驱动观测；write 错误仍为真相面） */
+  readonly cancelled: boolean;
+  /** 底层投递通道已关（完成/放弃/取消后翻转） */
+  readonly closed: boolean;
+}
+
 /** handler 收到的请求（provider 侧；请求体经 bodyNext 拉取，EOF = null） */
 export interface HttpHandlerRequest {
   /** native request id（结算关联；/http/internals 观测） */
   requestId: number;
   /** 逻辑流 id */
   streamId: number;
+  /**
+   * 所属逻辑会话（hex；内核本地协商事实，非 wire 字段）。授权缓存应以此为
+   * 隔离键——同 peer 异 session 不继承授权（spec fabric §3.2）。
+   */
+  sessionId: string;
+  /**
+   * 对端取消信号（RESET/会话终态遗弃 → abort；事件驱动，挂起中的 handler
+   * 也能即时收到）。正常完成不触发。
+   */
+  signal: AbortSignal;
   method: string;
   path: string;
   headers: Array<Header>;
   bodyNext(): Promise<Buffer | null>;
+  /**
+   * 流式结算：立即发响应头（SSE 首包/WS 101 早发），body 经返回的 writer
+   * 持续 write/finish。与返回值结算互斥（先到者胜）；已结算 → null。
+   */
+  respondStreaming(
+    status: number,
+    headers?: Array<Header>,
+  ): StreamWriterHandle | null;
 }
 
-/** handler 返回的响应（本阶段静态分块 body；流式供给后续 phase） */
+/** handler 返回的响应（静态分块 body；流式走 respondStreaming） */
 export interface HttpHandlerResponse {
   /** 100..=599 */
   status: number;
@@ -58,7 +92,11 @@ export interface HttpHandlerResponse {
 
 export type HttpHandler = (
   request: HttpHandlerRequest,
-) => HttpHandlerResponse | PromiseLike<HttpHandlerResponse>;
+) =>
+  | HttpHandlerResponse
+  | PromiseLike<HttpHandlerResponse | null | void>
+  | null
+  | void;
 
 /** serveHttp 返回句柄（design §3.4 HttpServer） */
 export interface HttpServer {

@@ -912,6 +912,12 @@ impl SessionShared {
         self.resume_control.lock().unwrap().channel_owner
     }
 
+    /// 当前通道 owner 代次（crate 内——生命周期相位守卫用：失败路径只有
+    /// 在自己仍是当前胜者时才允许回落 phase）。
+    pub(crate) fn current_channel_owner(&self) -> u64 {
+        self.resume_control.lock().unwrap().channel_owner
+    }
+
     /// 测试观测面：当前胜者通道 transport epoch（fence 测试）。
     #[doc(hidden)]
     pub fn debug_active_epoch(&self) -> u64 {
@@ -3550,12 +3556,19 @@ async fn accept_resume(
     // provider has installed the candidate channel. If installation failed,
     // mk_session_with_expectation already half-closed the candidate transport;
     // pending remains available for a same-nonce cached retry.
+    //
+    // owner 守卫：OK 发送失败只在「本通道仍是当前胜者」时回落 phase——
+    // 被更晚恢复超替的失败不得把新胜者刚置的 Active 打回 Recovering
+    // （0.6.0 s6b 实证：废弃 RESUME 的迟到失败覆盖了后续成功轮的相位）。
+    let installed_owner = shared.current_channel_owner();
     session
         .channel()
         .send_frame(&resume_ok)
         .await
         .inspect_err(|_e| {
-            if shared.phase_sync() == SessionPhase::Active {
+            if shared.current_channel_owner() == installed_owner
+                && shared.phase_sync() == SessionPhase::Active
+            {
                 shared.set_phase_sync(SessionPhase::Recovering);
             }
         })?;

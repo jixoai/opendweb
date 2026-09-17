@@ -53,21 +53,35 @@ async function fetchHttp(session, request) {
  * （bodyNext 拉取请求体，EOF = null；respondStreaming 流式回响应）：
  * - 返回 { status, headers?, bodyChunks? } —— 一次性静态响应；
  * - 调用 req.respondStreaming(status, headers) —— 响应头立即发出，返回
- *   { write(chunk), finish() }（SSE/长连接/WS 101 早发等真实流式；对端
- *   abort/RESET 时 write 报错，调用方据此提前收敛上游）。
+ *   { write(chunk), finish(), finished, cancelled, closed }（SSE/长连接/
+ *   WS 101 早发等真实流式）。
+ *
+ * 生命周期信号（0.6.0 sdk-lifecycle-signals）：
+ * - req.sessionId —— 请求所属逻辑会话（hex；授权缓存隔离键）
+ * - req.signal —— AbortSignal：对端取消（RESET/会话终态遗弃）事件驱动
+ *   触发；挂起中的 handler（尚未 write）也能即时收到。正常完成不触发。
+ * - writer 三态正交：finished（本地半关意图）/ cancelled（对端取消事件）/
+ *   closed（底层投递通道已关）。getter 为观测面，write 错误仍为真相面。
+ *
  * @param {import("../index.js").Fabric} fabric
  * @param {string} peerId
  * @param {(req: {
  *   requestId: number;
  *   streamId: number;
+ *   sessionId: string;
+ *   signal: AbortSignal;
  *   method: string;
  *   path: string;
  *   headers: Array<{ name: string; value: string }>;
  *   bodyNext: () => Promise<Buffer | null>;
- *   respondStreaming: (status: number, headers?: Array<{ name: string; value: string }>) => { write: (chunk: Uint8Array) => Promise<void>; finish: () => void; finished: boolean } | null;
+ *   respondStreaming: (status: number, headers?: Array<{ name: string; value: string }>) => { write: (chunk: Uint8Array) => Promise<void>; finish: () => void; finished: boolean; cancelled: boolean; closed: boolean } | null;
  * }) => Promise<{ status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void> | { status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void} handler
  */
 async function serveHttp(fabric, peerId, handler) {
+  /** per-server：已流式结算的请求（返回值兜底结算需跳过） */
+  const streamed = new Set();
+  /** per-server：requestId → AbortController（cancel 事件触发 abort） */
+  const controllers = new Map();
   const server = await fabric.serveHttp(peerId, (err, json) => {
     if (err) return;
     /** @type {any} */
@@ -77,14 +91,21 @@ async function serveHttp(fabric, peerId, handler) {
     } catch {
       return;
     }
+    if (ev?.type === "cancel") {
+      controllers.get(ev.requestId)?.abort();
+      controllers.delete(ev.requestId);
+      return;
+    }
     if (ev?.type !== "request") return;
-    /** @type {Set<number>} 已流式结算的请求（返回值兜底结算需跳过） */
-    const streamed = new Set();
+    const controller = new AbortController();
+    controllers.set(ev.requestId, controller);
     Promise.resolve()
       .then(() =>
         handler({
           requestId: ev.requestId,
           streamId: ev.streamId,
+          sessionId: ev.sessionId,
+          signal: controller.signal,
           method: ev.method,
           path: ev.path,
           headers: ev.headers ?? [],
@@ -97,13 +118,27 @@ async function serveHttp(fabric, peerId, handler) {
             );
             if (writer == null) return null; // 已结算/晚到：幂等 null
             streamed.add(ev.requestId);
+            // controller 生命周期 = 流生命周期（非请求结算时刻）：终态出口
+            // finish / write 错误 / cancel 事件处删除，防长流期间丢 cancel
+            const rid = ev.requestId;
             return {
-              write: (chunk) => writer.write(Buffer.from(chunk)),
+              write: (chunk) =>
+                writer.write(Buffer.from(chunk)).catch((e) => {
+                  controllers.delete(rid); // 通道已死（对端取消/引擎丢弃）
+                  throw e;
+                }),
               finish: () => {
                 writer.finish();
+                controllers.delete(rid); // 本地半关：后续 cancel 无意义
               },
               get finished() {
                 return writer.finished;
+              },
+              get cancelled() {
+                return writer.cancelled;
+              },
+              get closed() {
+                return writer.closed;
               },
             };
           },
@@ -124,6 +159,11 @@ async function serveHttp(fabric, peerId, handler) {
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
         Promise.resolve(server.rejectRequest(ev.requestId, msg)).catch(() => {});
+      })
+      .finally(() => {
+        // 静态结算即请求终态 → 清 controller；流式请求的 controller 留到
+        // 流终态出口（finish / write 错误 / cancel 事件）再清
+        if (!streamed.has(ev.requestId)) controllers.delete(ev.requestId);
       });
   });
   return {
