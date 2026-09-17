@@ -12,7 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 nix = { version = "0.29", features = ["net"] }
-tokio = { workspace = true }
+# net 为 relay/callback 接线新增（TcpStream/lookup_host）；其余沿用 workspace 集合
+tokio = { workspace = true, features = ["net"] }
 iroh-relay = { workspace = true }
 iroh-base = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -25,8 +26,26 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+# CallbackProvider webhook 客户端（task 1.5b）：hyper/hyper-util/http-body-util
+# 均已在树内（axum 依赖）；rustls/tokio-rustls/webpki-roots 已在树内
+# （iroh-relay tls-ring）——零新增外部包，只声明直接依赖/开启 feature。
+# hyper client conn 逐连接握手（不池化）是 SSRF 固定 IP 直连的最直接形态。
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
 
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+# task 1.9 e2e：真 iroh 客户端（Endpoint 全量形态 + dns::DnsResolver）。
+# workspace 已锁定 =1.1.0（dweb-fabric 同源），无新增外部语义。
+iroh = { workspace = true }
+# task 2.7 故事级 e2e：Fabric API（invite v2/join/relay capability 流通）
+# 对真 restricted server 二进制的全链路驱动。path 引用与 dweb-client-sdk
+# 同源；仅 dev 依赖——server 产物零增重。
+dweb-fabric = { path = "../dweb-fabric" }
+

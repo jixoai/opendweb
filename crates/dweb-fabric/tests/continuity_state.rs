@@ -12,7 +12,10 @@
 use std::time::Duration;
 
 use dweb_fabric::continuity::{ConnectionPhase, Direction, Frame, FrameType};
-use dweb_fabric::{Fabric, FabricConfig, FabricEvent, HttpProxyConfig, RelayConfig, RelayTlsTrust, SecretInjection, JOIN_TIMEOUT_MS_DEFAULT};
+use dweb_fabric::{
+    Fabric, FabricConfig, FabricEvent, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig,
+    RelayTlsTrust, SecretInjection,
+};
 
 fn cfg(dir: &tempfile::TempDir) -> FabricConfig {
     FabricConfig {
@@ -50,7 +53,9 @@ async fn pair() -> (Fabric, Fabric, tempfile::TempDir, tempfile::TempDir) {
     let dir_b = tempfile::tempdir().unwrap();
     let port_a = reserve_loopback_port();
     let port_b = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg_fixed_port(&dir_b, port_b), &fabric_id)
         .await
@@ -66,7 +71,9 @@ async fn pair() -> (Fabric, Fabric, tempfile::TempDir, tempfile::TempDir) {
 
 /// 等待 watch 达到谓词（有界）。
 async fn wait_phase(
-    rx: &mut tokio::sync::watch::Receiver<std::sync::Arc<dweb_fabric::continuity::ConnectionStateSnapshot>>,
+    rx: &mut tokio::sync::watch::Receiver<
+        std::sync::Arc<dweb_fabric::continuity::ConnectionStateSnapshot>,
+    >,
     pred: impl Fn(&dweb_fabric::continuity::ConnectionStateSnapshot) -> bool,
     label: &str,
 ) -> dweb_fabric::continuity::ConnectionStateSnapshot {
@@ -76,7 +83,10 @@ async fn wait_phase(
             return (**rx.borrow()).clone();
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("wait_phase timeout: {label}（当前 {:?}）", rx.borrow().phase);
+            panic!(
+                "wait_phase timeout: {label}（当前 {:?}）",
+                rx.borrow().phase
+            );
         }
         tokio::time::timeout(Duration::from_secs(20), rx.changed())
             .await
@@ -92,7 +102,9 @@ async fn wait_phase(
 }
 
 async fn wait_phase_long(
-    rx: &mut tokio::sync::watch::Receiver<std::sync::Arc<dweb_fabric::continuity::ConnectionStateSnapshot>>,
+    rx: &mut tokio::sync::watch::Receiver<
+        std::sync::Arc<dweb_fabric::continuity::ConnectionStateSnapshot>,
+    >,
     pred: impl Fn(&dweb_fabric::continuity::ConnectionStateSnapshot) -> bool,
     label: &str,
 ) -> dweb_fabric::continuity::ConnectionStateSnapshot {
@@ -102,7 +114,10 @@ async fn wait_phase_long(
             return (**rx.borrow()).clone();
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("wait_phase timeout: {label}（当前 {:?}）", rx.borrow().phase);
+            panic!(
+                "wait_phase timeout: {label}（当前 {:?}）",
+                rx.borrow().phase
+            );
         }
         tokio::time::timeout(Duration::from_secs(40), rx.changed())
             .await
@@ -139,7 +154,12 @@ async fn continuity_death_is_watch_only_and_epoch_monotonic() {
 
     // 建连（拨号 + 双侧采纳）
     let mut txa = a.continuity_open_transport(&b_id).await.unwrap();
-    let ready = wait_phase(&mut watch_a, |s| s.phase == ConnectionPhase::Ready, "ready#1").await;
+    let ready = wait_phase(
+        &mut watch_a,
+        |s| s.phase == ConnectionPhase::Ready,
+        "ready#1",
+    )
+    .await;
     assert_eq!(ready.epoch, 1, "首次采纳 epoch=1");
 
     // t2 帧往返：B 接受流并回写
@@ -153,7 +173,9 @@ async fn continuity_death_is_watch_only_and_epoch_monotonic() {
         ts.send(&echo).await.unwrap();
         ts
     });
-    txa.send(&data_frame(7, 0, b"phase1-roundtrip")).await.unwrap();
+    txa.send(&data_frame(7, 0, b"phase1-roundtrip"))
+        .await
+        .unwrap();
     let back = txa.recv().await.unwrap();
     assert_eq!(back.payload, txa_legacy_payload());
     assert_eq!(back.direction, Direction::ProviderToClient);
@@ -182,8 +204,13 @@ async fn continuity_death_is_watch_only_and_epoch_monotonic() {
     // 自动重连：Ready 回归 + epoch 严格递增（对端 supervisor 也在重拨——
     // 当对端发起方 id 更小时其连接可经 winner 规则接管本端，额外 +1 合法）
     let epoch1 = ready.epoch;
-    let ready2 = wait_phase(&mut watch_a, |s| s.phase == ConnectionPhase::Ready && s.epoch > epoch1, "ready#2").await;
-    assert!(ready2.epoch >= epoch1 + 1, "重连后 epoch 严格递增");
+    let ready2 = wait_phase(
+        &mut watch_a,
+        |s| s.phase == ConnectionPhase::Ready && s.epoch > epoch1,
+        "ready#2",
+    )
+    .await;
+    assert!(ready2.epoch > epoch1, "重连后 epoch 严格递增");
 
     // 第二轮注入：继续严格递增
     let epoch2 = ready2.epoch;
@@ -218,12 +245,25 @@ async fn continuity_dual_dial_converges() {
     let mut watch_a = a.continuity_watch(&b_id).await.unwrap();
     let mut watch_b = b.continuity_watch(&a_id).await.unwrap();
 
-    let (ra, rb) = tokio::join!(a.continuity_open_transport(&b_id), b.continuity_open_transport(&a_id));
+    let (ra, rb) = tokio::join!(
+        a.continuity_open_transport(&b_id),
+        b.continuity_open_transport(&a_id)
+    );
     // 立即弃置拨号期传输：winner 收敛可能换代连接，旧传输绑旧连接即成死流
     drop(ra.expect("A 拨通"));
     drop(rb.expect("B 拨通"));
-    wait_phase(&mut watch_a, |s| s.phase == ConnectionPhase::Ready, "A ready").await;
-    wait_phase(&mut watch_b, |s| s.phase == ConnectionPhase::Ready, "B ready").await;
+    wait_phase(
+        &mut watch_a,
+        |s| s.phase == ConnectionPhase::Ready,
+        "A ready",
+    )
+    .await;
+    wait_phase(
+        &mut watch_b,
+        |s| s.phase == ConnectionPhase::Ready,
+        "B ready",
+    )
+    .await;
     // 收敛稳定性：500ms 内各端 epoch 不再变化（winner 裁决完成、无翻扑）。
     // 注：epoch 是**各端独立**的采纳计数（design §2.3 RESUME_INIT 的
     // local_connection_epoch 与 last_seen_remote_epoch 分列）——双端数值
@@ -327,8 +367,7 @@ async fn continuity_relay_stop_and_restart_reconnects() {
             tls_make(),
         );
         // 仅 TLS 钉固定端口；plain-http 随机（两个监听抢同端口会 EADDRINUSE）
-        let mut relay =
-            iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
+        let mut relay = iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
         relay.tls = Some(tls);
         relay.key_cache_capacity = Some(1024);
         let mut config = iroh_relay::server::ServerConfig::default();
@@ -361,7 +400,12 @@ async fn continuity_relay_stop_and_restart_reconnects() {
     let b_id = b_endpoint_id(&b);
     let mut watch_a = a.continuity_watch(&b_id).await.unwrap();
     let _t = a.continuity_open_transport(&b_id).await.unwrap();
-    wait_phase(&mut watch_a, |s| s.phase == ConnectionPhase::Ready, "relay ready").await;
+    wait_phase(
+        &mut watch_a,
+        |s| s.phase == ConnectionPhase::Ready,
+        "relay ready",
+    )
+    .await;
 
     // relay 宕机：drop server 即停（本机回环直连打洞无法低成本伪造「无直连
     // 路径」——沿用 relay_failover c2 的既定手法：宕机窗口内以非故意 close
@@ -389,7 +433,10 @@ async fn continuity_relay_stop_and_restart_reconnects() {
         "relay-up reconnect",
     )
     .await;
-    assert!(ready.epoch >= 2, "恢复后 epoch 严格递增（含对端重拨接管 +N）");
+    assert!(
+        ready.epoch >= 2,
+        "恢复后 epoch 严格递增（含对端重拨接管 +N）"
+    );
 }
 
 /// t3（集成形式）：订阅者 lag 后收敛（多跳变只读一次 → 最新且 seq 单调）。
@@ -399,7 +446,7 @@ async fn continuity_watch_lag_converges() {
     let b_id = b_endpoint_id(&b);
     let mut watch = a.continuity_watch(&b_id).await.unwrap();
     let s0 = a.continuity_snapshot(&b_id).await.unwrap();
-    assert_eq!(s0.state_seq, (*watch.borrow()).state_seq);
+    assert_eq!(s0.state_seq, watch.borrow().state_seq);
     // 制造多次跳变（建连即 Connecting→Handshaking→Ready）
     let _t = a.continuity_open_transport(&b_id).await.unwrap();
     // 慢订阅：期间不读

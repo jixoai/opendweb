@@ -819,6 +819,39 @@ impl Roster {
         Ok(token)
     }
 
+    /// [`Roster::issue_invite`] 的 v2 形态（server-access-policy 附录 A；
+    /// task 2.1）。同样自包含、不落名册；差异：recipient 恒必填、relay
+    /// 为有序列表（capability 串由调用方 mint——fabric 层按配置的
+    /// restricted 条目对 recipient 现签，canonical_bytes 在编码期复验
+    /// recipient/expires 一致性）。
+    pub fn issue_invite_v2(
+        &mut self,
+        identity: &NodeIdentity,
+        relays: Vec<crate::protocol::InviteRelayV2>,
+        direct_addrs: Vec<std::net::SocketAddr>,
+        recipient: EndpointId,
+        ttl_ms: u64,
+        now_ms: u64,
+    ) -> Result<crate::protocol::InviteV2Token, RosterError> {
+        let root = self.require_root(identity)?;
+        let expires_at_ms = now_ms
+            .checked_add(ttl_ms)
+            .ok_or_else(|| ProtocolError::Encoding("invite ttl overflow".to_owned()))?;
+        let invite = crate::protocol::InviteV2 {
+            fabric_id: self.fabric_id,
+            invite_id: crate::protocol::random_bytes::<16>(),
+            issuer: root,
+            expires_at_ms,
+            recipient,
+            relays,
+            direct_addrs,
+        };
+        // Eagerly validate the limits + capability 一致性（编码期与解码期同规）
+        invite.canonical_bytes()?;
+        let token = crate::protocol::InviteV2Token::sign(invite, identity.secret_key())?;
+        Ok(token)
+    }
+
     /// Verifies a redemption attempt *without consuming* the invite:
     /// token signature, root issuer, fabric binding, expiry, recipient
     /// binding and the redeemer's proof-of-possession over the challenge
@@ -863,6 +896,63 @@ impl Roster {
         {
             return Err(RosterError::InviteRecipientMismatch {
                 expected,
+                redeemer: *redeemer,
+            });
+        }
+        let challenge = crate::protocol::redeem_challenge_bytes(
+            &self.fabric_id,
+            &token.invite.invite_id,
+            pop_challenge,
+        );
+        if redeemer.verify(&challenge, pop_sig).is_err() {
+            return Err(RosterError::BadPoP {
+                redeemer: *redeemer,
+            });
+        }
+        Ok(*redeemer)
+    }
+
+    /// [`Roster::redeem_verify`] 的 v2 形态（server-access-policy 附录 A；
+    /// task 2.4）。验证链同 v1（fabric 绑定 / root issuer / 令牌签名 /
+    /// 过期 / PoP），差异点：v2 的 recipient 恒必填——redeemer 必须
+    /// exactly equal 令牌 recipient（无 v1 的 None 放行分支）。
+    /// 内嵌 capability 的一致性（recipient/TTL）已在
+    /// [`crate::protocol::InviteV2Token::decode`] 完成，此处不重复。
+    pub fn redeem_verify_v2(
+        &self,
+        token: &crate::protocol::InviteV2Token,
+        redeemer: &EndpointId,
+        pop_challenge: &[u8; 32],
+        pop_sig: &Signature,
+        now_ms: u64,
+    ) -> Result<EndpointId, RosterError> {
+        if token.invite.fabric_id != self.fabric_id {
+            return Err(RosterError::WrongFabric {
+                got: token.invite.fabric_id,
+                expected: self.fabric_id,
+            });
+        }
+        if Some(token.invite.issuer) != self.root {
+            return Err(RosterError::InviteNotRoot {
+                issuer: token.invite.issuer,
+                root: self.root,
+            });
+        }
+        token.verify().map_err(|e| {
+            RosterError::Protocol(ProtocolError::Quarantine {
+                reason: format!("invite v2 token failed verification: {e}"),
+            })
+        })?;
+        if token.is_expired(now_ms) {
+            return Err(RosterError::InviteExpired {
+                expires_at_ms: token.invite.expires_at_ms,
+                now_ms,
+            });
+        }
+        // v2 恒必填（附录 A P0-4）：recipient 是兑换者本人
+        if token.invite.recipient != *redeemer {
+            return Err(RosterError::InviteRecipientMismatch {
+                expected: token.invite.recipient,
                 redeemer: *redeemer,
             });
         }

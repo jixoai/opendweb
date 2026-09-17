@@ -38,15 +38,13 @@ pub(crate) struct DialingGuard {
 impl DialingGuard {
     /// 取该 peer 的拨号许可（无人拨号时立即获得；有在途拨号则排队等其
     /// 完成后再获得——获得者复查 fast-path 决定是否还需拨号）。
-    pub(crate) async fn permit(
-        &self,
-        peer: &EndpointId,
-    ) -> tokio::sync::OwnedSemaphorePermit {
+    pub(crate) async fn permit(&self, peer: &EndpointId) -> tokio::sync::OwnedSemaphorePermit {
         let sem = {
             let mut map = self.inner.lock().await;
-            Arc::clone(map.entry(*peer).or_insert_with(|| {
-                std::sync::Arc::new(tokio::sync::Semaphore::new(1))
-            }))
+            Arc::clone(
+                map.entry(*peer)
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))),
+            )
         };
         sem.acquire_owned()
             .await
@@ -97,11 +95,14 @@ async fn dial_and_adopt(
     {
         let roster = inner.roster.lock().await;
         if !roster.is_member(remote, now_ms()) {
-            let err = FabricError::Session(SessionError::NotMember(
-                endpoint_id_display(remote),
-            ));
+            let err = FabricError::Session(SessionError::NotMember(endpoint_id_display(remote)));
             state
-                .set_phase(remote, ConnectionPhase::Disconnected, Some("not a member".into()), false)
+                .set_phase(
+                    remote,
+                    ConnectionPhase::Disconnected,
+                    Some("not a member".into()),
+                    false,
+                )
                 .await;
             return Err(err);
         }
@@ -111,7 +112,12 @@ async fn dial_and_adopt(
         Ok(c) => c,
         Err(e) => {
             state
-                .set_phase(remote, ConnectionPhase::Disconnected, Some(format!("{e}")), false)
+                .set_phase(
+                    remote,
+                    ConnectionPhase::Disconnected,
+                    Some(format!("{e}")),
+                    false,
+                )
                 .await;
             return Err(FabricError::Session(SessionError::Connect(format!("{e}"))));
         }
@@ -143,7 +149,11 @@ async fn dial_and_adopt(
 }
 
 /// 接受侧入口（accept loop 的 continuity ALPN 分派）。
-pub(crate) async fn register_incoming(inner: &Arc<FabricInner>, remote: EndpointId, conn: iroh::endpoint::Connection) {
+pub(crate) async fn register_incoming(
+    inner: &Arc<FabricInner>,
+    remote: EndpointId,
+    conn: iroh::endpoint::Connection,
+) {
     let handle = Arc::new(ConnHandle {
         conn,
         initiator: remote,
@@ -240,7 +250,7 @@ fn spawn_supervisor(inner: &Arc<FabricInner>, remote: EndpointId, handle: Arc<Co
     if let Some(task) = register_lifecycle_task(&inner.accept_children, task) {
         // registry 已关闭（shutdown 收尾中）：本地收割不留残留
         task.abort();
-        let _ = futures_nowait(task);
+        futures_nowait(task);
     }
 }
 
@@ -288,15 +298,11 @@ pub async fn accept_stream(
 pub async fn reset(fabric: &Fabric, peer_id: &str) -> Result<(), FabricError> {
     let inner = Arc::clone(&fabric.inner);
     let remote = endpoint_id_parse(peer_id).map_err(FabricError::from)?;
-    let handle = inner
-        .continuity
-        .active(&remote)
-        .await
-        .ok_or_else(|| {
-            FabricError::Session(SessionError::Connect(
-                "no active continuity connection".into(),
-            ))
-        })?;
+    let handle = inner.continuity.active(&remote).await.ok_or_else(|| {
+        FabricError::Session(SessionError::Connect(
+            "no active continuity connection".into(),
+        ))
+    })?;
     handle.conn.close(7u32.into(), b"injected-death");
     Ok(())
 }

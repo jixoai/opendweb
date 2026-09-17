@@ -89,12 +89,17 @@ export interface RelayStatusJs {
 
 `;
 
-/** 契约形态的 relay 配置（唯一声明，确定性重写 napi 宽松尾部） */
+/** 契约形态的 relay 配置（唯一声明，确定性重写 napi 宽松尾部）。
+ *  server-access-policy task 2.5：新增 relays 判别分支（per-relay
+ *  capability 条目；与 urls 互斥由 native 构造期拒绝）。条目类型
+ *  RelayEntryOptions 以 napi 生成的 interface 为契约（同 InviteOptions/
+ *  Member 先例），由 relay-options-union 从回收区间携带保留。 */
 const RELAY_OPTIONS_UNION = `/** relay 配置（判别联合：非法组合构造期拒绝） */
 export type RelayOptions =
   | { mode?: 'n0' }
   | { mode: 'disabled' }
   | { mode: 'custom'; urls: [string, ...string[]] }
+  | { mode: 'custom'; relays: [RelayEntryOptions, ...RelayEntryOptions[]] }
 `;
 
 /** napi 生成的 HttpProxyUrl interface 块（含前导空行；删除后保留块间单空行） */
@@ -238,10 +243,12 @@ const TRANSFORMS = [
   {
     name: "relay-options-union",
     // 唯一声明（P1-1，确定性重写）：精确回收 napi 生成的 RelayOptions +
-    // RelayStatusJs 两块 interface，原位替换为契约判别联合。4.2 起 NAPI 尾部
-    // 还有 continuity 导出（SessionStateSnapshotJs 等）——必须保留。
-    // 区间内出现 RelayOptions/RelayStatusJs 之外的任何顶层声明即 fail-loud
-    // （napi 输出格式变化时拒绝盲改）；区间缺失任一已知块同样拒绝。
+    // RelayStatusJs 块，原位替换为契约判别联合。4.2 起 NAPI 尾部还有
+    // continuity 导出（SessionStateSnapshotJs 等）——必须保留。
+    // task 2.5：RelayEntryOptions / RelayCapabilityJs（napi 生成顺序不保证
+    // 落点）落在回收区间内时携带保留（napi interface 即契约形态，同
+    // InviteOptions/Member 先例）；区间外的落点不受影响。区间内出现家族
+    // 之外的任何顶层声明仍 fail-loud（napi 输出格式变化时拒绝盲改）。
     apply(s) {
       if (count(s, TAIL_MARK) > 1) {
         throw new Error(`fix-dts[relay-options-union]: 尾部标记出现 ${count(s, TAIL_MARK)} 处（预期 ≤1）`);
@@ -276,8 +283,11 @@ const TRANSFORMS = [
       for (let m = declRe.exec(region); m !== null; m = declRe.exec(region)) {
         found.add(m[1]);
       }
+      // task 2.5：家族成员白名单 + 携带集合（联合模板不重复声明它们——
+      // napi interface 形态即契约，落点在区间内则原块保留）
+      const CARRY = ["RelayEntryOptions", "RelayCapabilityJs"];
       for (const name of found) {
-        if (name !== "RelayOptions" && name !== "RelayStatusJs") {
+        if (name !== "RelayOptions" && name !== "RelayStatusJs" && !CARRY.includes(name)) {
           throw new Error(
             `fix-dts[relay-options-union]: 回收区间出现未知导出 ${name}` +
               "（区间形态变化，拒绝盲改；新导出应保留在尾部——检查 TAIL_MARK/块边界逻辑）",
@@ -289,12 +299,52 @@ const TRANSFORMS = [
           "fix-dts[relay-options-union]: 回收区间缺少预期的 RelayOptions/RelayStatusJs（napi 输出形态变化）",
         );
       }
-      return s.slice(0, tailStart) + RELAY_OPTIONS_UNION.trimEnd() + "\n" + s.slice(cutEnd);
+      // 提取携带成员的完整块（前导 doc 注释 + 接口体；顺序固定）
+      const carried = [];
+      for (const name of CARRY) {
+        if (!found.has(name)) continue;
+        const declAt = region.indexOf(`export interface ${name}`);
+        // 前导 /** ... */（紧邻才算，避免吞掉上一块的尾注）
+        let start = declAt;
+        const before = region.slice(0, declAt);
+        const docEnd = before.lastIndexOf("*/");
+        if (docEnd >= 0 && /^\s*$/.test(region.slice(docEnd + 2, declAt))) {
+          const docStart = before.lastIndexOf("/**", docEnd);
+          if (docStart >= 0) start = docStart;
+        }
+        let d = 0;
+        let e = -1;
+        for (let i = region.indexOf("{", declAt); i < region.length; i++) {
+          if (region[i] === "{") d++;
+          else if (region[i] === "}") {
+            d--;
+            if (d === 0) {
+              e = i;
+              break;
+            }
+          }
+        }
+        if (e < 0) {
+          throw new Error(`fix-dts[relay-options-union]: ${name} 块未配平（拒绝盲改）`);
+        }
+        carried.push(region.slice(start, e + 1).trimEnd());
+      }
+      const carryText = carried.length ? "\n\n" + carried.join("\n\n") + "\n" : "\n";
+      return (
+        s.slice(0, tailStart) +
+        RELAY_OPTIONS_UNION.trimEnd() +
+        "\n" +
+        carryText +
+        s.slice(cutEnd)
+      );
     },
     assertInvariant(s) {
       return (
         count(s, "export type RelayOptions") === 1 &&
         count(s, "export interface RelayOptions") === 0 &&
+        count(s, "export interface RelayEntryOptions") === 1 &&
+        count(s, "export interface RelayCapabilityJs") === 1 &&
+        count(s, "relays: [RelayEntryOptions, ...RelayEntryOptions[]]") === 1 &&
         !s.includes(TAIL_MARK)
       );
     },

@@ -68,6 +68,12 @@ pub struct GapOverflow {
     pub byte_cap: usize,
 }
 
+impl Default for RecvWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecvWindow {
     pub fn new() -> Self {
         Self {
@@ -126,9 +132,11 @@ impl RecvWindow {
     /// insertion path. Existing entries (including mismatching duplicates)
     /// never grow the gap buffer and therefore return zero.
     pub(crate) fn incoming_gap_bytes(&self, offset: u64, payload: &Bytes) -> usize {
-        (offset > self.expected_offset && !self.gaps.contains_key(&offset))
-            .then_some(payload.len())
-            .unwrap_or(0)
+        if offset > self.expected_offset && !self.gaps.contains_key(&offset) {
+            payload.len()
+        } else {
+            0
+        }
     }
 
     /// 喂入一段 (offset, payload)。
@@ -669,9 +677,11 @@ mod tests {
 
     #[test]
     fn journal_caps() {
-        let mut lim = JournalLimits::default();
-        lim.max_stream_bytes = 100;
-        lim.max_segments = 4;
+        let lim = JournalLimits {
+            max_stream_bytes: 100,
+            max_segments: 4,
+            ..Default::default()
+        };
         let mut j = StreamJournal::new(1, lim);
         assert!(j.record(b(1, 40), false).is_ok());
         assert!(j.record(b(1, 40), false).is_ok());
@@ -720,7 +730,7 @@ mod tests {
                         assert_eq!(j.next_offset(), before + len as u64);
                     }
                 } else {
-                    let span = (next() % 128) as u64;
+                    let span = next() % 128;
                     j.advance_ack(j.acked_offset() + span);
                 }
                 assert!(j.held_bytes() <= lim.max_stream_bytes);

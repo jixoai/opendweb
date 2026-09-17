@@ -22,13 +22,13 @@ use tokio::sync::oneshot;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::session::{
-    self, decode_resume_ok, encode_resume_init, encode_session_init, encode_session_init_ok,
-    init_reason, reject_reason, RequestState, SessionOptions,
+    self, RequestState, SessionOptions, decode_resume_ok, encode_resume_init, encode_session_init,
+    encode_session_init_ok, init_reason, reject_reason,
 };
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
-    Fabric, FabricConfig, HttpProxyConfig, RelayConfig, RelayTlsTrust, SecretInjection,
-    JOIN_TIMEOUT_MS_DEFAULT,
+    Fabric, FabricConfig, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig, RelayTlsTrust,
+    SecretInjection,
 };
 
 fn cfg(dir: &tempfile::TempDir) -> FabricConfig {
@@ -716,10 +716,12 @@ async fn session_resume_cached_duplicate_does_not_change_owner() {
         1,
         "两阶段提交只向真正安装者发送 RESUME_OK"
     );
-    assert!(responses
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .all(|r| r.frame_type == FrameType::ResumeOk));
+    assert!(
+        responses
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .all(|r| r.frame_type == FrameType::ResumeOk)
+    );
     assert_eq!(
         shared.debug_channel_owner(),
         owner_before + 1,
@@ -1012,11 +1014,10 @@ async fn session_slow_consumer_backpressure_then_release() {
     let b_id = b.endpoint_id();
     let a_id = a.endpoint_id();
     let opts = SessionOptions {
-        limits: {
-            let mut l = dweb_fabric::continuity::model::JournalLimits::default();
-            l.max_stream_bytes = 128 * 1024;
-            l.max_session_bytes = 256 * 1024;
-            l
+        limits: dweb_fabric::continuity::model::JournalLimits {
+            max_stream_bytes: 128 * 1024,
+            max_session_bytes: 256 * 1024,
+            ..Default::default()
         },
     };
     let cap_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));

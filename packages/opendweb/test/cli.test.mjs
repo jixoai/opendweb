@@ -194,6 +194,96 @@ test("public URL rules: host charset and canonical port match the Rust binary (R
   assert.equal(ok6.publicRelayUrl, "http://[fd00::1]");
 });
 
+test("resolveServerArgs: access options precedence (flag > env > config > default)", () => {
+  // default：全链未给 → access 各键 undefined（startServer 不写 env，继承父
+  // 进程环境或落 Rust 侧默认 open/static）；键面恰为 [server.access] 八键
+  const dflt = resolveServerArgs([], {});
+  assert.deepEqual(
+    Object.keys(dflt.access).sort(),
+    [
+      "allowLoopbackCallback",
+      "callbackCacheTtlMs",
+      "callbackTimeoutMs",
+      "callbackToken",
+      "callbackUrl",
+      "mode",
+      "ownersFile",
+      "policy",
+    ],
+  );
+  for (const k of Object.keys(dflt.access)) assert.equal(dflt.access[k], undefined, k);
+
+  const config = {
+    access: {
+      mode: "restricted",
+      policy: "callback",
+      ownersFile: "/cfg/owners.jsonl",
+      callbackUrl: "https://cfg.example.com/hook",
+      callbackToken: "cfg-token",
+      callbackTimeoutMs: 1200,
+      callbackCacheTtlMs: 20000,
+      allowLoopbackCallback: true,
+    },
+  };
+  // config 单独生效（schema 已校验的类型直通，数值保持数值）
+  assert.deepEqual(resolveServerArgs([], {}, config).access, config.access);
+
+  // env > config：字符串 env 数值化（同规区间内）；allowLoopbackCallback 是
+  // config-only 键（Rust 侧无 env），不受 env 影响
+  const envWins = resolveServerArgs(
+    [],
+    {
+      DWEB_ACCESS_MODE: "open",
+      DWEB_ACCESS_POLICY: "static",
+      DWEB_OWNERS_FILE: "/env/owners.jsonl",
+      DWEB_CALLBACK_URL: "https://env.example.com/hook",
+      DWEB_CALLBACK_TOKEN: "env-token",
+      DWEB_CALLBACK_TIMEOUT_MS: "800",
+      DWEB_CALLBACK_CACHE_TTL_MS: "0",
+    },
+    config,
+  );
+  assert.equal(envWins.access.mode, "open");
+  assert.equal(envWins.access.policy, "static");
+  assert.equal(envWins.access.ownersFile, "/env/owners.jsonl");
+  assert.equal(envWins.access.callbackUrl, "https://env.example.com/hook");
+  assert.equal(envWins.access.callbackToken, "env-token");
+  assert.equal(envWins.access.callbackTimeoutMs, 800);
+  assert.equal(envWins.access.callbackCacheTtlMs, 0); // 0 合法（禁用缓存）
+  assert.equal(envWins.access.allowLoopbackCallback, true);
+
+  // flag > env：--access-mode/--owners-file 是 access 面仅有的两个 CLI flag
+  // （与 Rust 侧 flag 集合对齐的 TS 暴露子集；--data-dir 走 DWEB_DATA_DIR env）
+  const flagWins = resolveServerArgs(
+    ["--access-mode", "restricted", "--owners-file=/flag/owners.jsonl"],
+    { DWEB_ACCESS_MODE: "open", DWEB_OWNERS_FILE: "/env/owners.jsonl" },
+    config,
+  );
+  assert.equal(flagWins.access.mode, "restricted");
+  assert.equal(flagWins.access.ownersFile, "/flag/owners.jsonl");
+});
+
+test("resolveServerArgs: access numeric env validation mirrors Rust ranges", () => {
+  for (const bad of ["0", "2001", "-5", "1.5", "abc"]) {
+    assert.ok(resolveServerArgs([], { DWEB_CALLBACK_TIMEOUT_MS: bad }).error, `timeout ${bad} rejected`);
+  }
+  // 空串 = 未给出（与 Rust 的 filter 空串语义一致）
+  assert.equal(resolveServerArgs([], { DWEB_CALLBACK_TIMEOUT_MS: "" }).access.callbackTimeoutMs, undefined);
+  assert.equal(resolveServerArgs([], { DWEB_CALLBACK_TIMEOUT_MS: "2000" }).access.callbackTimeoutMs, 2000);
+  for (const bad of ["-1", "60001", "2.5", "xyz"]) {
+    assert.ok(resolveServerArgs([], { DWEB_CALLBACK_CACHE_TTL_MS: bad }).error, `cacheTtl ${bad} rejected`);
+  }
+  assert.equal(resolveServerArgs([], { DWEB_CALLBACK_CACHE_TTL_MS: "0" }).access.callbackCacheTtlMs, 0);
+  assert.equal(resolveServerArgs([], { DWEB_CALLBACK_CACHE_TTL_MS: "60000" }).access.callbackCacheTtlMs, 60000);
+});
+
+test("resolveServerArgs: access flag surface (missing value; no --data-dir on the TS CLI)", () => {
+  assert.equal(resolveServerArgs(["--access-mode"], {}).error, "missing value for --access-mode");
+  assert.equal(resolveServerArgs(["--owners-file"], {}).error, "missing value for --owners-file");
+  // 数据目录不入 TS CLI flag 面（部署拓扑属性：DWEB_DATA_DIR env / 默认 dweb-data）
+  assert.equal(resolveServerArgs(["--data-dir", "/x"], {}).error, "unknown option --data-dir");
+});
+
 test("banner: all-ASCII, Local/Network enumeration, NAME | PORT service table", () => {
   const ips = ["192.168.2.13", "10.211.55.2"];
   const banner = buildBanner({

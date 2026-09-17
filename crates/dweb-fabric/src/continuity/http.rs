@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::fabric::{Fabric, FabricError};
 use crate::session::SessionError;
 
-use super::session::{accept_any, RequestState, Session, SessionOptions, SessionShared};
+use super::session::{RequestState, Session, SessionOptions, SessionShared, accept_any};
 
 /// HTTP 头（数组形态保重复项，§3.4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,10 +165,10 @@ pub struct HttpClientResponse {
 impl HttpClientResponse {
     /// 读下一块 body（首块 = meta 行后的剩余字节）。
     pub async fn recv_body(&mut self) -> Result<Bytes, FabricError> {
-        if let Some(b) = self.buf.take() {
-            if !b.is_empty() {
-                return Ok(b);
-            }
+        if let Some(b) = self.buf.take()
+            && !b.is_empty()
+        {
+            return Ok(b);
         }
         self.session.channel().recv(self.stream_id).await
     }
@@ -450,13 +450,7 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                 "status": resp.status,
                 "headers": resp.headers.iter().map(|h| json!({"name": h.name, "value": h.value})).collect::<Vec<_>>(),
             });
-            if !send_resilient(
-                &session,
-                stream_id,
-                Bytes::from(format!("{}\n", meta_line.to_string())),
-            )
-            .await
-            {
+            if !send_resilient(&session, stream_id, Bytes::from(format!("{}\n", meta_line))).await {
                 return;
             }
             if let Some(mut body) = resp.body {
@@ -519,10 +513,7 @@ async fn respond_error(
         "headers": [ { "name": "content-type", "value": "text/plain" } ],
     });
     session
-        .send_data(
-            stream_id,
-            Bytes::from(format!("{}\n{msg}", meta.to_string())),
-        )
+        .send_data(stream_id, Bytes::from(format!("{}\n{msg}", meta)))
         .await?;
     session.finish(stream_id).await
 }

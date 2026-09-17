@@ -4,13 +4,21 @@
 //! 公网 URL 覆盖（public-exposure D1/D2）：`--public-gateway` / `--public-relay`
 //! 与 `DWEB_PUBLIC_GATEWAY_URL` / `DWEB_PUBLIC_RELAY_URL` 声明反代/隧道后的
 //! 公网入口，services.json 按条目跳过 Host 派生（厂商中立的反代适配层）。
+//! 访问控制（server-access-policy Phase 1）：`--access-mode` / `--data-dir` /
+//! `--owners-file` / `--allow-loopback-callback` 与 `owners` 子命令；restricted
+//! 模式构造 AccessGate 装入 relay on_connect 验证链与 rendezvous 静态 ACL
+//! （tasks 1.5/1.5b/1.6 接线），registry mtime 轮询热重载，
+//! DWEB_RELAY_CLIENT_RX 限流透传（task 1.7），services.json 发布 server_id
+//! （task 1.8）。
 
+mod access;
 mod relay;
 mod rendezvous;
 mod services;
 
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 
 /// CLI 覆盖项（flag > env > default）
 #[derive(Default)]
@@ -20,6 +28,10 @@ struct Cli {
     relay_enabled: Option<bool>,
     public_gateway: Option<String>,
     public_relay: Option<String>,
+    access_mode: Option<String>,
+    data_dir: Option<String>,
+    owners_file: Option<String>,
+    allow_loopback_callback: Option<bool>,
 }
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -31,7 +43,15 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
             None => (arg.clone(), None),
         };
-        let value_opts = ["--gateway", "--relay", "--public-gateway", "--public-relay"];
+        let value_opts = [
+            "--gateway",
+            "--relay",
+            "--public-gateway",
+            "--public-relay",
+            "--access-mode",
+            "--data-dir",
+            "--owners-file",
+        ];
         if value_opts.contains(&name.as_str()) {
             let value = match inline_value {
                 Some(v) => v,
@@ -43,12 +63,16 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 "--relay" => cli.relay = Some(value),
                 "--gateway" => cli.gateway = Some(value),
                 "--public-gateway" => cli.public_gateway = Some(value),
-                _ => cli.public_relay = Some(value),
+                "--public-relay" => cli.public_relay = Some(value),
+                "--access-mode" => cli.access_mode = Some(value),
+                "--data-dir" => cli.data_dir = Some(value),
+                _ => cli.owners_file = Some(value),
             }
             continue;
         }
         match name.as_str() {
             "--no-relay" => cli.relay_enabled = Some(false),
+            "--allow-loopback-callback" => cli.allow_loopback_callback = Some(true),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -96,6 +120,20 @@ fn relay_enabled(cli: &Cli) -> bool {
 
 fn env_addr(key: &str) -> Option<SocketAddr> {
     std::env::var(key).ok()?.parse().ok()
+}
+
+/// DWEB_RELAY_CLIENT_RX 解析（task 1.7，纯函数便于测试）：字节/秒，非零
+/// u32。未设置/空 = None（不限流）；非法值（0/负/溢出/非数字）硬错误。
+fn parse_client_rx(raw: Option<String>) -> Result<Option<NonZeroU32>, String> {
+    let Some(raw) = raw.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<u32>()
+        .map_err(|e| format!("invalid DWEB_RELAY_CLIENT_RX {raw}: {e}"))?;
+    NonZeroU32::new(value)
+        .map(Some)
+        .ok_or_else(|| format!("invalid DWEB_RELAY_CLIENT_RX {raw}: must be > 0"))
 }
 
 /// 公网 URL 白名单校验 + 规范化（public-exposure D2；R2 P1-1/P1-3）：
@@ -220,7 +258,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = match parse_cli(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `owners` 子命令（task 1.2）：直接操作 data_dir 的 owners.jsonl 后退出，
+    // 不启动服务（admin 低频操作，design §7.3）
+    if argv.first().map(String::as_str) == Some("owners") {
+        return match access::registry::owners_cli(argv.into_iter().skip(1), &|k| {
+            std::env::var(k).ok()
+        }) {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        };
+    }
+
+    let cli = match parse_cli(argv.into_iter()) {
         Ok(cli) => cli,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -238,6 +294,93 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         };
+    // 访问控制配置（task 1.3）：flag > env > default，fail-fast 校验
+    // （非法 mode / callback 缺配置 / restricted+QAD 拒绝）先于一切 bind/spawn。
+    let access_cli = access::config::AccessCliInputs {
+        access_mode: cli.access_mode.clone(),
+        data_dir: cli.data_dir.clone(),
+        owners_file: cli.owners_file.clone(),
+        allow_loopback_callback: cli.allow_loopback_callback,
+    };
+    let access_cfg =
+        match access::config::resolve_access_config(&access_cli, &|k| std::env::var(k).ok()) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        };
+
+    // 数据层初始化（task 1.1/1.2）：server.key load-or-create + owners.jsonl
+    // 归并。执行点接线（task 1.5/1.5b）：restricted 模式构造 AccessGate
+    // （callback URL 非法在此 fail-fast，退出码 2），registry 以 Arc 共享给
+    // 验证链与热重载看护。
+    let identity = access::identity::ServerIdentity::load_or_create(&access_cfg.data_dir)?;
+    let owners = std::sync::Arc::new(access::registry::OwnerRegistry::load(
+        &access_cfg.owners_file,
+    )?);
+    let owners_snapshot = owners.snapshot();
+    if let Some(warning) =
+        access::config::restricted_static_empty_warning(&access_cfg, owners_snapshot.is_empty())
+    {
+        tracing::warn!("{warning}");
+    }
+    tracing::info!(
+        "server id {} (access mode {:?}, owner registry: {} active, generation {})",
+        identity.server_id(),
+        access_cfg.mode,
+        owners_snapshot.len(),
+        owners_snapshot.generation()
+    );
+
+    // restricted：构造验证链聚合器并挂 registry 热重载看护（mtime 轮询 5s；
+    // open 模式 relay 走 AllowAll 快路径，无需 gate/看护）
+    let (relay_gate, rdz_gate) = match access_cfg.mode {
+        access::config::AccessMode::Restricted => {
+            let gate = match access::gate::AccessGate::new(
+                *identity.server_id().as_bytes(),
+                std::sync::Arc::clone(&owners),
+                access_cfg.policy.clone(),
+            ) {
+                Ok(g) => g,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            let gate = std::sync::Arc::new(gate);
+            tracing::info!(
+                "relay access control enabled (policy {}, deny reasons on dweb/ namespace)",
+                match access_cfg.policy {
+                    access::config::PolicyConfig::Static => "static",
+                    access::config::PolicyConfig::Callback(_) => "callback",
+                }
+            );
+            access::gate::spawn_registry_reload_watcher(
+                std::sync::Arc::clone(&owners),
+                Some(std::sync::Arc::clone(&gate)),
+            );
+            // rendezvous gate（task 1.6）：恒 Static 策略——design §8.5 R3
+            // P0-B2 冻结 rendezvous 不接 callback（其 HTTP 面无握手身份，
+            // 动态策略另立 change）；共享同一 registry/server_id（L1/L1b
+            // 同一套验证器，registry 热重载经 Arc 共享生效）
+            let rdz = match access::gate::AccessGate::new(
+                *identity.server_id().as_bytes(),
+                std::sync::Arc::clone(&owners),
+                access::config::PolicyConfig::Static,
+            ) {
+                Ok(g) => std::sync::Arc::new(g),
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            tracing::info!("rendezvous access control enabled (static ACL: announce/resolve)");
+            (Some(gate), Some(rdz))
+        }
+        access::config::AccessMode::Open => (None, None),
+    };
+
     let relay_bind_addr = match relay_bind(&cli) {
         Ok(a) => a,
         Err(msg) => {
@@ -245,10 +388,24 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+    // client_rx 限流（task 1.7）：DWEB_RELAY_CLIENT_RX 字节/秒，与 access
+    // mode 正交（open 模式同样生效）；非法值硬错误（与 bind 同类，退出码 2）
+    let client_rx = match parse_client_rx(std::env::var("DWEB_RELAY_CLIENT_RX").ok()) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
+        }
+    };
+    if let Some(bytes_per_second) = client_rx {
+        tracing::info!("relay client_rx rate limit: {bytes_per_second} bytes/s");
+    }
     let relay = relay::start(
         relay_enabled(&cli),
         relay_bind_addr,
         env_addr("DWEB_RELAY_QUIC_BIND"),
+        relay_gate,
+        client_rx,
     )
     .await?;
 
@@ -276,9 +433,12 @@ async fn main() -> Result<()> {
         fallback_ipv4: services::primary_non_loopback_ipv4(),
         public_gateway_url,
         public_relay_url,
+        // task 1.8：ServerId 以 hex 发布（iroh_base::PublicKey Display = 小写
+        // hex，与 owners.jsonl 的 root hex 同一展示形态）
+        server_id: identity.server_id().to_string(),
     });
 
-    let app = rendezvous::router().merge(services::router(info));
+    let app = rendezvous::router_with_access(rdz_gate).merge(services::router(info));
     let http = axum::serve(listener, app);
     tokio::select! {
         res = http => res?,
@@ -474,5 +634,63 @@ mod tests {
         assert_eq!(resolve_gateway_bind(Some("A"), Some("G")), "A");
         assert_eq!(resolve_gateway_bind(None, Some("G")), "G");
         assert_eq!(resolve_gateway_bind(None, None), DEFAULT_GATEWAY_BIND);
+    }
+
+    /// client_rx 解析（task 1.7）：未设置/空 = 不限流；0/非法 = 硬错误
+    #[test]
+    fn client_rx_parse_matrix() {
+        assert_eq!(parse_client_rx(None).unwrap(), None);
+        assert_eq!(parse_client_rx(Some(String::new())).unwrap(), None);
+        assert_eq!(
+            parse_client_rx(Some("1024".into())).unwrap(),
+            Some(NonZeroU32::new(1024).unwrap())
+        );
+        assert_eq!(
+            parse_client_rx(Some("1".into())).unwrap(),
+            Some(NonZeroU32::new(1).unwrap())
+        );
+        for bad in ["0", "-1", "abc", "4294967296"] {
+            assert!(
+                parse_client_rx(Some(bad.into())).is_err(),
+                "DWEB_RELAY_CLIENT_RX={bad}"
+            );
+        }
+    }
+
+    /// 访问控制 flag（task 1.3）：--access-mode/--data-dir/--owners-file 值形 +
+    /// --allow-loopback-callback bool 形 + inline 等价
+    #[test]
+    fn cli_access_flags_parsed() {
+        let cli = parse_cli(
+            [
+                "--access-mode",
+                "restricted",
+                "--data-dir",
+                "/srv/dweb",
+                "--owners-file",
+                "/srv/dweb/owners.jsonl",
+                "--allow-loopback-callback",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(cli.access_mode.as_deref(), Some("restricted"));
+        assert_eq!(cli.data_dir.as_deref(), Some("/srv/dweb"));
+        assert_eq!(cli.owners_file.as_deref(), Some("/srv/dweb/owners.jsonl"));
+        assert_eq!(cli.allow_loopback_callback, Some(true));
+
+        let inline = parse_cli(
+            ["--access-mode=restricted", "--data-dir=/srv/dweb"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(inline.access_mode, cli.access_mode);
+        assert_eq!(inline.data_dir, cli.data_dir);
+        // 缺值拒绝
+        assert!(parse_cli(["--access-mode".into()].into_iter()).is_err());
+        assert!(parse_cli(["--data-dir".into()].into_iter()).is_err());
+        assert!(parse_cli(["--owners-file".into()].into_iter()).is_err());
     }
 }

@@ -13,13 +13,13 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    fetch_http, serve_http, Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit,
-    HttpResponse,
+    Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit, HttpResponse, fetch_http,
+    serve_http,
 };
-use dweb_fabric::continuity::session::{self, RequestState, SessionOptions};
+use dweb_fabric::continuity::session::{self, SessionOptions};
 use dweb_fabric::{
-    Fabric, FabricConfig, HttpProxyConfig, RelayConfig, RelayTlsTrust, SecretInjection,
-    JOIN_TIMEOUT_MS_DEFAULT,
+    Fabric, FabricConfig, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig, RelayTlsTrust,
+    SecretInjection,
 };
 
 fn cfg(dir: &tempfile::TempDir) -> FabricConfig {

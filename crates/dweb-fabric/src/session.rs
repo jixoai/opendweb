@@ -2,7 +2,10 @@
 //! 规格：openspec/changes/fabric-mvp/specs/fabric/session/spec.md
 
 use crate::identity::EndpointId;
-use crate::protocol::{InviteToken, SignedFact, random_bytes, redeem_challenge_bytes};
+use crate::protocol::{
+    FabricId, InviteToken, InviteV2Token, MEMBER_CAP_TTL_MS, MEMBER_CAPS, RelayCapV1, SignedFact,
+    TOKEN2_PREFIX, random_bytes, redeem_challenge_bytes,
+};
 use crate::roster::Roster;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{EndpointAddr, RelayUrl};
@@ -253,6 +256,10 @@ pub mod frame_type {
     pub const REDEEM_PROOF: u8 = 0x12;
     pub const REDEEM_OK: u8 = 0x13;
     pub const REDEEM_ERR: u8 = 0x14;
+    /// server-access-policy 附录 A2：v2 令牌（dweb2.）兑换成功回执。
+    /// payload = 名册 dump（与 OK 同构）+ capability 附发段；v1 令牌一律
+    /// 回 OK(0x13)，旧客户端永不收到 OK2。
+    pub const REDEEM_OK2: u8 = 0x15;
 }
 
 fn now_ms() -> u64 {
@@ -535,6 +542,8 @@ pub fn redeem_verify_emit(e: &crate::roster::RosterError) -> Option<redeem_err::
 
 /// 独立 issuer 会话入口：不属于 Fabric 生命周期时使用。Fabric accept loop 必须
 /// 使用 [`handle_redeem_as_issuer_gated`] 以获得 [R8-1] 提交门保护。
+/// 无 fabric relay 上下文 → v2 令牌回 OK2 但附发段为空（capability 是
+/// 可选增强，附录 A2）。
 pub async fn handle_redeem_as_issuer(
     conn: &Connection,
     roster: &Arc<tokio::sync::Mutex<Roster>>,
@@ -543,7 +552,7 @@ pub async fn handle_redeem_as_issuer(
     let commit = tokio::sync::Mutex::new(());
     let gate = Arc::new(std::sync::Mutex::new(false));
     let requested = std::sync::Mutex::new(false);
-    handle_redeem_as_issuer_gated(conn, roster, identity, &commit, &requested, gate).await
+    handle_redeem_as_issuer_gated(conn, roster, identity, &commit, &requested, gate, None).await
 }
 
 /// 兑换（issuer 侧）：单 bidi 流 + 整体时限；成功即已签发 Grant 并回执全量 dump。
@@ -551,6 +560,12 @@ pub async fn handle_redeem_as_issuer(
 /// emit=false 行（协议违规/入口解码/内部 IO/post-consume 失败）不发结构化帧直接关闭。
 /// `roster_commit` 与 `lifecycle_gate` 由 Fabric 提供，用于 [R8-1] 将 grant
 /// 提交和 shutdown 门切换线性化。
+///
+/// server-access-policy 附录 A2（task 2.4）：REDEEM_INTENT 的令牌串以
+/// `dweb2.` 开头时走 v2 路径（[`Roster::redeem_verify_v2`]），成功回
+/// REDEEM_OK2(0x15) = 名册 dump + capability 附发段（`v2_minter` 为
+/// None 时附发空段）；`dweb1.` 一律回既有 REDEEM_OK(0x13)——v1 路径
+/// 字节语义零变化。
 pub async fn handle_redeem_as_issuer_gated(
     conn: &Connection,
     roster: &Arc<tokio::sync::Mutex<Roster>>,
@@ -558,6 +573,7 @@ pub async fn handle_redeem_as_issuer_gated(
     roster_commit: &tokio::sync::Mutex<()>,
     shutdown_requested: &std::sync::Mutex<bool>,
     lifecycle_gate: Arc<std::sync::Mutex<bool>>,
+    v2_minter: Option<&RedeemCapMinter<'_>>,
 ) -> Result<(), SessionError> {
     /// 兑换失败的两类出口：
     /// - Silent：emit=false 行与一切 I/O/校验异常——无结构化帧，**立即关闭**
@@ -588,7 +604,19 @@ pub async fn handle_redeem_as_issuer_gated(
             return Err(silent("first frame must be redeem intent".into()));
         }
         let token_str = String::from_utf8_lossy(&payload).into_owned();
-        let token = InviteToken::decode(&token_str).map_err(|e| silent(e.to_string()))?;
+        // 附录 A2 版本信号：dweb2. → v2 路径（OK2 回执）；dweb1. → 既有
+        // v1 路径。解码失败两边同归 silent（entry-* 行语义不变）。
+        let v2 = token_str.starts_with(TOKEN2_PREFIX);
+        let token_v1 = if v2 {
+            None
+        } else {
+            Some(InviteToken::decode(&token_str).map_err(|e| silent(e.to_string()))?)
+        };
+        let token_v2 = if v2 {
+            Some(InviteV2Token::decode(&token_str).map_err(|e| silent(e.to_string()))?)
+        } else {
+            None
+        };
 
         let challenge = random_bytes::<32>();
         write_frame(&mut send, frame_type::REDEEM_CHALLENGE, &challenge)
@@ -615,7 +643,8 @@ pub async fn handle_redeem_as_issuer_gated(
         // ---- 状态事务（锁内零网络 I/O）：verify/consume/grant/编码 ----
         enum Flow {
             Emit(redeem_err::RedeemErrorKind, String),
-            Receipt(Vec<u8>),
+            /// (帧类型, payload)
+            Receipt(u8, Vec<u8>),
         }
         let flow = {
             // [R8-1] grant/consume 与 shutdown 门共享提交锁；门置位后拒绝，
@@ -628,21 +657,59 @@ pub async fn handle_redeem_as_issuer_gated(
             }
             let mut r = roster.lock().await;
             // 过期判断取当前时间，而非任务开始时的快照
-            if let Err(e) = r.redeem_verify(&token, &redeemer, &challenge, &sig, now_ms()) {
+            let verified = match (&token_v1, &token_v2) {
+                (Some(token), None) => {
+                    r.redeem_verify(token, &redeemer, &challenge, &sig, now_ms())
+                }
+                (None, Some(token)) => {
+                    r.redeem_verify_v2(token, &redeemer, &challenge, &sig, now_ms())
+                }
+                // 上文构造互斥；此臂不可达
+                _ => unreachable!("exactly one of v1/v2 token is decoded"),
+            };
+            if let Err(e) = verified {
                 match redeem_verify_emit(&e) {
                     Some(kind) => Flow::Emit(kind, e.to_string()),
                     // verify-protocol 防御分支：emit=false
                     None => return Err(silent(e.to_string())),
                 }
             } else {
-                match r.consume_invite(&token.invite.invite_id, now_ms()) {
+                let invite_id = token_v1
+                    .as_ref()
+                    .map(|t| t.invite.invite_id)
+                    .or_else(|| token_v2.as_ref().map(|t| t.invite.invite_id))
+                    .expect("exactly one token");
+                match r.consume_invite(&invite_id, now_ms()) {
                     Ok(true) => {
                         // post_consume：grant/编码失败显式冻结（emit=false）
                         if let Err(e) = r.grant(identity, redeemer, None, None, now_ms()) {
                             return Err(silent(format!("post-consume grant failed: {e}")));
                         }
+                        // 附录 A2：v2 成功回 OK2 = 名册 dump + capability 附发段
+                        //（member 附发在提交锁内完成——纯 CPU 签名，无 I/O）
+                        let minter = v2_minter.filter(|_| token_v2.is_some());
+                        let cap_segment = match (minter, &token_v2) {
+                            (Some(m), Some(token)) => {
+                                let caps = m.mint_for(
+                                    &redeemer,
+                                    token.invite.expires_at_ms,
+                                    &token.invite.relays,
+                                    now_ms(),
+                                );
+                                encode_ok2_cap_segment(&caps)
+                            }
+                            (None, Some(_)) => encode_ok2_cap_segment(&[]),
+                            _ => Vec::new(),
+                        };
                         match SignedFact::encode_all(r.facts()) {
-                            Ok(buf) => Flow::Receipt(buf),
+                            Ok(mut buf) => {
+                                if token_v2.is_some() {
+                                    buf.extend_from_slice(&cap_segment);
+                                    Flow::Receipt(frame_type::REDEEM_OK2, buf)
+                                } else {
+                                    Flow::Receipt(frame_type::REDEEM_OK, buf)
+                                }
+                            }
                             Err(e) => {
                                 return Err(silent(format!(
                                     "post-consume receipt encode failed: {e}"
@@ -669,8 +736,8 @@ pub async fn handle_redeem_as_issuer_gated(
                     .map_err(|e| silent(format!("finish failed: {e}")))?;
                 Err(InnerErr::Emitted(reason))
             }
-            Flow::Receipt(receipt) => {
-                write_frame(&mut send, frame_type::REDEEM_OK, &receipt)
+            Flow::Receipt(frame, receipt) => {
+                write_frame(&mut send, frame, &receipt)
                     .await
                     .map_err(|e| silent(format!("post-consume receipt write failed: {e}")))?;
                 // 半关闭发送侧，让回执在连接关闭前可靠送达；失败立即关闭
@@ -715,6 +782,305 @@ pub fn endpoint_addr_from_invite(token: &InviteToken) -> Result<EndpointAddr, Se
         ));
     }
     Ok(addr)
+}
+
+/// 由 v2 邀请令牌构造 EndpointAddr：relay 列表全部并入候选（附录 A；
+/// capability 注入是 RelayMap 条目级动作，由 fabric 层在拨号前完成，
+/// EndpointAddr 只承载路径候选）。
+pub fn endpoint_addr_from_invite_v2(token: &InviteV2Token) -> Result<EndpointAddr, SessionError> {
+    let mut addr = EndpointAddr::new(token.invite.issuer);
+    for relay in &token.invite.relays {
+        if let Ok(url) = relay.url.parse::<RelayUrl>() {
+            addr = addr.with_relay_url(url);
+        }
+    }
+    for ip in &token.invite.direct_addrs {
+        addr = addr.with_ip_addr(*ip);
+    }
+    if addr.addrs.is_empty() {
+        return Err(SessionError::NoAddressingInfo(
+            crate::identity::endpoint_id_display(&token.invite.issuer),
+        ));
+    }
+    Ok(addr)
+}
+
+// ==== REDEEM_OK2 capability 附发段（server-access-policy 附录 A2；task 2.4） ====
+
+/// OK2 附发条目数上限（附录 A2：0..=8）。
+pub const OK2_CAP_ITEM_MAX: usize = 8;
+/// 单项 url / capability 串上限（附录 A2：≤512B）。
+pub const OK2_ITEM_BYTES_MAX: usize = 512;
+
+/// capability 附发段编码：`u32 BE count + 每项 [u16 url_len + url + u16
+/// cap_len + cap]`（附录 A2 冻结布局；调用方保证 count ≤ 8、单项 ≤512B，
+/// 越界输入截断为错误日志外的 fail-fast——debug_assert + 截断到上限，
+/// 签发侧自产数据恒在界内）。
+pub fn encode_ok2_cap_segment(caps: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + caps.len() * (2 + 32 + 2 + 287));
+    out.extend_from_slice(&(caps.len().min(OK2_CAP_ITEM_MAX) as u32).to_be_bytes());
+    for (url, cap) in caps.iter().take(OK2_CAP_ITEM_MAX) {
+        let url = url.as_bytes();
+        let cap = cap.as_bytes();
+        debug_assert!(url.len() <= OK2_ITEM_BYTES_MAX && cap.len() <= OK2_ITEM_BYTES_MAX);
+        out.extend_from_slice(&(url.len() as u16).to_be_bytes());
+        out.extend_from_slice(url);
+        out.extend_from_slice(&(cap.len() as u16).to_be_bytes());
+        out.extend_from_slice(cap);
+    }
+    out
+}
+
+/// OK2 capability 段的解析结果：采纳条目 + 各类跳过计数（附录 A2 的
+/// "跳过并计数"语义——跳过不是错误，名册回执语义不受影响）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Ok2Caps {
+    /// 采纳的 (relay_url, capability 串)，按到达序。
+    pub items: Vec<(String, String)>,
+    /// 重复 url 被丢弃的条数（首条为准）。
+    pub skipped_duplicate: usize,
+    /// capability 串格式非法（非良构 dwebr1.）被跳过的条数。
+    pub skipped_malformed: usize,
+    /// recipient != redeemer 被跳过的条数（防御性）。
+    pub skipped_not_recipient: usize,
+}
+
+/// 整帧级违规（附录 A2：count 越界 / 单项长度越界 / url 非 http(s) /
+/// 段截断）→ 该帧视为无效回执（JoinError::Other 语义，不降级、不部分采纳）。
+fn parse_ok2_caps(tail: &[u8], redeemer: &EndpointId) -> Result<Ok2Caps, String> {
+    fn bad(why: String) -> Result<Ok2Caps, String> {
+        Err(why)
+    }
+    if tail.len() < 4 {
+        return bad("OK2 capability segment shorter than the u32 count prefix".to_owned());
+    }
+    let count = u32::from_be_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
+    if count > OK2_CAP_ITEM_MAX {
+        return bad(format!(
+            "OK2 cap_item_count {count} exceeds the limit of {OK2_CAP_ITEM_MAX}"
+        ));
+    }
+    let mut off = 4usize;
+    let mut out = Ok2Caps::default();
+    for i in 0..count {
+        if tail.len() < off + 2 {
+            return bad(format!("OK2 cap item {i} url length prefix truncated"));
+        }
+        let url_len = u16::from_be_bytes([tail[off], tail[off + 1]]) as usize;
+        off += 2;
+        if url_len > OK2_ITEM_BYTES_MAX {
+            return bad(format!(
+                "OK2 cap item {i} url exceeds {OK2_ITEM_BYTES_MAX}B"
+            ));
+        }
+        if tail.len() < off + url_len {
+            return bad(format!("OK2 cap item {i} url bytes truncated"));
+        }
+        let url_bytes = &tail[off..off + url_len];
+        let url = match std::str::from_utf8(url_bytes) {
+            // 附录 A2：url 非 UTF-8 / 非 http(s) → 整帧无效
+            Err(_) => return bad(format!("OK2 cap item {i} url is not valid UTF-8")),
+            Ok(u) if u.starts_with("http://") || u.starts_with("https://") => u.to_owned(),
+            Ok(u) => return bad(format!("OK2 cap item {i} url is not http(s): {u:?}")),
+        };
+        off += url_len;
+        if tail.len() < off + 2 {
+            return bad(format!(
+                "OK2 cap item {i} capability length prefix truncated"
+            ));
+        }
+        let cap_len = u16::from_be_bytes([tail[off], tail[off + 1]]) as usize;
+        off += 2;
+        if cap_len > OK2_ITEM_BYTES_MAX {
+            return bad(format!(
+                "OK2 cap item {i} capability exceeds {OK2_ITEM_BYTES_MAX}B"
+            ));
+        }
+        if tail.len() < off + cap_len {
+            return bad(format!("OK2 cap item {i} capability bytes truncated"));
+        }
+        let cap = match std::str::from_utf8(&tail[off..off + cap_len]) {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                // 非 UTF-8：无法作为 dwebr1. 串——按格式非法跳过（计数）
+                off += cap_len;
+                out.skipped_malformed += 1;
+                continue;
+            }
+        };
+        off += cap_len;
+        // 逐条跳过语义（附录 A2）：串非法 → skip；recipient ≠ redeemer → skip
+        let parsed = match RelayCapV1::decode(&cap) {
+            Ok(p) => p,
+            Err(_) => {
+                out.skipped_malformed += 1;
+                continue;
+            }
+        };
+        if parsed.recipient != *redeemer {
+            out.skipped_not_recipient += 1;
+            continue;
+        }
+        if out.items.iter().any(|(u, _)| *u == url) {
+            out.skipped_duplicate += 1;
+            continue;
+        }
+        out.items.push((url, cap));
+    }
+    if off != tail.len() {
+        return bad(format!(
+            "OK2 capability segment has {} trailing byte(s)",
+            tail.len() - off
+        ));
+    }
+    Ok(out)
+}
+
+/// issuer 侧 OK2 member capability 附发源（design §7.3 / §7.2 签发最小化）。
+/// 由 fabric 层注入（root 身份 + 当前 relay 配置中的 restricted 条目）；
+/// 独立会话入口无 fabric 上下文 → 不注入（OK2 只回名册 dump + 空段）。
+pub struct RedeemCapMinter<'a> {
+    pub fabric_id: FabricId,
+    /// root 签发身份（invite issuer 本人）。
+    pub signer: &'a iroh_base::SecretKey,
+    /// restricted 条目（relay URL → ServerId），来自 issuer 当前 RelayConfig。
+    pub restricted: Vec<(String, [u8; 32])>,
+}
+
+impl RedeemCapMinter<'_> {
+    /// 对 invite v2 relay 列表中命中 restricted 配置的每条 relay 签发
+    /// member capability：caps = 仅 RELAY（§7.2：member 默认不给 RDZ 位）、
+    /// recipient = redeemer、TTL = min(invite 剩余, 90d)。
+    pub fn mint_for(
+        &self,
+        redeemer: &EndpointId,
+        invite_expires_at_ms: u64,
+        invite_relays: &[crate::protocol::InviteRelayV2],
+        now_ms: u64,
+    ) -> Vec<(String, String)> {
+        let expires = now_ms
+            .saturating_add(MEMBER_CAP_TTL_MS)
+            .min(invite_expires_at_ms);
+        let mut out = Vec::new();
+        for (url, server_id) in &self.restricted {
+            if !invite_relays.iter().any(|r| r.url == *url) {
+                continue;
+            }
+            if let Ok(token) = RelayCapV1::sign_and_encode(
+                self.signer,
+                &self.fabric_id,
+                server_id,
+                redeemer,
+                MEMBER_CAPS,
+                now_ms,
+                expires,
+            ) {
+                out.push((url.clone(), token));
+            }
+        }
+        out
+    }
+}
+
+/// v2 兑换回执（OK2）：名册事实 + 采纳的 per-relay capability。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedeemReceiptV2 {
+    pub facts: Vec<SignedFact>,
+    /// 采纳的 (relay_url, capability 串)——fabric 层负责持久化与 RelayMap 注入。
+    pub relay_caps: Vec<(String, String)>,
+    /// 附录 A2 跳过计数（诊断透出用；0 = 全部采纳）。
+    pub skipped: Ok2Caps,
+}
+
+/// 兑换（B 侧，v2 令牌）：与 v1 三段式完全同构；最终帧接受 OK（防御性——
+/// 合规 v1 issuer 对 dweb2. 令牌只会静默关闭，此处 OK 分支仅为对称矩阵的
+/// 保守处理）、OK2（附录 A2 布局 + 逐条跳过语义）、ERR（既有归约）。
+/// OK2 整帧级违规 → 非结构化失败（JoinError::Other 语义，不降级）。
+pub async fn redeem_v2_as_joiner(
+    conn: &Connection,
+    token: &InviteV2Token,
+    secret: &iroh_base::SecretKey,
+    redeemer: &EndpointId,
+) -> Result<RedeemReceiptV2, RedeemError> {
+    tokio::time::timeout(REDEEM_DEADLINE, async {
+        let (mut send, mut recv) = conn.open_bi().await.map_err(unstructured)?;
+        let token_str = token.encode().map_err(unstructured)?;
+        write_frame(&mut send, frame_type::REDEEM_INTENT, token_str.as_bytes())
+            .await
+            .map_err(unstructured)?;
+
+        let (t, challenge) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(unstructured)?;
+        if t != frame_type::REDEEM_CHALLENGE {
+            return Err(RedeemError::Unstructured(format!(
+                "expect challenge, got frame {t:#x}"
+            )));
+        }
+        let challenge: [u8; 32] = challenge
+            .as_slice()
+            .try_into()
+            .map_err(|_| RedeemError::Unstructured("bad challenge length".into()))?;
+        let pop =
+            redeem_challenge_bytes(&token.invite.fabric_id, &token.invite.invite_id, &challenge);
+        let sig = secret.sign(&pop);
+
+        let mut proof = Vec::with_capacity(32 + 64);
+        proof.extend_from_slice(redeemer.as_bytes());
+        proof.extend_from_slice(&sig.to_bytes());
+        write_frame(&mut send, frame_type::REDEEM_PROOF, &proof)
+            .await
+            .map_err(unstructured)?;
+
+        let (t, payload) = read_frame(&mut recv, MAX_REDEEM_FRAME)
+            .await
+            .map_err(unstructured)?;
+        match t {
+            frame_type::REDEEM_OK2 => {
+                // 名册段定界（decode_all_prefix）→ capability 段
+                let (facts, consumed) = SignedFact::decode_all_prefix(&payload).map_err(|e| {
+                    RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))
+                })?;
+                if facts.len() > MAX_HELLO_FACTS {
+                    return Err(RedeemError::Unstructured(
+                        "receipt fact count exceeds the limit".into(),
+                    ));
+                }
+                let skipped_tail = &payload[consumed..];
+                let caps = parse_ok2_caps(skipped_tail, redeemer).map_err(|why| {
+                    RedeemError::Unstructured(format!("OK2 frame violated wire: {why}"))
+                })?;
+                Ok(RedeemReceiptV2 {
+                    facts,
+                    relay_caps: caps.items.clone(),
+                    skipped: caps,
+                })
+            }
+            frame_type::REDEEM_OK => SignedFact::decode_all(&payload)
+                .map(|facts| RedeemReceiptV2 {
+                    facts,
+                    relay_caps: Vec::new(),
+                    skipped: Ok2Caps::default(),
+                })
+                .map_err(|e| RedeemError::Unstructured(format!("receipt fact decode failed: {e}"))),
+            frame_type::REDEEM_ERR => {
+                let records = redeem_err::decode_records(&payload).map_err(|v| {
+                    RedeemError::Unstructured(format!("redeem error frame violated wire: {v}"))
+                })?;
+                if records.is_empty() {
+                    return Err(RedeemError::Unstructured(
+                        "redeem error frame carries no record".into(),
+                    ));
+                }
+                Err(RedeemError::Rejected(redeem_err::reduce(&records)))
+            }
+            other => Err(RedeemError::Unstructured(format!(
+                "unexpected frame {other:#x}"
+            ))),
+        }
+    })
+    .await
+    .map_err(|_| RedeemError::Timeout)?
 }
 
 #[cfg(test)]
@@ -961,5 +1327,172 @@ mod redeem_err_tests {
             None,
             "DirFabricMismatch must never be sent on the redeem channel"
         );
+    }
+}
+
+// ==== REDEEM_OK2 capability 附发段测试（server-access-policy 附录 A2） ============
+
+#[cfg(test)]
+mod ok2_tests {
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::protocol::{CAP_KNOWN_MASK, FabricId, RelayCapV1};
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// 对 redeemer 现签一条合法 capability（recipient 绑定测试夹具）。
+    fn cap_for(
+        signer: &NodeIdentity,
+        recipient: &crate::identity::EndpointId,
+        expires: u64,
+    ) -> String {
+        RelayCapV1::sign_and_encode(
+            signer.secret_key(),
+            &FabricId::from_name("ok2-fabric"),
+            &[2u8; 32],
+            recipient,
+            crate::protocol::MEMBER_CAPS,
+            now_ms(),
+            expires,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ok2_segment_layout_roundtrip() {
+        let root = NodeIdentity::from_seed([7u8; 32]);
+        let member = NodeIdentity::from_seed([8u8; 32]);
+        let cap_a = cap_for(&root, &member.endpoint_id(), now_ms() + 60_000);
+        let caps = vec![
+            ("https://relay-a.example".to_owned(), cap_a.clone()),
+            (
+                "https://relay-b.example".to_owned(),
+                "dwebr1.Ignored".to_owned(),
+            ),
+        ];
+        let wire = encode_ok2_cap_segment(&caps);
+        // 布局冻结：u32 BE count + [u16 url_len + url + u16 cap_len + cap]
+        assert_eq!(&wire[0..4], &(2u32).to_be_bytes());
+        let mut off = 4usize;
+        for (url, cap) in &caps {
+            assert_eq!(&wire[off..off + 2], &(url.len() as u16).to_be_bytes());
+            assert_eq!(&wire[off + 2..off + 2 + url.len()], url.as_bytes());
+            off += 2 + url.len();
+            assert_eq!(&wire[off..off + 2], &(cap.len() as u16).to_be_bytes());
+            off += 2 + cap.len();
+        }
+        assert_eq!(off, wire.len());
+    }
+
+    #[test]
+    fn ok2_parse_accepts_and_skips_per_item() {
+        let root = NodeIdentity::from_seed([7u8; 32]);
+        let member = NodeIdentity::from_seed([8u8; 32]);
+        let other = NodeIdentity::from_seed([9u8; 32]);
+        let good = cap_for(&root, &member.endpoint_id(), now_ms() + 60_000);
+        let not_mine = cap_for(&root, &other.endpoint_id(), now_ms() + 60_000);
+        let items = vec![
+            ("https://first.example".to_owned(), good.clone()),
+            // 串格式非法（非良构 dwebr1.）→ 跳过计数
+            (
+                "https://bad.example".to_owned(),
+                "not-a-capability".to_owned(),
+            ),
+            // recipient != redeemer → 跳过计数
+            ("https://other.example".to_owned(), not_mine),
+            // 重复 url：首条为准（后到丢弃计数；两条都是合法串）
+            ("https://first.example".to_owned(), good.clone()),
+        ];
+        let tail = encode_ok2_cap_segment(&items);
+        let parsed = parse_ok2_caps(&tail, &member.endpoint_id()).unwrap();
+        assert_eq!(parsed.items.len(), 1, "只有首条 first.example 采纳");
+        assert_eq!(parsed.items[0].0, "https://first.example");
+        assert_eq!(parsed.items[0].1, good);
+        assert_eq!(parsed.skipped_malformed, 1);
+        assert_eq!(parsed.skipped_not_recipient, 1);
+        assert_eq!(parsed.skipped_duplicate, 1);
+    }
+
+    /// 整帧级违规（count 越界/单项长度越界/url 非 http(s)/截断/尾随字节）
+    /// → Err（joiner 侧归 JoinError::Other，不降级、不部分采纳）。
+    #[test]
+    fn ok2_parse_rejects_whole_frame_violations() {
+        let root = NodeIdentity::from_seed([7u8; 32]);
+        let member = NodeIdentity::from_seed([8u8; 32]);
+        let good = cap_for(&root, &member.endpoint_id(), now_ms() + 60_000);
+        // count > 8
+        let mut wire = encode_ok2_cap_segment(&[("https://r.example".to_owned(), good.clone())]);
+        wire[0..4].copy_from_slice(&(9u32).to_be_bytes());
+        assert!(parse_ok2_caps(&wire, &member.endpoint_id()).is_err());
+        // url 非 http(s)（ftp）
+        let ftp = encode_ok2_cap_segment(&[("ftp://r.example".to_owned(), good.clone())]);
+        assert!(parse_ok2_caps(&ftp, &member.endpoint_id()).is_err());
+        // 段截断：砍掉尾部
+        let full = encode_ok2_cap_segment(&[("https://r.example".to_owned(), good.clone())]);
+        assert!(parse_ok2_caps(&full[..full.len() - 1], &member.endpoint_id()).is_err());
+        // 尾随字节
+        let mut trailing = full.clone();
+        trailing.push(0xAA);
+        assert!(parse_ok2_caps(&trailing, &member.endpoint_id()).is_err());
+        // 空段（count=0，合法——v1 issuer 回 OK2 的空附发形态）
+        let empty = encode_ok2_cap_segment(&[]);
+        let parsed = parse_ok2_caps(&empty, &member.endpoint_id()).unwrap();
+        assert!(parsed.items.is_empty());
+        // u16 长度域超 512B：手工拼装（encoder 不产越界输入）
+        let mut over = Vec::new();
+        over.extend_from_slice(&(1u32).to_be_bytes());
+        over.extend_from_slice(&(600u16).to_be_bytes());
+        over.extend_from_slice(&vec![b'a'; 600]);
+        over.extend_from_slice(&(0u16).to_be_bytes());
+        assert!(parse_ok2_caps(&over, &member.endpoint_id()).is_err());
+    }
+
+    /// minter 签发语义（§7.2/§7.3）：默认仅 RELAY、绑 redeemer、
+    /// TTL = min(invite 剩余, 90d)、非 invite 命中的 restricted 条目跳过。
+    #[test]
+    fn minter_issues_minimal_member_caps() {
+        let root = NodeIdentity::from_seed([7u8; 32]);
+        let member = NodeIdentity::from_seed([8u8; 32]);
+        let now = now_ms();
+        let minter = RedeemCapMinter {
+            fabric_id: FabricId::from_name("ok2-fabric"),
+            signer: root.secret_key(),
+            restricted: vec![
+                ("https://r1.example".to_owned(), [1u8; 32]),
+                ("https://r2.example".to_owned(), [2u8; 32]),
+            ],
+        };
+        let invite_relays = vec![
+            crate::protocol::InviteRelayV2 {
+                url: "https://r1.example".to_owned(),
+                capability: None,
+            },
+            // r2 不在 invite 内 → 不附发
+        ];
+        // invite 剩余 1h（< 90d）→ TTL 取 invite 剩余
+        let caps = minter.mint_for(&member.endpoint_id(), now + 3_600_000, &invite_relays, now);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].0, "https://r1.example");
+        let parsed = RelayCapV1::decode(&caps[0].1).unwrap();
+        assert_eq!(parsed.recipient, member.endpoint_id());
+        assert_eq!(parsed.issuer, root.endpoint_id());
+        assert_eq!(parsed.caps, crate::protocol::CAP_RELAY, "§7.2 默认仅 RELAY");
+        assert_eq!(parsed.expires_at, now + 3_600_000, "TTL = invite 剩余");
+        // invite 剩余 > 90d → TTL 取 90d 上限
+        let caps2 = minter.mint_for(
+            &member.endpoint_id(),
+            now + 400 * 24 * 3600 * 1000,
+            &invite_relays,
+            now,
+        );
+        let parsed2 = RelayCapV1::decode(&caps2[0].1).unwrap();
+        assert_eq!(parsed2.expires_at, now + MEMBER_CAP_TTL_MS);
+        assert!(parsed2.caps & !crate::protocol::CAP_KNOWN_MASK == 0);
+        let _ = CAP_KNOWN_MASK; // 域内引用（位图常量一致性）
     }
 }

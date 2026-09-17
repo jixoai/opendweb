@@ -14,12 +14,77 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast};
 
-/// relay 配置：禁用 / 自托管(或自定义) URL 列表 / n0 官方默认
+/// relay 配置：禁用 / 自托管(或自定义) URL 列表 / n0 官方默认 /
+/// 带 per-relay capability 的自定义列表（server-access-policy task 2.2）
 #[derive(Debug, Clone)]
 pub enum RelayConfig {
     Disabled,
     Custom(Vec<String>),
     N0Default,
+    /// 自定义 relay 列表 + 条目级 capability 凭证（design §11.3）：
+    /// 构造 RelayMap 时 url+token 成对注入（iroh 条目级 auth token）。
+    /// 与 `Custom` 语义差异仅在凭证：无凭证条目等价 `Custom` 同款候选。
+    CustomWithCaps(Vec<RelayEntry>),
+}
+
+/// `RelayConfig::CustomWithCaps` 的单条 relay 条目（design §11.3 + task 2.3
+/// 裁定）：url 恒填；capability 凭证二选一——
+/// - `server_id`：restricted relay 的 ServerId（admin 注册时转交 owner），
+///   root 侧据此刻自签 own/bootstrap/member capability；
+/// - `token`：现成的 `dwebr1.` 串（手工/测试用——如 admin 预铸后转交），
+///   直接注入本地 RelayMap，不参与 invite 签发（v1 无凭证位、v2 凭证
+///   由 server_id 现签保证 recipient 绑定）。
+///
+/// 两者可同时给出（token 优先生效于本地注入，server_id 供签发）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayEntry {
+    /// relay URL（构造期校验可解析性，与 Custom 同规）。
+    pub url: String,
+    /// restricted relay 的 ServerId（32B；None = 非 restricted 条目）。
+    pub server_id: Option<[u8; 32]>,
+    /// 现成 capability 串（None = 无静态凭证）。
+    pub token: Option<String>,
+}
+
+impl RelayEntry {
+    /// 该条目是否为 restricted（参与 invite v2 签发 / OK2 附发）。
+    fn is_restricted(&self) -> bool {
+        self.server_id.is_some()
+    }
+
+    /// 本地 RelayMap 注入用的 token（静态 token 优先；None = 无凭证）。
+    fn local_token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+}
+
+impl RelayConfig {
+    /// 是否含 restricted 条目（invite v2 触发条件，task 2.1）。
+    fn has_restricted(&self) -> bool {
+        match self {
+            Self::CustomWithCaps(entries) => entries.iter().any(RelayEntry::is_restricted),
+            _ => false,
+        }
+    }
+}
+
+/// 将 (url, token) 对注入 iroh RelayMap（条目级 auth token；task 2.2）。
+/// RelayMap 内部为共享 RwLock 的 BTreeMap——本函数在 endpoint 构造前与
+/// 运行中均可安全调用（iroh socket 持同一句柄，热注入即时生效）。
+/// token 为空串时注入无凭证条目（等价默认形态）。
+pub fn inject_relay_tokens(map: &iroh_relay::RelayMap, entries: &[(String, String)]) {
+    for (url, token) in entries {
+        let Ok(u) = url.parse::<iroh::RelayUrl>() else {
+            // 构造期已校验配置 URL；此处的不可解析项只可能来自令牌/回执
+            // 携带的外部 URL——跳过（不因一条坏候选拖垮整张 map）
+            continue;
+        };
+        let mut cfg = iroh_relay::RelayConfig::from(u.clone());
+        if !token.is_empty() {
+            cfg = cfg.with_auth_token(token.clone());
+        }
+        map.insert(u, std::sync::Arc::new(cfg));
+    }
 }
 
 /// relay TLS 信任根（HB 5.1 受限枚举）：公共 API 不暴露 iroh 上游类型，
@@ -97,8 +162,9 @@ pub struct InviteOptions {
     pub allow_relayless: bool,
 }
 
-/// join 网络工作流的稳定错误码（D11 八码）。本地数据面错误豁免于八码之外，
-/// 按原生变体透出（missing-identity / corrupted / roster-io）。
+/// join 网络工作流的稳定错误码（D11 八码 + server-access-policy 附录 A2
+/// 第九码）。本地数据面错误豁免于八码之外，按原生变体透出
+/// （missing-identity / corrupted / roster-io）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JoinErrorCode {
     TokenInvalid,
@@ -109,10 +175,13 @@ pub enum JoinErrorCode {
     DialFailed,
     DialTimeout,
     TokenConsumed,
+    /// 附录 A2 第九码：`dweb2.` 令牌交给仅支持 v1 的客户端（旧客户端
+    /// 无法解析 v2 布局；message 含升级指引，不得静默降级为 token-invalid）。
+    UnsupportedInviteVersion,
 }
 
 impl JoinErrorCode {
-    /// SDK 消息前缀使用的 kebab 串（error-matrix 冻结集合）。
+    /// SDK 消息前缀使用的 kebab 串（error-matrix 冻结集合 + 附录 A2 扩展）。
     pub fn kebab(&self) -> &'static str {
         match self {
             Self::TokenInvalid => "token-invalid",
@@ -123,6 +192,7 @@ impl JoinErrorCode {
             Self::DialFailed => "dial-failed",
             Self::DialTimeout => "dial-timeout",
             Self::TokenConsumed => "token-consumed",
+            Self::UnsupportedInviteVersion => "unsupported-invite-version",
         }
     }
 }
@@ -210,7 +280,8 @@ impl FabricConfig {
     pub fn validate(&self) -> Result<(), FabricError> {
         normalize_advertise_addrs(&self.advertise_addrs)?;
         // relay 配置完备性（P1-3）：custom 空列表与不可解析 URL 在任何
-        // 身份/名册持久化之前拒绝。
+        // 身份/名册持久化之前拒绝。CustomWithCaps 同规（task 2.2），另校验
+        // 静态 token 的 dwebr1. 形态（fail-fast，杜绝运行期注入坏凭证）。
         if let RelayConfig::Custom(urls) = &self.relay
             && urls.is_empty()
         {
@@ -225,6 +296,38 @@ impl FabricConfig {
                         "invalid relay url {u}: {e}"
                     )))
                 })?;
+            }
+        }
+        if let RelayConfig::CustomWithCaps(entries) = &self.relay {
+            if entries.is_empty() {
+                return Err(FabricError::Session(SessionError::Connect(
+                    "custom relay list must not be empty".into(),
+                )));
+            }
+            // 附录 A：v2 令牌 relay_count 上限 8——CustomWithCaps 是 v2 专属
+            // 形态，超限配置在构造期拒绝（否则签发永远失败）
+            if entries.len() > crate::protocol::MAX_RELAYS_V2 {
+                return Err(FabricError::Session(SessionError::Connect(format!(
+                    "custom relay list of {} entries exceeds the v2 invite limit of {}",
+                    entries.len(),
+                    crate::protocol::MAX_RELAYS_V2
+                ))));
+            }
+            for entry in entries {
+                entry.url.parse::<iroh::RelayUrl>().map_err(|e| {
+                    FabricError::Session(SessionError::Connect(format!(
+                        "invalid relay url {}: {e}",
+                        entry.url
+                    )))
+                })?;
+                if let Some(token) = &entry.token
+                    && crate::protocol::RelayCapV1::decode(token).is_err()
+                {
+                    return Err(FabricError::Session(SessionError::Connect(format!(
+                        "relay '{}' carries a malformed dwebr1. capability token",
+                        entry.url
+                    ))));
+                }
             }
         }
         if let HttpProxyConfig::Url(u) = &self.http_proxy {
@@ -291,6 +394,131 @@ pub fn normalize_advertise_addrs(addrs: &[String]) -> Result<Vec<String>, Fabric
 fn parse_proxy_url(u: &str) -> Result<iroh::RelayUrl, FabricError> {
     u.parse::<iroh::RelayUrl>()
         .map_err(|_| FabricError::BadProxyUrl(u.to_owned()))
+}
+
+// ==== 成员 relay capability 持久化（server-access-policy task 2.3 / §7.3） ====
+
+/// data_dir 内的成员 capability 存储文件（REDEEM_OK2 附发令牌的落盘点；
+/// 形态：`[{"url":"...","capability":"dwebr1...."}]`，同 url 以新兑换覆盖）。
+pub const RELAY_CAPS_FILE: &str = "relay.caps.json";
+
+fn relay_caps_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(RELAY_CAPS_FILE)
+}
+
+/// 读取持久化的 (url, capability) 列表；文件缺失 = 空（成员尚未兑换过）。
+/// capability 串形态在写入侧已校验（dwebr1. 良构），读取侧再验一次——
+/// 外部篡改/损坏按数据面错误上报，不静默吞掉。
+fn load_relay_caps(data_dir: &std::path::Path) -> Result<Vec<(String, String)>, FabricError> {
+    let path = relay_caps_path(data_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| FabricError::RelayCapsStore {
+        path: path.clone(),
+        reason: format!("read failed: {e}"),
+    })?;
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_slice(&bytes).map_err(|e| FabricError::RelayCapsStore {
+            path: path.clone(),
+            reason: format!("corrupted (not a JSON array): {e}"),
+        })?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let url = item.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+            FabricError::RelayCapsStore {
+                path: path.clone(),
+                reason: "corrupted (entry missing 'url')".to_owned(),
+            }
+        })?;
+        let cap = item
+            .get("capability")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| FabricError::RelayCapsStore {
+                path: path.clone(),
+                reason: "corrupted (entry missing 'capability')".to_owned(),
+            })?;
+        if crate::protocol::RelayCapV1::decode(cap).is_err() {
+            return Err(FabricError::RelayCapsStore {
+                path: path.clone(),
+                reason: format!("corrupted (entry capability is not a dwebr1. token for {url})"),
+            });
+        }
+        out.push((url.to_owned(), cap.to_owned()));
+    }
+    Ok(out)
+}
+
+/// 文件级 append/update + 原子写（tmp+fsync+rename；0600——capability 是
+/// bearer 凭证）。语义（task 2.3）：新兑换覆盖同 url 条目，其余原样保留。
+/// 实现为 read-merge-write：读现有文件（缺失 = 空）→ 内存 upsert → 全量落盘。
+fn store_relay_caps(
+    data_dir: &std::path::Path,
+    incoming: &[(String, String)],
+) -> Result<(), FabricError> {
+    let path = relay_caps_path(data_dir);
+    let mut merged = load_relay_caps(data_dir)?;
+    upsert_relay_caps(&mut merged, incoming);
+    // 形态冻结：[{url, capability}] 对象数组（tuple 会编码成 JSON 数组，不用）
+    let items: Vec<serde_json::Value> = merged
+        .iter()
+        .map(|(url, cap)| serde_json::json!({ "url": url, "capability": cap }))
+        .collect();
+    let json = serde_json::to_string_pretty(&items).map_err(|e| FabricError::RelayCapsStore {
+        path: path.clone(),
+        reason: format!("encode failed: {e}"),
+    })?;
+    let mut tmp = std::ffi::OsString::from(path.as_os_str());
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .map_err(|e| FabricError::RelayCapsStore {
+                path: tmp.clone(),
+                reason: format!("open failed: {e}"),
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|e| FabricError::RelayCapsStore {
+                path: tmp.clone(),
+                reason: format!("write failed: {e}"),
+            })?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| FabricError::RelayCapsStore {
+        path,
+        reason: format!("rename failed: {e}"),
+    })?;
+    Ok(())
+}
+
+/// 内存态 upsert：同 url 覆盖、新 url 追加（保序）。
+fn upsert_relay_caps(store: &mut Vec<(String, String)>, incoming: &[(String, String)]) -> bool {
+    let mut changed = false;
+    for (url, cap) in incoming {
+        match store.iter_mut().find(|(u, _)| u == url) {
+            Some(slot) => {
+                if slot.1 != *cap {
+                    slot.1 = cap.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                store.push((url.clone(), cap.clone()));
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 /// 中继状态快照（relay_status() 与 relay 事件 payload 同构；D4）。
@@ -391,6 +619,9 @@ fn invite_relay_url(relay: &RelayConfig, snapshot: &RelayStatusSnapshot) -> Stri
         RelayConfig::Disabled => return String::new(),
         RelayConfig::Custom(urls) => urls.first().cloned().unwrap_or_default(),
         RelayConfig::N0Default => n0_default_urls().first().cloned().unwrap_or_default(),
+        RelayConfig::CustomWithCaps(entries) => {
+            entries.first().map(|e| e.url.clone()).unwrap_or_default()
+        }
     };
     if snapshot.online == Some(true)
         && let Some(active) = &snapshot.active_url
@@ -399,6 +630,7 @@ fn invite_relay_url(relay: &RelayConfig, snapshot: &RelayStatusSnapshot) -> Stri
             RelayConfig::Custom(urls) => urls.clone(),
             RelayConfig::N0Default => n0_default_urls(),
             RelayConfig::Disabled => Vec::new(),
+            RelayConfig::CustomWithCaps(entries) => entries.iter().map(|e| e.url.clone()).collect(),
         };
         // 命中配置原样串（规范化键比较）；不命中（不应发生）时仍用在线事实
         return candidates
@@ -407,6 +639,37 @@ fn invite_relay_url(relay: &RelayConfig, snapshot: &RelayStatusSnapshot) -> Stri
             .unwrap_or_else(|| active.clone());
     }
     config_first
+}
+
+/// InviteV2 的 relay 列表序（task 2.1，纯函数）："活快照优先"在列表语义
+/// 下的落法——online 快照的 active 条目稳定提前，其余保持配置序（列表
+/// 携带全部候选，活跃性由 joiner 的并发拨号兜底；iroh 对 EndpointAddr
+/// 的全部路径并发发起初始包，天然 dial-failover）。
+fn invite_v2_relay_order<'a>(
+    entries: &'a [RelayEntry],
+    snapshot: &RelayStatusSnapshot,
+) -> Vec<&'a RelayEntry> {
+    let ordered: Vec<&RelayEntry> = entries.iter().collect();
+    if snapshot.online != Some(true) {
+        return ordered;
+    }
+    let Some(active) = &snapshot.active_url else {
+        return ordered;
+    };
+    let mut front: Vec<&RelayEntry> = Vec::with_capacity(ordered.len());
+    let mut rest: Vec<&RelayEntry> = Vec::with_capacity(ordered.len());
+    for e in &ordered {
+        if same_relay_url(&e.url, active) {
+            front.push(*e);
+        } else {
+            rest.push(*e);
+        }
+    }
+    if front.is_empty() {
+        return ordered;
+    }
+    front.extend(rest);
+    front
 }
 
 /// shutdown drain 主体（R4 P1-1：由后台任务持有，调用方 Future 取消不中断）。
@@ -455,7 +718,10 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     // Closing——快照订阅者可观测收尾态）
     inner
         .continuity
-        .close_all(crate::continuity::state::ConnectionPhase::Closing, "shutdown")
+        .close_all(
+            crate::continuity::state::ConnectionPhase::Closing,
+            "shutdown",
+        )
         .await;
     inner.endpoint.close().await;
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
@@ -557,13 +823,58 @@ fn same_relay_url(a: &str, b: &str) -> bool {
     }
 }
 
+/// relay deny reason 提取（task 2.5 透出通道的第一段）：iroh 上游把
+/// `ServerDeniedAuth { reason }` 折进错误链 Display 文本（"The relay denied
+/// our authentication (…)"），本函数按服务端冻结语法
+/// `dweb/[a-z0-9][a-z0-9._-]{0,63}` 从文本中扫描结构化 reason。
+/// reason 由 dweb-server 侧约束生成（ASCII 白名单语法，无凭证/路径段），
+/// 透传不违反 D4 脱敏语义；非 deny 错误返回 None。
+pub(crate) fn extract_deny_reason(err_text: &str) -> Option<&str> {
+    const PREFIX: &str = "dweb/";
+    let bytes = err_text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = err_text[start..].find(PREFIX) {
+        let at = start + pos;
+        // 词边界：前一个字符不得是 reason 语法字符（拒绝 "adweb/x" 类内嵌
+        // 误命中——deny reason 只以独立 token 出现）
+        let boundary_ok = at == 0 || {
+            let prev = bytes[at - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'.' || prev == b'_' || prev == b'-')
+        };
+        // reason 主体：首段 [a-z0-9._-]{1,64}（服务端语法整体上限 64 字符）
+        let mut end = at + PREFIX.len();
+        let mut count = 0;
+        while end < bytes.len() && count < 64 {
+            let c = bytes[end];
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'_' || c == b'-' {
+                end += 1;
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        // 至少 1 个合法主体字符（"dweb/" 空 reason 不算）
+        if boundary_ok && count >= 1 {
+            return Some(&err_text[at..end]);
+        }
+        start = at + PREFIX.len();
+    }
+    None
+}
+
 /// 错误脱敏（D4）：仅输出粗粒度错误类别 + relay host，不含 URL 凭证段与完整路径。
+/// server-access-policy task 2.5：`dweb/*` 结构化 deny reason 例外透传——
+/// 受限 relay 拒绝接入时，reason 是排障的唯一信号（no-capability/
+/// capability-expired/not-recipient 语义各不相同），语法由服务端白名单约束。
 fn sanitize_relay_error(err_text: &str) -> String {
     let cleaned: String = err_text
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect();
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(reason) = extract_deny_reason(&cleaned) {
+        return format!("relay denied: {reason}");
+    }
     let lower = cleaned.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
         "connect timeout".to_owned()
@@ -680,6 +991,17 @@ pub enum FabricError {
     /// bind_addr 非法。
     #[error("invalid bind address '{0}'")]
     BadBindAddr(String),
+    /// v2 邀请签发但未给 recipient（附录 A：v2 recipient 恒必填——restricted
+    /// relay 的 bootstrap capability 必须预绑定接收者，task 2.1）。
+    #[error(
+        "v2 invites require an explicit recipient: the relay capability embedded in a dweb2. \
+         token must be pre-bound to the invitee's EndpointId (appendix A)"
+    )]
+    InviteV2RequiresRecipient,
+    /// 成员 relay capability 存档（relay.caps.json）读写失败（task 2.3；
+    /// capability 是 bearer 凭证，损坏不静默吞掉）。
+    #[error("relay capability store {path}: {reason}")]
+    RelayCapsStore { path: PathBuf, reason: String },
 }
 
 struct PeerEntry {
@@ -775,6 +1097,15 @@ pub struct FabricInner {
     events: broadcast::Sender<FabricEvent>,
     pub(crate) relay: RelayConfig,
     advertise_addrs: Vec<String>,
+    /// endpoint 的 RelayMap 共享句柄（task 2.2；Custom/CustomWithCaps 才有，
+    /// N0Default/Disabled 上游预设不暴露注入面）。运行期热注入 = 对该 map
+    /// insert 带 auth token 的条目——iroh socket 持同一内部 RwLock，即时生效。
+    relay_map: Option<iroh_relay::RelayMap>,
+    /// data_dir（relay.caps.json 落盘路径来源，task 2.3）。
+    data_dir: PathBuf,
+    /// 成员 relay capability 内存视图（加载自 relay.caps.json；join OK2
+    /// 后 upsert + 回写）。std 锁：读写均为短临界区，无 await。
+    relay_caps: std::sync::Mutex<Vec<(String, String)>>,
     /// 从邀请令牌/连接学到的对端可达信息（relay URL 或 ip:port）；
     /// 有界（HB 3.1：per-endpoint 1024 地址 / 全局 65536 endpoint，FIFO 淘汰）。
     pub(crate) known_addrs: Mutex<KnownAddrs>,
@@ -921,13 +1252,31 @@ fn now_ms() -> u64 {
 /// relay_url 非空但不可解析 / 直连地址不可解析 -> TOKEN_INVALID（附原因）。
 /// 公开供 SDK 的 joinWithToken 在消费身份句柄/加载本地数据面之前调用，
 /// 保证「令牌自身错误优先于目录检查」的冻结顺序。
+///
+/// 本函数是**仅支持 v1 的路径**（附录 A2 兼容矩阵"v1 joiner"列）：
+/// `dweb2.` 令牌报第九码 [`JoinErrorCode::UnsupportedInviteVersion`]
+/// （含升级指引，不静默降级为 token-invalid）。v2 令牌的完整前置检查
+/// 见 [`precheck_join_token_v2`]；[`Fabric::join`] 按前缀分派。
 pub fn precheck_join_token(token_str: &str) -> Result<crate::protocol::InviteToken, FabricError> {
-    let token = crate::protocol::InviteToken::decode(token_str).map_err(|e| FabricError::Join {
-        code: JoinErrorCode::TokenInvalid,
-        message: format!(
-            "the invite token is malformed or has a bad signature; ask the inviter for a new \
-             one ({e})"
-        ),
+    let token = crate::protocol::InviteToken::decode(token_str).map_err(|e| {
+        // 附录 A2：版本不支持是第九码，不是"令牌损坏"——分开映射，
+        // SDK 才能给出正确的升级指引而非"找 inviter 重签"
+        match &e {
+            crate::protocol::ProtocolError::UnsupportedInviteVersion(why) => FabricError::Join {
+                code: JoinErrorCode::UnsupportedInviteVersion,
+                message: format!(
+                    "this is a v2 (dweb2.) invite token and this code path supports v1 only; \
+                     upgrade the SDK to redeem it ({why})"
+                ),
+            },
+            _ => FabricError::Join {
+                code: JoinErrorCode::TokenInvalid,
+                message: format!(
+                    "the invite token is malformed or has a bad signature; ask the inviter for \
+                     a new one ({e})"
+                ),
+            },
+        }
     })?;
     if token.is_expired(now_ms()) {
         return Err(FabricError::Join {
@@ -964,6 +1313,40 @@ pub fn precheck_join_token(token_str: &str) -> Result<crate::protocol::InviteTok
     Ok(token)
 }
 
+/// v2 令牌前置检查（task 2.1；与 [`precheck_join_token`] 同一冻结顺序）：
+/// 解码（附录 A 全部校验含 capability 一致性）→ 过期 → relay URL 可解析
+/// （直连地址是二进制 SocketAddr，解码期已定形，无字符串再解析步）。
+pub fn precheck_join_token_v2(
+    token_str: &str,
+) -> Result<crate::protocol::InviteV2Token, FabricError> {
+    let token =
+        crate::protocol::InviteV2Token::decode(token_str).map_err(|e| FabricError::Join {
+            code: JoinErrorCode::TokenInvalid,
+            message: format!(
+                "the invite token is malformed or has a bad signature; ask the inviter for a new \
+                 one ({e})"
+            ),
+        })?;
+    if token.is_expired(now_ms()) {
+        return Err(FabricError::Join {
+            code: JoinErrorCode::TokenExpired,
+            message: format!(
+                "the invite token has expired (expired at {} ms); ask the inviter for a new one",
+                token.invite.expires_at_ms
+            ),
+        });
+    }
+    for relay in &token.invite.relays {
+        if relay.url.parse::<iroh::RelayUrl>().is_err() {
+            return Err(FabricError::Join {
+                code: JoinErrorCode::TokenInvalid,
+                message: format!("token relay URL is not parseable: '{}'", relay.url),
+            });
+        }
+    }
+    Ok(token)
+}
+
 /// join 步骤 7 的阶段化结果：deadline 到期时关闭已建立的连接后上报。
 enum JoinPhaseError {
     /// connect 立即错误（拒绝/DNS/协议）。
@@ -992,16 +1375,24 @@ struct DetachedConnects {
 }
 
 /// deadline 包住 connect + redeem 的完整网络工作流。到期取消等待并关闭
-/// 已建立的连接。成功返回 (conn, facts)——由调用方关闭连接并 merge。
+/// 已建立的连接。成功返回 (conn, facts, relay_caps)——由调用方关闭连接
+/// 并 merge（v1 路径 caps 恒空；v2 为 OK2 附发段，task 2.4）。
 async fn join_with_deadline(
     endpoint: &Endpoint,
     detached: &std::sync::Mutex<DetachedConnects>,
     addr: &EndpointAddr,
-    token: &crate::protocol::InviteToken,
+    token: &crate::protocol::InviteVersion,
     secret: &iroh_base::SecretKey,
     redeemer: &EndpointId,
     timeout: std::time::Duration,
-) -> Result<(Connection, Vec<crate::protocol::SignedFact>), JoinPhaseError> {
+) -> Result<
+    (
+        Connection,
+        Vec<crate::protocol::SignedFact>,
+        Vec<(String, String)>,
+    ),
+    JoinPhaseError,
+> {
     let deadline = tokio::time::Instant::now() + timeout;
     // connect 不被取消（P1-10：取消中的 iroh connect 会留下半开连接卡死该
     // NodeId 的后续拨号）。deadline 语义用 spawn 承载：到期时任务在后台自然
@@ -1049,12 +1440,23 @@ async fn join_with_deadline(
         Ok(Ok(Err(e))) => return Err(JoinPhaseError::Connect(e)),
         Ok(Ok(Ok(conn))) => conn,
     };
-    match tokio::time::timeout_at(
-        deadline,
-        session::redeem_as_joiner(&conn, token, secret, redeemer),
-    )
-    .await
-    {
+    // redeem 阶段按令牌版本分派（v1 = 既有 redeem_as_joiner；v2 =
+    // redeem_v2_as_joiner，附录 A2 OK2 回执）；外层 deadline 语义两版一致
+    let redeem_result = match token {
+        crate::protocol::InviteVersion::V1(t) => tokio::time::timeout_at(
+            deadline,
+            session::redeem_as_joiner(&conn, t, secret, redeemer),
+        )
+        .await
+        .map(|r| r.map(|facts| (facts, Vec::new()))),
+        crate::protocol::InviteVersion::V2(t) => tokio::time::timeout_at(
+            deadline,
+            session::redeem_v2_as_joiner(&conn, t, secret, redeemer),
+        )
+        .await
+        .map(|r| r.map(|receipt| (receipt.facts, receipt.relay_caps))),
+    };
+    match redeem_result {
         // 外层 deadline 到期（redeem 阶段）：等值边界下外层拥有唯一结果
         Err(_) => {
             conn.close(0u32.into(), b"join-timeout");
@@ -1066,7 +1468,7 @@ async fn join_with_deadline(
             conn.close(0u32.into(), b"redeem-failed");
             Err(JoinPhaseError::Redeem(e))
         }
-        Ok(Ok(facts)) => Ok((conn, facts)),
+        Ok(Ok((facts, caps))) => Ok((conn, facts, caps)),
     }
 }
 
@@ -1386,7 +1788,22 @@ impl Fabric {
             // 消除“对外公告单条 canonical、实际连接区域节点”的配置/状态错配
             //（active_url 必须落在 urls 内）。
             RelayConfig::N0Default => n0_default_urls(),
+            RelayConfig::CustomWithCaps(entries) => {
+                for e in entries {
+                    validate_relay_url(&e.url)?;
+                }
+                entries.iter().map(|e| e.url.clone()).collect()
+            }
         };
+        // task 2.3：成员端持久化 capability（上次兑换的 OK2 附发令牌）在
+        // endpoint 构造前加载——构造期即注入 RelayMap；损坏文件 fail-fast
+        //（capability 是 bearer 凭证，不静默丢弃）。
+        let persisted_relay_caps = load_relay_caps(&config.data_dir)?;
+        // task 2.2：Custom/CustomWithCaps 显式构造 RelayMap（CustomWithCaps
+        // 条目带 auth token），保留共享句柄——iroh socket 持同一内部 RwLock，
+        // 运行期（join 注入 bootstrap/member capability）热更新即时生效。
+        // N0Default/Disabled 不持句柄（上游预设内部构造，无注入面）。
+        let mut relay_map_handle: Option<iroh_relay::RelayMap> = None;
         let mut builder = match &config.relay {
             RelayConfig::Disabled => {
                 Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(RelayMode::Disabled)
@@ -1397,8 +1814,35 @@ impl Fabric {
                 let parsed = parsed.map_err(|e: iroh::RelayUrlParseError| {
                     FabricError::Session(SessionError::Connect(e.to_string()))
                 })?;
+                // 等价 RelayMode::custom(parsed)（其内部就是 from_iter），
+                // 仅多保留一个共享句柄
+                let map = iroh_relay::RelayMap::from_iter(parsed);
+                inject_relay_tokens(
+                    &map,
+                    &persisted_relay_caps
+                        .iter()
+                        .map(|(u, c)| (u.clone(), c.clone()))
+                        .collect::<Vec<_>>(),
+                );
+                relay_map_handle = Some(map.clone());
                 Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .relay_mode(RelayMode::custom(parsed))
+                    .relay_mode(RelayMode::Custom(map))
+            }
+            RelayConfig::CustomWithCaps(entries) => {
+                let map = iroh_relay::RelayMap::empty();
+                // 静态 token（配置显式给出的现成凭证）+ 成员持久化 capability；
+                // server_id 条目的 own capability 由 ensure_relay_capabilities
+                // 显式签发注入（root 语义，不在构造期隐式执行）
+                let mut tokens: Vec<(String, String)> = persisted_relay_caps.clone();
+                for e in entries {
+                    if let Some(t) = e.local_token() {
+                        tokens.push((e.url.clone(), t.to_owned()));
+                    }
+                }
+                inject_relay_tokens(&map, &tokens);
+                relay_map_handle = Some(map.clone());
+                Endpoint::builder(iroh::endpoint::presets::Minimal)
+                    .relay_mode(RelayMode::Custom(map))
             }
             RelayConfig::N0Default => Endpoint::builder(iroh::endpoint::presets::N0),
         };
@@ -1439,7 +1883,7 @@ impl Fabric {
         let shutdown_started = Arc::new(std::sync::Mutex::new(false));
         let mode = match &config.relay {
             RelayConfig::Disabled => "disabled",
-            RelayConfig::Custom(_) => "custom",
+            RelayConfig::Custom(_) | RelayConfig::CustomWithCaps(_) => "custom",
             RelayConfig::N0Default => "n0",
         };
         // HB 8.1 + R3 P1-3：初始快照的 online / active_url / last_error 来自
@@ -1500,6 +1944,11 @@ impl Fabric {
             events,
             relay: config.relay.clone(),
             advertise_addrs,
+            // task 2.2/2.3：RelayMap 共享句柄（Custom/CustomWithCaps）、
+            // data_dir（relay.caps.json 落盘）与已加载的成员 capability 视图
+            relay_map: relay_map_handle,
+            data_dir: config.data_dir.clone(),
+            relay_caps: std::sync::Mutex::new(persisted_relay_caps),
             known_addrs: Mutex::new(KnownAddrs::default()),
             recent_disconnects: Mutex::new(HashMap::new()),
             connect_inflight: Mutex::new(InflightState::default()),
@@ -1576,6 +2025,15 @@ impl Fabric {
         self.inner.relay_snapshot.lock().unwrap().clone()
     }
 
+    /// 读取 endpoint RelayMap 条目的 auth token（task 2.2/2.3 测试探针；
+    /// url 以配置原样形态匹配，无该条目或无凭证返回 None）。
+    #[doc(hidden)]
+    pub fn relay_map_token(&self, url: &str) -> Option<String> {
+        let map = self.inner.relay_map.as_ref()?;
+        let parsed = url.parse::<iroh::RelayUrl>().ok()?;
+        map.get(&parsed).and_then(|cfg| cfg.auth_token.clone())
+    }
+
     /// watcher 任务是否已退出（shutdown 显式 abort + join 后为 true；测试用）。
     #[doc(hidden)]
     pub fn relay_watcher_exited(&self) -> bool {
@@ -1642,6 +2100,11 @@ impl Fabric {
     /// `opts.allow_relayless = true` 显式放行（可达性责任归调用方）。
     /// 直连地址只信显式配置字段：签发路径永不混入运行时探测地址
     /// （direct_addr_hints 是本进程临时端口，进程退出即死）。
+    ///
+    /// task 2.1：relay 配置含 restricted 条目（server_id）时签 **InviteV2**
+    /// （附录 A：recipient 恒必填、relay 列表、每条 bootstrap capability）；
+    /// 否则 v1 路径零变化。v2 安全门沿用 v1（relay 空且无 advertise_addrs
+    /// 拒签）。
     pub async fn invite_with(
         &self,
         ttl_ms: u64,
@@ -1654,6 +2117,10 @@ impl Fabric {
             }
             None => None,
         };
+        // task 2.1：restricted 条目存在 → v2 签发路径
+        if self.inner.relay.has_restricted() {
+            return self.invite_v2(ttl_ms, recipient, opts).await;
+        }
         // c1：令牌携带 issuer **实际在线**的 relay（快照 active_url；已连接
         // = joiner 经它必然可达 issuer），并映射回配置原样字符串（HB 8.1：
         // 对外回显配置形态，不做规范化改写）。快照未就绪（刚启动尚未沉降
@@ -1683,6 +2150,153 @@ impl Fabric {
             )?
         };
         Ok(token.encode()?)
+    }
+
+    /// InviteV2 签发（root-only；附录 A，task 2.1）。
+    ///
+    /// - relay 列表 = CustomWithCaps 全量条目，"活快照优先"（active 条目
+    ///   稳定提前，其余配置序）；
+    /// - 每条 restricted（server_id）条目对 recipient 现签 bootstrap
+    ///   capability（caps=仅 RELAY（§7.2 签发最小化）、TTL = 令牌 expires
+    ///   （§7.3 bootstrap ≤ invite expires））；
+    /// - 静态 token 条目不嵌入（recipient 绑定无法由本机保证——本地注入专用）；
+    /// - recipient 恒必填（缺省报 [`FabricError::InviteV2RequiresRecipient`]）；
+    /// - 安全门沿用 v1（relay 空且无 advertise_addrs 且未 allow_relayless 拒签）。
+    async fn invite_v2(
+        &self,
+        ttl_ms: u64,
+        recipient: Option<EndpointId>,
+        opts: InviteOptions,
+    ) -> Result<String, FabricError> {
+        let Some(recipient) = recipient else {
+            return Err(FabricError::InviteV2RequiresRecipient);
+        };
+        let entries = match &self.inner.relay {
+            RelayConfig::CustomWithCaps(entries) => entries,
+            // invite_with 已保证 has_restricted() ⇒ CustomWithCaps；此臂不可达
+            _ => return Err(FabricError::InviteV2RequiresRecipient),
+        };
+        let addrs = self.inner.advertise_addrs.clone();
+        let relays_any = !entries.is_empty();
+        if !relays_any && addrs.is_empty() && !opts.allow_relayless {
+            return Err(FabricError::InviteWithoutRelay);
+        }
+        // v2 直连地址 = 二进制 SocketAddr（构造期已校验 advertise_addrs）
+        let direct_addrs: Vec<std::net::SocketAddr> = addrs
+            .iter()
+            .map(|a| {
+                a.parse::<std::net::SocketAddr>()
+                    .map_err(|_| FabricError::BadAdvertiseAddr {
+                        addr: a.clone(),
+                        reason: "not a parseable ip:port".to_owned(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let now = now_ms();
+        let expires_at = now.checked_add(ttl_ms).ok_or_else(|| {
+            FabricError::Session(SessionError::Connect("invite ttl overflow".into()))
+        })?;
+        let snapshot = self.inner.relay_snapshot.lock().unwrap().clone();
+        let fabric_id = self.inner.roster.lock().await.fabric_id();
+        // bootstrap capability：restricted 条目逐条现签（recipient 预绑定）
+        let relays: Vec<crate::protocol::InviteRelayV2> = invite_v2_relay_order(entries, &snapshot)
+            .into_iter()
+            .map(|entry| {
+                let capability = entry.server_id.map(|sid| {
+                    crate::protocol::RelayCapV1::sign_and_encode(
+                        self.inner.identity.secret_key(),
+                        &fabric_id,
+                        &sid,
+                        &recipient,
+                        crate::protocol::MEMBER_CAPS,
+                        now,
+                        expires_at,
+                    )
+                });
+                let capability = capability.transpose().map_err(|e| {
+                    FabricError::Session(SessionError::Connect(format!(
+                        "bootstrap capability mint failed for {}: {e}",
+                        entry.url
+                    )))
+                })?;
+                Ok(crate::protocol::InviteRelayV2 {
+                    url: entry.url.clone(),
+                    capability,
+                })
+            })
+            .collect::<Result<_, FabricError>>()?;
+        let token = {
+            // [R8-1] 与 v1 同一提交锁（签发属运行时名册面操作）
+            let _commit = self.inner.roster_commit.lock().await;
+            if self.inner.lifecycle_closing() {
+                return Err(FabricInner::shutting_down_error());
+            }
+            self.inner.roster.lock().await.issue_invite_v2(
+                &self.inner.identity,
+                relays,
+                direct_addrs,
+                recipient,
+                ttl_ms,
+                now,
+            )?
+        };
+        Ok(token.encode()?)
+    }
+
+    /// root 自签 own capability 并注入本地 RelayMap（task 2.3 / §7.3）。
+    ///
+    /// 对 CustomWithCaps 中 server_id=Some 的条目，root 身份自签 own
+    /// capability（caps=RELAY|RDZ_ANNOUNCE|RDZ_RESOLVE（§7.2 root 全位）、
+    /// TTL=180d-1s（§11.1 上限内）、recipient=issuer=root）注入 endpoint
+    /// RelayMap；静态 token 条目原样透传注入。返回 (url, token) 供调用方
+    /// 复用（如转交/审计）。own capability 不持久化——root 每次启动重签
+    /// （Ed25519 确定性 + 幂等覆盖，无状态漂移）。非 root 调用报
+    /// [`crate::roster::RosterError::NotRoot`]（与名册 root-only 操作同源）。
+    pub async fn ensure_relay_capabilities(&self) -> Result<Vec<(String, String)>, FabricError> {
+        let entries = match &self.inner.relay {
+            RelayConfig::CustomWithCaps(entries) => entries,
+            _ => return Ok(Vec::new()),
+        };
+        let me = self.inner.identity.endpoint_id();
+        {
+            let roster = self.inner.roster.lock().await;
+            if !matches!(roster.root(), Some(root) if root == me) {
+                return Err(FabricError::Roster(crate::roster::RosterError::NotRoot {
+                    caller: me,
+                    root: roster.root(),
+                }));
+            }
+        }
+        let fabric_id = self.inner.roster.lock().await.fabric_id();
+        let now = now_ms();
+        let expires_at = now + crate::protocol::ROOT_CAP_TTL_MS;
+        let mut out = Vec::new();
+        for entry in entries {
+            if let Some(sid) = entry.server_id {
+                let token = crate::protocol::RelayCapV1::sign_and_encode(
+                    self.inner.identity.secret_key(),
+                    &fabric_id,
+                    &sid,
+                    &me,
+                    crate::protocol::ROOT_CAPS,
+                    now,
+                    expires_at,
+                )
+                .map_err(|e| {
+                    FabricError::Session(SessionError::Connect(format!(
+                        "own capability mint failed for {}: {e}",
+                        entry.url
+                    )))
+                })?;
+                out.push((entry.url.clone(), token));
+            } else if let Some(t) = entry.local_token() {
+                out.push((entry.url.clone(), t.to_owned()));
+            }
+        }
+        if let Some(map) = &self.inner.relay_map {
+            inject_relay_tokens(map, &out);
+        }
+        Ok(out)
     }
 
     /// 撤销成员（root-only），并断开与其的既有会话。
@@ -1725,6 +2339,38 @@ impl Fabric {
 
     // ---- 加入与连接 ----
 
+    /// join/connect 拨号错误的 deny reason 附注（task 2.5）：relay watcher 已
+    /// 把 `dweb/*` deny reason 记入快照 last_error（sanitize 例外透传）——
+    /// 拨号失败分类时若存在，附在错误 message 尾部（结构化 reason 是唯一
+    /// 可操作信号：无票/过期/转借的修复路径各不相同，不得折叠进泛化类别）。
+    fn relay_deny_note(&self) -> Option<String> {
+        let snap = self.inner.relay_snapshot.lock().unwrap().clone();
+        snap.last_error
+            .as_deref()
+            .and_then(extract_deny_reason)
+            .map(|r| format!("relay denied: {r}"))
+    }
+
+    /// Connect 错误分类的 deny 附注（task 2.5）：iroh ConnectError 的错误链
+    /// 可能内嵌 relay 握手拒绝文本（`ServerDeniedAuth` Display 折进 reason）；
+    /// 快照侧 watcher 记录可能晚于 connect 失败（首次握手拒绝的竞态窗口），
+    /// 1s 宽限轮询收敛——无 deny 的常规失败最多多等 1s（探针路径同量级）。
+    async fn connect_deny_note(&self, connect_reason: &str) -> Option<String> {
+        if let Some(r) = extract_deny_reason(connect_reason) {
+            return Some(format!("relay denied: {r}"));
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(note) = self.relay_deny_note() {
+                return Some(note);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// 兑换邀请令牌（joiner 侧）。成功后本节点是成员且持有完整名册。
     ///
     /// 失败按 D11 分类总函数有序判定（互斥穷尽）：
@@ -1733,6 +2379,11 @@ impl Fabric {
     /// 拨号前零等待) -> deadline 包住的 connect+redeem 网络工作流（8 码归类，
     /// 含 2s transport-only TCP relay 探针驱动的 RELAY_OFFLINE/DIAL_TIMEOUT 附注）。
     pub async fn join(&self, token_str: &str) -> Result<(), FabricError> {
+        // task 2.1：按串前缀分派——dweb2. 走 v2 路径（附录 A 令牌 + OK2
+        // 回执 + member capability 持久化/注入）；dweb1. 路径零变化。
+        if token_str.starts_with(crate::protocol::TOKEN2_PREFIX) {
+            return self.join_v2(token_str).await;
+        }
         // 1-3：解码 / 过期 / 地址规范化（令牌自身错误优先于目录检查）。
         let token = precheck_join_token(token_str)?;
         if self.inner.lifecycle_closing() {
@@ -1789,25 +2440,39 @@ impl Fabric {
             &self.inner.relay,
         );
         // 7：deadline 包住 connect + redeem（到期取消等待并关闭已建立的连接）。
+        // token 克隆进 deadline 工作流（错误归因探针仍需原令牌字段）
         let join_err = join_with_deadline(
             &self.inner.endpoint,
             &self.inner.detached_connects,
             &addr,
-            &token,
+            &crate::protocol::InviteVersion::V1(token.clone()),
             self.inner.identity.secret_key(),
             &self.inner.identity.endpoint_id(),
             std::time::Duration::from_millis(self.inner.join_timeout_ms),
         )
         .await;
         match join_err {
-            Ok((conn, facts)) => {
+            Ok((conn, facts, caps)) => {
                 conn.close(0u32.into(), b"redeem-done");
+                debug_assert!(
+                    caps.is_empty(),
+                    "v1 redeem path never returns relay capabilities"
+                );
                 self.merge_and_emit(facts).await?; // roster-io 豁免透出
                 Ok(())
             }
             // connect 立即错误的归因需要探针（不解析 iroh ConnectError 内部）。
             Err(JoinPhaseError::Connect(e)) => {
                 let reason = e.to_string();
+                // task 2.5：relay deny（受限 server 拒接入）优先于探针归因
+                // 附进 message——TCP 探针只会报"端口活着"，deny reason 才是
+                // 真因（无票/过期/转借）
+                if let Some(note) = self.connect_deny_note(&reason).await {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::DialFailed,
+                        message: format!("could not reach the issuer: {reason} ({note})"),
+                    });
+                }
                 if probe_applies(&token, self.inner.proxy_is_none) {
                     let relay_url = token.invite.issuer_relay_url.clone();
                     if !run_relay_probe(&relay_url).await {
@@ -1827,17 +2492,178 @@ impl Fabric {
             }
             Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
             Err(JoinPhaseError::DeadlineElapsed) => {
-                let note = if probe_applies(&token, self.inner.proxy_is_none)
-                    && run_relay_probe(&token.invite.issuer_relay_url).await
-                {
-                    "relay online: issuer likely offline (invites must be redeemed while the \
-                     inviter is running)"
-                        .to_owned()
-                } else {
-                    format!(
+                let note = match &self.relay_deny_note() {
+                    // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
+                    // 静默退避重试，connect 常以超时面落地）
+                    Some(note) => format!("join failed to reach the issuer via relay ({note})"),
+                    None if probe_applies(&token, self.inner.proxy_is_none)
+                        && run_relay_probe(&token.invite.issuer_relay_url).await =>
+                    {
+                        "relay online: issuer likely offline (invites must be redeemed while the \
+                         inviter is running)"
+                            .to_owned()
+                    }
+                    None => format!(
                         "join deadline exceeded after {}ms",
                         self.inner.join_timeout_ms
-                    )
+                    ),
+                };
+                Err(FabricError::Join {
+                    code: JoinErrorCode::DialTimeout,
+                    message: note,
+                })
+            }
+        }
+    }
+
+    /// join 的 v2 路径（附录 A/A2；task 2.1/2.4）：与 v1 同一分类总函数
+    /// 顺序，差异点：
+    /// - 拨号候选 = relay 列表全量 + 直连地址 + 本地 relay 配置合并；
+    /// - 拨号前把令牌内嵌 bootstrap capability 注入本地 RelayMap（附录 A：
+    ///   bootstrap 仅用于 join 拨号窗口的 relay 接入）；
+    /// - 成功回执 OK2 → 名册 merge（同 OK 路径）+ capability 段提取 →
+    ///   upsert relay.caps.json（同 url 覆盖）+ 热注入本地 RelayMap。
+    async fn join_v2(&self, token_str: &str) -> Result<(), FabricError> {
+        // 1-3：解码（附录 A 全部校验）/ 过期 / relay URL 可解析
+        let token = precheck_join_token_v2(token_str)?;
+        if self.inner.lifecycle_closing() {
+            return Err(FabricInner::shutting_down_error());
+        }
+        // 4：学习 issuer 可达信息（relay 列表 + 直连地址，有界 HB 3.1）
+        {
+            let mut learned: Vec<String> =
+                token.invite.relays.iter().map(|r| r.url.clone()).collect();
+            learned.extend(token.invite.direct_addrs.iter().map(|a| a.to_string()));
+            self.inner
+                .known_addrs
+                .lock()
+                .await
+                .set(token.invite.issuer, learned);
+        }
+        // 5：目录归属
+        {
+            let roster = self.inner.roster.lock().await;
+            if roster.fabric_id() != token.invite.fabric_id {
+                return Err(FabricError::Roster(
+                    crate::roster::RosterError::DirFabricMismatch {
+                        path: crate::roster::roster_file_path(roster.data_dir()),
+                        stored: roster.fabric_id(),
+                        requested: token.invite.fabric_id,
+                    },
+                ));
+            }
+        }
+        // 6：空路径
+        if token.invite.relays.is_empty() && token.invite.direct_addrs.is_empty() {
+            return Err(FabricError::Join {
+                code: JoinErrorCode::NoReachablePath,
+                message: "the token carries no relay URL and no direct addresses (likely \
+                          signed without a relay); ask the inviter to re-sign with a relay \
+                          configured"
+                    .to_owned(),
+            });
+        }
+        // bootstrap capability 注入（热更新共享句柄；N0/Disabled 模式无注入面，
+        // 候选合并仍携带 relay URL——受限部署的 joiner 应以 Custom 形态配置）
+        let bootstrap: Vec<(String, String)> = token
+            .invite
+            .relays
+            .iter()
+            .filter_map(|r| r.capability.as_ref().map(|c| (r.url.clone(), c.clone())))
+            .collect();
+        if let Some(map) = &self.inner.relay_map {
+            inject_relay_tokens(map, &bootstrap);
+        }
+        // c1 同款：本地 relay 配置追加为拨号候选
+        let addr = Self::with_local_relay_candidates(
+            session::endpoint_addr_from_invite_v2(&token)?,
+            &self.inner.relay,
+        );
+        // 7：deadline 包住 connect + redeem（token 克隆进工作流；后续错误
+        // 归因仍需原令牌的 relay 列表）
+        let join_err = join_with_deadline(
+            &self.inner.endpoint,
+            &self.inner.detached_connects,
+            &addr,
+            &crate::protocol::InviteVersion::V2(token.clone()),
+            self.inner.identity.secret_key(),
+            &self.inner.identity.endpoint_id(),
+            std::time::Duration::from_millis(self.inner.join_timeout_ms),
+        )
+        .await;
+        let first_relay = token
+            .invite
+            .relays
+            .first()
+            .map(|r| r.url.clone())
+            .unwrap_or_default();
+        match join_err {
+            Ok((conn, facts, caps)) => {
+                conn.close(0u32.into(), b"redeem-done");
+                self.merge_and_emit(facts).await?; // roster-io 豁免透出
+                // member capability：内存 upsert + 文件 append/update（同 url
+                // 覆盖）→ 热注入（重启后由 start() 加载同源注入）
+                if !caps.is_empty() {
+                    {
+                        let mut store = self.inner.relay_caps.lock().unwrap();
+                        upsert_relay_caps(&mut store, &caps);
+                    }
+                    store_relay_caps(&self.inner.data_dir, &caps)?;
+                    if let Some(map) = &self.inner.relay_map {
+                        inject_relay_tokens(map, &caps);
+                    }
+                }
+                Ok(())
+            }
+            Err(JoinPhaseError::Connect(e)) => {
+                let reason = e.to_string();
+                // task 2.5：relay deny（受限 server 拒接入，如 bootstrap
+                // capability 过期/转借）优先于探针归因附进 message
+                if let Some(note) = self.connect_deny_note(&reason).await {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::DialFailed,
+                        message: format!("could not reach the issuer: {reason} ({note})"),
+                    });
+                }
+                // 探针适用条件同 v1 probe_applies：relay-only 令牌（无直连
+                // 地址）且无代理——直连路径存在时 relay 探针不构成归因依据
+                let probe_applies = !first_relay.is_empty() && token.invite.direct_addrs.is_empty();
+                if probe_applies && self.inner.proxy_is_none && !run_relay_probe(&first_relay).await
+                {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::RelayOffline,
+                        message: format!(
+                            "configured relay(es) are unreachable; check the server or \
+                                 network (connect error: {reason})"
+                        ),
+                    });
+                }
+                Err(FabricError::Join {
+                    code: JoinErrorCode::DialFailed,
+                    message: format!("could not reach the issuer: {reason}"),
+                })
+            }
+            Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
+            Err(JoinPhaseError::DeadlineElapsed) => {
+                let note = match &self.relay_deny_note() {
+                    // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
+                    // 静默退避重试，connect 常以超时面落地）
+                    Some(note) => {
+                        format!("join failed to reach the issuer via relay ({note})")
+                    }
+                    None if !first_relay.is_empty()
+                        && token.invite.direct_addrs.is_empty()
+                        && self.inner.proxy_is_none
+                        && run_relay_probe(&first_relay).await =>
+                    {
+                        "relay online: issuer likely offline (invites must be redeemed while the \
+                     inviter is running)"
+                            .to_owned()
+                    }
+                    None => format!(
+                        "join deadline exceeded after {}ms",
+                        self.inner.join_timeout_ms
+                    ),
                 };
                 Err(FabricError::Join {
                     code: JoinErrorCode::DialTimeout,
@@ -2212,6 +3038,15 @@ impl Fabric {
             RelayConfig::Custom(urls) => {
                 for u in urls {
                     if let Ok(url) = u.parse::<iroh::RelayUrl>() {
+                        addr = addr.with_relay_url(url);
+                    }
+                }
+            }
+            RelayConfig::CustomWithCaps(entries) => {
+                // task 2.2：候选合并只管路径 URL；per-relay capability 的
+                // RelayMap 条目级注入在拨号前由 join 路径完成
+                for e in entries {
+                    if let Ok(url) = e.url.parse::<iroh::RelayUrl>() {
                         addr = addr.with_relay_url(url);
                     }
                 }
@@ -2645,6 +3480,25 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
                         matches!(roster.root(), Some(r) if r == inner2.identity.endpoint_id())
                     };
                     if is_root {
+                        // task 2.4：v2 兑换的 member capability 附发源——
+                        // root 当前配置的 restricted 条目（url→server_id）；
+                        // 非 CustomWithCaps 配置 → 空表（OK2 只回名册 + 空段）
+                        let (fabric_id, restricted) = {
+                            let roster = inner2.roster.lock().await;
+                            let restricted = match &inner2.relay {
+                                RelayConfig::CustomWithCaps(entries) => entries
+                                    .iter()
+                                    .filter_map(|e| e.server_id.map(|sid| (e.url.clone(), sid)))
+                                    .collect(),
+                                _ => Vec::new(),
+                            };
+                            (roster.fabric_id(), restricted)
+                        };
+                        let minter = session::RedeemCapMinter {
+                            fabric_id,
+                            signer: inner2.identity.secret_key(),
+                            restricted,
+                        };
                         let _res = session::handle_redeem_as_issuer_gated(
                             &conn,
                             &inner2.roster,
@@ -2652,6 +3506,7 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
                             &inner2.roster_commit,
                             &inner2.shutdown_started,
                             inner2.lifecycle_gate.clone(),
+                            Some(&minter),
                         )
                         .await;
                         {
@@ -2728,6 +3583,306 @@ fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    // ==== server-access-policy Phase 2（tasks 2.1/2.2/2.3） ======================
+
+    fn relay_entry(url: &str, server_id: Option<[u8; 32]>, token: Option<&str>) -> RelayEntry {
+        RelayEntry {
+            url: url.to_owned(),
+            server_id,
+            token: token.map(str::to_owned),
+        }
+    }
+
+    /// CustomWithCaps 测试配置（relay URL 不可达也无妨——endpoint 构造不拨号）。
+    fn caps_cfg(dir: &std::path::Path, entries: Vec<RelayEntry>) -> FabricConfig {
+        FabricConfig {
+            data_dir: dir.to_owned(),
+            relay: RelayConfig::CustomWithCaps(entries),
+            ..FabricConfig::new(dir)
+        }
+    }
+
+    #[tokio::test]
+    async fn invite_v2_signed_when_restricted_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = caps_cfg(
+            dir.path(),
+            vec![
+                relay_entry("https://relay-a.example", Some([0xA1; 32]), None),
+                relay_entry("https://relay-b.example", None, None),
+            ],
+        );
+        let a = Fabric::create_root(cfg).await.unwrap();
+        let fabric_id = a.inner.roster.lock().await.fabric_id();
+        let b_id = NodeIdentity::from_seed([0x22; 32]).endpoint_id();
+        let token_str = a
+            .invite_with(
+                60_000,
+                Some(&endpoint_id_display(&b_id)),
+                InviteOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(token_str.starts_with("dweb2."), "restricted 配置必须签 v2");
+        let token = crate::protocol::InviteV2Token::decode(&token_str).unwrap();
+        assert_eq!(token.invite.fabric_id, fabric_id);
+        assert_eq!(token.invite.recipient, b_id);
+        assert_eq!(token.invite.relays.len(), 2);
+        // restricted 条目带 bootstrap capability：recipient 预绑定、TTL ≤ invite
+        let cap = token.invite.relays[0].capability.as_ref().unwrap();
+        let parsed = crate::protocol::RelayCapV1::decode(cap).unwrap();
+        assert_eq!(parsed.recipient, b_id);
+        assert_eq!(parsed.server_id, [0xA1; 32]);
+        assert_eq!(
+            parsed.caps,
+            crate::protocol::MEMBER_CAPS,
+            "§7.2 默认仅 RELAY"
+        );
+        assert!(parsed.expires_at <= token.invite.expires_at_ms);
+        // 非 restricted 条目无凭证
+        assert!(token.invite.relays[1].capability.is_none());
+    }
+
+    #[tokio::test]
+    async fn invite_v2_requires_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = caps_cfg(
+            dir.path(),
+            vec![relay_entry("https://r.example", Some([1; 32]), None)],
+        );
+        let a = Fabric::create_root(cfg).await.unwrap();
+        match a.invite(60_000, None).await {
+            Err(FabricError::InviteV2RequiresRecipient) => {}
+            other => panic!("expected InviteV2RequiresRecipient, got {other:?}"),
+        }
+    }
+
+    /// 无 restricted 条目（server_id 全 None）→ v1 令牌，前缀行为零变化。
+    #[tokio::test]
+    async fn invite_stays_v1_without_restricted_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = caps_cfg(
+            dir.path(),
+            vec![relay_entry("https://r.example", None, None)],
+        );
+        let a = Fabric::create_root(cfg).await.unwrap();
+        let token_str = a.invite(60_000, None).await.unwrap();
+        assert!(token_str.starts_with("dweb1."), "非 restricted 配置维持 v1");
+        assert!(crate::protocol::InviteToken::decode(&token_str).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ensure_relay_capabilities_root_self_signs_non_root_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = caps_cfg(
+            dir.path(),
+            vec![
+                relay_entry("https://relay-a.example", Some([0xA1; 32]), None),
+                relay_entry("https://relay-b.example", None, None),
+            ],
+        );
+        let a = Fabric::create_root(cfg).await.unwrap();
+        let caps = a.ensure_relay_capabilities().await.unwrap();
+        assert_eq!(caps.len(), 1, "仅 server_id 条目自签");
+        assert_eq!(caps[0].0, "https://relay-a.example");
+        let parsed = crate::protocol::RelayCapV1::decode(&caps[0].1).unwrap();
+        let me = a.inner.identity.endpoint_id();
+        assert_eq!(parsed.recipient, me, "own capability recipient = root");
+        assert_eq!(parsed.issuer, me);
+        assert_eq!(parsed.caps, crate::protocol::ROOT_CAPS, "root 全位（§7.2）");
+        assert_eq!(
+            parsed.expires_at - parsed.issued_at,
+            crate::protocol::ROOT_CAP_TTL_MS,
+            "TTL = 180d - 1ms"
+        );
+        // 注入生效：endpoint RelayMap 条目带 auth token
+        assert_eq!(
+            a.relay_map_token("https://relay-a.example").as_deref(),
+            Some(caps[0].1.as_str())
+        );
+        assert_eq!(a.relay_map_token("https://relay-b.example"), None);
+
+        // 非 root 调用 → NotRoot（同源 RosterError）
+        let dir_b = tempfile::tempdir().unwrap();
+        let fid = a.fabric_id_hex().await;
+        let b = Fabric::attach(
+            caps_cfg(
+                dir_b.path(),
+                vec![relay_entry(
+                    "https://relay-a.example",
+                    Some([0xA1; 32]),
+                    None,
+                )],
+            ),
+            &fid,
+        )
+        .await
+        .unwrap();
+        match b.ensure_relay_capabilities().await {
+            Err(FabricError::Roster(crate::roster::RosterError::NotRoot { .. })) => {}
+            other => panic!("expected NotRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relay_caps_store_roundtrip_and_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            load_relay_caps(dir.path()).unwrap().is_empty(),
+            "缺文件 = 空"
+        );
+        let t1 = crate::protocol::RelayCapV1::sign_and_encode(
+            NodeIdentity::from_seed([1; 32]).secret_key(),
+            &crate::protocol::FabricId::from_name("f"),
+            &[2; 32],
+            &NodeIdentity::from_seed([3; 32]).endpoint_id(),
+            crate::protocol::MEMBER_CAPS,
+            1000,
+            1000 + 60_000,
+        )
+        .unwrap();
+        let t2 = crate::protocol::RelayCapV1::sign_and_encode(
+            NodeIdentity::from_seed([1; 32]).secret_key(),
+            &crate::protocol::FabricId::from_name("f"),
+            &[2; 32],
+            &NodeIdentity::from_seed([3; 32]).endpoint_id(),
+            crate::protocol::MEMBER_CAPS,
+            2000,
+            2000 + 60_000,
+        )
+        .unwrap();
+        // 初始落盘 + 新 url 追加 + 同 url 覆盖
+        store_relay_caps(dir.path(), &[("https://a.example".to_owned(), t1.clone())]).unwrap();
+        store_relay_caps(dir.path(), &[("https://b.example".to_owned(), t2.clone())]).unwrap();
+        store_relay_caps(dir.path(), &[("https://a.example".to_owned(), t2.clone())]).unwrap();
+        let loaded = load_relay_caps(dir.path()).unwrap();
+        assert_eq!(
+            loaded,
+            vec![
+                ("https://a.example".to_owned(), t2.clone()),
+                ("https://b.example".to_owned(), t2.clone()),
+            ],
+            "同 url 覆盖、异 url 保序追加"
+        );
+        // 内存 upsert 语义与文件一致
+        let mut mem = vec![("https://a.example".to_owned(), t1)];
+        assert!(upsert_relay_caps(
+            &mut mem,
+            &[("https://a.example".to_owned(), t2.clone())]
+        ));
+        assert_eq!(mem.len(), 1);
+        assert_eq!(mem[0].1, t2);
+        assert!(!upsert_relay_caps(
+            &mut mem,
+            &[("https://a.example".to_owned(), t2.clone())]
+        ));
+        // 损坏文件 → 显式错误（不静默吞 bearer 凭证）
+        std::fs::write(relay_caps_path(dir.path()), b"not json").unwrap();
+        assert!(matches!(
+            load_relay_caps(dir.path()),
+            Err(FabricError::RelayCapsStore { .. })
+        ));
+    }
+
+    #[test]
+    fn invite_v2_relay_order_active_first() {
+        let entries = vec![
+            relay_entry("https://dead.example", Some([1; 32]), None),
+            relay_entry("https://live.example", Some([2; 32]), None),
+        ];
+        let snapshot = RelayStatusSnapshot {
+            mode: "custom",
+            urls: vec!["https://dead.example".into(), "https://live.example".into()],
+            online: Some(true),
+            active_url: Some("https://live.example/".into()),
+            last_error: None,
+        };
+        let ordered = invite_v2_relay_order(&entries, &snapshot);
+        assert_eq!(ordered[0].url, "https://live.example", "active 稳定提前");
+        assert_eq!(ordered[1].url, "https://dead.example", "其余保配置序");
+        // 快照未沉降 → 配置序
+        let offline = RelayStatusSnapshot {
+            online: Some(false),
+            active_url: None,
+            ..snapshot
+        };
+        let ordered = invite_v2_relay_order(&entries, &offline);
+        assert_eq!(ordered[0].url, "https://dead.example");
+    }
+
+    #[test]
+    fn inject_relay_tokens_sets_entry_level_auth() {
+        let map = iroh_relay::RelayMap::empty();
+        inject_relay_tokens(
+            &map,
+            &[
+                ("https://r.example".to_owned(), "tok-1".to_owned()),
+                ("https://plain.example".to_owned(), String::new()),
+                ("::not a url::".to_owned(), "tok-2".to_owned()),
+            ],
+        );
+        let cfg = map
+            .get(&"https://r.example".parse::<iroh::RelayUrl>().unwrap())
+            .unwrap();
+        assert_eq!(cfg.auth_token.as_deref(), Some("tok-1"));
+        let plain = map
+            .get(&"https://plain.example".parse::<iroh::RelayUrl>().unwrap())
+            .unwrap();
+        assert!(plain.auth_token.is_none(), "空 token = 无凭证条目");
+        assert_eq!(map.len(), 2, "不可解析 URL 跳过");
+    }
+
+    #[test]
+    fn precheck_dweb2_token_maps_to_ninth_code() {
+        // 构造合法 v2 令牌（recipient 必填）→ v1 precheck 必须报第九码
+        let issuer = NodeIdentity::from_seed([5; 32]);
+        let invite = crate::protocol::InviteV2 {
+            fabric_id: crate::protocol::FabricId::from_name("ninth"),
+            invite_id: [0xCD; 16],
+            issuer: issuer.endpoint_id(),
+            expires_at_ms: now_ms() + 60_000,
+            recipient: NodeIdentity::from_seed([6; 32]).endpoint_id(),
+            relays: vec![],
+            direct_addrs: vec![],
+        };
+        let token = crate::protocol::InviteV2Token::sign(invite, issuer.secret_key())
+            .unwrap()
+            .encode()
+            .unwrap();
+        match precheck_join_token(&token) {
+            Err(FabricError::Join {
+                code: JoinErrorCode::UnsupportedInviteVersion,
+                message,
+            }) => {
+                assert!(message.contains("upgrade"), "含升级指引: {message}");
+                assert_eq!(
+                    JoinErrorCode::UnsupportedInviteVersion.kebab(),
+                    "unsupported-invite-version"
+                );
+            }
+            other => panic!("expected ninth code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_dial_candidates_includes_custom_with_caps_urls() {
+        let id = NodeIdentity::from_seed([1; 32]).endpoint_id();
+        let relay = RelayConfig::CustomWithCaps(vec![
+            relay_entry("https://r1.example", Some([1; 32]), None),
+            relay_entry("https://r2.example", None, None),
+        ]);
+        let addr = Fabric::merge_dial_candidates(&id, &["127.0.0.1:9999".to_owned()], &relay);
+        let urls: Vec<String> = addr
+            .addrs
+            .iter()
+            .filter_map(|a| match a {
+                iroh_base::TransportAddr::Relay(u) => Some(u.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(urls.len(), 2, "全部条目并入候选（spec delta 场景）");
+    }
 
     // ---- 3.1 advertise_addrs 构造期校验 --------------------------------------
 
@@ -2903,6 +4058,44 @@ mod tests {
         assert_eq!(sanitize_relay_error("dns resolution failed"), "dns error");
         assert_eq!(sanitize_relay_error("invalid certificate"), "tls error");
         assert_eq!(sanitize_relay_error(""), "connection error");
+    }
+
+    // ---- task 2.5：deny reason 提取/透传 -------------------------------------------
+
+    #[test]
+    fn extract_deny_reason_scans_structured_tokens() {
+        // iroh ServerDeniedAuth Display 形态（错误链折进文本）
+        assert_eq!(
+            extract_deny_reason("The relay denied our authentication (dweb/no-capability)"),
+            Some("dweb/no-capability")
+        );
+        assert_eq!(
+            extract_deny_reason("handshake: relay denied: dweb/capability-expired, retrying"),
+            Some("dweb/capability-expired")
+        );
+        // 多段 reason（服务端语法允许 . _ -）
+        assert_eq!(
+            extract_deny_reason("x dweb/policy.denied_2-a y"),
+            Some("dweb/policy.denied_2-a")
+        );
+        // 非 deny 文本 / 空 reason / 前缀不完整
+        assert_eq!(extract_deny_reason("tcp connect timed out"), None);
+        assert_eq!(extract_deny_reason("dweb/ (empty reason)"), None);
+        assert_eq!(extract_deny_reason("adweb/no-capability"), None);
+    }
+
+    #[test]
+    fn sanitize_relay_error_passes_deny_reason_through() {
+        // D4 脱敏的 task 2.5 例外：结构化 deny reason 不折叠进泛化类别
+        assert_eq!(
+            sanitize_relay_error("The relay denied our authentication (dweb/not-recipient)"),
+            "relay denied: dweb/not-recipient"
+        );
+        // deny 优先于类别映射（含 timeout 字样的 deny 文本）
+        assert_eq!(
+            sanitize_relay_error("denied dweb/capability-expired after timeout"),
+            "relay denied: dweb/capability-expired"
+        );
     }
 
     // ---- HB 3.1 拨号候选合并（learned 不遮蔽 relay，冻结语义） ----------------------
