@@ -436,6 +436,9 @@ pub struct SessionShared {
     /// 交付队列（stream_id → 有序字节），应用侧 recv 消费。
     delivered: tokio::sync::Mutex<HashMap<u64, DeliverQueue>>,
     delivered_notify: tokio::sync::Notify,
+    /// 对端 RESET 唤醒面（per-request cancel）：serve 响应循环 select 监听——
+    /// 挂起中的响应流（handler 无后续 write）也能即时止付并 Drop 接收器。
+    pub(crate) reset_notify: tokio::sync::Notify,
     /// 异 session_id 帧计数（P0-1：旧代/串线帧不污染会话）+ 旧通道 fence
     /// 计数（R3-2：epoch/owner 不符的迟到帧）。
     stale_frame_count: std::sync::atomic::AtomicU64,
@@ -491,6 +494,7 @@ impl SessionShared {
             open_metas: tokio::sync::Mutex::new(HashMap::new()),
             delivered: tokio::sync::Mutex::new(HashMap::new()),
             delivered_notify: tokio::sync::Notify::new(),
+            reset_notify: tokio::sync::Notify::new(),
             stale_frame_count: std::sync::atomic::AtomicU64::new(0),
             ack_violation_count: std::sync::atomic::AtomicU64::new(0),
             protocol_violation_count: std::sync::atomic::AtomicU64::new(0),
@@ -1460,6 +1464,8 @@ impl SessionShared {
                     ctx.peer_reset = true;
                     drop(streams);
                     self.delivered_notify.notify_waiters();
+                    // 唤醒可能阻塞在 body 供给上的 serve 响应循环（即时止付）
+                    self.reset_notify.notify_waiters();
                 } else {
                     // R3-4b：未见过的流——违规计数丢弃
                     drop(streams);

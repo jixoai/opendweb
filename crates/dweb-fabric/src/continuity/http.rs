@@ -240,23 +240,40 @@ pub async fn fetch_http(
     if !init.keep_open {
         channel.finish(stream_id).await?;
     }
-    // 等 meta 行（首块；有界——head_timeout 可配，默认 30s）
+    // 等 meta 行（首块；有界——head_timeout 可配，默认 30s）。超时前发 RESET
+    // 清理 provider 侧在途请求（未清理则 handler 悬挂至其自身超时）。
     let head_timeout = init
         .head_timeout
         .unwrap_or(std::time::Duration::from_secs(30));
+    let head_timeout_err =
+        || FabricError::Session(SessionError::Connect("response head timeout".into()));
+    let reset_stream = |channel: &crate::continuity::session::SessionChannel| {
+        let frame = crate::continuity::Frame {
+            frame_type: crate::continuity::FrameType::Reset,
+            flags: 0,
+            session_id: session.shared().session_id,
+            stream_id,
+            direction: session.shared().send_direction(),
+            byte_offset: 0,
+            payload: Bytes::new(),
+        };
+        // best-effort：通道已死时取消目的已达（对端同样终结该流）
+        let _ = channel.send_frame(&frame);
+    };
     let mut buf: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + head_timeout;
     let (status, headers, rest) = loop {
         if tokio::time::Instant::now() >= deadline {
-            return Err(FabricError::Session(SessionError::Connect(
-                "response head timeout".into(),
-            )));
+            reset_stream(&channel);
+            return Err(head_timeout_err());
         }
-        let chunk = tokio::time::timeout(head_timeout, channel.recv(stream_id))
-            .await
-            .map_err(|_| {
-                FabricError::Session(SessionError::Connect("response head timeout".into()))
-            })??;
+        let chunk = match tokio::time::timeout(head_timeout, channel.recv(stream_id)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                reset_stream(&channel);
+                return Err(head_timeout_err());
+            }
+        };
         buf.extend_from_slice(&chunk);
         if let Some((status, headers, rest)) = peel_meta_line(&buf) {
             break (status, headers, rest);
@@ -438,7 +455,21 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                 return;
             }
             if let Some(mut body) = resp.body {
-                while let Some(chunk) = body.recv().await {
+                loop {
+                    let chunk = tokio::select! {
+                        c = body.recv() => match c {
+                            Some(c) => c,
+                            None => break, // handler 正常 EOF
+                        },
+                        // 对端 RESET 即时唤醒（挂起中的响应流——handler 无后续
+                        // write 时 body.recv() 永不返回，止付必须事件驱动）
+                        _ = shared.reset_notify.notified() => {
+                            if shared.peer_reset(stream_id).await {
+                                return; // 止付并丢弃接收器（供给面随 Drop 关闭）
+                            }
+                            continue; // 假唤醒（他流 RESET）：回到 body.recv()
+                        }
+                    };
                     // 对端 RESET（per-request cancel）：止付并丢弃接收器——
                     // 流式供给面随 Drop 关闭，handler 侧写失败提前收敛。
                     if shared.peer_reset(stream_id).await {

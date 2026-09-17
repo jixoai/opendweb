@@ -563,6 +563,12 @@ active/recovering → 返回既有句柄；dead/closed → 新建会话（新 se
 - body 迭代器 `return()`（提前终止）映射对端 FIN/本地取消；`throw()` 不由
   用户调用（协议错误经 reject 传播）。
 
+**响应分块边界不变量（B1/B2 冻结契约）**：serve 侧响应体的**一次 write 分块
+＝ 一条 DATA 帧载荷 ＝ fetch 侧 bodyNext 的一次返回**（恢复重放按 journal 段
+原序补发，段边界＝原 write 边界）。承载层带内协议（如 WS 关闭码尾块）可依赖
+该不变量判定「最终分块」；内核实现变更若引入分块合并/拆分，须升版协议并
+迁移载体层。
+
 **取消（AbortSignal 双向适配器）**：
 - 不使用 napi 内部 AbortSignal（AsyncTask 专用、Rc 非跨线程）。每请求在 JS
   侧创建 `AbortController`，其 `signal` 交给 handler；controller 的 `abort()`

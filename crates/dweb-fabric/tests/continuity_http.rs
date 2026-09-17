@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    fetch_http, serve_http, Header, HttpEngineError, HttpRequest, HttpRequestInit,
-    HttpResponse, HttpHandler,
+    fetch_http, serve_http, Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit,
+    HttpResponse,
 };
 use dweb_fabric::continuity::session::{self, RequestState, SessionOptions};
 use dweb_fabric::{
@@ -56,7 +56,9 @@ async fn pair() -> (Fabric, Fabric, tempfile::TempDir, tempfile::TempDir) {
     let dir_b = tempfile::tempdir().unwrap();
     let port_a = reserve_loopback_port();
     let port_b = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg_fixed_port(&dir_b, port_b), &fabric_id)
         .await
@@ -70,8 +72,9 @@ async fn pair() -> (Fabric, Fabric, tempfile::TempDir, tempfile::TempDir) {
     (a, b, dir_a, dir_b)
 }
 
-type BoxHttpFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HttpResponse, HttpEngineError>> + Send>>;
+type BoxHttpFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HttpResponse, HttpEngineError>> + Send>,
+>;
 
 /// 闭包 → HttpHandler（测试便利）。
 struct FnHandler<F>(F);
@@ -91,7 +94,12 @@ where
     Arc::new(FnHandler(f))
 }
 
-fn body_channel(cap: usize) -> (tokio::sync::mpsc::Sender<Bytes>, tokio::sync::mpsc::Receiver<Bytes>) {
+fn body_channel(
+    cap: usize,
+) -> (
+    tokio::sync::mpsc::Sender<Bytes>,
+    tokio::sync::mpsc::Receiver<Bytes>,
+) {
     tokio::sync::mpsc::channel(cap)
 }
 
@@ -120,21 +128,25 @@ async fn http_json_post_roundtrip() {
             })
         })
     });
-    let provider = tokio::spawn(async move {
-        serve_http(&b, &a_id, opts, h).await
-    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
 
     let client = session::open_session(&a, &b_id, opts).await.expect("open");
     let mut resp = tokio::time::timeout(
         Duration::from_secs(20),
-        fetch_http(&client, HttpRequestInit::post("/echo", Bytes::from_static(b"hello engine"))),
+        fetch_http(
+            &client,
+            HttpRequestInit::post("/echo", Bytes::from_static(b"hello engine")),
+        ),
     )
     .await
     .expect("fetch 有界")
     .expect("fetch ok");
     assert_eq!(resp.status, 200);
     assert_eq!(
-        resp.headers.iter().find(|h| h.name == "content-type").map(|h| h.value.as_str()),
+        resp.headers
+            .iter()
+            .find(|h| h.name == "content-type")
+            .map(|h| h.value.as_str()),
         Some("application/json")
     );
     let body = tokio::time::timeout(Duration::from_secs(10), resp.read_all_body())
@@ -205,7 +217,10 @@ async fn http_sse_survives_connection_swap() {
     .expect("fetch ok");
     assert_eq!(resp.status, 200);
     assert_eq!(
-        resp.headers.iter().find(|h| h.name == "content-type").map(|h| h.value.as_str()),
+        resp.headers
+            .iter()
+            .find(|h| h.name == "content-type")
+            .map(|h| h.value.as_str()),
         Some("text/event-stream")
     );
 
@@ -235,7 +250,10 @@ async fn http_sse_survives_connection_swap() {
     let expected: Vec<u8> = (0..10u32)
         .flat_map(|i| format!("data: tick-{i:02}\n\n").into_bytes())
         .collect();
-    assert_eq!(got, expected, "SSE 断线续传必须字节级精确（丢块/重复即失败）");
+    assert_eq!(
+        got, expected,
+        "SSE 断线续传必须字节级精确（丢块/重复即失败）"
+    );
     assert_eq!(
         exec_count.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -297,6 +315,76 @@ async fn http_ws_tunnel_bidirectional() {
             .expect("echo 有界")
             .expect("echo data");
         assert_eq!(&back[..], payload.as_bytes().repeat(8).as_slice());
+    }
+    provider.abort();
+}
+
+/// h4：对端 RESET 即时唤醒挂起中的响应流（B1/B2 P0）——handler 已发头、body
+/// 供给面静默（无后续 write）时，dispatch 不得悬挂至超时：RESET 到达即止付并
+/// Drop 接收器。供给 sender 的 reserve() 立刻报错 = 接收器已 Drop 的直接证据。
+#[tokio::test]
+async fn http_reset_wakes_idle_response_dispatch() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let probe = std::sync::Arc::new(tokio::sync::Mutex::new(
+        None::<tokio::sync::mpsc::Sender<Bytes>>,
+    ));
+    let p = std::sync::Arc::clone(&probe);
+    let h = handler(move |_req: HttpRequest| {
+        let p = std::sync::Arc::clone(&p);
+        Box::pin(async move {
+            let (tx, rx) = body_channel(4);
+            *p.lock().await = Some(tx);
+            // body 永不供给（响应流挂起形态——上游沉默）
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/idle")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+
+    // 等 handler 挂起（channel 就绪）→ 客户端 per-request 取消
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while probe.lock().await.is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "handler 未挂起");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    resp.abort().await;
+
+    // RESET 即时唤醒 dispatch：止付 → Drop 接收器 → sender.reserve() 报错
+    // （接收器存活时 reserve 对空通道恒成功；唤醒失败则挂到本 deadline 失败）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let tx = probe.lock().await.clone().expect("probe alive");
+        match tokio::time::timeout(Duration::from_secs(1), tx.reserve()).await {
+            Ok(Err(_send_err)) => break, // 接收器已 Drop——即时止付成立
+            Ok(Ok(_permit)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "RESET 未唤醒 idle 响应流（接收器仍存活）"
+                );
+                drop(_permit);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => panic!("reserve 探测不应超时"),
+        }
     }
     provider.abort();
 }
