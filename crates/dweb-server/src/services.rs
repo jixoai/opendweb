@@ -52,6 +52,9 @@ pub struct ServiceInfo {
     pub public_gateway_url: Option<String>,
     /// 公网 relay 覆盖；设置且 relay 启用时 relay 条目跳过派生
     pub public_relay_url: Option<String>,
+    /// ServerId（小写 hex，与 owners.jsonl 的 root 同展示形态；task 1.8：
+    /// 字段只增——capability 的 server_id 绑定值，客户端可校验跨 Server 重放）
+    pub server_id: String,
 }
 
 /// manifest 服务条目（wire 字段顺序冻结：name, enabled, url；url 为 string | null）
@@ -62,13 +65,16 @@ pub struct ServiceEntry {
     pub url: Option<String>,
 }
 
-/// 服务清单（wire 字段顺序冻结：server, version, gateway, services）
+/// 服务清单（既有 wire 字段顺序冻结：server, version, gateway, services；
+/// task 1.8 只增字段 server_id 追加在尾部，不扰动既有字段顺序）
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Manifest {
     pub server: String,
     pub version: String,
     pub gateway: Option<String>,
     pub services: Vec<ServiceEntry>,
+    /// ServerId（小写 hex；server-access-policy task 1.8）
+    pub server_id: String,
 }
 
 /// 数值序最小的非 loopback IPv4（hardening-backlog 9.2 统一语义 D1）：
@@ -311,6 +317,7 @@ pub fn build_manifest(
             version: env!("CARGO_PKG_VERSION").into(),
             gateway,
             services,
+            server_id: info.server_id.clone(),
         },
         warnings,
     )
@@ -455,6 +462,7 @@ mod tests {
             fallback_ipv4: Some("192.168.2.13".parse().unwrap()),
             public_gateway_url: None,
             public_relay_url: None,
+            server_id: "5a".repeat(32),
         }
     }
 
@@ -476,11 +484,33 @@ mod tests {
         serde_json::to_value(m).unwrap()
     }
 
-    /// 字段快照断言：version 为占位值（各包版本归 owner），其余字段名/结构/URL 完全一致
+    /// 字段快照断言：version 为占位值（各包版本归 owner），server_id 为
+    /// task 1.8 只增字段（归档 fixture 冻结不含，与 version 同作占位处理），
+    /// 其余字段名/结构/URL 完全一致
     fn assert_matches_fixture(m: &Manifest, case: &FixtureCase) {
         let mut actual = manifest_json(m);
-        actual["version"] = case.manifest["version"].clone();
+        let obj = actual.as_object_mut().unwrap();
+        obj.insert("version".into(), case.manifest["version"].clone());
+        obj.remove("server_id");
         assert_eq!(actual, case.manifest, "case {}", case.name);
+    }
+
+    /// task 1.8：server_id 只增字段——hex 形态、原样公告、不扰动既有字段
+    #[test]
+    fn manifest_publishes_server_id() {
+        let info = ServiceInfo {
+            server_id: "ab".repeat(32),
+            ..info_full()
+        };
+        let (m, w) = build_manifest(&info, "http", Some("192.168.2.13:8787"));
+        assert_eq!(w, Vec::<String>::new());
+        assert_eq!(m.server_id, "ab".repeat(32));
+        let v = manifest_json(&m);
+        assert_eq!(v["server_id"], "ab".repeat(32));
+        // 既有字段全部仍在（字段只增）
+        for key in ["server", "version", "gateway", "services"] {
+            assert!(v.as_object().unwrap().contains_key(key), "missing {key}");
+        }
     }
 
     #[test]

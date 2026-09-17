@@ -14,12 +14,13 @@
 //!
 //! Server 不签发 capability（Owner 意志只能由 root key 表达，design §6.2）；
 //! [`sign_and_encode`] 仅供测试与工具链（Phase 2 root 自签）。
-//! [`verify_l1`] 是纯函数：执行点接线（on_connect/rendezvous ACL）是下一棒。
+//! [`verify_l1`] 是纯函数：执行点接线在 access::gate / relay.rs（task 1.5）。
 //! 解析卫生：先长度门、后字符集白名单、再逐段形状（checked 切分，绝不 panic，
 //! design §13 解析 DoS 面）。
 //!
-//! 本棒（Phase 1-A）只产出数据层 API，main 尚未消费——bin crate 的 dead_code
-//! 闸门对预留接口报警，在此模块级豁免；task 1.5/1.5b 接线后移除本豁免。
+//! task 1.5 接线后，relay 面未消费的项（RDZ caps 位、TOKEN_LEN 冻结常量、
+//! 测试签发器）仍预留 rendezvous ACL（task 1.6）与 SDK 面（Phase 2）使用，
+//! 定点豁免 dead_code：
 #![allow(dead_code)]
 
 use base64::Engine;

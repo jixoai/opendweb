@@ -99,6 +99,12 @@ test("services.json manifest matches contract and GET / is an ASCII summary", as
     const manifest = JSON.parse(res.body);
     assert.equal(manifest.server, "opendweb");
     assert.ok(typeof manifest.version === "string" && manifest.version.length > 0);
+    // server-access-policy task 1.8：server_id 只增字段（ServerId 小写 hex 64；
+    // 与 owners.jsonl root 展示形态一致），同进程多次请求稳定
+    assert.equal(typeof manifest.server_id, "string");
+    assert.match(manifest.server_id, /^[0-9a-f]{64}$/);
+    const again = JSON.parse((await rawRequest(port, "/services.json", { Host: `127.0.0.1:${port}` })).body);
+    assert.equal(again.server_id, manifest.server_id, "server_id stable within a process");
     assert.equal(manifest.gateway, `http://127.0.0.1:${port}`);
     // 字段快照：条目字段恰为 name/enabled/url；顺序 rendezvous -> relay
     assert.deepEqual(

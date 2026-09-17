@@ -63,9 +63,7 @@ impl RegistrySnapshot {
         self.inner.generation
     }
 
-    /// L1b B1：(fabric_id, issuer) 是否 ∈ registry。
-    /// 本棒仅测试消费；on_connect 接线（task 1.5）后移除豁免。
-    #[allow(dead_code)]
+    /// L1b B1：(fabric_id, issuer) 是否 ∈ registry（验证链接线 task 1.5 消费）
     pub fn contains(&self, fabric_id: &[u8; 32], root: &[u8; 32]) -> bool {
         self.inner.active.contains(&(*fabric_id, *root))
     }
@@ -116,6 +114,20 @@ impl OwnerRegistry {
     /// 读全量 jsonl 归并活跃集合；文件不存在 = 空集合（首次启动合法形态）。
     /// 每次 load 消耗一个新 generation（恒非零，可作缓存键成分）。
     pub fn load(path: &Path) -> Result<Self> {
+        let active = Self::load_active(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            state: Mutex::new(State {
+                current: Arc::new(SnapshotInner {
+                    generation: next_generation(),
+                    active,
+                }),
+            }),
+        })
+    }
+
+    /// jsonl 全量归并（load 与 reload 共享；坏行硬错误，见模块注释）
+    fn load_active(path: &Path) -> Result<HashSet<OwnerKey>> {
         let mut active: HashSet<OwnerKey> = HashSet::new();
         match std::fs::File::open(path) {
             Ok(file) => {
@@ -147,15 +159,7 @@ impl OwnerRegistry {
                 return Err(e).with_context(|| format!("open owners file {}", path.display()));
             }
         }
-        Ok(Self {
-            path: path.to_path_buf(),
-            state: Mutex::new(State {
-                current: Arc::new(SnapshotInner {
-                    generation: next_generation(),
-                    active,
-                }),
-            }),
-        })
+        Ok(active)
     }
 
     /// 注册 Owner：append+fsync 后更新内存快照与 generation。
@@ -216,6 +220,27 @@ impl OwnerRegistry {
         RegistrySnapshot {
             inner: Arc::clone(&self.state.lock().unwrap().current),
         }
+    }
+
+    /// registry 文件路径（热重载看护的 stat 目标）
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 从磁盘重载活跃集合（mtime 轮询/SIGHUP 热重载接线，task 1.5）：
+    /// 成功则原子替换内存快照并 generation+1（全局单调不回退——外部进程
+    /// 经 CLI 追加事件与本进程 register 走同一计数器）；失败（坏行/IO）
+    /// 保留旧快照并上抛错误，由调用方决定重试节奏。
+    /// 文件缺失 = 空集合（与 load 同语义：admin 删除文件即移除全部 owner，
+    /// fail-closed）。
+    pub fn reload(&self) -> Result<()> {
+        let fresh = Self::load_active(&self.path)?;
+        let mut state = self.state.lock().unwrap();
+        state.current = Arc::new(SnapshotInner {
+            generation: next_generation(),
+            active: fresh,
+        });
+        Ok(())
     }
 }
 
