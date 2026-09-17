@@ -70,6 +70,9 @@ const EVENT_DISCONNECT: &str = "relay.disconnect";
 /// leader 任务的外层等待宽限（leader 内部已有 timeout 上界，此处防调度
 /// 抖动造成误判 transient）
 const LEADER_AWAIT_SLACK: Duration = Duration::from_millis(500);
+/// 决策缓存容量粗门（实现复核 R1 P2-3）：键空间可被握手身份无限拉大，
+/// 超限整表清空——缓存仅为性能层，清空无正确性影响
+const CACHE_MAX_ENTRIES: usize = 10_000;
 
 /// webhook 裁决结果（已 sanitize：reason 恒为合法 `dweb/` slug）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +111,9 @@ impl Decision {
 
 /// 决策缓存键（design §8.5 R4 P1-4 冻结）：generation 在键内，registry
 /// 变更后旧键自然不命中；投影为 113B 定长原文（无票 = 全零 sentinel）。
+/// 注（实现复核 R1 P2-5）：spec 键式含 event 字段——当前唯一入缓存的事件
+/// 是 relay.connect（disconnect 明确不入缓存），event 省略语义等价；
+/// 将来若有新事件入缓存，MUST 先把 event 补进本结构体。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     generation: u64,
@@ -306,7 +312,19 @@ impl CallbackProvider {
                 }
                 match tokio::time::timeout(self.0.timeout, rx.changed()).await {
                     Err(_) => return Decision::transient_unavailable(),
-                    Ok(Err(_)) => return Decision::transient_unavailable(), // leader 未发布即消亡
+                    Ok(Err(_)) => {
+                        // leader 未发布即消亡。实现复核 R1 P2-4 自愈：
+                        // 顺手摘除在途条目（sender 已无任何 receiver 即安全），
+                        // 防 leader panic 路径下条目永驻、同键永久 joiner 化
+                        let mut inflight = self.0.inflight.lock().unwrap();
+                        if inflight
+                            .get(&key)
+                            .is_some_and(|tx| tx.receiver_count() == 0)
+                        {
+                            inflight.remove(&key);
+                        }
+                        return Decision::transient_unavailable();
+                    }
                     Ok(Ok(())) => continue,
                 }
             }
@@ -327,15 +345,20 @@ impl CallbackProvider {
     }
 
     /// `relay.disconnect` best-effort 观察通知（fire-and-forget）：受同一
-    /// 全局并发上限约束（try，超限直接丢弃），不重试、不阻塞、不入缓存、
-    /// 每 connection 至多一次（OnDisconnectGuard 保证每连接恰一次回调）。
-    /// 并发 permit 随任务持有至 HTTP 结束（保证在途语义真实生效）。
+    /// 全局并发上限与**超时上限**约束（try，超限直接丢弃；超时即放弃），
+    /// 不重试、不阻塞、不入缓存、每 connection 至多一次（OnDisconnectGuard
+    /// 保证每连接恰一次回调）。并发 permit 随任务持有至 HTTP 结束（保证
+    /// 在途语义真实生效）。
+    /// 实现复核 R1 P1-1：HTTP 调用必须包 timeout——慢/挂起 webhook 无上界
+    /// 会无限期持有全局 permit（OS 级 connect ~75s），耗尽并发槽拖垮
+    /// callback 模式的准入面（fail-closed 方向的 DoS）。
     pub fn notify_disconnect(&self, endpoint_id: &[u8; 32], connection_id: u64) {
         // 并发超限：直接丢弃（§8.5 冻结）
         let Ok(_concurrency_permit) = self.0.global.clone().try_acquire_owned() else {
             return;
         };
         let this = self.clone();
+        let timeout = self.0.timeout;
         let endpoint = *endpoint_id;
         tokio::spawn(async move {
             let body = DisconnectView {
@@ -343,9 +366,11 @@ impl CallbackProvider {
                 endpoint_id: z32(&endpoint),
                 connection_id: connection_id.to_string(),
             };
-            let _ = this
-                .webhook_call(&serde_json::to_string(&body).unwrap_or_default())
-                .await;
+            let _ = tokio::time::timeout(
+                timeout,
+                this.webhook_call(&serde_json::to_string(&body).unwrap_or_default()),
+            )
+            .await;
             // _concurrency_permit 在此 drop（在途计数随任务生命周期）
         });
     }
@@ -422,11 +447,13 @@ impl CallbackProvider {
     fn finish(&self, key: &CacheKey, decision: &Decision) {
         if decision.cacheable && decision.ttl_ms > 0 {
             let ttl = Duration::from_millis(decision.ttl_ms);
-            self.0
-                .cache
-                .lock()
-                .unwrap()
-                .insert(key.clone(), (decision.clone(), Instant::now() + ttl));
+            let mut cache = self.0.cache.lock().unwrap();
+            // 实现复核 R1 P2-3：容量粗门——键空间可被握手身份无限拉大
+            //（每条 ~200B），超限整表清空（正确性无损：缓存仅为性能层）
+            if cache.len() >= CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+            cache.insert(key.clone(), (decision.clone(), Instant::now() + ttl));
         }
         let mut inflight = self.0.inflight.lock().unwrap();
         if let Some(tx) = inflight.remove(key) {
@@ -1387,6 +1414,30 @@ mod tests {
             rec.authorization.as_deref(),
             Some("Bearer test-token"),
             "disconnect 同样带 Bearer"
+        );
+    }
+
+    /// 实现复核 R1 P1-1 回归：disconnect 的 webhook 调用必须受 timeout
+    /// 上界——慢 webhook 不允许无限期持有全局并发 permit（会耗尽槽位把
+    /// callback 准入面拖入 fail-closed DoS）。
+    #[tokio::test]
+    async fn disconnect_notify_timeout_releases_concurrency_permit() {
+        let (url, _count, _seen) = spawn_mock(Mock::Delayed(
+            std::time::Duration::from_secs(10),
+            String::new(),
+        ))
+        .await;
+        let mut cfg = cb_config(url);
+        cfg.timeout_ms = 200;
+        let provider = CallbackProvider::new(&cfg).unwrap();
+        let ep = [0x2A; 32];
+        provider.notify_disconnect(&ep, 7);
+        // 等 timeout + 余量：permit 应已释放（无 timeout 包裹时会被 10s
+        // 的 mock 挂住，此时 try_acquire 失败）
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(
+            provider.0.global.clone().try_acquire_owned().is_ok(),
+            "disconnect permit 必须在 timeout 内释放"
         );
     }
 

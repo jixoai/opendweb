@@ -39,6 +39,19 @@ impl ServerIdentity {
         let path = data_dir.join(SERVER_KEY_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => {
+                // 实现复核 R1 P2-2：既有文件权限漂移告警（不阻断——修复属
+                // admin 运维动作；静默继续会掩盖 seed 暴露面）
+                #[cfg(unix)]
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode != 0o600 {
+                        tracing::warn!(
+                            "server key {} has mode {mode:o}, expected 0600 — tighten it (seed exposure risk)",
+                            path.display()
+                        );
+                    }
+                }
                 let found = bytes.len();
                 let seed: [u8; SEED_LEN] = bytes.try_into().map_err(|_| {
                     anyhow::anyhow!(

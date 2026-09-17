@@ -810,19 +810,20 @@ capability ≤ 90d、bootstrap ≤ invite expires（§7.3）
   CLI:   --access-mode <open|restricted>   --data-dir <path>
          --owners-file <path>              （dweb-server 新增，风格同 --gateway）
   env:   DWEB_ACCESS_MODE / DWEB_DATA_DIR / DWEB_OWNERS_FILE
-  config: [server.access]
-           mode = "open" | "restricted"
-           policy = "static" | "callback"          # L2 provider 选择，默认 static
-           owners_file = "…"                        # 票据有效性底线（L1b）数据源
-           callback_url = "https://…"               # callback policy 必填（见 SSRF 边界）
-           callback_token = "…"                     # Bearer（server→hook 鉴权）
-           callback_timeout_ms = 2000               # 硬上限 2000
-           callback_cache_ttl_ms = 30000            # 上限 60000
-           callback_max_concurrency = 64            # 全局在途上限
-           callback_per_source = 16                 # 每来源在途上限
-           callback_queue = 256                     # 有界等待队列（队满即拒）
-           allow_loopback_callback = false          # loopback webhook 豁免（开发）
-           limits.client_rx = …                     # 透传 iroh-relay
+  config: [server.access]                          # TOML 键名 camelCase（沿仓库
+           mode = "open" | "restricted"             # config-file 既有惯例；实装
+           policy = "static" | "callback"           # zod strict 拒 snake_case）
+           ownersFile = "…"                         # 票据有效性底线（L1b）数据源
+           callbackUrl = "https://…"                # callback policy 必填（SSRF 边界）
+           callbackToken = "…"                      # Bearer（server→hook 鉴权）
+           callbackTimeoutMs = 2000                 # 硬上限 2000
+           callbackCacheTtlMs = 30000               # 上限 60000
+           allowLoopbackCallback = false            # loopback webhook 豁免（开发）
+  仅 env、不入 config 段（Phase 1）：
+           DWEB_CALLBACK_MAX_CONCURRENCY(64) / DWEB_CALLBACK_PER_SOURCE(16)
+           / DWEB_CALLBACK_QUEUE(256) / DWEB_RELAY_CLIENT_RX（限流）
+  dataDir 不入 config 段（部署拓扑属性：flag --data-dir / env
+  DWEB_DATA_DIR / 默认 dweb-data 三入口）
 registry 载入：启动读全量 jsonl 归并活跃集合（只读快照 Arc 供验证链）；
   Phase 1 支持文件重载（SIGHUP/mtime），Phase 3 admin API。
 Limits（R1 P1 修正）：仅接线 iroh-relay 1.1.0 **已实现**的
