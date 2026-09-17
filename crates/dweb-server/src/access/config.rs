@@ -74,6 +74,10 @@ pub struct AccessConfig {
     pub policy: PolicyConfig,
     pub data_dir: PathBuf,
     pub owners_file: PathBuf,
+    /// per-owner 在线连接配额（task 3.2 前半，Phase 3）：None = 无上限
+    /// （默认）。仅 restricted 模式的 relay gate 消费——配额按
+    /// capability.fabric_id 计数，open 模式无验证链可归因。
+    pub max_connections_per_owner: Option<usize>,
 }
 
 /// CLI flag 输入（main 的 parse_cli 产出后传入；env 由 getter 注入便于测试）
@@ -89,7 +93,8 @@ pub struct AccessCliInputs {
 /// DWEB_ACCESS_MODE / DWEB_DATA_DIR / DWEB_OWNERS_FILE / DWEB_ACCESS_POLICY /
 /// DWEB_CALLBACK_URL / DWEB_CALLBACK_TOKEN / DWEB_CALLBACK_TIMEOUT_MS /
 /// DWEB_CALLBACK_CACHE_TTL_MS / DWEB_CALLBACK_MAX_CONCURRENCY /
-/// DWEB_CALLBACK_PER_SOURCE / DWEB_CALLBACK_QUEUE / DWEB_RELAY_QUIC_BIND。
+/// DWEB_CALLBACK_PER_SOURCE / DWEB_CALLBACK_QUEUE / DWEB_RELAY_QUIC_BIND /
+/// DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER（task 3.2 per-owner 连接配额）。
 pub fn resolve_access_config(
     cli: &AccessCliInputs,
     get_env: &dyn Fn(&str) -> Option<String>,
@@ -134,9 +139,29 @@ pub fn resolve_access_config(
         policy,
         data_dir,
         owners_file,
+        max_connections_per_owner: parse_max_connections_per_owner(get_env)?,
     };
     validate(&config, get_env)?;
     Ok(config)
+}
+
+/// per-owner 连接配额解析（task 3.2 前半，design §11.2「仅 env、不入
+/// config 段」的 Phase 3 钩子形态，同 DWEB_RELAY_CLIENT_RX）：未设置/空 =
+/// None（无上限）；非法值（非数字/0/溢出）fail-fast（退出码 2）。
+fn parse_max_connections_per_owner(
+    get_env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<usize>, String> {
+    let key = "DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER";
+    let Some(raw) = get_env(key).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<usize>()
+        .map_err(|e| format!("invalid {key} {raw:?}: {e}"))?;
+    if value == 0 {
+        return Err(format!("invalid {key} {raw:?}: must be > 0"));
+    }
+    Ok(Some(value))
 }
 
 fn resolve_callback_config(
@@ -465,6 +490,40 @@ mod tests {
         match cfg.policy {
             PolicyConfig::Callback(cb) => assert!(cb.allow_loopback),
             other => panic!("expected callback policy, got {other:?}"),
+        }
+    }
+
+    /// per-owner 连接配额 env（task 3.2）：默认无上限；合法值解析；
+    /// 0/非数字 fail-fast
+    #[test]
+    fn max_connections_per_owner_env_matrix() {
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &|_| None).unwrap();
+        assert_eq!(cfg.max_connections_per_owner, None, "默认无上限");
+        // 空串 = 未设置
+        let cfg = resolve_access_config(
+            &AccessCliInputs::default(),
+            &env(&[("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_connections_per_owner, None);
+        // 合法值
+        let cfg = resolve_access_config(
+            &AccessCliInputs::default(),
+            &env(&[("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "16")]),
+        )
+        .unwrap();
+        assert_eq!(cfg.max_connections_per_owner, Some(16));
+        // 0 / 非数字 → fail-fast（退出码 2 路径）
+        for bad in ["0", "-1", "many"] {
+            let err = resolve_access_config(
+                &AccessCliInputs::default(),
+                &env(&[("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", bad)]),
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER"),
+                "{err}"
+            );
         }
     }
 }

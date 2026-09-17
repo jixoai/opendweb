@@ -78,6 +78,13 @@ impl ServerIdentity {
     pub fn server_id(&self) -> PublicKey {
         self.secret.public()
     }
+
+    /// Ed25519 签名（design §6.2 收窄职责内的两个消费面之一：Owner 注册
+    /// 回执——task 3.1 admin API 对 canonical 事件签名供审计；MUST NOT 用于
+    /// 签 relay capability，Owner 意志只能由 root key 表达）。
+    pub fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.secret.sign(message).to_bytes()
+    }
 }
 
 /// 0600 + tmp + 内容 fsync + rename 原子写 + 目录 fsync（design §11.2；同构

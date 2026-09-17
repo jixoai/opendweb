@@ -667,6 +667,9 @@ mod tests {
             NOW,
             NOW + TTL,
         );
-        assert_eq!(token, "dwebr1.AQMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXMqTrBcFGHBx1nuDx_8O_oEI6OxFMFdddyaHkzPb2r58BwAAAaMYXFAAAAABoxiTPoDKl8Nfr0zIfv5h5qDsMVtPs9G5afdFkgIsPxzjf50TA8kUtCXBkblcrYsEAzRO7TUzDx5Mm2kAOM7aVZ6FaV8J");
+        assert_eq!(
+            token,
+            "dwebr1.AQMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKKiOPddAnxlf1S2y08ul1yymcJvx2UEhvzdIgBtA9vXMqTrBcFGHBx1nuDx_8O_oEI6OxFMFdddyaHkzPb2r58BwAAAaMYXFAAAAABoxiTPoDKl8Nfr0zIfv5h5qDsMVtPs9G5afdFkgIsPxzjf50TA8kUtCXBkblcrYsEAzRO7TUzDx5Mm2kAOM7aVZ6FaV8J"
+        );
     }
 }

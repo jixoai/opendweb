@@ -40,14 +40,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dweb_fabric::identity::{NodeIdentity, endpoint_id_display};
-use dweb_fabric::protocol::{
-    InviteV2Token, RelayCapV1, ROOT_CAPS, TOKEN2_PREFIX, TOKEN_PREFIX,
-};
+use dweb_fabric::protocol::{InviteV2Token, ROOT_CAPS, RelayCapV1, TOKEN_PREFIX, TOKEN2_PREFIX};
 use dweb_fabric::roster::Roster;
 use dweb_fabric::secret::SecretSeed;
 use dweb_fabric::{
-    Fabric, FabricConfig, FabricError, FabricEvent, HttpProxyConfig, InviteOptions,
-    JoinErrorCode, RelayConfig, RelayEntry, RelayTlsTrust, SecretInjection, precheck_join_token,
+    Fabric, FabricConfig, FabricError, FabricEvent, HttpProxyConfig, InviteOptions, JoinErrorCode,
+    RelayConfig, RelayEntry, RelayTlsTrust, SecretInjection, precheck_join_token,
 };
 use iroh::{RelayUrl, SecretKey};
 use tempfile::TempDir;
@@ -110,8 +108,9 @@ impl Server {
             }
             let gl = self.logs.lock().unwrap();
             if gateway.is_none() {
-                gateway =
-                    gl.iter().find_map(|l| parse_listening_addr(l, "gateway listening on http://"));
+                gateway = gl
+                    .iter()
+                    .find_map(|l| parse_listening_addr(l, "gateway listening on http://"));
             }
             if relay.is_none() {
                 relay = gl
@@ -272,7 +271,12 @@ async fn expect_denied(relay: SocketAddr, secret: &SecretKey, token: Option<Stri
 
 /// 故事节点配置：CustomWithCaps 单 relay 条目（server_id 按参数；seed 注入
 /// 身份——测试身份先于 server 存在，S1 注册 owner 需要 fabric_id+pubkey）。
-fn story_cfg(dir: &TempDir, url: &str, server_id: Option<[u8; 32]>, seed: [u8; 32]) -> FabricConfig {
+fn story_cfg(
+    dir: &TempDir,
+    url: &str,
+    server_id: Option<[u8; 32]>,
+    seed: [u8; 32],
+) -> FabricConfig {
     FabricConfig {
         data_dir: dir.path().to_owned(),
         relay: RelayConfig::CustomWithCaps(vec![RelayEntry {
@@ -383,7 +387,11 @@ async fn restricted_story_s1_to_s8() {
         fabric_id.as_bytes(),
         root_a.secret_key().public().as_bytes(),
     );
-    let server = Server::spawn(dir_server.path(), &[("DWEB_ACCESS_MODE", "restricted")], &[]);
+    let server = Server::spawn(
+        dir_server.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+    );
     let server_id = fetch_server_id(server.gateway).await;
     let relay_addr = server.relay_addr();
     let relay_url_s = format!("http://{relay_addr}");
@@ -449,7 +457,9 @@ async fn restricted_story_s1_to_s8() {
     )
     .await
     .expect("B attach");
-    b.join(&token).await.expect("B 经 restricted relay join 成功");
+    b.join(&token)
+        .await
+        .expect("B 经 restricted relay join 成功");
     let members = b.members().await;
     assert_eq!(members.len(), 2, "名册含 root+B");
     assert!(
@@ -489,7 +499,10 @@ async fn restricted_story_s1_to_s8() {
     let reason = expect_denied(relay_addr, &secret_c, None).await;
     assert_eq!(reason, "dweb/no-capability", "C 无票");
     let reason = expect_denied(relay_addr, &secret_c, Some(b_token.clone())).await;
-    assert_eq!(reason, "dweb/not-recipient", "B 的 member 票给 C 的 endpoint");
+    assert_eq!(
+        reason, "dweb/not-recipient",
+        "B 的 member 票给 C 的 endpoint"
+    );
     let reason = expect_denied(relay_addr, &secret_c, Some(bootstrap.clone())).await;
     assert_eq!(reason, "dweb/not-recipient", "C 重放 A 给 B 签的票");
     story("S6 越权矩阵完成（no-capability / not-recipient ×2）");
@@ -506,7 +519,10 @@ async fn restricted_story_s1_to_s8() {
         .invite(300_000, None)
         .await
         .expect("v1 invite 签发（relay 非空即过 D3 门）");
-    assert!(v1_token.starts_with(TOKEN_PREFIX), "非 restricted 配置签 v1");
+    assert!(
+        v1_token.starts_with(TOKEN_PREFIX),
+        "非 restricted 配置签 v1"
+    );
     let j = Fabric::attach(legacy_cfg(&dir_j, &relay_url_s), &a1.fabric_id_hex().await)
         .await
         .expect("旧形态 joiner attach");
@@ -520,7 +536,9 @@ async fn restricted_story_s1_to_s8() {
             assert!(
                 matches!(
                     code,
-                    JoinErrorCode::DialFailed | JoinErrorCode::DialTimeout | JoinErrorCode::RelayOffline
+                    JoinErrorCode::DialFailed
+                        | JoinErrorCode::DialTimeout
+                        | JoinErrorCode::RelayOffline
                 ),
                 "无票 joiner 应归拨号族（got {code}）: {message}"
             );
@@ -554,7 +572,9 @@ async fn restricted_story_s1_to_s8() {
     let a2 = Fabric::open(story_cfg(&dir_a, &relay_url_s, Some(server_id), seed_a))
         .await
         .expect("A 重启 open");
-    a2.ensure_relay_capabilities().await.expect("root 重签 own cap");
+    a2.ensure_relay_capabilities()
+        .await
+        .expect("root 重签 own cap");
     await_relay_online(&a2).await;
     let b2 = Fabric::open(story_cfg(&dir_b, &relay_url_s, None, seed_b))
         .await
@@ -567,7 +587,9 @@ async fn restricted_story_s1_to_s8() {
     assert_eq!(b2.members().await.len(), 2, "重启后成员关系保留");
     await_relay_online(&b2).await;
     let mut rx_a2 = a2.subscribe();
-    b2.connect(&a2.endpoint_id()).await.expect("重启后 B→A connect");
+    b2.connect(&a2.endpoint_id())
+        .await
+        .expect("重启后 B→A connect");
     b2.send(&a2.endpoint_id(), b"story: after restart".to_vec())
         .await
         .expect("重启后 send");

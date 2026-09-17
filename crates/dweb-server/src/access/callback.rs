@@ -381,6 +381,12 @@ impl CallbackProvider {
         self.0.cache.lock().unwrap().clear();
     }
 
+    /// 决策缓存条目数（admin status 观测面，task 3.1；含未过期与惰性
+    /// 待清理的过期条目——容量粗门 10_000 的运行时可见性）
+    pub fn cache_len(&self) -> usize {
+        self.0.cache.lock().unwrap().len()
+    }
+
     fn cache_get(&self, key: &CacheKey) -> Option<Decision> {
         let mut cache = self.0.cache.lock().unwrap();
         match cache.get(key) {

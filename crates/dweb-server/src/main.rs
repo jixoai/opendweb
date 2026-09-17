@@ -9,7 +9,9 @@
 //! 模式构造 AccessGate 装入 relay on_connect 验证链与 rendezvous 静态 ACL
 //! （tasks 1.5/1.5b/1.6 接线），registry mtime 轮询热重载，
 //! DWEB_RELAY_CLIENT_RX 限流透传（task 1.7），services.json 发布 server_id
-//! （task 1.8）。
+//! （task 1.8）。Phase 3 第一棒（tasks 3.1/3.2 前半）：DWEB_ADMIN_TOKEN
+//! 存在时挂 /admin/* 管理面（owners CRUD + 回执签名 + status）；
+//! DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER per-owner 连接配额。
 
 mod access;
 mod relay;
@@ -314,8 +316,11 @@ async fn main() -> Result<()> {
     // 数据层初始化（task 1.1/1.2）：server.key load-or-create + owners.jsonl
     // 归并。执行点接线（task 1.5/1.5b）：restricted 模式构造 AccessGate
     // （callback URL 非法在此 fail-fast，退出码 2），registry 以 Arc 共享给
-    // 验证链与热重载看护。
-    let identity = access::identity::ServerIdentity::load_or_create(&access_cfg.data_dir)?;
+    // 验证链与热重载看护。identity 同以 Arc 共享——admin API（task 3.1）
+    // 的回执签名与 services.json 的 ServerId 同一实例。
+    let identity = std::sync::Arc::new(access::identity::ServerIdentity::load_or_create(
+        &access_cfg.data_dir,
+    )?);
     let owners = std::sync::Arc::new(access::registry::OwnerRegistry::load(
         &access_cfg.owners_file,
     )?);
@@ -337,12 +342,14 @@ async fn main() -> Result<()> {
     // open 模式 relay 走 AllowAll 快路径，无需 gate/看护）
     let (relay_gate, rdz_gate) = match access_cfg.mode {
         access::config::AccessMode::Restricted => {
+            // per-owner 连接配额（task 3.2 前半）：仅 relay gate 消费
+            // （rendezvous Op 无连接语义）
             let gate = match access::gate::AccessGate::new(
                 *identity.server_id().as_bytes(),
                 std::sync::Arc::clone(&owners),
                 access_cfg.policy.clone(),
             ) {
-                Ok(g) => g,
+                Ok(g) => g.with_max_connections_per_owner(access_cfg.max_connections_per_owner),
                 Err(msg) => {
                     eprintln!("error: {msg}");
                     std::process::exit(2);
@@ -350,10 +357,14 @@ async fn main() -> Result<()> {
             };
             let gate = std::sync::Arc::new(gate);
             tracing::info!(
-                "relay access control enabled (policy {}, deny reasons on dweb/ namespace)",
+                "relay access control enabled (policy {}, deny reasons on dweb/ namespace{})",
                 match access_cfg.policy {
                     access::config::PolicyConfig::Static => "static",
                     access::config::PolicyConfig::Callback(_) => "callback",
+                },
+                match access_cfg.max_connections_per_owner {
+                    Some(n) => format!(", per-owner connection quota {n}"),
+                    None => String::new(),
                 }
             );
             access::gate::spawn_registry_reload_watcher(
@@ -400,6 +411,28 @@ async fn main() -> Result<()> {
     if let Some(bytes_per_second) = client_rx {
         tracing::info!("relay client_rx rate limit: {bytes_per_second} bytes/s");
     }
+    // admin API（task 3.1）：DWEB_ADMIN_TOKEN 存在才挂路由——未配置 =
+    // /admin/* 404 零暴露（静态 token 方案与 admin 信任域论证见 admin.rs
+    // 模块注释）。registry/relay gate 以 Arc 共享：API 注册即时生效于
+    // 验证链（同进程同一 OwnerRegistry 快照替换）；先于 relay::start 构造
+    // （relay_gate 所有权随后移交 relay）。
+    let admin_router = std::env::var("DWEB_ADMIN_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            tracing::info!("admin API enabled (Bearer DWEB_ADMIN_TOKEN, /admin/*)");
+            access::admin::router(access::admin::AdminState::new(
+                token,
+                std::sync::Arc::clone(&identity),
+                std::sync::Arc::clone(&owners),
+                relay_gate.clone(),
+                access_cfg.mode,
+                match access_cfg.policy {
+                    access::config::PolicyConfig::Static => "static",
+                    access::config::PolicyConfig::Callback(_) => "callback",
+                },
+            ))
+        });
     let relay = relay::start(
         relay_enabled(&cli),
         relay_bind_addr,
@@ -439,6 +472,10 @@ async fn main() -> Result<()> {
     });
 
     let app = rendezvous::router_with_access(rdz_gate).merge(services::router(info));
+    let app = match admin_router {
+        Some(admin) => app.merge(admin),
+        None => app,
+    };
     let http = axum::serve(listener, app);
     tokio::select! {
         res = http => res?,

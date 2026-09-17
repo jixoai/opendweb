@@ -1,4 +1,4 @@
-//! AccessGate：验证链执行点聚合（task 1.5 + 1.5b + 1.6，需求来源
+//! AccessGate：验证链执行点聚合（task 1.5 + 1.5b + 1.6 + 3.2 前半，需求来源
 //! 2026-09-17；design §8.2 C0/L1/L1b/L2 验证链全图 + §8.4 rendezvous
 //! 授权 + spec「relay capability 验证」/「动态策略回调」/「rendezvous
 //! 访问控制」全部 Scenario）。
@@ -27,8 +27,13 @@ use crate::access::cap::{self, CAP_RDZ_ANNOUNCE, CAP_RDZ_RESOLVE, CAP_RELAY, Cap
 use crate::access::config::PolicyConfig;
 use crate::access::registry::{OwnerRegistry, RegistrySnapshot};
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// per-owner 连接配额超限 deny reason（task 3.2 前半；wire 冻结 slug，
+/// 语法同 dweb/ 家族）
+pub const OWNER_QUOTA_EXCEEDED: &str = "dweb/owner-quota-exceeded";
 
 /// 待验证操作面（L1b B2 的 caps 位选择）。rendezvous announce/resolve 的
 /// Op 变体随 task 1.6 接入（design §8.4：按 HTTP 面能力分别设计）。
@@ -108,11 +113,124 @@ enum Policy {
     Callback(Arc<CallbackProvider>),
 }
 
+/// per-owner 在线连接表（task 3.2 前半，Phase 3）：票接入的
+/// (endpoint_id, connection_id) → fabric_id 归属 + owner 维度计数。
+/// 生命周期配对（依赖 iroh-relay 装配语义，handshake.rs authorize_with）：
+/// on_connect 返回 Allow 后 OnDisconnectGuard 立即创建，其 Drop **恒**触发
+/// on_disconnect（恰一次）——reserve 与 release 由此天然配对，连接中途
+/// 死亡（accept 发送失败）也不例外。
+/// 无票接入（A_cb）不计入 owner 维度（无 fabric 可归，配额语义只约束
+/// 票据接入）；open 模式无 gate，零计数。
+struct OnlineTable(Mutex<OnlineInner>);
+
+#[derive(Default)]
+struct OnlineInner {
+    /// (endpoint_id, connection_id) → fabric_id（on_disconnect 按连接精确定位）
+    conns: HashMap<([u8; 32], u64), [u8; 32]>,
+    /// fabric_id → 在线连接数（配额判定与 admin status 投影）
+    owners: HashMap<[u8; 32], usize>,
+}
+
+/// admin status 的在线表只读投影（GET /admin/status 消费）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnlineView {
+    /// per endpoint（票接入）：{endpoint_id, fabric_id, connections}
+    pub per_endpoint: Vec<OnlineEndpoint>,
+    /// per owner（fabric_id → 在线连接数）
+    pub per_owner: Vec<([u8; 32], usize)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnlineEndpoint {
+    pub endpoint_id: [u8; 32],
+    pub fabric_id: [u8; 32],
+    pub connections: usize,
+}
+
+impl OnlineTable {
+    /// 原子配额预约（check+incr 同锁，杜绝并发 TOCTOU 超限）。
+    /// 返回 false = 超限（不产生任何计数副作用）。
+    fn reserve(
+        &self,
+        fabric_id: &[u8; 32],
+        endpoint_id: [u8; 32],
+        connection_id: u64,
+        limit: Option<usize>,
+    ) -> bool {
+        let mut inner = self.0.lock().unwrap();
+        let current = inner.owners.get(fabric_id).copied().unwrap_or(0);
+        if limit.is_some_and(|l| current >= l) {
+            return false;
+        }
+        // 同键重复预约（ConnectionId 进程内唯一，不应发生——防御性先回退
+        // 旧归属再重记，保计数守恒）
+        if let Some(old) = inner.conns.insert((endpoint_id, connection_id), *fabric_id) {
+            decrement_owner(&mut inner.owners, &old);
+        }
+        *inner.owners.entry(*fabric_id).or_insert(0) += 1;
+        true
+    }
+
+    /// 名额释放（on_disconnect；幂等——未知键零副作用）
+    fn release(&self, endpoint_id: [u8; 32], connection_id: u64) {
+        let mut inner = self.0.lock().unwrap();
+        if let Some(fabric_id) = inner.conns.remove(&(endpoint_id, connection_id)) {
+            decrement_owner(&mut inner.owners, &fabric_id);
+        }
+    }
+
+    /// 只读投影（admin status 低频调用；双表分别确定性排序）
+    fn view(&self) -> OnlineView {
+        let inner = self.0.lock().unwrap();
+        let mut by_endpoint: HashMap<[u8; 32], (Vec<[u8; 32]>, usize)> = HashMap::new();
+        for ((endpoint, _conn), fabric) in &inner.conns {
+            let entry = by_endpoint.entry(*endpoint).or_default();
+            entry.0.push(*fabric);
+            entry.1 += 1;
+        }
+        let mut per_endpoint: Vec<OnlineEndpoint> = by_endpoint
+            .into_iter()
+            .map(|(endpoint_id, (fabrics, connections))| OnlineEndpoint {
+                endpoint_id,
+                // 同一 endpoint 的多条连接理论上同 fabric（recipient 绑定）；
+                // 防御性取首条
+                fabric_id: fabrics.first().copied().unwrap_or([0u8; 32]),
+                connections,
+            })
+            .collect();
+        per_endpoint.sort_by_key(|e| e.endpoint_id);
+        let mut per_owner: Vec<([u8; 32], usize)> =
+            inner.owners.iter().map(|(k, v)| (*k, *v)).collect();
+        per_owner.sort();
+        OnlineView {
+            per_endpoint,
+            per_owner,
+        }
+    }
+}
+
+/// owner 计数递减（归零即删键，防 HashMap 无界增长）
+fn decrement_owner(owners: &mut HashMap<[u8; 32], usize>, fabric_id: &[u8; 32]) {
+    if let Some(count) = owners.get_mut(fabric_id)
+        && *count > 0
+    {
+        *count -= 1;
+        if *count == 0 {
+            owners.remove(fabric_id);
+        }
+    }
+}
+
 /// 验证链聚合器。`restricted` 模式构造（open 模式不构造，relay 走 AllowAll）。
 pub struct AccessGate {
     server_id: [u8; 32],
     registry: Arc<OwnerRegistry>,
     policy: Policy,
+    /// task 3.2 前半：票接入在线表（恒维护——admin status 需要；配额为
+    /// None 时仅观测不拦截）
+    online: OnlineTable,
+    /// per-owner 在线连接上限（None = 无上限）
+    max_connections_per_owner: Option<usize>,
 }
 
 impl std::fmt::Debug for AccessGate {
@@ -144,7 +262,16 @@ impl AccessGate {
             server_id,
             registry,
             policy,
+            online: OnlineTable(Mutex::new(OnlineInner::default())),
+            max_connections_per_owner: None,
         })
+    }
+
+    /// per-owner 连接配额（task 3.2 前半；builder 形态——main 仅对 relay
+    /// gate 设置，rendezvous gate 无连接语义不设置）
+    pub fn with_max_connections_per_owner(mut self, limit: Option<usize>) -> Self {
+        self.max_connections_per_owner = limit;
+        self
     }
 
     /// 执行验证链（C0 → L1 → L1b → L2）。全链 O(1) + 单次验签；唯一网络
@@ -188,7 +315,30 @@ impl AccessGate {
                 if !parsed.has_cap(input.op.required_cap()) {
                     return GateDecision::Deny(Cow::Borrowed(input.op.missing_reason()));
                 }
-                self.decide_l2(Some(&parsed), input, snapshot).await
+                // per-owner 连接配额（task 3.2 前半）：relay 面且持票接入才
+                // 计数——无票接入无 owner 维度（A_cb 不占配额）；rendezvous
+                // Op 是无状态 HTTP 请求，不占连接名额。位置在 L1b 之后、
+                // L2 之前：配额是 Server 自身的资源硬限（同 client_rx 定位），
+                // 不交 webhook 裁决，也省一次注定被拒的回调。
+                let mut reserved = false;
+                if input.op == Op::RelayConnect {
+                    if !self.online.reserve(
+                        &parsed.fabric_id,
+                        input.endpoint_id,
+                        input.connection_id,
+                        self.max_connections_per_owner,
+                    ) {
+                        return GateDecision::Deny(Cow::Borrowed(OWNER_QUOTA_EXCEEDED));
+                    }
+                    reserved = true;
+                }
+                let decision = self.decide_l2(Some(&parsed), input, snapshot).await;
+                // L2 deny 的连接不会注册（iroh-relay 先 authorize 后
+                // register），on_disconnect 永不触发——不回滚即泄漏名额
+                if reserved && matches!(decision, GateDecision::Deny(_)) {
+                    self.online.release(input.endpoint_id, input.connection_id);
+                }
+                decision
             }
         }
     }
@@ -224,9 +374,10 @@ impl AccessGate {
         }
     }
 
-    /// on_disconnect 钩子：callback 模式转发 best-effort 观察通知；
-    /// static 模式空实现（design §8.5）
+    /// on_disconnect 钩子：per-owner 在线名额释放（task 3.2）+ callback
+    /// 模式转发 best-effort 观察通知；static 模式后者为空实现（design §8.5）
     pub fn on_disconnect(&self, endpoint_id: [u8; 32], connection_id: u64) {
+        self.online.release(endpoint_id, connection_id);
         if let Policy::Callback(provider) = &self.policy {
             provider.notify_disconnect(&endpoint_id, connection_id);
         }
@@ -237,6 +388,24 @@ impl AccessGate {
     pub fn invalidate_callback_cache(&self) {
         if let Policy::Callback(provider) = &self.policy {
             provider.invalidate_all();
+        }
+    }
+
+    /// per-owner 连接配额（admin status 透出；None = 无上限）
+    pub fn max_connections_per_owner(&self) -> Option<usize> {
+        self.max_connections_per_owner
+    }
+
+    /// 票接入在线表只读投影（GET /admin/status；task 3.1/3.2）
+    pub fn online_view(&self) -> OnlineView {
+        self.online.view()
+    }
+
+    /// callback 决策缓存条目数（admin status；static 恒 0）
+    pub fn cache_entries(&self) -> usize {
+        match &self.policy {
+            Policy::Static => 0,
+            Policy::Callback(provider) => provider.cache_len(),
         }
     }
 }
@@ -928,5 +1097,202 @@ mod tests {
             url: format!("http://127.0.0.1:{port}/hook"),
             count,
         }
+    }
+
+    // ---- per-owner 连接配额（task 3.2 前半）----
+
+    /// 配额 fixture：static 策略 + limit 已设；带可变 connection_id 的输入
+    fn quota_input(f: &Fixture, recipient: [u8; 32], connection_id: u64) -> GateInput {
+        let now = now_ms();
+        let token = sign_and_encode(
+            &f.issuer,
+            &f.fabric_id,
+            &f.server_id,
+            &recipient,
+            CAP_RELAY,
+            now,
+            now + TTL,
+        );
+        GateInput {
+            endpoint_id: recipient,
+            auth_header: Some(format!("Bearer {token}")),
+            query_token: None,
+            connection_id,
+            op: Op::RelayConnect,
+        }
+    }
+
+    /// 同 owner（同 fabric）第二条连接超限 deny；断连释放后名额恢复
+    #[tokio::test]
+    async fn quota_exceeded_and_release_restores_slot() {
+        let (f, gate) = Fixture::new();
+        let gate = gate.with_max_connections_per_owner(Some(1));
+        let a = f.recipient;
+        let b = [0xCC; 32];
+        // 连接 1（endpoint A）→ Allow（占用唯一名额）
+        assert_eq!(
+            gate.decide(&quota_input(&f, a, 1)).await,
+            GateDecision::Allow
+        );
+        // 连接 2（endpoint B，同 owner 票）→ 超限 deny
+        assert_eq!(
+            gate.decide(&quota_input(&f, b, 2)).await,
+            GateDecision::Deny(Cow::Borrowed(OWNER_QUOTA_EXCEEDED))
+        );
+        // status 投影：恰一条在线（deny 不占名额）
+        let view = gate.online_view();
+        assert_eq!(view.per_owner, vec![(f.fabric_id, 1)]);
+        assert_eq!(view.per_endpoint.len(), 1);
+        assert_eq!(view.per_endpoint[0].endpoint_id, a);
+        // 断连连接 1 → 名额恢复 → 新连接放行
+        gate.on_disconnect(a, 1);
+        assert_eq!(gate.online_view().per_owner, vec![]);
+        assert_eq!(
+            gate.decide(&quota_input(&f, b, 3)).await,
+            GateDecision::Allow
+        );
+    }
+
+    /// 不同 owner（不同 fabric）互不挤占；同 endpoint 多连接按条计数
+    #[tokio::test]
+    async fn quota_isolated_per_owner_and_counts_per_connection() {
+        let (f, gate) = Fixture::new();
+        let gate = gate.with_max_connections_per_owner(Some(2));
+        // owner 2：另一 fabric 的已注册 issuer
+        let issuer2 = SigningKey::from_bytes(&[0x71; 32]);
+        let fabric2 = [0x72; 32];
+        f.registry
+            .register(&fabric2, &issuer2.verifying_key().to_bytes())
+            .unwrap();
+        let now = now_ms();
+        let token2 = sign_and_encode(
+            &issuer2,
+            &fabric2,
+            &f.server_id,
+            &f.recipient,
+            CAP_RELAY,
+            now,
+            now + TTL,
+        );
+        // owner1 两条（同 endpoint 不同 connection_id，各自计数）→ 满
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 1)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 2)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 3)).await,
+            GateDecision::Deny(Cow::Borrowed(OWNER_QUOTA_EXCEEDED))
+        );
+        // owner2 名额独立（owner1 满 不影响）
+        let input2 = GateInput {
+            endpoint_id: f.recipient,
+            auth_header: Some(format!("Bearer {token2}")),
+            query_token: None,
+            connection_id: 4,
+            op: Op::RelayConnect,
+        };
+        assert_eq!(gate.decide(&input2).await, GateDecision::Allow);
+        // 释放 owner1 一条 → 恢复
+        gate.on_disconnect(f.recipient, 1);
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 5)).await,
+            GateDecision::Allow
+        );
+        // 幂等释放：同键二次 release 零副作用（不误减 owner2）
+        gate.on_disconnect(f.recipient, 1);
+        let view = gate.online_view();
+        assert!(view.per_owner.contains(&(f.fabric_id, 2)));
+        assert!(view.per_owner.contains(&(fabric2, 1)));
+    }
+
+    /// 默认无上限；无票接入不占 owner 配额；rendezvous Op 不占连接名额
+    #[tokio::test]
+    async fn quota_default_unlimited_and_no_ticket_rdz_exempt() {
+        // 默认（无上限）：同 owner 连打多条全部放行
+        let (f, gate) = Fixture::new();
+        for conn in 1..=5u64 {
+            assert_eq!(
+                gate.decide(&quota_input(&f, f.recipient, conn)).await,
+                GateDecision::Allow
+            );
+        }
+        assert_eq!(gate.max_connections_per_owner(), None);
+        assert_eq!(gate.cache_entries(), 0, "static 策略缓存恒空");
+
+        // callback 模式 + 配额 1：无票端点被 webhook 放行（A_cb）不占
+        // owner 名额——随后同 owner 票接入仍可用
+        let mock = callback_mock_json(r#"{"allow":true}"#).await;
+        let gate = AccessGate::new(
+            f.server_id,
+            f.registry.clone(),
+            PolicyConfig::Callback(cb_cfg(mock.url.clone())),
+        )
+        .unwrap()
+        .with_max_connections_per_owner(Some(1));
+        let no_ticket = GateInput {
+            endpoint_id: [0xDD; 32],
+            auth_header: None,
+            query_token: None,
+            connection_id: 100,
+            op: Op::RelayConnect,
+        };
+        assert_eq!(gate.decide(&no_ticket).await, GateDecision::Allow);
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 101)).await,
+            GateDecision::Allow,
+            "无票 A_cb 接入不占 owner 维度配额"
+        );
+
+        // rendezvous Op（announce）：无状态 HTTP 请求不占连接名额
+        let announce_input = GateInput {
+            endpoint_id: f.recipient,
+            auth_header: Some(format!(
+                "Bearer {}",
+                f.token(CAP_RDZ_ANNOUNCE, now_ms(), now_ms() + TTL)
+            )),
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzAnnounce,
+        };
+        assert_eq!(gate.decide(&announce_input).await, GateDecision::Allow);
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 102)).await,
+            GateDecision::Deny(Cow::Borrowed(OWNER_QUOTA_EXCEEDED)),
+            "announce 不占名额：owner 唯一名额仍被 101 占用"
+        );
+    }
+
+    /// L2 deny（webhook 拒绝）必须回滚预约——deny 连接不注册、
+    /// on_disconnect 永不触发，不回滚即泄漏名额
+    #[tokio::test]
+    async fn quota_reservation_rolled_back_on_l2_deny() {
+        let (f, _gate) = Fixture::new();
+        let deny_mock = callback_mock_json(r#"{"allow":false,"reason":"dweb/e2e-denied"}"#).await;
+        let gate = AccessGate::new(
+            f.server_id,
+            f.registry.clone(),
+            PolicyConfig::Callback(cb_cfg(deny_mock.url.clone())),
+        )
+        .unwrap()
+        .with_max_connections_per_owner(Some(1));
+        // webhook deny（cb_cfg cache_ttl_ms=0：deny 不入缓存）→ 名额未占用
+        for (endpoint, conn) in [(f.recipient, 1u64), ([0xEE; 32], 2u64)] {
+            let d = gate.decide(&quota_input(&f, endpoint, conn)).await;
+            assert_eq!(deny_reason(d), "dweb/e2e-denied");
+        }
+        assert_eq!(
+            gate.online_view().per_owner,
+            vec![],
+            "L2 deny 不留预约（否则唯一名额被永久泄漏）"
+        );
+        assert_eq!(
+            gate.online_view().per_endpoint,
+            vec![],
+            "endpoint 维度同样无残留"
+        );
     }
 }

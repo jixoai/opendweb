@@ -918,7 +918,12 @@ SDK 配置面             RelayOptions 可选新字段                          
   - registry 移除 Owner 的存量连接：on_connect 只拦新连接，存量连接
     保持至自然断开/重连（R1 P1 诚实化：Phase 1 语义为"新连接即时拒绝
     + 存量靠 TTL/重连收敛"；主动断连钩子 Phase 3 评估——iroh-relay
-    Server 有 Clients 表，工程上可及，但非本 change 承诺）
+    Server 有 Clients 表，工程上可及，但非本 change 承诺。
+    Phase 3 评估结论〔2026-09-18，Phase3-A 实证〕：**可及且零 fork**——
+    公开 API 链 `Server::relay_service()` → `RelayService::clients()` →
+    `Clients::disconnect(endpoint_id, connection_id: Option)`（iroh-relay
+    1.1.0 server.rs:261 / http_server.rs:949-955〔文档明示运行期踢连接〕/
+    clients.rs:181-207〔异步 start_shutdown〕）；实现列入下一棒 3.2b）
   - 直连流量不经 Server，relay ACL 不适用（由 Q2/Q3 端侧门控守护）
 
 资源保护（DoS 面）

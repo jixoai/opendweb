@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs::OpenOptions,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -46,6 +46,16 @@ enum Op {
     Unregister,
 }
 
+/// 活跃 Owner 条目（admin API 列表用，task 3.1；registered_at = 该键最后
+/// 一次 register 事件的 ts——重复注册刷新时间戳，append-only 日志保留
+/// 全部历史事件）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerEntry {
+    pub fabric_id: [u8; 32],
+    pub root: [u8; 32],
+    pub registered_at: u64,
+}
+
 /// 活跃集合只读快照。验证链 O(1) 查表（snapshot() 是 Arc 克隆，零拷贝派发）。
 #[derive(Clone)]
 pub struct RegistrySnapshot {
@@ -54,7 +64,9 @@ pub struct RegistrySnapshot {
 
 struct SnapshotInner {
     generation: u64,
-    active: HashSet<OwnerKey>,
+    /// Phase 3（task 3.1）：值 = registered_at（GET /admin/owners 暴露）；
+    /// 归并语义与 HashSet 时代一致（register 插入/覆盖、unregister 移除）
+    active: HashMap<OwnerKey, u64>,
 }
 
 impl RegistrySnapshot {
@@ -65,7 +77,7 @@ impl RegistrySnapshot {
 
     /// L1b B1：(fabric_id, issuer) 是否 ∈ registry（验证链接线 task 1.5 消费）
     pub fn contains(&self, fabric_id: &[u8; 32], root: &[u8; 32]) -> bool {
-        self.inner.active.contains(&(*fabric_id, *root))
+        self.inner.active.contains_key(&(*fabric_id, *root))
     }
 
     /// 活跃 Owner 数（空 registry 启动告警与 CLI 回显用）
@@ -76,6 +88,23 @@ impl RegistrySnapshot {
     /// 是否为空（restricted+static+空 registry 启动告警，task 1.3）
     pub fn is_empty(&self) -> bool {
         self.inner.active.is_empty()
+    }
+
+    /// 活跃集合确定性列表（按 (fabric_id, root) 字节序排序；admin API 与
+    /// 测试断言用——admin 信任域的低频只读投影，无锁竞争顾虑）
+    pub fn entries(&self) -> Vec<OwnerEntry> {
+        let mut list: Vec<OwnerEntry> = self
+            .inner
+            .active
+            .iter()
+            .map(|((fabric_id, root), registered_at)| OwnerEntry {
+                fabric_id: *fabric_id,
+                root: *root,
+                registered_at: *registered_at,
+            })
+            .collect();
+        list.sort_by_key(|e| (e.fabric_id, e.root));
+        list
     }
 }
 
@@ -126,9 +155,10 @@ impl OwnerRegistry {
         })
     }
 
-    /// jsonl 全量归并（load 与 reload 共享；坏行硬错误，见模块注释）
-    fn load_active(path: &Path) -> Result<HashSet<OwnerKey>> {
-        let mut active: HashSet<OwnerKey> = HashSet::new();
+    /// jsonl 全量归并（load 与 reload 共享；坏行硬错误，见模块注释）。
+    /// 值 = 该键最后一次 register 事件的 ts。
+    fn load_active(path: &Path) -> Result<HashMap<OwnerKey, u64>> {
+        let mut active: HashMap<OwnerKey, u64> = HashMap::new();
         match std::fs::File::open(path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
@@ -146,7 +176,7 @@ impl OwnerRegistry {
                         .map_err(|e| anyhow::anyhow!("{}:{} {e}", path.display(), idx + 1))?;
                     match record.op {
                         Op::Register => {
-                            active.insert((fabric_id, root));
+                            active.insert((fabric_id, root), record.ts);
                         }
                         Op::Unregister => {
                             active.remove(&(fabric_id, root));
@@ -202,7 +232,7 @@ impl OwnerRegistry {
         let mut active = state.current.active.clone();
         match op {
             Op::Register => {
-                active.insert((*fabric_id, *root));
+                active.insert((*fabric_id, *root), record.ts);
             }
             Op::Unregister => {
                 active.remove(&(*fabric_id, *root));
@@ -488,6 +518,47 @@ mod tests {
         assert!(parse_owner_hex(&"a".repeat(63)).is_err());
         assert!(parse_owner_hex(&"a".repeat(65)).is_err());
         assert!(parse_owner_hex(&"g".repeat(64)).is_err());
+    }
+
+    /// task 3.1：entries() 暴露 registered_at（最后 register 事件 ts），
+    /// 确定性排序；磁盘重载保留 ts；重复 register 刷新 ts
+    #[test]
+    fn entries_track_registered_at_sorted_and_survive_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":111}}\n",
+                "31".repeat(32),
+                "32".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        reg.register(&key(1), &key(2)).unwrap(); // 内存路径（ts = now）
+        let entries = reg.snapshot().entries();
+        assert_eq!(entries.len(), 2);
+        // 按 (fabric_id, root) 字节序：0x01..（内存路径）< 0x31..（磁盘路径）
+        assert_eq!(entries[0].fabric_id, key(1));
+        assert!(entries[0].registered_at > 111, "内存 register 记录当下 ts");
+        assert_eq!(entries[1].fabric_id, [0x31; 32]);
+        assert_eq!(entries[1].registered_at, 111, "磁盘 load 路径保留 jsonl ts");
+
+        // 磁盘重载：ts 持久（append-only 日志的 ts 是唯一事实源）
+        let reloaded = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(reloaded.snapshot().entries(), entries);
+
+        // 重复 register 刷新 registered_at（活跃集合不重复，时间戳前进）
+        let before = reloaded.snapshot().entries()[0].registered_at;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reloaded.register(&key(1), &key(2)).unwrap();
+        let after = reloaded.snapshot().entries();
+        assert_eq!(after.len(), 2);
+        assert!(
+            after[0].registered_at > before,
+            "重复 register 刷新 registered_at"
+        );
     }
 
     #[test]

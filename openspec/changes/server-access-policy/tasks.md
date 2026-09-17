@@ -118,10 +118,32 @@
 
 ## Phase 3 — 运营面（另行排期）
 
-- [ ] 3.1 admin API：server.key 签发的 admin token；registry 热加载
+- [x] 3.1 admin API：server.key 签发的 admin token；registry 热加载
        与注册回执签名
-- [ ] 3.2 per-owner 配额钩子（连接计数/端点数上限）与存量连接主动
+       （Phase3-A 实现：`Authorization: Bearer <DWEB_ADMIN_TOKEN>` 静态
+       token（env 必填才挂路由，未配置 = /admin/* 404 零暴露；server.key
+       challenge 签名方案因需交互式握手被裁定否决——admin 信任域与
+       callback_token 同级，见 access/admin.rs 模块注释）；路由
+       GET/POST /admin/owners + DELETE /admin/owners/{fabric}/{root} +
+       GET /admin/status（mode/policy/generation/配额/per-endpoint 在线表/
+       per-owner 计数/cache_entries）；注册/注销复用 OwnerRegistry（CLI/
+       文件重载/API 三入口同一实例）+ callback 缓存失效；回执 = server.key
+       对 canonical b"dweb/admin-receipt/v1\0"||op||fabric||root||ts||
+       generation 的 Ed25519 签名（响应自带全部被签字段，可对 services.json
+       的 ServerId 独立验签）；jsonl 仍为 source of truth，mtime 热重载保留）
+- [x] 3.2 per-owner 配额钩子（连接计数/端点数上限）与存量连接主动
        断连钩子评估（iroh-relay Clients 表可及性）
+       （Phase3-A 实现：DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER env（默认无
+       上限，仅 restricted relay gate 消费）；AccessGate 在线表
+       (endpoint_id,connection_id)→fabric_id + owner 计数，on_connect
+        Allow 原子预约（L1b 后、L2 前，L2 deny 回滚防泄漏），on_disconnect
+        释放；超限 deny reason dweb/owner-quota-exceeded；无票 A_cb 接入
+        与 rendezvous Op 不占名额。**断连钩子评估结论：可及**——iroh-relay
+        1.1.0 公开 API 链 Server::relay_service() → RelayService::clients()
+        → Clients::disconnect(endpoint_id, connection_id: Option)（http_
+        server.rs:949-955 文档明示运行期踢连接用途；clients.rs:181-207
+        异步 start_shutdown），unregister 踢存量可零 fork 实现，列入
+        下一棒 3.2b；本棒按任务定义仅交付评估结论）
 - [ ] 3.3 member capability 续期协议化评估（RENEW 消息 vs regular 会话
        重发的 MVP 语义固化）；`peer_scope` capability 扩展评估
 - [ ] 3.4 多平台矩阵（darwin-arm64/windows-x64）与 Docker/compose

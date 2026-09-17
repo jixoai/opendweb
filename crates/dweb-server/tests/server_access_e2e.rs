@@ -24,6 +24,11 @@
 //! - e11 空 registry：static fail-closed / callback identity-only
 //! - e12 client_rx 限流与 access mode 正交（open + 小限流仍准入）
 //! - e13 rendezvous ACL 主接线（gateway 401 JSON 形态）
+//! - e14 admin API：空 registry 服务经 POST /admin/owners 注册 → 同票
+//!   即时可用（无热重载窗口）+ 回执可用 services.json ServerId 验签 +
+//!   401/404 鉴权与未挂载面
+//! - e15 per-owner 连接配额：配额满新连接 deny（dweb/owner-quota-exceeded
+//!   经握手回传）+ 断连名额恢复 + /admin/status 在线投影
 //!
 //! 进程纪律：Server guard Drop 恒 kill+wait（防孤儿 dweb-server——全局
 //! 规则：测试泄漏常驻进程是重大事故）；网络测试以 --gateway/--relay
@@ -1004,6 +1009,214 @@ fn announce_request(signer: &SigningKey, addr: &str) -> serde_json::Value {
         "timestamp_ms": ts,
         "signature": base64url(signer.sign(&buf).to_bytes()),
     })
+}
+
+// ---------- e14：admin API 注册 → 同票即时可用 ----------
+
+/// admin 回执 canonical（b"dweb/admin-receipt/v1\0" || op u8 || fabric 32 ||
+/// root 32 || ts u64BE || generation u64BE——测试侧独立重实现，与 admin.rs
+/// 互为交叉验证）
+fn admin_receipt_canonical(
+    op: u8,
+    fabric: &[u8; 32],
+    root: &[u8; 32],
+    ts: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut buf = b"dweb/admin-receipt/v1\0".to_vec();
+    buf.push(op);
+    buf.extend_from_slice(fabric);
+    buf.extend_from_slice(root);
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf.extend_from_slice(&generation.to_be_bytes());
+    buf
+}
+
+#[tokio::test]
+async fn e14_admin_api_registers_owner_and_capability_works_immediately() {
+    let dir = TempDir::new().unwrap();
+    // 空 registry 启动（不预注册——注册只经 admin API，验证即时生效路径）
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 鉴权面：错 token → 401；无 token 的其它服务实例 → /admin/* 404
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/owners",
+        "GET",
+        None,
+        &[("authorization", "Bearer wrong-token")],
+    )
+    .await;
+    assert_eq!(status, 401, "错 admin token 必须 401: {body}");
+    {
+        let plain_dir = TempDir::new().unwrap();
+        let plain = Server::spawn(
+            plain_dir.path(),
+            &[("DWEB_ACCESS_MODE", "restricted")],
+            &[],
+            false,
+        );
+        let (status, _body) = http_request(plain.gateway, "/admin/status", "GET", None, &[]).await;
+        assert_eq!(
+            status, 404,
+            "未配置 DWEB_ADMIN_TOKEN 的实例不挂载 admin 路由"
+        );
+    }
+
+    // 注册 owner（Bearer 正确 token）→ 200 + 回执
+    let owner = Owner::new(0xE1);
+    let fabric = owner.fabric_id;
+    let root = owner.issuer.verifying_key().to_bytes();
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/owners",
+        "POST",
+        Some(
+            &serde_json::json!({
+                "fabric_id_hex": hex::encode(fabric),
+                "root_hex": hex::encode(root),
+            })
+            .to_string(),
+        ),
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200, "admin register: {body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt["op"], "register");
+    let ts = receipt["ts"].as_u64().unwrap();
+    let generation = receipt["generation"].as_u64().unwrap();
+    // 回执验签（services.json 的 ServerId——跨面一致性 + canonical 交叉验证）
+    use base64::Engine;
+    let sig: [u8; 64] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(receipt["receipt_sig"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(&server_id).unwrap();
+    use ed25519_dalek::Verifier;
+    verifying
+        .verify(
+            &admin_receipt_canonical(0x01, &fabric, &root, ts, generation),
+            &ed25519_dalek::Signature::from_bytes(&sig),
+        )
+        .expect("receipt_sig 必须可验签");
+
+    // 列表与 status 反映注册（同一 registry 实例——无 mtime 热重载窗口）
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/owners",
+        "GET",
+        None,
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list["generation"].as_u64().unwrap(), generation);
+    assert_eq!(list["owners"][0]["fabric_id"], hex::encode(fabric));
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/status",
+        "GET",
+        None,
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let status_body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(status_body["mode"], "restricted");
+    assert_eq!(status_body["policy"], "static");
+    assert_eq!(status_body["generation"].as_u64().unwrap(), generation);
+
+    // 同票即时可用（admin 注册即刻生效于验证链——同进程快照替换）
+    let client = SecretKey::generate();
+    let token = owner.token_for(&server_id, &client.public(), CAP_RELAY);
+    expect_connected(relay, &client, Some(token)).await;
+}
+
+// ---------- e15：per-owner 连接配额 ----------
+
+#[tokio::test]
+async fn e15_owner_connection_quota_denies_and_restores() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xE2);
+    owner.register(dir.path());
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "1"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 连接 1：全量 endpoint（持有 relay 连接的常驻形态——名额被占用的前提）
+    let a = SecretKey::generate();
+    let token_a = owner.token_for(&server_id, &a.public(), CAP_RELAY);
+    let ep_a = iroh_endpoint(relay, a.clone(), Some(token_a)).await;
+    await_online(&ep_a).await;
+
+    // /admin/status：per-owner 在线 1（无热重载依赖，直接断言）
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/status",
+        "GET",
+        None,
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["max_connections_per_owner"], 1);
+    assert_eq!(
+        st["per_owner_connections"][0]["fabric_id"],
+        hex::encode(owner.fabric_id)
+    );
+    assert_eq!(st["per_owner_connections"][0]["connections"], 1);
+    assert_eq!(
+        st["active_connections"][0]["endpoint_id"],
+        a.public().to_string()
+    );
+
+    // 连接 2（同 owner，另一 endpoint 的票）→ 配额超限 deny（握手回传）
+    let b = SecretKey::generate();
+    let token_b = owner.token_for(&server_id, &b.public(), CAP_RELAY);
+    let reason = expect_denied(relay, &b, Some(token_b.clone())).await;
+    assert_eq!(reason, "dweb/owner-quota-exceeded");
+
+    // 断开连接 1（drop endpoint → relay 连接关闭 → on_disconnect 释放）→
+    // 探测式重试直到名额恢复（上限 15s；含 relay 感知断连的传播时延）
+    drop(ep_a);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            raw_relay_connect(relay, &b, Some(token_b.clone())),
+        )
+        .await
+        .expect("probe connect 超时");
+        match probe {
+            Ok(()) => break,
+            Err(iroh_relay::client::ConnectError::Handshake { source, .. }) => match source {
+                iroh_relay::protos::handshake::Error::ServerDeniedAuth { reason, .. }
+                    if reason == "dweb/owner-quota-exceeded" => {}
+                other => panic!("非预期握手失败: {other:#}"),
+            },
+            Err(other) => panic!("传输层失败: {other:#}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "断开后 15s 内名额未恢复（配额泄漏）"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 fn base64url(bytes: [u8; 64]) -> String {
