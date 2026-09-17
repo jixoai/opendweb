@@ -20,8 +20,17 @@ pub mod transport;
 /// continuity 专用 ALPN（与 legacy envelope 物理隔离；design §1.1）。
 pub const ALPN_CONTINUITY: &[u8] = b"/dweb/fabric-continuity/1";
 
-pub use frame::{Direction, Frame, FrameError, FrameType, HEADER_LEN, MAGIC, MAX_FRAME, WIRE_VERSION};
-pub use model::{GapOverflow, JournalError, JournalLimits, RecvWindow, SegmentAction, StreamJournal};
-pub use session::{RequestState, Session, SessionChannel, SessionOptions, SessionPhase, SessionRegistry, SessionShared};
+pub use frame::{
+    Direction, Frame, FrameError, FrameType, HEADER_LEN, MAGIC, MAX_FRAME, WIRE_VERSION,
+};
+pub use model::{
+    GapOverflow, JournalError, JournalLimits, RecvWindow, SegmentAction, StreamJournal,
+};
+pub use session::{
+    RequestState, Session, SessionChannel, SessionOptions, SessionPhase, SessionRegistry,
+    SessionShared,
+};
 pub use state::{ConnHandle, ConnectionPhase, ConnectionStateSnapshot, ContinuityState};
-pub use transport::{ContinuityTransport, StreamFramer, TransportError, TransportRecv, TransportSend};
+pub use transport::{
+    ContinuityTransport, StreamFramer, TransportError, TransportRecv, TransportSend,
+};

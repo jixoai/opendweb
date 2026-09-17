@@ -24,7 +24,7 @@ use crate::fabric::{Fabric, FabricError};
 use crate::session::SessionError;
 
 use super::session::{
-    Session, SessionChannel, SessionOptions, SessionShared, RequestState, accept_any,
+    RequestState, Session, SessionChannel, SessionOptions, SessionShared, accept_any,
 };
 
 /// HTTP 头（数组形态保重复项，§3.4）。
@@ -54,8 +54,9 @@ impl From<HttpEngineError> for FabricError {
     }
 }
 
-type BoxHttpFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<HttpResponse, HttpEngineError>> + Send>>;
+type BoxHttpFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<HttpResponse, HttpEngineError>> + Send>,
+>;
 
 /// handler trait（object-safe；N-API 层在 task 4.2 适配 TS handler）。
 pub trait HttpHandler: Send + Sync + 'static {
@@ -159,10 +160,10 @@ pub struct HttpClientResponse {
 impl HttpClientResponse {
     /// 读下一块 body（首块 = meta 行后的剩余字节）。
     pub async fn recv_body(&mut self) -> Result<Bytes, FabricError> {
-        if let Some(b) = self.buf.take() {
-            if !b.is_empty() {
-                return Ok(b);
-            }
+        if let Some(b) = self.buf.take()
+            && !b.is_empty()
+        {
+            return Ok(b);
         }
         self.channel.recv(self.stream_id).await
     }
@@ -192,8 +193,7 @@ pub async fn fetch_http(
 ) -> Result<HttpClientResponse, FabricError> {
     let channel = session.channel();
     let idem = hex16(
-        &super::session::rand_16()
-            .ok_or_else(|| HttpEngineError("entropy unavailable".into()))?,
+        &super::session::rand_16().ok_or_else(|| HttpEngineError("entropy unavailable".into()))?,
     );
     let body_len: usize = init.body.iter().map(|b| b.len()).sum();
     // OPEN payload = §2.4 元数据全量（requestId 在 open_stream_raw 内由流 id 决定）
@@ -228,9 +228,12 @@ pub async fn fetch_http(
                 "response head timeout".into(),
             )));
         }
-        let chunk = tokio::time::timeout(std::time::Duration::from_secs(30), channel.recv(stream_id))
-            .await
-            .map_err(|_| FabricError::Session(SessionError::Connect("response head timeout".into())))??;
+        let chunk =
+            tokio::time::timeout(std::time::Duration::from_secs(30), channel.recv(stream_id))
+                .await
+                .map_err(|_| {
+                    FabricError::Session(SessionError::Connect("response head timeout".into()))
+                })??;
         buf.extend_from_slice(&chunk);
         if let Some((status, headers, rest)) = peel_meta_line(&buf) {
             break (status, headers, rest);
@@ -323,17 +326,16 @@ async fn wait_active(session: &Arc<Session>) -> bool {
 /// record-once + 定 offset 裸帧重发：journal 恰好记一次，发送失败等恢复后
 /// 以同一 offset 重发（对端 RecvWindow 去重闭合；部分写入帧由帧边界丢弃）。
 /// 返回 false = 恢复失败（流留未完态）。
-async fn send_resilient(
-    session: &Arc<Session>,
-    stream_id: u64,
-    payload: Bytes,
-) -> bool {
+async fn send_resilient(session: &Arc<Session>, stream_id: u64, payload: Bytes) -> bool {
     let offset = match session.prepare_send(stream_id, &payload).await {
         Ok(o) => o,
         Err(_) => return false, // journal 上限/关闭：背压终态
     };
     loop {
-        match session.send_data_at(stream_id, offset, payload.clone()).await {
+        match session
+            .send_data_at(stream_id, offset, payload.clone())
+            .await
+        {
             Ok(()) => return true,
             Err(_) => {
                 if !wait_active(session).await {
@@ -347,11 +349,7 @@ async fn send_resilient(
 /// 单流 dispatch：元数据解析 → 副作用闸门 → handler → 响应投影。
 /// 断线窗口 = 发送失败：等 Active 后定 offset 重发；FIN 失败同理重发
 /// （final_sent 已记，幂等）。
-async fn dispatch_stream(
-    session: Arc<Session>,
-    stream_id: u64,
-    handler: Arc<dyn HttpHandler>,
-) {
+async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn HttpHandler>) {
     let shared = session.shared();
     // 恢复轮短路：上游已执行（重放由协议层完成，§2.8 STARTED 不重执行）
     match shared.request_state(stream_id).await {
@@ -407,13 +405,7 @@ async fn dispatch_stream(
                 "status": resp.status,
                 "headers": resp.headers.iter().map(|h| json!({"name": h.name, "value": h.value})).collect::<Vec<_>>(),
             });
-            if !send_resilient(
-                &session,
-                stream_id,
-                Bytes::from(format!("{}\n", meta_line.to_string())),
-            )
-            .await
-            {
+            if !send_resilient(&session, stream_id, Bytes::from(format!("{}\n", meta_line))).await {
                 return;
             }
             if let Some(mut body) = resp.body {
@@ -455,10 +447,7 @@ async fn respond_error(
         "headers": [ { "name": "content-type", "value": "text/plain" } ],
     });
     session
-        .send_data(
-            stream_id,
-            Bytes::from(format!("{}\n{msg}", meta.to_string())),
-        )
+        .send_data(stream_id, Bytes::from(format!("{}\n{msg}", meta)))
         .await?;
     session.finish(stream_id).await
 }

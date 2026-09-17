@@ -60,6 +60,12 @@ pub struct GapOverflow {
     pub cap: usize,
 }
 
+impl Default for RecvWindow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RecvWindow {
     pub fn new() -> Self {
         Self {
@@ -134,9 +140,10 @@ impl RecvWindow {
             if verify_start < overlap_end {
                 let hs = (verify_start - self.history_start) as usize;
                 let he = (overlap_end - self.history_start) as usize;
-                let hist_slice = self.history.get(hs..he).expect(
-                    "history 必须覆盖 [history_start, expected) 区间（append 记账不变量）",
-                );
+                let hist_slice = self
+                    .history
+                    .get(hs..he)
+                    .expect("history 必须覆盖 [history_start, expected) 区间（append 记账不变量）");
                 let ps = (verify_start - offset) as usize;
                 let pe = ps + (overlap_end - verify_start) as usize;
                 if hist_slice != &payload[ps..pe] {
@@ -399,7 +406,12 @@ mod tests {
         let mut w = RecvWindow::new();
         w.feed(0, b(1, 10), 8).unwrap();
         // 重放段 5..15：前 5B 与历史一致，后 5B 是新数据
-        let seg = Bytes::from(vec![1u8; 5].into_iter().chain(vec![3u8; 5]).collect::<Vec<_>>());
+        let seg = Bytes::from(
+            vec![1u8; 5]
+                .into_iter()
+                .chain(vec![3u8; 5])
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(w.feed(5, seg, 8).unwrap(), SegmentAction::Deliver(b(3, 5)));
         assert_eq!(w.expected_offset(), 15);
     }
@@ -468,10 +480,7 @@ mod tests {
         assert_eq!(w.history_start, 32768);
         // 完全低于视界的重放段：丢弃 + unverifiable 计数
         assert_eq!(w.unverifiable_duplicates(), 0);
-        assert_eq!(
-            w.feed(0, b(1, 32768), 8).unwrap(),
-            SegmentAction::Duplicate
-        );
+        assert_eq!(w.feed(0, b(1, 32768), 8).unwrap(), SegmentAction::Duplicate);
         assert_eq!(w.unverifiable_duplicates(), 1);
         assert_eq!(w.delivered_bytes(), 3 * 32768);
         // 跨界段（前缀低于视界、中间与历史一致、后缀是新数据）：跳过前缀交付后缀
@@ -577,9 +586,11 @@ mod tests {
 
     #[test]
     fn journal_caps() {
-        let mut lim = JournalLimits::default();
-        lim.max_stream_bytes = 100;
-        lim.max_segments = 4;
+        let lim = JournalLimits {
+            max_stream_bytes: 100,
+            max_segments: 4,
+            ..Default::default()
+        };
         let mut j = StreamJournal::new(1, lim);
         assert!(j.record(b(1, 40), false).is_ok());
         assert!(j.record(b(1, 40), false).is_ok());
@@ -628,7 +639,7 @@ mod tests {
                         assert_eq!(j.next_offset(), before + len as u64);
                     }
                 } else {
-                    let span = (next() % 128) as u64;
+                    let span = next() % 128;
                     j.advance_ack(j.acked_offset() + span);
                 }
                 assert!(j.held_bytes() <= lim.max_stream_bytes);

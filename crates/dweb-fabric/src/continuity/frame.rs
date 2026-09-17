@@ -205,7 +205,7 @@ impl Frame {
         if src.len() < HEADER_LEN {
             return Err(FrameError::TooShort(src.len()));
         }
-        let mut cur = &src[..];
+        let mut cur = src;
         let magic = [cur.get_u8(), cur.get_u8(), cur.get_u8(), cur.get_u8()];
         if magic != MAGIC {
             return Err(FrameError::BadMagic);
@@ -224,8 +224,7 @@ impl Frame {
         cur.copy_to_slice(&mut session_id);
         let stream_id = cur.get_u64();
         let dir_raw = cur.get_u8();
-        let direction =
-            Direction::from_u8(dir_raw).ok_or(FrameError::BadDirection(dir_raw))?;
+        let direction = Direction::from_u8(dir_raw).ok_or(FrameError::BadDirection(dir_raw))?;
         let reserved = cur.get_u8();
         if reserved != 0 {
             return Err(FrameError::BadReserved);
@@ -275,7 +274,11 @@ mod tests {
     fn sample(ft: FrameType, stream_id: u64, payload: &[u8]) -> Frame {
         Frame {
             frame_type: ft,
-            flags: if ft == FrameType::Data { flags::START } else { 0 },
+            flags: if ft == FrameType::Data {
+                flags::START
+            } else {
+                0
+            },
             session_id: [9u8; 16],
             stream_id,
             direction: Direction::ClientToProvider,
@@ -377,7 +380,10 @@ mod tests {
         // 坏 direction
         let mut b = good.clone();
         b[32] = 9;
-        assert!(matches!(Frame::decode(&b), Err(FrameError::BadDirection(9))));
+        assert!(matches!(
+            Frame::decode(&b),
+            Err(FrameError::BadDirection(9))
+        ));
         // 声明长度超过实际
         let mut b = good.clone();
         let n = b.len();

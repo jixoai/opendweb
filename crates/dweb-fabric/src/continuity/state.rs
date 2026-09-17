@@ -129,7 +129,7 @@ impl ContinuityState {
         let epoch = slot.epoch_next;
         slot.epoch_next += 1;
         slot.handle = Some(Arc::clone(&handle));
-        let _ = slot.tx.send_modify(|snap| {
+        slot.tx.send_modify(|snap| {
             let s = Arc::make_mut(snap);
             s.phase = ConnectionPhase::Ready;
             s.epoch = epoch;
@@ -155,7 +155,7 @@ impl ContinuityState {
         if clear_handle {
             slot.handle = None;
         }
-        let _ = slot.tx.send_modify(|snap| {
+        slot.tx.send_modify(|snap| {
             let s = Arc::make_mut(snap);
             s.phase = phase;
             s.reason = reason;
@@ -168,11 +168,11 @@ impl ContinuityState {
     /// shutdown 收口：全部句柄 deliberate 关闭 + 置 Closing。
     pub async fn close_all(&self, phase: ConnectionPhase, reason: &str) {
         let mut slots = self.slots.lock().await;
-        for (_, slot) in slots.iter_mut() {
+        for slot in slots.values_mut() {
             if let Some(h) = slot.handle.take() {
                 h.close_deliberate(reason.as_bytes());
             }
-            let _ = slot.tx.send_modify(|snap| {
+            slot.tx.send_modify(|snap| {
                 let s = Arc::make_mut(snap);
                 s.phase = phase;
                 s.reason = Some(reason.to_string());
@@ -229,8 +229,10 @@ mod tests {
         let mut rx = st.watch(&p).await;
         assert_eq!(*rx.borrow(), s0);
         // 慢订阅者不读期间发生多次跳变
-        st.set_phase(&p, ConnectionPhase::Connecting, None, false).await;
-        st.set_phase(&p, ConnectionPhase::Handshaking, None, false).await;
+        st.set_phase(&p, ConnectionPhase::Connecting, None, false)
+            .await;
+        st.set_phase(&p, ConnectionPhase::Handshaking, None, false)
+            .await;
         // lag 收敛：读一次即最新，无缺事件悬挂
         rx.changed().await.unwrap();
         let latest = rx.borrow().clone();

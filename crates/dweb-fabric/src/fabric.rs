@@ -2495,9 +2495,7 @@ impl Fabric {
                 let note = match &self.relay_deny_note() {
                     // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
                     // 静默退避重试，connect 常以超时面落地）
-                    Some(note) => format!(
-                        "join failed to reach the issuer via relay ({note})"
-                    ),
+                    Some(note) => format!("join failed to reach the issuer via relay ({note})"),
                     None if probe_applies(&token, self.inner.proxy_is_none)
                         && run_relay_probe(&token.invite.issuer_relay_url).await =>
                     {
@@ -2665,7 +2663,7 @@ impl Fabric {
                     None => format!(
                         "join deadline exceeded after {}ms",
                         self.inner.join_timeout_ms
-                    )
+                    ),
                 };
                 Err(FabricError::Join {
                     code: JoinErrorCode::DialTimeout,
@@ -4090,9 +4088,7 @@ mod tests {
     fn sanitize_relay_error_passes_deny_reason_through() {
         // D4 脱敏的 task 2.5 例外：结构化 deny reason 不折叠进泛化类别
         assert_eq!(
-            sanitize_relay_error(
-                "The relay denied our authentication (dweb/not-recipient)"
-            ),
+            sanitize_relay_error("The relay denied our authentication (dweb/not-recipient)"),
             "relay denied: dweb/not-recipient"
         );
         // deny 优先于类别映射（含 timeout 字样的 deny 文本）

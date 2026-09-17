@@ -31,11 +31,17 @@ impl StreamFramer {
         match Frame::decode(src) {
             Ok((frame, _used)) => FeedOutcome::Frame(frame),
             Err(FrameError::TooShort(_)) => FeedOutcome::NeedMore,
-            Err(FrameError::LengthMismatch { declared, available }) => {
+            Err(FrameError::LengthMismatch {
+                declared,
+                available,
+            }) => {
                 if declared > available {
                     FeedOutcome::NeedMore
                 } else {
-                    FeedOutcome::Fatal(FrameError::LengthMismatch { declared, available })
+                    FeedOutcome::Fatal(FrameError::LengthMismatch {
+                        declared,
+                        available,
+                    })
                 }
             }
             Err(e) => FeedOutcome::Fatal(e),
@@ -129,7 +135,9 @@ impl TransportRecv {
                 .read(&mut chunk)
                 .await
                 .map_err(|e| TransportError::Io(format!("{e}")))?;
-            let Some(n) = n else { return Err(TransportError::Ended) };
+            let Some(n) = n else {
+                return Err(TransportError::Ended);
+            };
             drain_framed(&mut self.framer, &mut self.pending, &chunk[..n])?;
             // 帧未齐：继续读
         }
@@ -183,10 +191,7 @@ impl ContinuityTransport {
     ) -> Self {
         Self {
             epoch,
-            send: TransportSend {
-                epoch,
-                send,
-            },
+            send: TransportSend { epoch, send },
             recv: TransportRecv {
                 epoch,
                 recv,
@@ -210,8 +215,8 @@ impl ContinuityTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::continuity::frame::{Direction, FrameType};
+    use bytes::Bytes;
 
     fn data_frame(offset: u64, payload: &[u8]) -> Frame {
         Frame {

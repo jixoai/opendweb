@@ -22,13 +22,13 @@ use tokio::sync::oneshot;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::session::{
-    self, decode_resume_ok, encode_resume_init, encode_session_init, init_reason, reject_reason,
-    RequestState, SessionOptions,
+    self, RequestState, SessionOptions, decode_resume_ok, encode_resume_init, encode_session_init,
+    init_reason, reject_reason,
 };
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
-    Fabric, FabricConfig, HttpProxyConfig, RelayConfig, RelayTlsTrust, SecretInjection,
-    JOIN_TIMEOUT_MS_DEFAULT,
+    Fabric, FabricConfig, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig, RelayTlsTrust,
+    SecretInjection,
 };
 
 fn cfg(dir: &tempfile::TempDir) -> FabricConfig {
@@ -66,7 +66,9 @@ async fn pair() -> (Fabric, Fabric, tempfile::TempDir, tempfile::TempDir) {
     let dir_b = tempfile::tempdir().unwrap();
     let port_a = reserve_loopback_port();
     let port_b = reserve_loopback_port();
-    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a)).await.unwrap();
+    let a = Fabric::create_root(cfg_fixed_port(&dir_a, port_a))
+        .await
+        .unwrap();
     let fabric_id = a.fabric_id_hex().await;
     let b = Fabric::attach(cfg_fixed_port(&dir_b, port_b), &fabric_id)
         .await
@@ -113,10 +115,13 @@ async fn open_session_bounded(
     peer: &str,
     opts: SessionOptions,
 ) -> session::Session {
-    tokio::time::timeout(Duration::from_secs(30), session::open_session(fabric, peer, opts))
-        .await
-        .expect("open_session 有界")
-        .expect("open_session 成功")
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        session::open_session(fabric, peer, opts),
+    )
+    .await
+    .expect("open_session 有界")
+    .expect("open_session 成功")
 }
 
 /// s1：握手 + 双向流 + 状态机 + ACK 驱动 journal 释放（双端）。
@@ -137,7 +142,10 @@ async fn session_handshake_roundtrip_and_ack_release() {
             "OPEN 落地即 ACCEPTED"
         );
         session.mark_started(1).await;
-        session.send_data(1, Bytes::from_static(b"pong")).await.unwrap();
+        session
+            .send_data(1, Bytes::from_static(b"pong"))
+            .await
+            .unwrap();
         session.finish(1).await.unwrap();
         session.mark_completed(1).await;
         session
@@ -146,7 +154,10 @@ async fn session_handshake_roundtrip_and_ack_release() {
     let client = open_session_bounded(&a, &b_id, opts).await;
     let s = client.open_stream("k1").await.expect("open_stream");
     assert_eq!(s, 1, "client 首流 id = 1（奇数）");
-    client.send_data(s, Bytes::from_static(b"ping")).await.unwrap();
+    client
+        .send_data(s, Bytes::from_static(b"ping"))
+        .await
+        .unwrap();
     client.finish(s).await.unwrap();
     let resp = client.recv(s).await.expect("response");
     assert_eq!(&resp[..], b"pong");
@@ -154,7 +165,10 @@ async fn session_handshake_roundtrip_and_ack_release() {
     assert!(client.recv(s).await.is_err(), "FIN 后 recv 终结");
 
     let provider = provider.await.unwrap();
-    assert_eq!(provider.request_state(1).await, Some(RequestState::Completed));
+    assert_eq!(
+        provider.request_state(1).await,
+        Some(RequestState::Completed)
+    );
 
     // ACK 推进后 journal 释放（双端；有界轮询）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -220,7 +234,11 @@ async fn session_dual_open_session_converges_to_one_sid() {
         .into_iter()
         .filter_map(Result::ok)
         .collect();
-    assert_eq!(accepted.len(), 1, "同 peer 只能有一个 provider canonical session");
+    assert_eq!(
+        accepted.len(),
+        1,
+        "同 peer 只能有一个 provider canonical session"
+    );
     assert_eq!(
         accepted[0].shared().session_id,
         a_session.shared().session_id,
@@ -329,7 +347,10 @@ async fn session_started_not_reexecuted_pending_response() {
             match wait_request(&session, 1, "pending").await {
                 RequestState::Started | RequestState::Completed => {
                     // 恢复轮：不重执行；此刻补发响应（模型：上游结果就绪）
-                    session.send_data(1, Bytes::from_static(b"late-pong")).await.unwrap();
+                    session
+                        .send_data(1, Bytes::from_static(b"late-pong"))
+                        .await
+                        .unwrap();
                     session.finish(1).await.unwrap();
                     session.mark_completed(1).await;
                 }
@@ -346,13 +367,19 @@ async fn session_started_not_reexecuted_pending_response() {
 
     let client = open_session_bounded(&a, &b_id, opts).await;
     let s = client.open_stream("pending-1").await.unwrap();
-    client.send_data(s, Bytes::from_static(b"ping")).await.unwrap();
+    client
+        .send_data(s, Bytes::from_static(b"ping"))
+        .await
+        .unwrap();
     client.finish(s).await.unwrap();
 
     // 确定性断点：等 provider 真实进入 STARTED 再注入死亡
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !started_flag.load(std::sync::atomic::Ordering::SeqCst) {
-        assert!(tokio::time::Instant::now() < deadline, "provider 未 STARTED");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "provider 未 STARTED"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     a.continuity_reset(&b_id).await.unwrap();
@@ -412,24 +439,17 @@ async fn session_resume_rejects_unknown_and_bad_token() {
 
     // 注入器 B：已知会话 + 错 token → TOKEN_INVALID（两代滑窗不匹配）
     let mut raw2 = a.continuity_open_transport(&b_id).await.unwrap();
-    raw2
-        .send(&Frame {
-            frame_type: FrameType::ResumeInit,
-            flags: 0,
-            session_id: client.shared().session_id,
-            stream_id: 0,
-            direction: Direction::ClientToProvider,
-            byte_offset: 0,
-            payload: Bytes::from(encode_resume_init(
-                1,
-                1,
-                &[0u8; 16],
-                &[7u8; 16],
-                &[],
-            )),
-        })
-        .await
-        .unwrap();
+    raw2.send(&Frame {
+        frame_type: FrameType::ResumeInit,
+        flags: 0,
+        session_id: client.shared().session_id,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(encode_resume_init(1, 1, &[0u8; 16], &[7u8; 16], &[])),
+    })
+    .await
+    .unwrap();
     let resp2 = tokio::time::timeout(Duration::from_secs(10), raw2.recv())
         .await
         .expect("reject 有界返回")
@@ -495,9 +515,15 @@ async fn session_multi_stream_resume_interleaved() {
     let s1 = client.open_stream("big").await.unwrap();
     let s3 = client.open_stream("small").await.unwrap();
     assert_eq!((s1, s3), (1, 3));
-    client.send_data(s1, Bytes::from_static(b"req-big")).await.unwrap();
+    client
+        .send_data(s1, Bytes::from_static(b"req-big"))
+        .await
+        .unwrap();
     client.finish(s1).await.unwrap();
-    client.send_data(s3, Bytes::from_static(b"req-small")).await.unwrap();
+    client
+        .send_data(s3, Bytes::from_static(b"req-small"))
+        .await
+        .unwrap();
     client.finish(s3).await.unwrap();
 
     // 读到大流首段后立即注入死亡（两流响应均未完）
@@ -545,7 +571,13 @@ async fn session_concurrent_double_resume_single_winner() {
             stream_id: 0,
             direction: Direction::ClientToProvider,
             byte_offset: 0,
-            payload: Bytes::from(encode_resume_init(token_gen, token_gen, &[0u8; 16], &token, &[])),
+            payload: Bytes::from(encode_resume_init(
+                token_gen,
+                token_gen,
+                &[0u8; 16],
+                &token,
+                &[],
+            )),
         })
         .await
         .unwrap();
@@ -554,30 +586,30 @@ async fn session_concurrent_double_resume_single_winner() {
             .expect("resume 响应有界")
             .unwrap()
     };
-    let send_resume_with_nonce =
-        |mut t: dweb_fabric::continuity::ContinuityTransport, nonce: [u8; 16]| async move {
-            t.send(&Frame {
-                frame_type: FrameType::ResumeInit,
-                flags: 0,
-                session_id: sid,
-                stream_id: 0,
-                direction: Direction::ClientToProvider,
-                byte_offset: 0,
-                payload: Bytes::from(encode_resume_init(
-                    token_gen,
-                    token_gen,
-                    &nonce,
-                    &token,
-                    &[],
-                )),
-            })
+    let send_resume_with_nonce = |mut t: dweb_fabric::continuity::ContinuityTransport,
+                                  nonce: [u8; 16]| async move {
+        t.send(&Frame {
+            frame_type: FrameType::ResumeInit,
+            flags: 0,
+            session_id: sid,
+            stream_id: 0,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from(encode_resume_init(
+                token_gen,
+                token_gen,
+                &nonce,
+                &token,
+                &[],
+            )),
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), t.recv())
             .await
-            .unwrap();
-            tokio::time::timeout(Duration::from_secs(10), t.recv())
-                .await
-                .expect("resume 响应有界")
-                .unwrap()
-        };
+            .expect("resume 响应有界")
+            .unwrap()
+    };
     let t1 = a.continuity_open_transport(&b_id).await.unwrap();
     let t2 = a.continuity_open_transport(&b_id).await.unwrap();
     // —— R3 语义矩阵（Codex 复评步骤 6）——
@@ -609,7 +641,11 @@ async fn session_concurrent_double_resume_single_winner() {
     //    winner（不是 cached 幂等路径）。
     let t3 = a.continuity_open_transport(&b_id).await.unwrap();
     let r3 = send_resume_with_nonce(t3, [7u8; 16]).await;
-    assert_eq!(r3.frame_type, FrameType::ResumeOk, "previous 精确匹配可恢复");
+    assert_eq!(
+        r3.frame_type,
+        FrameType::ResumeOk,
+        "previous 精确匹配可恢复"
+    );
     assert_eq!(decode_resume_ok(&r3.payload).unwrap().0, results[0].0 + 1);
     provider.abort();
 }
@@ -624,7 +660,9 @@ async fn session_resume_cached_duplicate_does_not_change_owner() {
     let opts = SessionOptions::default();
     let (ready_tx, ready_rx) = oneshot::channel();
     let provider = tokio::spawn(async move {
-        let initial = session::accept_any(&b, &a_id, opts).await.expect("initial accept");
+        let initial = session::accept_any(&b, &a_id, opts)
+            .await
+            .expect("initial accept");
         let gate_rx = initial.shared().resume_gate.enable();
         let owner_before = initial.shared().debug_channel_owner();
         ready_tx
@@ -674,16 +712,26 @@ async fn session_resume_cached_duplicate_does_not_change_owner() {
         .await
         .expect("winner reaches ResumeGate")
         .expect("gate remains open");
-    assert_eq!(shared.debug_channel_owner(), owner_before, "barrier 内尚未提交 owner");
+    assert_eq!(
+        shared.debug_channel_owner(),
+        owner_before,
+        "barrier 内尚未提交 owner"
+    );
     shared.resume_gate.release();
-    let (winner, duplicate) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(j1, j2)
-    })
-    .await
-    .expect("winner released");
+    let (winner, duplicate) =
+        tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(j1, j2) })
+            .await
+            .expect("winner released");
     assert_eq!(winner.expect("winner task").frame_type, FrameType::ResumeOk);
-    assert_eq!(duplicate.expect("duplicate task").frame_type, FrameType::ResumeOk);
-    assert_eq!(shared.debug_channel_owner(), owner_before + 1, "仅 winner 提交新 owner");
+    assert_eq!(
+        duplicate.expect("duplicate task").frame_type,
+        FrameType::ResumeOk
+    );
+    assert_eq!(
+        shared.debug_channel_owner(),
+        owner_before + 1,
+        "仅 winner 提交新 owner"
+    );
     provider.abort();
 }
 
@@ -819,7 +867,10 @@ async fn session_wire_rejects_129th_open() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while provider.shared().protocol_violations() == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "第 129 个 OPEN 未被拒绝");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "第 129 个 OPEN 未被拒绝"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(provider.shared().protocol_violations(), 1);
@@ -905,20 +956,17 @@ async fn session_slow_consumer_backpressure_then_release() {
     let b_id = b.endpoint_id();
     let a_id = a.endpoint_id();
     let opts = SessionOptions {
-        limits: {
-            let mut l = dweb_fabric::continuity::model::JournalLimits::default();
-            l.max_stream_bytes = 128 * 1024;
-            l.max_session_bytes = 256 * 1024;
-            l
+        limits: dweb_fabric::continuity::model::JournalLimits {
+            max_stream_bytes: 128 * 1024,
+            max_session_bytes: 256 * 1024,
+            ..Default::default()
         },
     };
     let cap_hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let flag = Arc::clone(&cap_hit);
     let provider = tokio::spawn(async move {
-        let session = session::accept_any(&b, &a_id, opts)
-            .await
-            .expect("accept");
+        let session = session::accept_any(&b, &a_id, opts).await.expect("accept");
         session.mark_started(1).await;
         let mut sent = Vec::new();
         for i in 0..16u32 {
@@ -936,7 +984,10 @@ async fn session_slow_consumer_backpressure_then_release() {
 
     let client = open_session_bounded(&a, &b_id, opts).await;
     let s = client.open_stream("slow").await.unwrap();
-    client.send_data(s, Bytes::from_static(b"req")).await.unwrap();
+    client
+        .send_data(s, Bytes::from_static(b"req"))
+        .await
+        .unwrap();
     client.finish(s).await.unwrap();
 
     // 慢消费者：不 recv——发送端必须封顶（有界），本端交付队列涨满
@@ -1064,7 +1115,10 @@ async fn session_bidir_big_replay_no_deadlock() {
     assert_eq!(got, resp_expected, "响应方向恢复后字节精确");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while !provider_done.load(std::sync::atomic::Ordering::SeqCst) {
-        assert!(tokio::time::Instant::now() < deadline, "provider 未完成校验");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "provider 未完成校验"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     provider.abort();
@@ -1089,7 +1143,10 @@ async fn session_resume_single_flight() {
                 _ => {
                     let _ = session.recv(1).await;
                     session.mark_started(1).await;
-                    session.send_data(1, Bytes::from_static(b"pong")).await.unwrap();
+                    session
+                        .send_data(1, Bytes::from_static(b"pong"))
+                        .await
+                        .unwrap();
                     session.finish(1).await.unwrap();
                     session.mark_completed(1).await;
                 }
@@ -1099,21 +1156,30 @@ async fn session_resume_single_flight() {
 
     let client = open_session_bounded(&a, &b_id, opts).await;
     let s = client.open_stream("sf").await.unwrap();
-    client.send_data(s, Bytes::from_static(b"ping")).await.unwrap();
+    client
+        .send_data(s, Bytes::from_static(b"ping"))
+        .await
+        .unwrap();
     client.finish(s).await.unwrap();
     assert_eq!(client.recv(s).await.unwrap(), Bytes::from_static(b"pong"));
 
     // 并发双 resume：single-flight 恰一执行者，两者都 Ok 返回
     a.continuity_reset(&b_id).await.unwrap();
     let (r1, r2) = tokio::join!(client.resume(&a), client.resume(&a));
-    assert!(r1.is_ok() && r2.is_ok(), "并发 resume 双双 Ok：{r1:?} {r2:?}");
+    assert!(
+        r1.is_ok() && r2.is_ok(),
+        "并发 resume 双双 Ok：{r1:?} {r2:?}"
+    );
     // 终态收敛 Active + 数据面继续
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while client.phase().await != session::SessionPhase::Active {
         assert!(tokio::time::Instant::now() < deadline, "未收敛 Active");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    client.send_data(s, Bytes::from_static(b"again")).await.unwrap();
+    client
+        .send_data(s, Bytes::from_static(b"again"))
+        .await
+        .unwrap();
     client.finish(s).await.unwrap();
     provider.abort();
 }
