@@ -22,6 +22,16 @@ configVersion = 1
 gatewayBind = "127.0.0.1:9000"
 publicGatewayUrl = "https://gw.example.com"
 
+[server.access]
+mode = "restricted"
+policy = "callback"
+ownersFile = "/srv/dweb/owners.jsonl"
+callbackUrl = "https://hooks.example.com/dweb"
+callbackToken = "sekret"
+callbackTimeoutMs = 1500
+callbackCacheTtlMs = 30000
+allowLoopbackCallback = false
+
 [[plugins]]
 name = "cf"
 
@@ -36,7 +46,20 @@ file = "opendweb.plugins/backup.ts"
 
 const JSON_SAMPLE = {
   configVersion: 1,
-  server: { gatewayBind: "127.0.0.1:9000", publicGatewayUrl: "https://gw.example.com" },
+  server: {
+    gatewayBind: "127.0.0.1:9000",
+    publicGatewayUrl: "https://gw.example.com",
+    access: {
+      mode: "restricted",
+      policy: "callback",
+      ownersFile: "/srv/dweb/owners.jsonl",
+      callbackUrl: "https://hooks.example.com/dweb",
+      callbackToken: "sekret",
+      callbackTimeoutMs: 1500,
+      callbackCacheTtlMs: 30000,
+      allowLoopbackCallback: false,
+    },
+  },
   plugins: [{ name: "cf" }, { name: "frp", options: { tokenEnv: "TUNNEL_TOKEN" } }, { file: "opendweb.plugins/backup.ts" }],
 };
 
@@ -125,4 +148,55 @@ test("schema rejects non-string plugin entries and empty names", () => {
   assert.equal(ConfigFileSchema.safeParse({ configVersion: 1, plugins: [42] }).success, false);
   assert.equal(ConfigFileSchema.safeParse({ configVersion: 1, plugins: [""] }).success, false);
   assert.equal(ConfigFileSchema.safeParse({ configVersion: 1, plugins: [{ name: "x", file: "y" }] }).success, false, "name 与 file 互斥");
+});
+
+test("[server.access] section: numbers stay numbers through file loading (design 11.2)", async () => {
+  const dir = await tmpDir();
+  const p = path.join(dir, "opendweb.config.toml");
+  await fsp.writeFile(
+    p,
+    [
+      "configVersion = 1",
+      "[server.access]",
+      'mode = "restricted"',
+      'policy = "callback"',
+      'ownersFile = "/srv/dweb/owners.jsonl"',
+      'callbackUrl = "https://hooks.example.com/dweb"',
+      'callbackToken = "sekret"',
+      "callbackTimeoutMs = 2000",
+      "callbackCacheTtlMs = 0",
+      "allowLoopbackCallback = true",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  const cfg = await loadConfigFile({ path: p });
+  // 边界值合法：timeout 上限 2000、cacheTtl 0（禁用缓存）——镜像 Rust 区间
+  assert.deepEqual(cfg.server.access, {
+    mode: "restricted",
+    policy: "callback",
+    ownersFile: "/srv/dweb/owners.jsonl",
+    callbackUrl: "https://hooks.example.com/dweb",
+    callbackToken: "sekret",
+    callbackTimeoutMs: 2000,
+    callbackCacheTtlMs: 0,
+    allowLoopbackCallback: true,
+  });
+});
+
+test("[server.access] rejects bad mode/policy, out-of-range or non-integer numbers, unknown keys (strict)", () => {
+  const access = (extra) => ConfigFileSchema.safeParse({ configVersion: 1, server: { access: extra } });
+  // mode/policy 枚举外的值拒绝
+  assert.equal(access({ mode: "publik" }).success, false, "mode 拼错拒绝");
+  assert.equal(access({ policy: "webhook" }).success, false, "policy 拼错拒绝");
+  // 数值字段：int + 区间（与 Rust env_u64 同规：timeout 1..=2000、cacheTtl 0..=60000）
+  assert.equal(access({ callbackTimeoutMs: -5 }).success, false, "负数 timeout 拒绝");
+  assert.equal(access({ callbackTimeoutMs: 1.5 }).success, false, "非整数 timeout 拒绝");
+  assert.equal(access({ callbackTimeoutMs: 2001 }).success, false, "超 Rust 硬上限拒绝");
+  assert.equal(access({ callbackCacheTtlMs: 60001 }).success, false, "超 cacheTtl 上限拒绝");
+  // 未知键 strict 拒绝——含 dataDir（数据目录是部署拓扑属性，不入 config 段）
+  assert.equal(access({ dataDir: "/srv/dweb" }).success, false, "dataDir 不入 [server.access]");
+  assert.equal(access({ limits: {} }).success, false, "未知子段拒绝");
+  // 空串 ownersFile 拒绝（min(1)）
+  assert.equal(access({ ownersFile: "" }).success, false);
 });

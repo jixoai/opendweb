@@ -11,12 +11,13 @@
 - [x] 1.2 owner registry：owners.jsonl append-only 写入/启动归并/活跃集合
        只读快照；register/unregister CLI 子命令（含 root 公钥 PoP 卫生
        校验工具）；SIGHUP/mtime 文件重载
-- [ ] 1.3 配置面：`--access-mode`/`--data-dir`/`--owners-file`（CLI）、
+- [x] 1.3 配置面：`--access-mode`/`--data-dir`/`--owners-file`（CLI）、
        `DWEB_ACCESS_MODE`/`DWEB_DATA_DIR`/`DWEB_OWNERS_FILE`（env）、
        `[server.access]`（config.toml）；fail-fast 校验（restricted+QAD
        bind 拒绝启动；restricted+空 registry 启动告警）
-       （第一棒已交付 CLI/env/fail-fast 全量；config.toml `[server.access]`
-       层全仓库未接线——Phase 1 收尾时经核对显式遗留，随后续配置面接线补齐）
+       （第一棒 CLI/env/fail-fast 全量；config.toml `[server.access]` TS
+       映射曾为显式遗留，第二棒已收口：config-file schema/opendweb CLI
+       三层链/startServer env 注入 + --allow-loopback-callback flag 透传）
 - [x] 1.4 RelayCapV1：canonical 编解码（域分隔 `dweb/relay-cap/v1`）、
        `dwebr1.` 串格式、caps 位图（未知位拒绝）、≤1KiB 长度门与
        base64url 白名单；编码长度测试冻结（≈242B canonical+sig /

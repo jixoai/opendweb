@@ -32,6 +32,25 @@ if (!BINARY_NAME) {
  * @property {string} [publicRelayUrl]   公网 relay 入口；仅显式定义时写 DWEB_PUBLIC_RELAY_URL
  * @property {boolean} [forwardStderr]   默认 true：子进程 stderr 实时转发到父进程；
  *                                   false 时仅留存尾部（stderrTail() 可取）
+ * @property {"open" | "restricted"} [accessMode] 访问控制模式（server-access-policy task 1.3）；
+ *                                   仅显式定义时写 DWEB_ACCESS_MODE，缺省继承父进程环境
+ * @property {"static" | "callback"} [accessPolicy] L2 策略选择（默认 static）；
+ *                                   仅显式定义时写 DWEB_ACCESS_POLICY
+ * @property {string} [ownersFile] owner registry 文件路径；仅显式定义时写 DWEB_OWNERS_FILE
+ * @property {string} [callbackUrl] callback policy 的 webhook 入口（policy=callback 必填）；
+ *                                   仅显式定义时写 DWEB_CALLBACK_URL
+ * @property {string} [callbackToken] webhook Bearer 凭证；仅显式定义时写 DWEB_CALLBACK_TOKEN
+ * @property {number} [callbackTimeoutMs] webhook 超时（1..=2000，默认 2000）；
+ *                                   仅显式定义时写 DWEB_CALLBACK_TIMEOUT_MS
+ * @property {number} [callbackCacheTtlMs] 决策缓存 TTL（0..=60000，默认 30000；0 = 禁用）；
+ *                                   仅显式定义时写 DWEB_CALLBACK_CACHE_TTL_MS
+ * @property {boolean} [allowLoopbackCallback] loopback webhook 豁免（开发用）。Rust 侧无对应
+ *                                   env（只认 --allow-loopback-callback flag），经 spawn 参数传递；
+ *                                   仅显式 true 时追加 flag，缺省不传
+ * @property {number} [relayClientRx] 每客户端 relay 接收字节率上限（字节/秒，>0）；
+ *                                   仅显式定义时写 DWEB_RELAY_CLIENT_RX
+ *                                   （dataDir 不透传：数据目录是部署拓扑属性，调用方需要时
+ *                                   经父进程 env DWEB_DATA_DIR 继承即可）
  */
 
 /**
@@ -83,8 +102,36 @@ export async function startServer(options = {}) {
   if (options.publicRelayUrl !== undefined) {
     env.DWEB_PUBLIC_RELAY_URL = options.publicRelayUrl;
   }
+  // 访问控制配置面（server-access-policy task 1.3）：同惯例仅显式定义时写 env，
+  // 缺省继承父进程环境（用户 shell 里已 export 的 DWEB_ACCESS_* 原样生效）
+  if (options.accessMode !== undefined) {
+    env.DWEB_ACCESS_MODE = options.accessMode;
+  }
+  if (options.accessPolicy !== undefined) {
+    env.DWEB_ACCESS_POLICY = options.accessPolicy;
+  }
+  if (options.ownersFile !== undefined) {
+    env.DWEB_OWNERS_FILE = options.ownersFile;
+  }
+  if (options.callbackUrl !== undefined) {
+    env.DWEB_CALLBACK_URL = options.callbackUrl;
+  }
+  if (options.callbackToken !== undefined) {
+    env.DWEB_CALLBACK_TOKEN = options.callbackToken;
+  }
+  if (options.callbackTimeoutMs !== undefined) {
+    env.DWEB_CALLBACK_TIMEOUT_MS = String(options.callbackTimeoutMs);
+  }
+  if (options.callbackCacheTtlMs !== undefined) {
+    env.DWEB_CALLBACK_CACHE_TTL_MS = String(options.callbackCacheTtlMs);
+  }
+  if (options.relayClientRx !== undefined) {
+    env.DWEB_RELAY_CLIENT_RX = String(options.relayClientRx);
+  }
+  // allowLoopbackCallback 无 Rust 侧 env（只认 flag）：经 spawn 参数传递
+  const args = options.allowLoopbackCallback === true ? ["--allow-loopback-callback"] : [];
 
-  const child = spawn(binPath, [], { env, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(binPath, args, { env, stdio: ["ignore", "pipe", "pipe"] });
   if (typeof child.pid !== "number") {
     throw new Error("failed to spawn dweb-server");
   }

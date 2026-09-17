@@ -7,6 +7,28 @@ import path from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { readTextIfExists, CliExit } from "./util.mjs";
 
+/**
+ * server.access 段（server-access-policy task 1.3 / design §11.2）：访问
+ * 控制配置面（mode/policy/owners/callback）。数值边界镜像 Rust 侧
+ * resolve_access_config 的 fail-fast 区间（timeout 1..=2000、cacheTtl
+ * 0..=60000），配置错误在装载期静态拒绝（零执行纪律）。
+ * dataDir 刻意不入本段——数据目录是部署拓扑属性（server.key/owners.jsonl
+ * 落点），走 flag(--data-dir)/env(DWEB_DATA_DIR)/默认(dweb-data)，与
+ * design §11.2 的 CLI/env 定位一致；误写入会被 strict 拒绝。
+ */
+export const ServerAccessConfigSchema = z
+  .object({
+    mode: z.enum(["open", "restricted"]).optional(),
+    policy: z.enum(["static", "callback"]).optional(),
+    ownersFile: z.string().min(1).optional(),
+    callbackUrl: z.string().min(1).optional(),
+    callbackToken: z.string().min(1).optional(),
+    callbackTimeoutMs: z.number().int().min(1).max(2000).optional(),
+    callbackCacheTtlMs: z.number().int().min(0).max(60000).optional(),
+    allowLoopbackCallback: z.boolean().optional(),
+  })
+  .strict();
+
 /** server 段：与 flag 同名同规；URL 字段复用 CLI 的同规校验由调用方接入 */
 export const ServerConfigSchema = z
   .object({
@@ -16,6 +38,7 @@ export const ServerConfigSchema = z
     trustProxy: z.boolean().optional(),
     publicGatewayUrl: z.string().optional(),
     publicRelayUrl: z.string().optional(),
+    access: ServerAccessConfigSchema.optional(),
   })
   .strict();
 

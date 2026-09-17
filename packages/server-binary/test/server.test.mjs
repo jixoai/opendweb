@@ -5,6 +5,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import fsp from "node:fs/promises";
 import { startServer } from "../index.js";
 
 const ASCII = /^[\x00-\x7F]*$/;
@@ -226,4 +229,61 @@ test("invalid public URL makes the child exit non-zero (fail-fast, exit code 2)"
   });
   const code = await server.exited;
   assert.equal(code, 2);
+});
+
+// server-access-policy task 1.3：[server.access] 配置面经 startServer env 注入
+// 的透传断言。形态沿用「fail-fast 用例断言子进程退出码 2」（上例），错误先于
+// identity/data 落盘发生，无测试产物。
+
+test("invalid accessMode makes the child exit non-zero (DWEB_ACCESS_MODE passthrough, exit 2)", async () => {
+  const server = await startServer({
+    gatewayBind: `127.0.0.1:${await freePort()}`,
+    relayBind: `127.0.0.1:${await freePort()}`,
+    accessMode: "bogus",
+  });
+  const code = await server.exited;
+  assert.equal(code, 2);
+});
+
+test("accessPolicy=callback without URL fail-fasts (DWEB_ACCESS_POLICY passthrough, exit 2)", async () => {
+  const server = await startServer({
+    gatewayBind: `127.0.0.1:${await freePort()}`,
+    relayBind: `127.0.0.1:${await freePort()}`,
+    accessPolicy: "callback",
+  });
+  const code = await server.exited;
+  assert.equal(code, 2);
+});
+
+test("allowLoopbackCallback option reaches the binary via the --allow-loopback-callback flag", async () => {
+  // restricted + callback + http loopback URL：无豁免时 Rust 在 AccessGate 装配
+  // 处 fail-fast（exit 2）；豁免 flag 到位则正常就绪。对偶断言证明 flag 透传
+  // （Rust 侧无对应 env，spawn 参数是唯一通道）。
+  // 数据目录重定向到 tmp：restricted 路径会 load-or-create server.key，不得
+  // 在包目录留下 dweb-data 测试产物。
+  const prevDataDir = process.env.DWEB_DATA_DIR;
+  process.env.DWEB_DATA_DIR = await fsp.mkdtemp(path.join(os.tmpdir(), "dweb-access-"));
+  const gatewayPort = await freePort();
+  const relayPort = await freePort();
+  const base = {
+    gatewayBind: `127.0.0.1:${gatewayPort}`,
+    relayBind: `127.0.0.1:${relayPort}`,
+    accessMode: "restricted",
+    accessPolicy: "callback",
+    callbackUrl: "http://127.0.0.1:9/hook",
+    callbackToken: "t",
+  };
+  try {
+    const denied = await startServer(base);
+    assert.equal(await denied.exited, 2, "http callback URL without the exemption must fail-fast");
+    const ok = await startServer({ ...base, allowLoopbackCallback: true });
+    try {
+      await waitHealthy(ok.gatewayUrl);
+    } finally {
+      await ok.stop();
+    }
+  } finally {
+    if (prevDataDir === undefined) delete process.env.DWEB_DATA_DIR;
+    else process.env.DWEB_DATA_DIR = prevDataDir;
+  }
 });

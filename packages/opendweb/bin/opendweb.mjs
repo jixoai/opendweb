@@ -6,9 +6,13 @@
 // 其余首 token 走自适应解析（未安装自愈：get ?? add）。
 // 用法：
 //   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
-//                   [--public-gateway <url>] [--public-relay <url>] [--config <path>]
+//                   [--public-gateway <url>] [--public-relay <url>]
+//                   [--access-mode <open|restricted>] [--owners-file <path>] [--config <path>]
 //   环境变量 DWEB_GATEWAY_BIND 同义；DWEB_PUBLIC_GATEWAY_URL / DWEB_PUBLIC_RELAY_URL
 //   为反代/隧道部署的公网入口公告（public-exposure）。
+//   访问控制（[server.access] 配置段，task 1.3）：--access-mode/--owners-file
+//   flag + DWEB_ACCESS_* env + config 三层同链；--data-dir 走 DWEB_DATA_DIR
+//   env（数据目录不入 config 段）。
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -167,19 +171,48 @@ export function validateBind(value, label) {
 }
 
 /**
+ * env 数值解析（[server.access] 链，与 Rust env_u64 同规）：整数 + 区间
+ * 校验，非法值返回错误文案（CLI fail-fast，早于子进程 spawn）。空串/未设
+ * 视为未给出（与 Rust 的 filter 空串语义一致）。
+ * @param {string | undefined} raw
+ * @param {{ label: string, min: number, max: number }} range
+ * @returns {{ value?: number, error?: string }}
+ */
+function envIntInRange(raw, { label, min, max }) {
+  if (raw === undefined || raw === "") return {};
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    return { error: `invalid ${label} ${raw}: must be an integer in ${min}..=${max}` };
+  }
+  return { value: n };
+}
+
+/**
  * 解析 server 子命令参数。优先级 flag > env > config file > default
  * （plugin-marketplace D4：config 层插入在 env 之后；configServer 由静态
  * 配置文件解析而来，schema 已校验类型）。--gateway 为 canonical；
  * 支持 "--opt value" 与 "--opt=value" 双形式；未知选项报错（退出码 2）。
+ * [server.access] 链（server-access-policy task 1.3）同构：flag 只设
+ * --access-mode/--owners-file（与 Rust 侧 flag 集合中 TS 暴露的子集对齐，
+ * --data-dir/--allow-loopback-callback 由 dweb-server 二进制直用）；其余
+ * 走 env/config。mode/policy/ownersFile/callback* 不做 CLI 端白名单校验，
+ * 非法值透传给 Rust fail-fast（报错带准确 env 名）；数值字段同规区间校验。
  * @param {string[]} argv process.argv.slice(3)（"server" 之后）
  * @param {Record<string, string|undefined>} [env]
- * @param {{ gatewayBind?: string, relayBind?: string, relayEnabled?: boolean, trustProxy?: boolean, publicGatewayUrl?: string, publicRelayUrl?: string }} [configServer]
- * @returns {{ gatewayBind: string, relayBind: string, relayEnabled: boolean, trustProxy: boolean, publicGatewayUrl: string | null, publicRelayUrl: string | null } | { error: string }}
+ * @param {{ gatewayBind?: string, relayBind?: string, relayEnabled?: boolean, trustProxy?: boolean, publicGatewayUrl?: string, publicRelayUrl?: string, access?: { mode?: string, policy?: string, ownersFile?: string, callbackUrl?: string, callbackToken?: string, callbackTimeoutMs?: number, callbackCacheTtlMs?: number, allowLoopbackCallback?: boolean } }} [configServer]
+ * @returns {{ gatewayBind: string, relayBind: string, relayEnabled: boolean, trustProxy: boolean, publicGatewayUrl: string | null, publicRelayUrl: string | null, access: { mode?: string, policy?: string, ownersFile?: string, callbackUrl?: string, callbackToken?: string, callbackTimeoutMs?: number, callbackCacheTtlMs?: number, allowLoopbackCallback?: boolean } } | { error: string }}
  */
 export function resolveServerArgs(argv, env = process.env, configServer = {}) {
   /** @type {Record<string, string|boolean|undefined>} */
   const opts = {};
-  const VALUE_OPTS = new Set(["--gateway", "--relay", "--public-gateway", "--public-relay"]);
+  const VALUE_OPTS = new Set([
+    "--gateway",
+    "--relay",
+    "--public-gateway",
+    "--public-relay",
+    "--access-mode",
+    "--owners-file",
+  ]);
   const FLAG_OPTS = new Set(["--no-relay", "--trust-proxy"]);
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -223,6 +256,33 @@ export function resolveServerArgs(argv, env = process.env, configServer = {}) {
     const err = validatePublicUrl(rawPublicRelay, "public relay url");
     if (err) return { error: err };
   }
+  // [server.access] 链：flag(--access-mode/--owners-file) > env > config（未
+  // 给出的键保持 undefined——startServer 仅显式定义时写 env，缺省继承父进程
+  // 环境或落 Rust 侧默认 open/static）。数值字段 env 形态是字符串，先过同规
+  // 区间校验再数值化。allowLoopbackCallback 无 flag/env（Rust 只认二进制
+  // flag --allow-loopback-callback），config 是唯一 TS 入口。
+  const timeoutMs = envIntInRange(env.DWEB_CALLBACK_TIMEOUT_MS, {
+    label: "DWEB_CALLBACK_TIMEOUT_MS",
+    min: 1,
+    max: 2000,
+  });
+  if (timeoutMs.error) return { error: timeoutMs.error };
+  const cacheTtlMs = envIntInRange(env.DWEB_CALLBACK_CACHE_TTL_MS, {
+    label: "DWEB_CALLBACK_CACHE_TTL_MS",
+    min: 0,
+    max: 60000,
+  });
+  if (cacheTtlMs.error) return { error: cacheTtlMs.error };
+  const access = {
+    mode: opts["--access-mode"] ?? env.DWEB_ACCESS_MODE ?? configServer.access?.mode,
+    policy: env.DWEB_ACCESS_POLICY ?? configServer.access?.policy,
+    ownersFile: opts["--owners-file"] ?? env.DWEB_OWNERS_FILE ?? configServer.access?.ownersFile,
+    callbackUrl: env.DWEB_CALLBACK_URL ?? configServer.access?.callbackUrl,
+    callbackToken: env.DWEB_CALLBACK_TOKEN ?? configServer.access?.callbackToken,
+    callbackTimeoutMs: timeoutMs.value ?? configServer.access?.callbackTimeoutMs,
+    callbackCacheTtlMs: cacheTtlMs.value ?? configServer.access?.callbackCacheTtlMs,
+    allowLoopbackCallback: configServer.access?.allowLoopbackCallback,
+  };
   return {
     gatewayBind,
     relayBind,
@@ -231,6 +291,7 @@ export function resolveServerArgs(argv, env = process.env, configServer = {}) {
     // canonical 形态（scheme 小写、无尾随 "/"）——与 Rust 侧重建语义一致
     publicGatewayUrl: rawPublicGateway === null ? null : normalizePublicUrl(rawPublicGateway),
     publicRelayUrl: rawPublicRelay === null ? null : normalizePublicUrl(rawPublicRelay),
+    access,
   };
 }
 
@@ -436,6 +497,8 @@ async function runServer(rest) {
   const final = applyServerOverrides(resolved, pre.merged);
 
   const { startServer } = await import("@jixo/opendweb-server-binary");
+  // access 字段（task 1.3）：undefined 值不写 env（startServer 仅显式定义时
+  // 注入），缺省继承父进程环境或落 Rust 侧默认——与 gateway/relay 链同构
   const server = await startServer({
     gatewayBind: final.gatewayBind,
     relayBind: final.relayBind,
@@ -443,6 +506,14 @@ async function runServer(rest) {
     trustProxy: final.trustProxy,
     publicGatewayUrl: final.publicGatewayUrl ?? undefined,
     publicRelayUrl: final.publicRelayUrl ?? undefined,
+    accessMode: final.access.mode,
+    accessPolicy: final.access.policy,
+    ownersFile: final.access.ownersFile,
+    callbackUrl: final.access.callbackUrl,
+    callbackToken: final.access.callbackToken,
+    callbackTimeoutMs: final.access.callbackTimeoutMs,
+    callbackCacheTtlMs: final.access.callbackCacheTtlMs,
+    allowLoopbackCallback: final.access.allowLoopbackCallback,
   });
   // R2 P1-2：先等 gateway 就绪（或子进程退出）再打横幅——子进程因端口冲突/
   // 环境问题秒退时，不打印伪成功横幅；错误转发 stderr 且退出码保留。
@@ -514,7 +585,8 @@ async function runServer(rest) {
   process.exit(code ?? 0);
 }
 
-/** preStart 覆写合并：键白名单 + 同规校验（URL 走 normalizePublicUrl） */
+/** preStart 覆写合并：键白名单 + 同规校验（URL 走 normalizePublicUrl）；
+ * access 段不经插件覆写——访问控制是安全面，仅 flag/env/config 三入口 */
 function applyServerOverrides(resolved, merged) {
   if (!merged || Object.keys(merged).length === 0) return resolved;
   const out = { ...resolved };
@@ -882,11 +954,18 @@ const HELP_TEXT = `opendweb - self-hosted server for opendweb fabrics
 
 Usage:
   opendweb server [--gateway <bind>] [--relay <bind>] [--no-relay] [--trust-proxy]
-                   [--public-gateway <url>] [--public-relay <url>] [--config <path>]
+                   [--public-gateway <url>] [--public-relay <url>]
+                   [--access-mode <open|restricted>] [--owners-file <path>] [--config <path>]
       Start the self-hosted server. The gateway (default 0.0.0.0:8787) serves
       rendezvous + /healthz + /services.json; the iroh relay (default
       0.0.0.0:3340) runs on its own port. Precedence: flag > env > config
       file (opendweb.config.toml|.json) > default.
+      Access control: --access-mode restricted gates relay access behind
+      owner-signed capabilities (open = no access control); --owners-file
+      points at the owners.jsonl registry. The [server.access] config
+      section carries mode/policy/owners/callback settings; the data
+      directory stays a deployment concern (DWEB_DATA_DIR env, default
+      dweb-data/).
 
   opendweb marketplace add|list|remove "npm:<glob>, ..."
       Manage plugin candidate globs. Default: npm:@jixo/opendweb-ext-*,
@@ -933,6 +1012,11 @@ Environment:
   DWEB_TRUST_PROXY          set to 1 to trust X-Forwarded-Proto behind a reverse proxy
   DWEB_PUBLIC_GATEWAY_URL   public gateway URL override (see --public-gateway)
   DWEB_PUBLIC_RELAY_URL     public relay URL override (see --public-relay)
+  DWEB_ACCESS_MODE          access mode: open (default) | restricted
+  DWEB_OWNERS_FILE          owner registry file (default <data-dir>/owners.jsonl)
+  DWEB_DATA_DIR             data directory for server.key/owners.jsonl (default dweb-data)
+  DWEB_ACCESS_POLICY        L2 policy: static (default) | callback (needs
+                            DWEB_CALLBACK_URL + DWEB_CALLBACK_TOKEN)
   DWEB_HOME                 CLI state directory (default ~/.opendweb)
 
 Clients need a single config entry: pick any Network address from the startup
