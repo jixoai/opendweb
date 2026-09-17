@@ -101,8 +101,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # npm trusted publishing 需要 npm >= 11.5（OIDC 免 token）
-      - run: npm install -g npm@latest
+      # npm trusted publishing 需要 npm >= 11.5（OIDC 免 token）。钉 11 大版本：
+      # npm@latest 已升 12.0（2026-09），npm pack --json 输出结构变化曾致
+      # ext-cf pack:dry 门禁空数组崩溃（v0.5.0 首跑实证）——升 12 须先全链验证。
+      - run: npm install -g npm@11
       - name: Download CI-built Windows binaries
         uses: actions/download-artifact@v4
         with:
