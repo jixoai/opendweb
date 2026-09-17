@@ -13,14 +13,16 @@
 
 #### Scenario: restricted 模式无凭证接入被拒
 
-- **WHEN** 服务端为 `restricted` 模式，客户端未携带 capability 连接 relay
+- **WHEN** 服务端为 `restricted` 且 `policy=static`，客户端未携带 capability 连接 relay
 - **THEN** 接入被拒绝，拒绝原因经 relay 握手协议回传客户端（`dweb/no-capability`），连接不注册
+- **注** `policy=callback` 时无凭证接入交 webhook 裁决（A_cb(S) 边界，见"动态策略回调"）
 
 #### Scenario: 拒绝原因按失败环节区分（独立用例矩阵）
 
 以下每个失败环节均为独立可构造用例，reason 互不相同：
 
 - **WHEN** 令牌格式/长度/base64url 字符集非法 → **THEN** `dweb/malformed-capability`
+- **WHEN** Authorization header 或 `?token=` 存在但为非 Bearer 形态/非法 UTF-8/非 `dwebr1.` 前缀（即"声明了凭证但不可解析"）→ **THEN** `dweb/malformed-capability`，该接入 MUST NOT 被归类为无票（无票路径仅限凭证完全缺失，防坏票混入 A_cb 动态名单）
 - **WHEN** caps 位图含未知保留位 → **THEN** `dweb/caps-unsupported`
 - **WHEN** 签名与 issuer 公钥不匹配（篡改任一字段）→ **THEN** `dweb/bad-signature`
 - **WHEN** issuer 的 (fabric_id, root) 二元组不在 registry 活跃集合 → **THEN** `dweb/unknown-owner`
@@ -46,12 +48,17 @@
 
 ### Requirement: Server 访问策略（owner registry 与 access mode）
 
-服务端 SHALL 维护 owner registry（`<data_dir>/owners.jsonl`，append-only，register/unregister 事件归并出活跃集合）：每条记录为 `(fabric_id, root EndpointId)` 二元组。access mode 经 `--access-mode`（CLI）与 `DWEB_ACCESS_MODE`（env）与 config.toml `[server.access]` 配置（优先级 flag > env > config > default），取值 `open`（默认）或 `restricted`。`restricted` 模式下 L2 准入策略由 `policy` 配置项选择 provider：`static`（默认，owner registry 二元组 + 所需 caps 位）或 `callback`（见"动态策略回调" requirement；`callback_url`/`callback_token` 必填，缺失时启动 fail-fast）。`restricted` + `static` + 空 registry MUST 拒绝一切 relay 接入（fail-closed）。registry 变更 MUST 持久化并在重启后恢复。registry 移除 Owner 的语义为：**新连接即时拒绝**（下次 on_connect 起 `dweb/unknown-owner`）；已建立的存量连接保持至自然断开或重连收敛（主动断连钩子不在本 change 承诺内）。Server Admin（本地配置管理者）与 Relay Owner（registry 内 fabric root）是不同身份；服务端 MUST NOT 提供 Owner 自助注册（注册是 Admin 动作）。
+服务端 SHALL 维护 owner registry（`<data_dir>/owners.jsonl`，append-only，register/unregister 事件归并出活跃集合）：每条记录为 `(fabric_id, root EndpointId)` 二元组。access mode 经 `--access-mode`（CLI）与 `DWEB_ACCESS_MODE`（env）与 config.toml `[server.access]` 配置（优先级 flag > env > config > default），取值 `open`（默认）或 `restricted`。`restricted` 模式下 L2 准入策略由 `policy` 配置项选择 provider：`static`（默认，无票必拒 + 有效票放行）或 `callback`（见"动态策略回调" requirement；`callback_url`/`callback_token` 必填，缺失时启动 fail-fast）。空 registry 语义按 policy 分裂：`static` + 空 registry MUST 拒绝一切 relay 接入（fail-closed）；`callback` + 空 registry = 一切票据被 L1b 拒绝，仅 webhook 放行的无票端点（A_cb(S)，identity-only 动态名单，admin 自担）可达。registry 变更 MUST 持久化并在重启后恢复，且 MUST 使缓存 generation+1（清空策略缓存）。registry 移除 Owner 的语义为：**新连接即时拒绝**（下次 on_connect 起 `dweb/unknown-owner`）；已建立的存量连接保持至自然断开或重连收敛（主动断连钩子不在本 change 承诺内）。Server Admin（本地配置管理者）与 Relay Owner（registry 内 fabric root）是不同身份；服务端 MUST NOT 提供 Owner 自助注册（注册是 Admin 动作）。
 
-#### Scenario: 空 registry fail-closed
+#### Scenario: 空 registry fail-closed（static）
 
-- **WHEN** `restricted` 模式且 registry 为空，任何客户端连接 relay
+- **WHEN** `restricted` 且 `policy=static` 且 registry 为空，任何客户端连接 relay
 - **THEN** 全部接入被拒绝
+
+#### Scenario: 空 registry 的 callback 模式为 identity-only
+
+- **WHEN** `restricted` 且 `policy=callback` 且 registry 为空，无票端点连接 relay 且 webhook 返回 allow=true
+- **THEN** 该端点接入成功（A_cb(S) 边界）；出示任何票据的端点均被 L1b 拒绝（`dweb/unknown-owner`）
 
 #### Scenario: registry 持久化
 
@@ -141,10 +148,15 @@
 - **WHEN** 端点未携带 capability，webhook 对该 endpoint_id 返回 allow=true
 - **THEN** 接入成功（A_cb(S) 边界内）；出示伪造票据的端点仍被密码学层拒绝
 
-#### Scenario: registry 变更即时清缓存
+#### Scenario: registry 变更即时清缓存（unregistered 票据不再回调）
 
-- **WHEN** owner 被 unregister 后，同键接入在缓存 TTL 未到期时再次发生
-- **THEN** 缓存已被 generation+1 失效，产生新回调，其票据因 L1b 被拒（`dweb/unknown-owner`）
+- **WHEN** owner 被 unregister 后，其名下已缓存的票据再次接入（缓存 TTL 未到期）
+- **THEN** 缓存已被 generation+1 失效；接入由 L1b 直接拒绝（`dweb/unknown-owner`），webhook 调用计数为 0（无效票据不触发 webhook）
+
+#### Scenario: registry 变更后有效 key 产生新回调
+
+- **WHEN** registry 发生任何变更（generation+1）后，一个仍有效票据或无票 A_cb key 再次接入
+- **THEN** 旧缓存不命中，产生一次新回调并按其结果准入
 
 #### Scenario: 并发风暴防护
 
@@ -163,12 +175,12 @@
 
 #### Scenario: Visitor 无法为授权集合外端点提供中继
 
-- **WHEN** 持有效 capability 的 Visitor 试图让无 capability 的第三方 peer 经本 relay 与任意端点通信
-- **THEN** 第三方 peer 自身的接入在验证链被拒；relay 投递目的地只能是在线已接入 client，授权集合外端点经本 Server 零可达
+- **WHEN** 持有效 capability 的 Visitor 试图让无 capability 的第三方 peer 经本 relay 与任意端点通信，且服务端为 `policy=static`（或 `policy=callback` 且 webhook 对该第三方无票接入返回 deny）
+- **THEN** 第三方 peer 自身的接入在验证链（或 webhook）被拒；relay 投递目的地只能是在线已接入 client，可达边界（A(S)，callback 模式为 A(S) ∪ A_cb(S)）之外的端点经本 Server 零可达
 
 ### Requirement: rendezvous 访问控制
 
-`restricted` 模式下，rendezvous announce 与 resolve MUST 要求 capability（HTTP `Authorization: Bearer dwebr1.…`）。announce：capability 的 caps MUST 含 RDZ_ANNOUNCE，且 **capability.recipient MUST == announce 请求体中签名的 EndpointId**（既有签名验证保留，签名私钥即 PoP，窃取 capability 者无法以他人身份登记）；不满足返回 401。resolve：caps MUST 含 RDZ_RESOLVE，为 **bearer-only 语义**（无 HTTP 面身份证明，capability 泄露即可用直至 TTL，属明示的降级承诺）；不满足返回 401。`open` 模式下 announce/resolve 行为与现状一致（签名 announce / 匿名 resolve）。
+`restricted` 模式下，rendezvous announce 与 resolve MUST 要求 capability（HTTP `Authorization: Bearer dwebr1.…`），且出示的 capability MUST 通过与 relay 面同一套不可绕过验证器（L1 密码学完整性 + L1b 票有效性底线：registry 二元组等，各失败 reason 一致映射为 HTTP 401 响应体 `{"error":"dweb/<reason>"}`；"存在但非法"的凭证同样不得按无票处理）。announce：capability 的 caps MUST 含 RDZ_ANNOUNCE，且 **capability.recipient MUST == announce 请求体中签名的 EndpointId**（既有签名验证保留，签名私钥即 PoP，窃取 capability 者无法以他人身份登记）；不满足返回 401。resolve：caps MUST 含 RDZ_RESOLVE，为 **bearer-only 语义**（无 HTTP 面身份证明，capability 泄露即可用直至 TTL，属明示的降级承诺；L1 的 recipient==握手身份检查在 resolve 面不适用——无握手身份，仅验密码学有效性）；不满足返回 401。rendezvous 不接入 callback webhook（动态策略另立 change）。`open` 模式下 announce/resolve 行为与现状一致（签名 announce / 匿名 resolve）。
 
 #### Scenario: restricted 下匿名 resolve 被拒
 

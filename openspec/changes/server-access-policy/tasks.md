@@ -27,17 +27,23 @@
        open 模式走 AllowAll 快路径
 - [ ] 1.5b CallbackProvider（policy=callback，事件仅 relay.connect/
        disconnect）：webhook 客户端（Bearer callback_token、超时硬上限
-       2s、请求/响应 body ≤4KiB、best-effort disconnect 事件）、L1b 底线
-       前置（无效票不触发 webhook）、决策缓存（registry_generation +
-       endpoint_id + BLAKE3(canonical 投影) + event 键；TTL≤60s，非法
-       cache_ttl_s=0；registry 变更清缓存）、并发防护（singleflight +
-       全局 64/来源 16/队列 256，队满即 policy-unavailable）、fail-closed
-       （非 200/3xx/超时/解析失败/body 超限）、reason 语法
-       dweb/[a-z0-9][a-z0-9._-]{0,63}（非法替换 dweb/policy-denied）、
-       SSRF 边界（HTTPS 强制 + allow_loopback_callback 豁免 + 私网/
-       link-local/metadata 网段拒绝 + 不跟随重定向 + token 日志脱敏）、
-       callback 配置缺失/非法启动 fail-fast、stock 装配断言
-       （Server::spawn 路径唯一，不绕 authorize_with/register）
+       2s、请求/响应 body ≤4KiB、disconnect payload 冻结
+       {event,endpoint_id,connection_id} 无 capability、每 connection
+       至多一次）、C0 凭证来源分类（存在但非法 → malformed 拒，不进
+       无票路径——直接检查 headers/query，不复用 auth_token() 归一化）、
+       L1b 底线前置（无效票不触发 webhook）、决策缓存
+       （registry_generation + endpoint_id + BLAKE3(155B 定长二进制投影，
+       无票 sentinel zero×96) + event 键；TTL≤60s；cache_ttl_s 省略=
+       配置默认/非法=0/未知字段忽略；registry 变更清缓存）、并发防护
+       （singleflight + 全局 64/来源 16（source=endpoint_id）/队列 256，
+       队满即 policy-unavailable）、fail-closed（非 200/3xx/超时/解析
+       失败/body 超限）、reason 语法 dweb/[a-z0-9][a-z0-9._-]{0,63}
+       （非法替换 dweb/policy-denied）、SSRF 边界（HTTPS 强制 +
+       allow_loopback_callback 豁免 + 解析-校验-连接原子语义：全部
+       A/AAAA 逐个校验/IPv4-mapped 归一化/固定地址直连不经代理/不跟随
+       重定向 + token 日志脱敏）、callback 配置缺失/非法启动 fail-fast、
+       stock 装配断言（Server::spawn 路径唯一，不绕 authorize_with/
+       register）
 - [ ] 1.6 rendezvous ACL：announce（caps 校验 + recipient==签名
        EndpointId 绑定）/ resolve（bearer-only，caps 校验）；open 模式
        现状路径零变化

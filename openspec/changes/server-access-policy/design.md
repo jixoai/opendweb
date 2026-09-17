@@ -442,6 +442,16 @@ E1: relay 握手认证的 endpoint_id == iroh endpoint TLS id == fabric Endpoint
 ```
 ClientRequest { endpoint_id(已认证), auth_token() }
   │
+  ▼ C0 凭证来源分类（R4 P1-6 修复：区分"声明了凭证但非法"与"无凭证"）
+  ┌────────────────────────────────────────────────────────────────┐
+  │ 实现 MUST 直接检查 Authorization header 与 ?token= query（不复 │
+  │ 用 auth_token() 的归一化——它对非法 UTF-8 header 返回 None，   │
+  │ 会把"坏票"误降级为"无票"）：                                   │
+  │ · 两者皆缺失 → 无票路径（跳过 L1/L1b，入 L2；static 拒 /       │
+  │   callback 交 webhook = A_cb(S) 语义）                         │
+  │ · 任一存在但非 Bearer 形态/非法 UTF-8/非 dwebr1. 前缀          │
+  │   → DENY "dweb/malformed-capability"（不得进入无票路径）        │
+  └────────────────────────────────────────────────────────────────┘
   ▼ L1 密码学完整性（本地，无网络调用；出示了 capability 才执行）
   ┌────────────────────────────────────────────────────────────────┐
   │ C1 长度门（≤1KiB）+ base64url 白名单 ──► DENY "dweb/malformed-capability" │
@@ -504,17 +514,21 @@ Visitor 参与 Owner 名下的连接:
                                                       模型的路径投影
 
 Visitor 主动把 Server 当自己的基础设施:
-  Visitor(cap) ─ok─► relay ──drop── 无票 peer        ❌ 对端 ∉ A(S)，进不来
-                                        ▲
+  Visitor(cap) ─ok─► relay ──drop── 无票 peer   ❌ static：对端 ∉ A(S) 必拒；
+                                        ▲         callback：仅当 admin 的 webhook
+                                        │         将该 peer 纳入 A_cb(S) 才可达
+                                        │        （admin 自担，默认 deny 即不可达）
                                         └─ capability 绑定 recipient(=Visitor)，
                                            第三方/自己其它 endpoint 均无票
 ```
 
 即：**per-connection capability 检查 + relay 只投递在线 client 的模型 ⟹
-经 relay 的通信端点在接入时刻均 ∈ A(S)**（撤销宽限期的存量接入除外，
-见 §0 时间性与 §13）。Visitor 抄下 IP:port、relay URL、EndpointId 都
-无济于事——授权集合外的端点一个都进不了 relay，也就不存在"经本
-Server 的中继路径"。
+经 relay 的通信端点在接入时刻均 ∈ A(S) ∪ A_cb(S)**（A_cb(S) 仅
+policy=callback 时非空，§8.5；撤销宽限期的存量接入除外，见 §0 时间性
+与 §13）。Visitor 抄下 IP:port、relay URL、EndpointId 都无济于事——
+可达边界之外的端点一个都进不了 relay，也就不存在"经本 Server 的
+中继路径"（static 模式下边界 = A(S)；callback 模式下 = A(S) ∪
+A_cb(S)，后者由 admin 的 webhook 自担）。
 
 补充边界（与 §0 R3 呼应）：Visitor 亲自作为 client 接入 relay 是合法的
 （它本来就是 fabric 通信的参与者）；它无法做的是**为 A(S) 之外的端点
@@ -606,28 +620,44 @@ Content-Type: application/json；请求体 ≤4KiB；响应体 ≤4KiB
   2000ms）/ 响应解析失败 / 缺 `allow` 字段 / `allow` 非布尔 / body
   超限 → DENY `dweb/policy-unavailable`（deny 结果同样入缓存）。
 - **并发防护**：per-key singleflight（同键并发 miss 只发一次回调）；
-  全局并发上限（默认 64）+ 每来源在途上限（默认 16）+ 有界等待队列
-  （默认 256，队满即 DENY `dweb/policy-unavailable`）——防回调风暴
-  耗尽 relay executor（client_rx 限流在连接注册后的数据面，保护不到
-  此处）。
-- **缓存冻结**：键 = (registry_generation, endpoint_id,
-  BLAKE3(capability canonical 投影), event)；registry 变更（文件重载/
-  unregister）即 generation+1 并清空全部缓存（撤销即时生效窗口 =
-  0）；TTL = min(响应 cache_ttl_s, callback_cache_ttl_ms 配置，上限
-  60s)；cache_ttl_s 非法值（负数/浮点/超 60）按 0 处理（不缓存）。
-  缓存仅作用于**新连接准入**，不作为存量连接撤销机制（§13）。
-- **传输与 SSRF 边界**：生产强制 `https://`（`--allow-loopback-callback`
-  显式豁免本机 loopback 供开发）；解析后地址拒绝私网（RFC1918/ULA）、
-  link-local、云 metadata 网段（豁免开关同上）；**不跟随重定向**
-  （3xx 一律按失联处理，防 token 跨 origin 泄露）；callback_token
-  仅从配置/secret 读取，日志与 tracing 全程脱敏。
+  全局并发上限（默认 64）+ 每来源在途上限（默认 16，**source =
+  endpoint_id**——R4 P1-3 冻结：iroh-relay hook 输入无远端地址
+  （ClientRequest 无 peer_addr），endpoint_id 是唯一可用的来源维度）
+  + 有界等待队列（默认 256，队满即 DENY `dweb/policy-unavailable`）
+  ——防回调风暴耗尽 relay executor（client_rx 限流在连接注册后的
+  数据面，保护不到此处）。
+- **缓存冻结（R4 P1-4 补 schema）**：键 = (registry_generation,
+  endpoint_id, BLAKE3(hash_input), event)，其中 hash_input 为**固定
+  二进制投影**：`caps u8 || issued_at u64 BE || expires_at u64 BE ||
+  fabric_id 32B || issuer 32B || recipient 32B`（155B 定长；无票时用
+  32 字节全零 sentinel 代替后三段，即 `caps=0 || issued_at=0 ||
+  expires_at=0 || zero×96`）；digest 为内部 32B 值（不出现在日志）。
+  registry 变更（文件重载/unregister）即 generation+1 并清空全部缓存
+  （撤销即时生效窗口 = 0）；TTL = min(响应 cache_ttl_s,
+  callback_cache_ttl_ms 配置，上限 60s)；**cache_ttl_s 省略 = 使用
+  配置默认；非整数/负数/浮点/超 60 一律按 0（不缓存）；响应未知字段
+  忽略（不拒绝）**。缓存仅作用于**新连接准入**，不作为存量连接撤销
+  机制（§13）。
+- **传输与 SSRF 边界（R4 P1-8 补解析原子性）**：生产强制 `https://`
+  （`--allow-loopback-callback` 显式豁免本机 loopback 供开发）；
+  **解析-校验-连接原子语义**：实现 MUST 自行解析 callback_url 主机
+  → 得到全部 A/AAAA 地址 → **逐个**归一化（IPv4-mapped IPv6 折算为
+  IPv4）并校验拒绝私网（RFC1918/ULA）、link-local、云 metadata 网段
+  （任一地址非法即整体拒绝，防多地址绕过与 DNS rebinding——解析后
+  的固定地址直接用于连接，不经系统代理、不二次解析）；**不跟随
+  重定向**（3xx 一律按失联处理，防 token 跨 origin 泄露）；
+  callback_token 仅从配置/secret 读取，日志与 tracing 全程脱敏。
 - **reason 语法冻结**：`dweb/[a-z0-9][a-z0-9._-]{0,63}`（ASCII slug，
   拒绝控制字符/非 ASCII/超长/空）；非法值一律替换为
   `dweb/policy-denied`（防日志注入与 deny 帧污染）。
-- **relay.disconnect 为 best-effort 观察通知**：fire-and-forget、
-  不阻塞、不重试、允许丢失（进程重启即丢）；**不可作为配额或撤销
-  依据**（配额依赖它则必须由业务侧自建可重放/幂等的事件通道——
-  非 Server 承诺）；其 callback 亦受同一并发/超时上限约束，超限
+- **relay.disconnect 为 best-effort 观察通知（R4 P1-5 冻结 payload）**：
+  请求体 = `{ "event": "relay.disconnect", "endpoint_id": "<z-base-32>",
+  "connection_id": "<opaque>" }`（**不携带 capability/context**——
+  Server 不为断开事件保存连接上下文快照；业务侧需要关联请用
+  connection_id 自行对账）；fire-and-forget、不阻塞、不重试、允许
+  丢失（进程重启即丢）；每 connection 至多一次；**不可作为配额或
+  撤销依据**（配额依赖它则必须由业务侧自建可重放/幂等的事件通道
+  ——非 Server 承诺）；其 callback 亦受同一并发/超时上限约束，超限
   直接丢弃。
 
 **webhook 属 admin 信任域**：callback_token 泄露 = 策略面泄露（不
@@ -681,7 +711,8 @@ A10 QAD（iroh-relay ServerConfig.quic）旁路
 A11 callback webhook 面（policy=callback 时新增；R3 修订）
     ├► 攻击者直连 webhook 端点伪造响应 ──► Bearer callback_token +
     │   admin 信任域 + SSRF 边界（私网/metadata 网段拒绝、不跟随
-    │   重定向、HTTPS 强制）✅
+    │   重定向、HTTPS 强制、解析-校验-连接原子语义防 DNS
+    │   rebinding/IPv4-mapped/多地址绕过）✅
     ├► webhook 不可达/超时拖垮接入 ──► fail-closed
     │   （dweb/policy-unavailable）+ 超时硬上限 2s + 缓存 ✅
     ├► 回调风暴（并发 miss 洪泛）──► per-key singleflight + 全局/来源
@@ -849,7 +880,8 @@ SDK 配置面             RelayOptions 可选新字段                          
                 rendezvous 面的绑定手段见 §8.4
 
 授权边界（§0 形式化）
-  通信端点（经 relay）恒 ⊆ A(S)；A(S) 外端点零可达性
+  经 relay 的通信端点 ⊆ A(S) ∪ A_cb(S)（A_cb 仅 policy=callback 非空，
+  admin 自担）；边界外端点零可达性
 
 明确不设防/接受项
   - Admin 可 DoS 自己的 Server（自伤，接受）
@@ -899,7 +931,10 @@ SDK 配置面             RelayOptions 可选新字段                          
 ```
 
 - 默认 open 保证存量部署升级零行为变化；restricted 是显式 opt-in。
-- restricted + 空 registry = 拒绝一切 relay 接入（fail-closed，文档明示）。
+- restricted + static + 空 registry = 拒绝一切 relay 接入（fail-closed，
+  文档明示）；restricted + callback + 空 registry = 一切票据被 L1b 拒，
+  仅 webhook 放行的无票端点（A_cb(S)）可达——即 identity-only 动态
+  名单模式，admin 责任边界同 §8.5。
 - wire 兼容性由"帧类型隔离 + invite 版本字段"承担；**不做双协议胶水**
   （Style 原则：新旧行为物理隔离，不写运行时探测分支）。
 
@@ -924,9 +959,10 @@ SDK 配置面             RelayOptions 可选新字段                          
 3. **三问独立被结构化保证**：Q1 在 Server（registry+capability），
    Q2/Q3 在端侧零改动——比把授权塞进 roster/session 的任何方案都更
    符合需求的分层原则，也符合 spec 既有"relay 仅限制 relay 使用"裁决。
-4. **安全语义闭合**：A1、A2、A3、A4、A5、A7、A9、A10 全闭；A2'（resolve
-   bearer-only）与 A3'（成员互连）是明示的语义裁决而非缺口；A6/A8 以
-   TTL+registry+Limits 缓解并如实标注窗口。
+4. **安全语义闭合**：A1、A2、A3、A4、A5、A7、A9、A10 全闭（A3 在
+   callback 模式下的可达边界扩展为 A(S) ∪ A_cb(S)，admin 自担）；A2'
+   （resolve bearer-only）与 A3'（成员互连）是明示的语义裁决而非
+   缺口；A6/A8 以 TTL+registry+Limits 缓解并如实标注窗口。
 5. **Owner/Visitor 零新概念成本**：不引入 role 字段；Visitor=持票者，
    Owner=registry 内 root；能力裁剪靠 caps 位签发策略表达。
 
@@ -1065,3 +1101,19 @@ payload 布局（全部整数大端 BE）：
 | P1-B7 | disconnect 一致性边界不足 | 明示 best-effort 观察通知，不可作配额/撤销依据 | §8.5、spec |
 | C | spec 负例矩阵不足 | 重写 callback requirement：11 scenario（无效票不触发 webhook/registry 清缓存/并发风暴/SSRF/非法 reason 等） | spec |
 | 遗漏5 | spec.md:7 A(S) 缺 restricted 限定 | 措辞修正（restricted 下 A(S)∪A_cb(S)；open 不设边界） | spec |
+
+### R4 终验（7.0/10，NEEDS-WORK 附条件）问题 → 处置对照
+
+R4 确认：L1b 单 hook 可实现性成立（L1→L1b→L2 全在同一 on_connect 内）；
+P0-B1/B2 核心结构闭合。剩余 8 个 P1 全部为文档级修复：
+
+| 编号 | 问题 | 处置 | 落点 |
+|---|---|---|---|
+| P1-1 | A_cb(S) 未贯穿旧断言 | §8.3/§9 A3/§13/§14/§15 全部统一为 A(S) ∪ A_cb(S)；空 registry 语义按 policy 分裂 | 各节 |
+| P1-2 | registry 清缓存 scenario 要求不可能的回调 | scenario 改为"L1b 直拒 + webhook 计数 0"；generation 清缓存用有效票/无票 key 单独验证 | spec |
+| P1-3 | per-source 无定义 | source = endpoint_id（hook 输入唯一可用维度） | §8.5 |
+| P1-4 | 缓存投影/响应 schema 未冻结 | 固定二进制投影（155B 定长 + 无票 sentinel）、digest 32B 内部值、cache_ttl_s 省略=默认/非法=0/未知字段忽略 | §8.5 |
+| P1-5 | disconnect payload 未冻结 | 冻结 {event, endpoint_id, connection_id}（无 capability）；每 connection 至多一次 | §8.5 |
+| P1-6 | 非法 Authorization 降级为无票 | C0 凭证来源分类：直接检查 headers/query，存在但非法 → malformed 拒（不进无票路径） | §8.2 |
+| P1-7 | rendezvous 完整 L1/L1b 链未冻结 | 明确复用同一不可绕过 verifier（caps 位按操作 + announce recipient 绑定 + resolve bearer-only） | spec |
+| P1-8 | DNS rebinding/地址族语义 | 解析-校验-连接原子语义（全部地址逐个校验、固定地址直连、不经代理、IPv4-mapped 归一化） | §8.5 |
