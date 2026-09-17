@@ -4,7 +4,11 @@
 //! 公网 URL 覆盖（public-exposure D1/D2）：`--public-gateway` / `--public-relay`
 //! 与 `DWEB_PUBLIC_GATEWAY_URL` / `DWEB_PUBLIC_RELAY_URL` 声明反代/隧道后的
 //! 公网入口，services.json 按条目跳过 Host 派生（厂商中立的反代适配层）。
+//! 访问控制（server-access-policy Phase 1）：`--access-mode` / `--data-dir` /
+//! `--owners-file` / `--allow-loopback-callback` 与 `owners` 子命令（数据层；
+//! 执行点接线见后续 task 1.5/1.5b/1.6）。
 
+mod access;
 mod relay;
 mod rendezvous;
 mod services;
@@ -20,6 +24,10 @@ struct Cli {
     relay_enabled: Option<bool>,
     public_gateway: Option<String>,
     public_relay: Option<String>,
+    access_mode: Option<String>,
+    data_dir: Option<String>,
+    owners_file: Option<String>,
+    allow_loopback_callback: Option<bool>,
 }
 
 fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
@@ -31,7 +39,15 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             Some((n, v)) => (n.to_owned(), Some(v.to_owned())),
             None => (arg.clone(), None),
         };
-        let value_opts = ["--gateway", "--relay", "--public-gateway", "--public-relay"];
+        let value_opts = [
+            "--gateway",
+            "--relay",
+            "--public-gateway",
+            "--public-relay",
+            "--access-mode",
+            "--data-dir",
+            "--owners-file",
+        ];
         if value_opts.contains(&name.as_str()) {
             let value = match inline_value {
                 Some(v) => v,
@@ -43,12 +59,16 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
                 "--relay" => cli.relay = Some(value),
                 "--gateway" => cli.gateway = Some(value),
                 "--public-gateway" => cli.public_gateway = Some(value),
-                _ => cli.public_relay = Some(value),
+                "--public-relay" => cli.public_relay = Some(value),
+                "--access-mode" => cli.access_mode = Some(value),
+                "--data-dir" => cli.data_dir = Some(value),
+                _ => cli.owners_file = Some(value),
             }
             continue;
         }
         match name.as_str() {
             "--no-relay" => cli.relay_enabled = Some(false),
+            "--allow-loopback-callback" => cli.allow_loopback_callback = Some(true),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -220,7 +240,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = match parse_cli(std::env::args().skip(1)) {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `owners` 子命令（task 1.2）：直接操作 data_dir 的 owners.jsonl 后退出，
+    // 不启动服务（admin 低频操作，design §7.3）
+    if argv.first().map(String::as_str) == Some("owners") {
+        return match access::registry::owners_cli(argv.into_iter().skip(1), &|k| {
+            std::env::var(k).ok()
+        }) {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        };
+    }
+
+    let cli = match parse_cli(argv.into_iter()) {
         Ok(cli) => cli,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -238,6 +276,43 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         };
+    // 访问控制配置（task 1.3）：flag > env > default，fail-fast 校验
+    // （非法 mode / callback 缺配置 / restricted+QAD 拒绝）先于一切 bind/spawn。
+    let access_cli = access::config::AccessCliInputs {
+        access_mode: cli.access_mode.clone(),
+        data_dir: cli.data_dir.clone(),
+        owners_file: cli.owners_file.clone(),
+        allow_loopback_callback: cli.allow_loopback_callback,
+    };
+    let access_cfg =
+        match access::config::resolve_access_config(&access_cli, &|k| std::env::var(k).ok()) {
+            Ok(cfg) => cfg,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            }
+        };
+
+    // 数据层初始化（task 1.1/1.2）：server.key load-or-create + owners.jsonl
+    // 归并。执行点接线（relay on_connect / rendezvous ACL / PolicyProvider）
+    // 是下一棒（tasks 1.5/1.5b/1.6）；本棒初始化并持有，供 services.json 的
+    // server_id 字段（task 1.8）与验证链接入。
+    let identity = access::identity::ServerIdentity::load_or_create(&access_cfg.data_dir)?;
+    let owners = access::registry::OwnerRegistry::load(&access_cfg.owners_file)?;
+    let owners_snapshot = owners.snapshot();
+    if let Some(warning) =
+        access::config::restricted_static_empty_warning(&access_cfg, owners_snapshot.is_empty())
+    {
+        tracing::warn!("{warning}");
+    }
+    tracing::info!(
+        "server id {} (access mode {:?}, owner registry: {} active, generation {})",
+        identity.server_id(),
+        access_cfg.mode,
+        owners_snapshot.len(),
+        owners_snapshot.generation()
+    );
+
     let relay_bind_addr = match relay_bind(&cli) {
         Ok(a) => a,
         Err(msg) => {
@@ -474,5 +549,42 @@ mod tests {
         assert_eq!(resolve_gateway_bind(Some("A"), Some("G")), "A");
         assert_eq!(resolve_gateway_bind(None, Some("G")), "G");
         assert_eq!(resolve_gateway_bind(None, None), DEFAULT_GATEWAY_BIND);
+    }
+
+    /// 访问控制 flag（task 1.3）：--access-mode/--data-dir/--owners-file 值形 +
+    /// --allow-loopback-callback bool 形 + inline 等价
+    #[test]
+    fn cli_access_flags_parsed() {
+        let cli = parse_cli(
+            [
+                "--access-mode",
+                "restricted",
+                "--data-dir",
+                "/srv/dweb",
+                "--owners-file",
+                "/srv/dweb/owners.jsonl",
+                "--allow-loopback-callback",
+            ]
+            .into_iter()
+            .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(cli.access_mode.as_deref(), Some("restricted"));
+        assert_eq!(cli.data_dir.as_deref(), Some("/srv/dweb"));
+        assert_eq!(cli.owners_file.as_deref(), Some("/srv/dweb/owners.jsonl"));
+        assert_eq!(cli.allow_loopback_callback, Some(true));
+
+        let inline = parse_cli(
+            ["--access-mode=restricted", "--data-dir=/srv/dweb"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+        assert_eq!(inline.access_mode, cli.access_mode);
+        assert_eq!(inline.data_dir, cli.data_dir);
+        // 缺值拒绝
+        assert!(parse_cli(["--access-mode".into()].into_iter()).is_err());
+        assert!(parse_cli(["--data-dir".into()].into_iter()).is_err());
+        assert!(parse_cli(["--owners-file".into()].into_iter()).is_err());
     }
 }
