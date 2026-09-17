@@ -629,7 +629,7 @@ Content-Type: application/json；请求体 ≤4KiB；响应体 ≤4KiB
 - **缓存冻结（R4 P1-4 补 schema）**：键 = (registry_generation,
   endpoint_id, BLAKE3(hash_input), event)，其中 hash_input 为**固定
   二进制投影**：`caps u8 || issued_at u64 BE || expires_at u64 BE ||
-  fabric_id 32B || issuer 32B || recipient 32B`（155B 定长；无票时用
+  fabric_id 32B || issuer 32B || recipient 32B`（113B 定长；无票时用
   32 字节全零 sentinel 代替后三段，即 `caps=0 || issued_at=0 ||
   expires_at=0 || zero×96`）；digest 为内部 32B 值（不出现在日志）。
   registry 变更（文件重载/unregister）即 generation+1 并清空全部缓存
@@ -679,7 +679,8 @@ A2' 窃取 capability 串用于 resolve（已明示的降级面）
     └► 可枚举 TTL 内登记地址，TTL 后失效 ⚠(明示接受：信息敏感度低+已比
        现状匿名枚举严格)
 A3 Visitor 给 A(S) 之外的 peers 当 relay（核心攻击）
-    └► peers 必须各自通过 on_connect（F6 投递模型）──► 无票 deny ✅（§8.3）
+    └► peers 必须各自通过 on_connect（F6 投递模型）──► static：无票
+       必拒；callback：仅 webhook 纳入 A_cb(S) 才可达 ✅（§8.3）
 A3' 同 Owner 名下两个 Visitor 经 relay 互连
     └► 允许（§0 R3 裁决：fabric 全连通模型的路径投影，非滥用）☑语义裁决
 A4 把 capability 转卖给其它 endpoint
@@ -923,9 +924,12 @@ SDK 配置面             RelayOptions 可选新字段                          
 阶段 2（Owner 启用 restricted）
                        - admin 注册 owner + --access-mode restricted
                        - 新 invite v2 / 新 SDK 携带 capability
-                       - 老 SDK（无 token）连 restricted relay：收到
-                         deny reason（iroh-relay 回传），SDK 显示
-                         "server requires capability"——可预期失败
+                       - 老 SDK（无 token）连 restricted relay：
+                         policy=static 收到 deny reason（iroh-relay
+                         回传），SDK 显示 "server requires capability"
+                         ——可预期失败；policy=callback 下老 SDK 的
+                         无票接入交 webhook 裁决（是否放行属 admin
+                         动态名单决策）
                        - 老 SDK 解析 v2 invite：unsupported-invite-version
 阶段 3（渐进收紧）     open↔restricted 可随时切换（capability 链路独立存在）
 ```
@@ -1112,7 +1116,7 @@ P0-B1/B2 核心结构闭合。剩余 8 个 P1 全部为文档级修复：
 | P1-1 | A_cb(S) 未贯穿旧断言 | §8.3/§9 A3/§13/§14/§15 全部统一为 A(S) ∪ A_cb(S)；空 registry 语义按 policy 分裂 | 各节 |
 | P1-2 | registry 清缓存 scenario 要求不可能的回调 | scenario 改为"L1b 直拒 + webhook 计数 0"；generation 清缓存用有效票/无票 key 单独验证 | spec |
 | P1-3 | per-source 无定义 | source = endpoint_id（hook 输入唯一可用维度） | §8.5 |
-| P1-4 | 缓存投影/响应 schema 未冻结 | 固定二进制投影（155B 定长 + 无票 sentinel）、digest 32B 内部值、cache_ttl_s 省略=默认/非法=0/未知字段忽略 | §8.5 |
+| P1-4 | 缓存投影/响应 schema 未冻结 | 固定二进制投影（113B 定长 + 无票 sentinel）、digest 32B 内部值、cache_ttl_s 省略=默认/非法=0/未知字段忽略 | §8.5 |
 | P1-5 | disconnect payload 未冻结 | 冻结 {event, endpoint_id, connection_id}（无 capability）；每 connection 至多一次 | §8.5 |
 | P1-6 | 非法 Authorization 降级为无票 | C0 凭证来源分类：直接检查 headers/query，存在但非法 → malformed 拒（不进无票路径） | §8.2 |
 | P1-7 | rendezvous 完整 L1/L1b 链未冻结 | 明确复用同一不可绕过 verifier（caps 位按操作 + announce recipient 绑定 + resolve bearer-only） | spec |

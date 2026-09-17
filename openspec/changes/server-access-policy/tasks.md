@@ -32,7 +32,7 @@
        至多一次）、C0 凭证来源分类（存在但非法 → malformed 拒，不进
        无票路径——直接检查 headers/query，不复用 auth_token() 归一化）、
        L1b 底线前置（无效票不触发 webhook）、决策缓存
-       （registry_generation + endpoint_id + BLAKE3(155B 定长二进制投影，
+       （registry_generation + endpoint_id + BLAKE3(113B 定长二进制投影，
        无票 sentinel zero×96) + event 键；TTL≤60s；cache_ttl_s 省略=
        配置默认/非法=0/未知字段忽略；registry 变更清缓存）、并发防护
        （singleflight + 全局 64/来源 16（source=endpoint_id）/队列 256，
