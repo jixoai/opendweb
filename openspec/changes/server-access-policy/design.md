@@ -18,24 +18,72 @@
 
 原始需求的"Visitor 不能**主动把 Server 当成自己的 relay/rendezvous 基础
 设施**使用"是一个自然语言约束，必须形式化为可执行、可验证的边界，否则
-无法评判任何方案。本 change 采用的形式化：
+无法评判任何方案。本 change 采用的形式化（**仅约束 `restricted` 模式**；
+`open` 模式下 Server 不启用访问控制，接入集合无界，行为与现状一致——
+R2 P0-N1 修正）：
 
 ```
-定义（Server 基础设施的"授权接入集合"）：
+定义（restricted 模式下 Server 基础设施的"授权接入集合"）：
   A(S) = { EndpointId e | e 持有某注册 Owner 签发的、未过期的、
            recipient==e 的有效 capability }
+  （时间性：A(S) 是"接入判定时刻"的快照语义——on_connect 时点校验；
+   撤销/过期对存量接入存在宽限期，见 §13 撤销窗口——R2 P1-N1 修正）
 
-边界裁决（"主动使用"的禁止含义）：
+边界裁决（"主动使用"的禁止含义，restricted 模式）：
   R1. 任意 e ∉ A(S)：不得接入 relay，不得 announce/resolve rendezvous
       ——匿名第三方白嫖被完全阻止。
-  R2. e ∈ A(S)：可作为 relay client 接入；其 relay 流量只能送达 A(S)
-      内的其它端点（iroh-relay 1.1.0 转发目的地只能是在线 ConnectedClient，
-      §1.1 F6）。
-  R3. e ∈ A(S) 与 A(S) 内其它端点经 relay 互连 —— 属于「参与授权 Owner
-      名下的连接」，不是「主动把 Server 当自己的基础设施」。
+  R2. e ∈ A(S)：可作为 relay client 接入；其 relay 流量只能送达
+      A(S) 接入中的其它端点（iroh-relay 1.1.0 投递目的地只能是在线
+      ConnectedClient，§1.1 F6）。
+  R3. e ∈ A(S) 与 A(S) 内其它端点经 relay 互连 —— 是否属于「参与授权
+      Owner 名下的连接」是产品语义裁决，见 §0.1。
 ```
 
-**R3 是本设计最重要的语义裁决**，理由有三：
+### 0.1 R3 的产品语义裁决（设计推荐，待 Owner 最终确认）
+
+R1/R2 两轮 Codex 复核对"同 Owner 名下端点经 relay 互连"是否违反原始需求
+存在分歧，且该分歧**不是技术问题而是产品意图问题**，技术事实如下（两轮
+复核均确认）：
+
+- 端侧 fabric 是全连通模型：roster 有效成员间任意可建 session
+  （fabric.rs:1902-1908、2675-2685）。
+- iroh-relay 1.1.0 的投递按 `dst_endpoint_id` 逐报进行，**没有
+  per-destination 的授权 hook**（AccessControl 仅 on_connect/on_disconnect，
+  server.rs:285-305）——relay 层无法表达"只能发给特定对端"，除非
+  vendored fork iroh-relay 在转发路径插入策略检查（本仓库既有裁决
+  "不动 iroh 上游"，见 relay-failover-hardening proposal）。
+
+由此只有两个自洽的产品语义可选：
+
+- **共享接入语义（本设计推荐，待 Owner 确认）**：授权单位是
+  "注册 Owner 签发的 capability"。Owner 名下端点（Owner 自身 + 其邀请的
+  Visitor）共享本 Server 的 relay 接入资格，彼此可经 relay 互连。滥用
+  边界 = A(S) 之外零可达（白嫖/冒充/为无关第三方中继全部阻断）；
+  A(S) 内的资源消耗由 registry 移除（新连接即时拒）+ TTL + client_rx
+  限流 + Phase 3 per-owner 配额约束。
+- **严格配对语义（否决）**：Visitor 仅可与 Owner 端点经 relay 通信。
+  需要 fork iroh-relay 加 per-dst enforcement——成本高、偏离"纯调用
+  上游"原则，且与 fabric 全连通模型（端侧本来允许 Visitor 互连直连）
+  形成两层语义不一致。若未来产品确需，capability 已预留 peer_scope
+  扩展位（§7.2），届时以独立 change 评估 fork。
+
+**裁决：本设计采用共享接入语义（推荐项；已向 Owner 提出裁决请求，
+最终确认前此条为设计推荐而非既成事实）。**若 Owner 否决，替代路径是
+严格配对语义 + vendored fork iroh-relay（成本见上），届时以独立 change
+重开。后续复核在 Owner 确认后不再将 R3 视为缺口。
+
+R3 成立的支撑论证（保留备查）：
+
+1. **fabric 全连通模型**：Owner 名下两个 Visitor 在端侧本来就能互建
+   session；他们经 relay 通信只是同一既定权限在传输路径上的投影。
+   Server 在 relay 层禁止它没有意义——端侧已授权，且 relay 看不见
+   fabric 语义（§5.2 鸡蛋问题）。
+2. **"与授权集合外端点通信"才是需求关心的滥用**：Visitor 给自己
+   fabric 之外的 peers、给第三方服务当中继——这些路径全部要求对端
+   ∈ A(S)，全部被 R2 阻断（对端无票进不来 relay）。
+3. **跨 Owner 通信在应用层不可能成立**：不同 fabric 的成员间 session
+   被端侧门控拒绝（roster 按 fabric_id 隔离）；relay 层即使出现 A(S)
+   内跨 Owner 的"混流"，也只是两端点间加密 QUIC 包的搬运，无应用语义。
 
 1. **fabric 本来就是成员全连通模型**：roster 的 `effective_members` 中任意
    两名成员都能互建 session（fabric.rs:1902-1908 发起侧无目标限制，
@@ -97,7 +145,7 @@ peer 绑定、session nonce）。它在 iroh-relay 现有模型上没有 hook �
 | F3 | iroh-relay WS 握手密码学认证 EndpointId；on_connect 在认证后、注册前被调用，可拿到 Bearer/query token | 握手签名/验证 iroh-relay protos/handshake.rs:223-240,452-471（派生消息 :200-220）；ClientRequest/auth_token server.rs:185-276；调用点 http_server.rs:868-898 |
 | F4 | 客户端 per-relay token 传递 iroh 已内置（native Bearer header / wasm query） | iroh-relay relay_map.rs:232-267、client.rs:320-325,407-410 |
 | F5 | 客户端身份 = iroh Ed25519 keypair；endpoint 以 identity key 构建，TLS peer id == EndpointId | identity.rs:43,110-113；fabric.rs:1421-1428（`builder.secret_key(identity.secret_key().clone())`） |
-| F6 | relay（WebSocket 面）是逐数据报转发：`Datagrams{dst_endpoint_id}`；**投递目的地只能是在线 ConnectedClient**（`try_send_packet`/`try_send_peer_gone` 均为 ConnectedClient 方法，server/client.rs:199-211）；目标不在注册表时**静默丢包**，仅对**已有 sent_to 关系**的目标断开时发 `EndpointGone`（clients.rs:147-168,199-216） | iroh-relay protos/relay.rs:177-186、server/clients.rs、server/client.rs |
+| F6 | relay（WebSocket 面）是逐数据报转发：`Datagrams{dst_endpoint_id}`；**投递目的地只能是在线 ConnectedClient**（投递分派在注册表 server/clients.rs:199-216，入队方法 server/client.rs:199-211）；目标不在注册表时**静默丢包**，仅对**已有 sent_to 关系**的目标断开时发 `EndpointGone`（clients.rs:119-168） | iroh-relay protos/relay.rs:177-186、server/clients.rs、server/client.rs |
 | F7 | holepunch 协调在 **iroh endpoint 内部**（remote_state），协调消息经 relay 数据报交换；Server 自研层不参与信令；spike-iroh 仅验证自建 relay + 基础互连 | iroh-1.1.0 socket/remote_map/remote_state.rs:504-531,922-945；spike-iroh/src/main.rs:301-343 |
 | F8 | rendezvous announce 有 EndpointId 签名验证，resolve 匿名；**无客户端运行时代码消费 /rendezvous API**（仅 server 自身、manifest 测试断言与 example fixture 命中） | rendezvous.rs:99-119（签名）、:186-201（匿名 resolve） |
 | F9 | 成员授权全部在端侧（roster 投影 + 双侧门控），Server 不参与 fabric 协议 | fabric.rs:1902-1908、fabric.rs:2675-2686；dweb-server 的 Cargo.toml 无 dweb-fabric 依赖 |
@@ -352,8 +400,8 @@ CapsV1（u8 位图，预留至 32 bit）
 Owner 注册（admin，低频）────► registry 持久化（jsonl append）
 Owner capability: root 本地自签（TTL 长，默认上限 180d）
 Visitor bootstrap:  invite v2 内嵌（TTL 短 ≤ invite expires；
-                    restricted relay 下 invite v2 强制 recipient 预绑定）
-Visitor member:     REDEEM_OK2 附发（TTL 中，默认上限 90d，绑 redeemer）
+                    InviteV2 recipient 恒必填——与 server 模式无关）
+Visitor member:     REDEEM_OK2 附发（TTL 建议 ≤90d/硬上限 180d，绑 redeemer）
 续期:               Owner 经 regular 会话重发（revoke 后门控拒绝→自然断粮）
 失效:               ① TTL 到期 ② registry 移除 Owner（新连接即时拒绝；
                     存量连接断连语义见 §13 撤销窗口）③ caps 位不匹配
@@ -390,7 +438,7 @@ ClientRequest { endpoint_id(已认证), auth_token() }
   7  server_id ≠ 本 ServerId ────────► DENY "dweb/wrong-server"
   8  expires_at ≤ now（now >= expires_at 即拒，与 protocol.rs:770-774
      语义一致）或 issued_at > now + CLOCK_SKEW（默认 120s）或
-     issued_at > expires_at 或 TTL > MAX_TTL（按 caps 类别 90d/180d）
+     issued_at > expires_at 或 TTL > 180d（验证侧统一上限，无类别判定）
      ────────────────────────────────► DENY "dweb/capability-expired"
                                        （时间类失败统一此 reason，日志细分）
   9  recipient ≠ endpoint_id ────────► DENY "dweb/not-recipient"  ← 防转借（E1）
@@ -426,9 +474,10 @@ Visitor 主动把 Server 当自己的基础设施:
 ```
 
 即：**per-connection capability 检查 + relay 只投递在线 client 的模型 ⟹
-通信端点恒 ⊆ A(S)**。Visitor 抄下 IP:port、relay URL、EndpointId 都无济于
-事——授权集合外的端点一个都进不了 relay，也就不存在"经本 Server 的
-中继路径"。
+经 relay 的通信端点在接入时刻均 ∈ A(S)**（撤销宽限期的存量接入除外，
+见 §0 时间性与 §13）。Visitor 抄下 IP:port、relay URL、EndpointId 都
+无济于事——授权集合外的端点一个都进不了 relay，也就不存在"经本
+Server 的中继路径"。
 
 补充边界（与 §0 R3 呼应）：Visitor 亲自作为 client 接入 relay 是合法的
 （它本来就是 fabric 通信的参与者）；它无法做的是**为 A(S) 之外的端点
@@ -472,11 +521,12 @@ A4 把 capability 转卖给其它 endpoint
     └► 同 A2：recipient 绑定 ✅
 A5 泄露的 invite 串
     ├► 抢兑成员资格 —— 既有威胁（单次兑换 + recipient 预绑定缓解）非新增
-    └► bootstrap capability 连 relay —— **restricted relay 下 invite v2
-       强制 recipient 预绑定**（R1 P0-4 修复）：capability.recipient ==
-       invite.recipient，泄露串对其它 EndpointId 无用 ✅
-       （open server 上 invite 可不绑 recipient，此时该 server 本来就
-        不设 relay 门槛，无增量风险）
+    └► bootstrap capability 连 relay —— **InviteV2 的 recipient 恒必填**
+       （R1 P0-4 修复 + R2 表述统一：V2 与 server 模式无关一律必填）：
+       capability.recipient == invite.recipient，泄露串对其它
+       EndpointId 无用 ✅（V1 令牌维持现状 recipient 可选——V1 无内嵌
+       capability，不存在 bootstrap 票；open server 的无门槛是模式属性
+       而非令牌属性）
 A6 恶意 Owner 刷资源（注册 fabric 后滥发票）
     └► registry 移除即时阻断新连接；Limits（client_rx）兜底；per-owner
        配额 Phase 3 ⚠(已缓解)
@@ -549,9 +599,12 @@ RelayCapV1（canonical，域分隔 b"dweb/relay-cap/v1\0"）
 │ expires_at   │ 8   │ ms（now >= expires_at 即拒；无滑窗）    │
 │ signature    │ 64  │ issuer Ed25519 over canonical bytes     │
 └──────────────┴─────┴─────────────────────────────────────────┘
-canonical 178B + sig 64B = 242B；base64url-nopad ≈ 324 字符，
-加 "dwebr1." 前缀共 ≈ 331 字符（Bearer header 无压力；编码长度以
-实现期测试冻结为准——R1 P2 修正）
+wire = 字段 146B + 签名 64B = 210B（签名输入 = 18B 域前缀
+"dweb/relay-cap/v1\0" + 146B 字段，域前缀不进 wire）；base64url-nopad
+280 字符 + "dwebr1." 前缀 = 287 字符（R2 P2 修正，以实现期编码
+测试冻结为准）
+TTL：验证侧统一上限 **180d**（不做类别判定）；签发侧建议 member
+capability ≤ 90d、bootstrap ≤ invite expires（§7.3）
 ```
 
 ### 11.2 Server 数据目录与配置
@@ -694,9 +747,9 @@ SDK 配置面             RelayOptions 可选新字段                          
 1. **架构必然性**：鸡蛋问题（§5.2）证明 Server 授权凭证必须独立于
    fabric 语义存在；F6 证明 relay 投递以在线 client 为界——per-connection
    检查 + A(S) 语义精确覆盖需求的真实边界（授权集合外零可达）。
-   R1 复核指出的"配对授权缺口"，经 §0 论证实为 fabric 全连通模型的
-   路径投影；更强的配对语义需要重写 relay 转发层且与 fabric 语义冲突，
-   不构成安全增益——已显式裁决并保留 future-work 扩展位。
+   R1/R2 复核指出的"配对授权缺口"，经 §0.1 升格为产品语义裁决：
+   共享接入语义（iroh-relay 原生能力边界）vs 严格配对语义（需 fork
+   relay）——本设计采用前者并保留 future-work 扩展位（peer_scope）。
 2. **复用最大化**：iroh-relay 的 ACL hook、token 通道、deny 回传与
    iroh 客户端 token 注入全部现成（F2/F3/F4）；fabric 侧只动 invite
    wire（附录 A）与新增 REDEEM_OK2 帧。核心新建面集中在 dweb-server。
@@ -737,9 +790,8 @@ InviteV2（串前缀 "dweb2."；canonical 域分隔升级 b"dweb/invite/v2\0"）
 │ invite_id      │ 16   │ 同 v1（单次兑换）                        │
 │ issuer         │ 32   │ root EndpointId                          │
 │ expires_at     │ 8    │ ms                                       │
-│ recipient      │ 32   │ ★ 变更：v2 必填（不再可选）              │
-│                │      │   restricted relay 场景由验证层强制；    │
-│                │      │   open server 亦推荐（收敛 A5）          │
+│ recipient      │ 32   │ ★ 变更：v2 恒必填（与 server 模式无关，  │
+│                │      │   编解码层强制；V1 维持现状可选）        │
 │ relay_count    │ 1    │ 0..=8                                    │
 │ relays[]       │ 变长 │ 每条：u16 url_len + url(UTF-8) +         │
 │                │      │   RelayCapV1 串（dwebr1.…，见 §11.1；    │
@@ -757,7 +809,43 @@ dweb1. 令牌不受影响（新旧并存，物理隔离）。
 聚焦 join 候选合并语义；两者实现独立、归档顺序解耦。
 ```
 
-## 附录 B：R1 复核问题 → 处置对照
+## 附录 A2：REDEEM_OK2 帧 wire 冻结（R2 P1-N2 修复）
+
+```
+帧：type = 0x15（REDEEM_OK2），仅当 REDEEM_INTENT 中的令牌为 dweb2. 时
+    issuer 才允许回发；dweb1. 一律回既有 REDEEM_OK(0x13)。
+payload 布局（全部整数大端 BE）：
+  ┌──────────────────┬──────┬─────────────────────────────────────┐
+  │ fact dump        │ 变长 │ 与 REDEEM_OK 完全同构（u32 count +  │
+  │                  │      │ SignedFact frames）                 │
+  │ cap_item_count   │ u32  │ 0..=8                               │
+  │ cap_items[]      │ 变长 │ 每项：u16 url_len + url(UTF-8，     │
+  │                  │      │ ≤512B) + u16 cap_len + cap（dwebr1. │
+  │                  │      │ 串，≤512B）                          │
+  └──────────────────┴──────┴─────────────────────────────────────┘
+约束：
+  - 兑换通道既有总上限沿用（payload ≤32KiB、5s 时限、单流）；
+  - cap_item_count 越界 / 单项长度越界 / url 非 http(s) → 整帧视为
+    无效回执：joiner 侧报 JoinError::Other（不降级、不部分采纳）；
+  - 重复 url 以首条为准（后到丢弃并计数）；
+  - cap 串格式非法（非 dwebr1. 前缀）：该条跳过并计数（名册回执
+    语义不受影响——capability 是可选增强，不是兑换成立的条件）；
+  - cap.recipient != redeemer EndpointId：该条跳过并计数（防御性，
+    正常签发链不会出现）。
+错误码（冻结为稳定枚举，SDK 透出）：
+  JoinError 新增第九码 UnsupportedInviteVersion（dweb2. 令牌交给
+  仅支持 v1 的旧客户端时返回；fabric.rs join 八码映射表同步扩展）。
+兼容矩阵：
+  ┌──────────────┬──────────────┬─────────────────────────────┐
+  │ joiner\issuer│ v1 issuer    │ v2 issuer                   │
+  ├──────────────┼──────────────┼──────────────┼──────────────┤
+  │ v1 joiner    │ OK(0x13)     │ UnsupportedInviteVersion（  │
+  │              │              │ 旧客户端无法解析 dweb2.）    │
+  │ v2 joiner    │ OK(0x13)     │ OK2(0x15)                  │
+  └──────────────┴──────────────┴─────────────────────────────┘
+```
+
+
 
 | 编号 | 问题（Codex R1, 5.5/10） | 处置 | 落点 |
 |---|---|---|---|
@@ -768,4 +856,18 @@ dweb1. 令牌不受影响（新旧并存，物理隔离）。
 | P0-5 | resolve 无法复用 E1 验证链 | announce 签名 key 绑定 + resolve bearer-only 明示降级 | §8.4、§9 A2' |
 | P0-6 | F6 EndpointGone/丢包表述错误 | F6 重写（静默丢包/sent_to 语义/holepunch 归属 iroh） | §1.1 F6、F7 |
 | P1 ×7 | fabric 二元组/时间语义/unregister/Limits/QAD/兼容措辞/wire 所有权/flag | 全部采纳（详见各节 R1 标注） | §8.2、§13、§11.2、§2.4、§14、§10、附录 A |
-| P2 ×2 | 引用精度/长度计算 | F3/F4 行号修正、caps 大小 242B/331 字符 | §1.1、§11.1 |
+| P2 ×2 | 引用精度/长度计算 | F3/F4 行号修正、caps 大小重算（当时数字有误，R2 表再次修正） | §1.1、§11.1 |
+
+### R2 复核（5.9/10）问题 → 处置对照
+
+| 编号 | 问题 | 处置 | 落点 |
+|---|---|---|---|
+| P0-1/P0-2（R2 复审未闭合） | 共享接入语义是产品放宽，需 Owner 裁决 | 升格为 §0.1 产品语义裁决记录（共享语义 vs 严格配对 fork 的取舍显式化，Owner 确认后作为需求基线） | §0.1 |
+| P0-N1 | A(S) 与 open 模式矛盾 | A(S)/R1-R3 显式限定 restricted；open 模式另行定义 | §0 |
+| P0-N2 | capability 未绑定 membership/Owner 上下文 | 归入 §0.1 裁决（共享语义下授权单位=capability 本身；membership 无法在 Server 侧验证——Server 无 roster，且 root 本就是 fabric 完全权威）；可审计性经 registry+TTL+配额约束 | §0.1、§13 |
+| P1-N1 | "恒属于 A(S)"与撤销宽限期矛盾 | A(S) 改为接入时刻快照语义 | §0 |
+| P1-N2 | OK2 wire 未冻结/缺稳定错误码 | 附录 A2：完整布局+约束+错误码+兼容矩阵 | 附录 A2 |
+| P1-N3 | deny reason 场景合并/缺边界场景 | spec delta 拆独立 scenario + 补 resolve 缺位/优先级/未来时间场景 | specs/server |
+| P0-3 遗留 | OK2 端序/framing/上限未冻结 | 附录 A2 冻结 | 附录 A2 |
+| P0-4 遗留 | recipient 必填的 V1/V2 例外表述冲突 | 统一：V2 恒必填（与模式无关）、V1 维持现状 | §7.3、§9 A5、附录 A |
+| P2 遗留 | 长度 242B/331 字符错误；F6 引用错位 | 修正 210B/287 字符 + 域前缀 18B 说明；F6 引用精确化 | §11.1、F6 |

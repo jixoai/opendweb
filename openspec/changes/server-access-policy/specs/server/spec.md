@@ -16,10 +16,17 @@
 - **WHEN** 服务端为 `restricted` 模式，客户端未携带 capability 连接 relay
 - **THEN** 接入被拒绝，拒绝原因经 relay 握手协议回传客户端（`dweb/no-capability`），连接不注册
 
-#### Scenario: 拒绝原因按失败环节区分
+#### Scenario: 拒绝原因按失败环节区分（独立用例矩阵）
 
-- **WHEN** capability 验证链分别因以下环节失败：格式/长度非法（`dweb/malformed-capability`）、未知 caps 保留位（`dweb/caps-unsupported`）、签名不匹配（`dweb/bad-signature`）、issuer 的 (fabric_id, root) 二元组不在 registry（`dweb/unknown-owner`）、server_id 不匹配（`dweb/wrong-server`）、时间校验失败（`dweb/capability-expired`）、recipient 与握手认证 id 不匹配（`dweb/not-recipient`）、caps 缺 RELAY 位（`dweb/caps-missing-relay`）
-- **THEN** 每种失败返回对应的结构化 reason 字符串，且互不相同
+以下每个失败环节均为独立可构造用例，reason 互不相同：
+
+- **WHEN** 令牌格式/长度/base64url 字符集非法 → **THEN** `dweb/malformed-capability`
+- **WHEN** caps 位图含未知保留位 → **THEN** `dweb/caps-unsupported`
+- **WHEN** 签名与 issuer 公钥不匹配（篡改任一字段）→ **THEN** `dweb/bad-signature`
+- **WHEN** issuer 的 (fabric_id, root) 二元组不在 registry 活跃集合 → **THEN** `dweb/unknown-owner`
+- **WHEN** server_id 与本服务端不符 → **THEN** `dweb/wrong-server`
+- **WHEN** recipient 与握手认证 endpoint_id 不匹配 → **THEN** `dweb/not-recipient`
+- **WHEN** caps 缺 RELAY 位（仅含 RDZ_* 的令牌连 relay）→ **THEN** `dweb/caps-missing-relay`
 
 ## ADDED Requirements
 
@@ -51,6 +58,11 @@
 - **WHEN** 注册 owner 后重启服务端
 - **THEN** registry 活跃集合恢复，已注册 owner 签发的有效 capability 仍可通过验证链
 
+#### Scenario: 配置优先级
+
+- **WHEN** 同一配置项在 CLI flag、环境变量、config.toml 中同时以不同值出现
+- **THEN** 生效值为 CLI flag > env > config.toml > default
+
 #### Scenario: unregister 阻断新连接
 
 - **WHEN** 某 owner 被 unregister 后，其名下已签发的 capability 再次用于新连接
@@ -63,7 +75,7 @@
 
 ### Requirement: relay capability 验证
 
-`restricted` 模式下，relay 的每条客户端接入 MUST 通过以下验证链（fail-closed，顺序执行）：令牌存在（iroh-relay auth_token 通道）→ 长度门（≤1KiB）与 base64url 字符集白名单 → `dwebr1.` 格式与字段形状校验 → caps 位图无未知保留位 → issuer Ed25519 验签（域分隔 `dweb/relay-cap/v1`）→ (fabric_id, issuer) ∈ registry 活跃集合 → server_id == 本服务端 ServerId → 时间校验（`now >= expires_at` 拒绝；`issued_at` 容忍 120s 时钟偏移；`issued_at <= expires_at`；TTL 上限：root 自签 180 天 / 附发 90 天）→ recipient == iroh-relay 握手认证的 endpoint_id → caps 含 RELAY 位。验证 MUST 在接入注册前完成，计算成本为 O(1) 查表 + 单次验签。capability 是身份绑定凭证而非纯 bearer：仅持有令牌串而无对应私钥者在 relay 面与 rendezvous announce 面 MUST 被拒绝。
+`restricted` 模式下，relay 的每条客户端接入 MUST 通过以下验证链（fail-closed，顺序执行）：令牌存在（iroh-relay auth_token 通道）→ 长度门（≤1KiB）与 base64url 字符集白名单 → `dwebr1.` 格式与字段形状校验 → caps 位图无未知保留位 → issuer Ed25519 验签（域分隔 `dweb/relay-cap/v1`）→ (fabric_id, issuer) ∈ registry 活跃集合 → server_id == 本服务端 ServerId → 时间校验（`now >= expires_at` 拒绝；`issued_at` 容忍 120s 时钟偏移；`issued_at <= expires_at`；TTL 验证侧统一上限 180 天）→ recipient == iroh-relay 握手认证的 endpoint_id → caps 含 RELAY 位。验证 MUST 在接入注册前完成，计算成本为 O(1) 查表 + 单次验签。capability 是身份绑定凭证而非纯 bearer：仅持有令牌串而无对应私钥者在 relay 面与 rendezvous announce 面 MUST 被拒绝。
 
 #### Scenario: 窃取令牌串不可用（relay 面）
 
@@ -82,7 +94,17 @@
 
 #### Scenario: 超长 TTL 被拒
 
-- **WHEN** capability 的 expires_at - issued_at 超过其类别 TTL 上限
+- **WHEN** capability 的 expires_at - issued_at 超过 180 天统一上限
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: 过大的未来签发时间被拒
+
+- **WHEN** capability 的 issued_at 超过当前时间 + 120s 时钟偏移容忍
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: issued_at 晚于 expires_at 被拒
+
+- **WHEN** capability 的 issued_at > expires_at（自相矛盾的时间字段）
 - **THEN** 接入被拒（`dweb/capability-expired`）
 
 #### Scenario: Visitor 无法为授权集合外端点提供中继
@@ -108,6 +130,11 @@
 
 - **WHEN** capability caps 仅含 RELAY，用于 announce
 - **THEN** 返回 401
+
+#### Scenario: resolve 缺 RDZ_RESOLVE 位
+
+- **WHEN** `restricted` 模式下持仅含 RELAY 位的 capability 执行 GET /rendezvous/{id}
+- **THEN** 返回 401，不返回任何登记项
 
 #### Scenario: open 模式现状不变
 
