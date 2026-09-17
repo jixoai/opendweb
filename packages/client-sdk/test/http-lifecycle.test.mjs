@@ -204,3 +204,49 @@ maybeTest("lifecycle: normal completion → signal silent, writer.closed flips, 
     await b.shutdown();
   }
 });
+
+maybeTest("lifecycle: fetchHttp signal aborts head-pending request (RESET to provider)", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    let handlerSawAbort = false;
+    /** @type {((v: void) => void) | undefined} */
+    let resolveHandler;
+    const handlerDone = new Promise((resolve) => {
+      resolveHandler = resolve;
+    });
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        // 挂起 handler：不 respondStreaming 也不返回——制造 head 等待形态
+        await new Promise((resolve) => {
+          if (req.signal.aborted) resolve(undefined);
+          else req.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+        });
+        handlerSawAbort = true;
+        resolveHandler?.();
+        return { status: 200, bodyChunks: [Buffer.from("late")] };
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const ctrl = new AbortController();
+    const pending = fetchHttp(session, { method: "GET", path: "/hang", signal: ctrl.signal });
+    // 短暂延迟确保请求已上线（head 等待中）
+    await sleep(300);
+    ctrl.abort();
+    // fetch 以错误结算（head cancelled——不等待 30s 默认超时）
+    const t0 = Date.now();
+    await assert.rejects(pending, /cancel|timeout|abort|session/i);
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 5_000, `fetchHttp 应在取消后有界失败（${elapsed}ms）`);
+    // provider 侧 signal 触发（事件驱动——RESET 到达）
+    await withTimeout(handlerDone, 15_000, "provider handler abort convergence");
+    assert.ok(handlerSawAbort, "provider handler must observe signal abort");
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});

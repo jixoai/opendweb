@@ -194,6 +194,27 @@ pub struct HttpRequestInit {
     pub keep_open: bool,
     /// 响应头等待上限（默认 30s；长轮询场景按需放宽/收紧）。
     pub head_timeout: Option<std::time::Duration>,
+    /// 外部取消开关（SDK 注入：JS AbortSignal → fire；head 等待期即时
+    /// RESET——消费端取消的对称面，provider 侧为 req.signal）。
+    pub cancel: Option<Arc<FetchCancel>>,
+}
+
+/// fetch 侧外部取消开关：fire 置位 + 唤醒（flag 兜底 Notify 注册窗口）。
+#[derive(Default)]
+pub struct FetchCancel {
+    fired: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl FetchCancel {
+    pub fn fire(&self) {
+        self.fired.store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl HttpRequestInit {
@@ -205,6 +226,7 @@ impl HttpRequestInit {
             body: Vec::new(),
             keep_open: false,
             head_timeout: None,
+            cancel: None,
         }
     }
 
@@ -216,6 +238,7 @@ impl HttpRequestInit {
             body: vec![body],
             keep_open: false,
             head_timeout: None,
+            cancel: None,
         }
     }
 }
@@ -338,16 +361,41 @@ pub async fn fetch_http(
     };
     let mut buf: Vec<u8> = Vec::new();
     let deadline = tokio::time::Instant::now() + head_timeout;
+    // 外部取消（SDK AbortSignal——与 head 超时同一 RESET 清理路径：对端
+    // 在途请求不得悬挂至其自身超时）。无开关时该分支恒挂起（零开销）。
+    let cancel_fut = async {
+        match &init.cancel {
+            Some(c) => c.notify.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancel_fut);
     let (status, headers, rest) = loop {
+        if let Some(c) = &init.cancel
+            && c.fired()
+        {
+            reset_stream.await;
+            return Err(FabricError::Session(SessionError::Connect(
+                "response head cancelled".into(),
+            )));
+        }
         if tokio::time::Instant::now() >= deadline {
             reset_stream.await;
             return Err(head_timeout_err());
         }
-        let chunk = match tokio::time::timeout(head_timeout, channel.recv(stream_id)).await {
-            Ok(r) => r?,
-            Err(_) => {
+        let chunk = tokio::select! {
+            r = tokio::time::timeout(head_timeout, channel.recv(stream_id)) => match r {
+                Ok(r) => r?,
+                Err(_) => {
+                    reset_stream.await;
+                    return Err(head_timeout_err());
+                }
+            },
+            _ = &mut cancel_fut => {
                 reset_stream.await;
-                return Err(head_timeout_err());
+                return Err(FabricError::Session(SessionError::Connect(
+                    "response head cancelled".into(),
+                )));
             }
         };
         buf.extend_from_slice(&chunk);

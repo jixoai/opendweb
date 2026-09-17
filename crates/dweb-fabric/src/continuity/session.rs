@@ -400,6 +400,29 @@ pub(crate) enum InstallPolicy {
     IfVacant,
 }
 
+/// provider 侧恢复放弃地平线：当前胜者通道死亡后，无成功 RESUME 的
+/// Recovering 会话在此时限后转 Dead（释放 canonical——同 peer 的新 INIT
+/// 得以准入；与 client 驱动侧 90s 放弃窗口 Q4 对齐）。
+const RESUME_GIVEUP: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// 测试旋钮（毫秒；0 = 默认）。进程级全局——仅串行测试面使用。
+static RESUME_GIVEUP_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 测试面：收紧恢复放弃窗口（#[doc(hidden)]；串行测试专用）。
+#[doc(hidden)]
+pub fn set_resume_giveup_for_test(ms: u64) {
+    RESUME_GIVEUP_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn resume_giveup() -> std::time::Duration {
+    let ms = RESUME_GIVEUP_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if ms != 0 {
+        std::time::Duration::from_millis(ms)
+    } else {
+        RESUME_GIVEUP
+    }
+}
+
 /// 双端共享的会话核心：provider 侧常驻注册表跨连接存活（进程重启即丢——
 /// RESUME 统一 REQUEST_STATE_LOST）；client 侧由 Session 句柄持有。
 pub struct SessionShared {
@@ -540,6 +563,21 @@ impl SessionShared {
     pub(crate) fn channel_is_current(&self, epoch: u64, owner: u64) -> bool {
         let ctl = self.resume_control.lock().unwrap();
         ctl.active_epoch == epoch && ctl.channel_owner == owner
+    }
+
+    /// 通道死亡进入 Recovering 时启动的有界放弃看门狗：到期仍是同一胜者
+    /// 且仍 Recovering → Dead（canonical 释放，reap_terminal 懒清注册表）。
+    /// 恢复成功（新通道安装）则 owner 已变——看门狗空转退出。
+    fn spawn_resume_giveup(self: &Arc<Self>, epoch: u64, owner: u64) {
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(resume_giveup()).await;
+            if shared.channel_is_current(epoch, owner)
+                && shared.phase_sync() == SessionPhase::Recovering
+            {
+                shared.set_phase_sync(SessionPhase::Dead);
+            }
+        });
     }
 
     /// 通道安装（R3-2d/P0 transition）：所有切换先串行化，停止旧泵并等待
@@ -1782,6 +1820,14 @@ impl SessionChannel {
         self.dead.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// 终结传输（Session::close Shutdown 语义）：发送半 FIN + 置 dead。
+    /// 对端 recv 得到 Ended → Recovering（看门狗放弃 / 新 INIT 替换）。
+    pub async fn terminate(&self) {
+        self.request_stop();
+        let _ = self.send.lock().await.finish();
+        self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn request_stop(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1990,12 +2036,14 @@ impl SessionChannel {
                     Err(TransportError::Ended) => {
                         if self.is_current() {
                             self.shared.set_phase(SessionPhase::Recovering).await;
+                            self.shared.spawn_resume_giveup(self.epoch, self.owner);
                         }
                         return Ok(());
                     }
                     Err(e) => {
                         if self.is_current() {
                             self.shared.set_phase(SessionPhase::Recovering).await;
+                            self.shared.spawn_resume_giveup(self.epoch, self.owner);
                         }
                         return Err(map_transport_err(e));
                     }
@@ -2050,6 +2098,7 @@ impl SessionChannel {
             // the winner. A newer owner cannot be pulled back to recovery.
             if self.is_current() {
                 self.shared.set_phase(SessionPhase::Recovering).await;
+                self.shared.spawn_resume_giveup(self.epoch, self.owner);
             }
             return Err(e);
         }
@@ -2194,12 +2243,16 @@ impl Session {
         out
     }
 
-    /// 显式关闭（Shutdown 语义第一步，SDK task 4.2）：置 Closed + 终止 pump。
-    /// 发送面此后经当前代通道解析失败/死通道报错；终局对端由超时暴露。
+    /// 显式关闭（Shutdown 语义第一步，SDK task 4.2）：置 Closed + 终止 pump
+    /// + **终结传输**（发送半 FIN——对端 pump 感知 Ended → Recovering →
+    /// 看门狗放弃/新 INIT 替换；0.6.0 前只停本地 pump，对端至进程退出都
+    /// 视会话存活，canonical 永不释放）。
     pub async fn close(&self) {
         if let Some(old) = self.pump.lock().unwrap().take() {
             old.abort();
         }
+        let chan = self.channel.read().unwrap().clone();
+        chan.terminate().await;
         self.shared.set_phase(SessionPhase::Closed).await;
     }
 
@@ -2409,10 +2462,21 @@ impl SessionRegistry {
             && let Some(existing) = state.sessions.get(&canonical_sid)
         {
             let existing_phase = existing.shared.phase_sync();
-            let incoming_wins = existing_phase == SessionPhase::Negotiating
+            // 0.6.0：Recovering 且通道已死的 canonical 允许被新 INIT 即时替换
+            //——客户端 close/重启后的立即重开（否则 canonical 原地滞留，
+            // e2e 实证永卡）。通道存活的 Recovering（真实瞬断，RESUME 在途）
+            // 仍保持 canonical。客户端侧 openSession 对 recovering 会话幂等
+            // 复用（不发新 sid），故新 sid INIT ⟹ 客户端已放弃旧会话。
+            let recovering_dead_channel = existing_phase == SessionPhase::Recovering
+                && existing
+                    .shared
+                    .current_channel()
+                    .is_none_or(|c| c.is_dead());
+            let incoming_wins = (existing_phase == SessionPhase::Negotiating
                 && existing
                     .initiator
-                    .is_some_and(|id| (incoming_endpoint, session_id) < (id, canonical_sid));
+                    .is_some_and(|id| (incoming_endpoint, session_id) < (id, canonical_sid)))
+                || recovering_dead_channel;
             if !incoming_wins {
                 return InitAdmission::Canonical(Arc::clone(&existing.shared));
             }
@@ -3283,9 +3347,19 @@ async fn accept_session_init(
             .continuity_sessions
             .get(&campaign.session_id)
             .await;
+        // 活跃判定只认 Active / （通道存活的）Recovering：Dead/Closed 与
+        // 通道已死的 Recovering 不得压制新 INIT（canonical 由 reap_terminal
+        // 懒清；放弃看门狗负责转 Dead；死通道 Recovering 即时替换语义见
+        // admit_init_ordered）。
         let local_is_active = local_shared
             .as_ref()
-            .is_some_and(|shared| shared.phase_sync() != SessionPhase::Negotiating);
+            .is_some_and(|shared| {
+                matches!(shared.phase_sync(), SessionPhase::Active)
+                    || (shared.phase_sync() == SessionPhase::Recovering
+                        && shared
+                            .current_channel()
+                            .is_some_and(|c| !c.is_dead()))
+            });
         let incoming_wins = (incoming_endpoint, sid) < (local_endpoint, campaign.session_id);
         if local_is_active || !incoming_wins {
             let canonical = fabric

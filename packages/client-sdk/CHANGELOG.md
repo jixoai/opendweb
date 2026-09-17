@@ -17,6 +17,16 @@
 - `fetchHttp` 请求面类型补 `headTimeoutMs` 声明（0.5.0 运行时已有）。
 - `/http` 类型面（index.d.ts）补全 `respondStreaming` / 流式 handler 形状。
 
+### Added（实现期补入）
+
+- **fetchHttp 消费端取消**：`request.signal`（JS 胶水）/ `abortKey`+
+  `session.abortFetch(key)`（原生面）——head 等待期 abort 即时 RESET，
+  对端在途请求不再悬挂至其自身超时（与 provider 侧 req.signal 对偶）。
+- **Session.close 传输终结**：close 发送半 FIN——对端即时感知（此前对端
+  至进程退出都视会话存活）。
+- **同 peer 重开修复**：Recovering-死通道 canonical 可被新 INIT 即时替换
+  + 恢复放弃看门狗（90s）——close/重启后立即可重开会话（此前永卡）。
+
 ### Fixed
 
 - 内核：废弃 RESUME 尝试的迟到 OK 发送失败不再把更晚胜者刚置位的

@@ -21,6 +21,13 @@
       owner 守卫缺陷（迟到的失败回落覆盖新胜者 Active——见 design 实现期
       发现 2）
 
+- [x] 1.6 fetch 侧取消（D7）：FetchCancel 开关 + head 等待取消分支 +
+      FetchHttpInit.abortKey + SessionHandle.abortFetch + JS 胶水 signal 接线
+- [x] 1.7 close 语义与 canonical 释放（D8）：Session::close 传输终结（FIN）；
+      恢复放弃看门狗（90s 默认 + 测试旋钮）；死通道 Recovering canonical
+      即时替换；campaign 守卫活跃判定收紧；内核钉 s6c（close 后同 peer
+      重开立即成功）
+
 ## 2. N-API 桥（packages/client-sdk/src/http.rs）
 
 - [x] 2.1 request 事件 JSON 增 `sessionId`（hex）

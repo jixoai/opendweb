@@ -242,6 +242,12 @@ export declare class SessionHandle {
    * 函数形态）见 /http 子路径胶水。
    */
   fetchHttp(init: FetchHttpInit): Promise<HttpClientResponseJs>
+  /**
+   * head 等待期外部取消（index.js 胶水由 fetchHttp request.signal 触发）：
+   * 即时向对端发 RESET 清理在途请求，pending fetch 以错误结算。晚到/
+   * 未知 key 为幂等 no-op。
+   */
+  abortFetch(abortKey: number): void
 }
 
 /**
@@ -317,6 +323,11 @@ export interface FetchHttpInit {
   keepOpen?: boolean
   /** 响应头等待上限毫秒（默认 30s——长轮询/慢上游按需放宽）。 */
   headTimeoutMs?: number
+  /**
+   * 外部取消键（index.js 胶水由 request.signal 生成注册；abort 时经
+   * SessionHandle.abortFetch(key) 触发 head 等待期即时 RESET）。
+   */
+  abortKey?: number
 }
 
 /** HTTP 头（数组形态保重复项，§3.4）。 */

@@ -7,10 +7,14 @@
 //   调用；结算经 server.resolveRequest/rejectRequest 回流
 const Native = require("../index.js");
 
+/** fetchHttp 取消键序号（request.signal → abortKey 注册表关联）。 */
+let fetchAbortKeySeq = 0;
+
 /**
  * 发起 HTTP 请求（design §3.4）。本阶段 body 为静态分块（AsyncIterable 请求
  * 体后续 phase）；响应经 pull-first bodyNext() 消费，亦可 for-await 迭代。
  * headTimeoutMs 可配（默认 30s——长轮询/慢上游按需放宽）。
+ * signal 可配（0.6.0）：abort → head 等待期即时 RESET（清理对端在途请求）。
  * @param {import("../index.js").SessionHandle} session
  * @param {{
  *   method: string;
@@ -31,6 +35,25 @@ async function fetchHttp(session, request) {
   if (request.body != null) init.body = request.body;
   if (request.keepOpen != null) init.keepOpen = request.keepOpen;
   if (request.headTimeoutMs != null) init.headTimeoutMs = request.headTimeoutMs;
+  // 消费端取消信号（0.6.0）：head 等待期 abort → 即时 RESET 清理对端在途
+  // 请求（abortKey 注册表经 SessionHandle.abortFetch 触发；fetch 结算即摘除，
+  // 晚到 abort 为幂等 no-op）
+  let abortKey = null;
+  if (request.signal != null) {
+    abortKey = ++fetchAbortKeySeq;
+    init.abortKey = abortKey;
+    request.signal.addEventListener(
+      "abort",
+      () => {
+        try {
+          session.abortFetch?.(abortKey);
+        } catch {
+          // 会话已关等：取消目的已达成（通道已死）
+        }
+      },
+      { once: true },
+    );
+  }
   const resp = await session.fetchHttp(init);
   // §3.4 HttpResponse.body AsyncIterable 投影：迭代逐块 pull（EOF 结束）
   Object.defineProperty(resp, Symbol.asyncIterator, {

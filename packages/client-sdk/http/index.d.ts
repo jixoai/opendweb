@@ -22,6 +22,11 @@ export interface HttpRequestInit {
   keepOpen?: boolean;
   /** 响应头等待上限毫秒（默认 30000；超时发 RESET 清理 provider 在途请求） */
   headTimeoutMs?: number;
+  /**
+   * 消费端取消信号（0.6.0）：abort → head 等待期即时 RESET（对端在途请求
+   * 不再悬挂至其自身超时）。与 provider 侧 req.signal 对偶。
+   */
+  signal?: AbortSignal;
 }
 
 /**

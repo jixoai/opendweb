@@ -16,8 +16,8 @@
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, CancelOutcome, Header,
-    HttpEngineError, HttpHandler, HttpRequest as KernelHttpRequest,
+    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, CancelOutcome, FetchCancel,
+    Header, HttpEngineError, HttpHandler, HttpRequest as KernelHttpRequest,
     HttpRequestInit as KernelHttpRequestInit, HttpResponse as KernelHttpResponse, RequestBody,
 };
 use dweb_fabric::continuity::session::{Session, SessionOptions, SessionPhase, SessionShared};
@@ -62,6 +62,9 @@ pub struct FetchHttpInit {
     pub keep_open: Option<bool>,
     /// 响应头等待上限毫秒（默认 30s——长轮询/慢上游按需放宽）。
     pub head_timeout_ms: Option<f64>,
+    /// 外部取消键（index.js 胶水由 request.signal 生成注册；abort 时经
+    /// SessionHandle.abortFetch(key) 触发 head 等待期即时 RESET）。
+    pub abort_key: Option<f64>,
 }
 
 /// fetchHttp 响应：status/headers/streamId + bodyNext（pull-first）。
@@ -165,6 +168,7 @@ impl HttpClientResponseJs {
 pub(crate) async fn fetch_http(
     session: &Arc<Session>,
     init: FetchHttpInit,
+    cancel: Option<Arc<FetchCancel>>,
 ) -> Result<HttpClientResponseJs> {
     let rin = KernelHttpRequestInit {
         method: init.method,
@@ -186,6 +190,7 @@ pub(crate) async fn fetch_http(
             .head_timeout_ms
             .filter(|ms| *ms > 0.0)
             .map(|ms| std::time::Duration::from_millis(ms as u64)),
+        cancel,
     };
     let resp = kernel_fetch_http(session, rin).await.map_err(session_err)?;
     let shared = Arc::clone(session.shared());

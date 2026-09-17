@@ -833,6 +833,40 @@ async fn session_abandoned_resume_then_cross_nonce_recovers() {
     provider.abort();
 }
 
+/// s6c（0.6.0）：close 后同 peer 重开。旧缺陷：provider 侧会话在客户端
+/// close 后永驻 Recovering（无放弃机制），canonical 永不释放——新 INIT
+/// 永远 ALREADY_ACTIVE、客户端 adopt 死 canonical 超时（e2e T7 实证卡死
+/// 45s+）。修复：恢复放弃看门狗（Recovering 且同一胜者 → 有界转 Dead，
+/// reap 释放 canonical）+ campaign 守卫活跃判定只认 Active/Recovering。
+#[tokio::test]
+async fn session_reopen_after_giveup_releases_canonical() {
+    session::set_resume_giveup_for_test(300);
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let provider = tokio::spawn(async move {
+        loop {
+            let _ = session::accept_any(&b, &a_id, opts).await;
+        }
+    });
+
+    let s1 = open_session_bounded(&a, &b_id, opts).await;
+    let sid1 = s1.shared().session_id;
+    s1.close().await;
+
+    // 看门狗窗口（300ms 放弃 + pump 死亡传播余量）
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // 重开：canonical 已释放（Dead → reap），新 sid 准入成功
+    let s2 = open_session_bounded(&a, &b_id, opts).await;
+    let sid2 = s2.shared().session_id;
+    assert_ne!(sid1, sid2, "重开必须得到新 session（canonical 已释放）");
+    s2.close().await;
+    provider.abort();
+    session::set_resume_giveup_for_test(0);
+}
+
 /// s7（硬化 P0-2）：SESSION_INIT 幂等（同 sid+token 重发 OK——ghost 收敛）；
 /// 同 sid 伪造 token → REJECT 0x02。
 #[tokio::test]

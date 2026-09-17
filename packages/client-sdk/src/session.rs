@@ -132,6 +132,10 @@ pub struct SessionHandle {
     state_callbacks: StateCallbacks,
     next_cb_id: std::sync::atomic::AtomicU64,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// head 等待中的外部取消开关（abortKey → FetchCancel；fetchHttp 完成/
+    /// 失败即摘除——abortFetch 晚到为幂等 no-op）。
+    fetch_cancels:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Arc<dweb_fabric::continuity::http::FetchCancel>>>>,
 }
 
 impl SessionHandle {
@@ -151,6 +155,7 @@ impl SessionHandle {
             state_callbacks,
             next_cb_id: std::sync::atomic::AtomicU64::new(1),
             closed,
+            fetch_cancels: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -227,7 +232,34 @@ impl SessionHandle {
         &self,
         init: FetchHttpInit,
     ) -> Result<crate::http::HttpClientResponseJs> {
-        crate::http::fetch_http(&self.session, init).await
+        let key = init.abort_key.filter(|k| *k > 0.0).map(|k| k as u64);
+        let cancel = key.map(|_| {
+            std::sync::Arc::new(dweb_fabric::continuity::http::FetchCancel::default())
+        });
+        if let (Some(k), Some(c)) = (key, cancel.as_ref()) {
+            self.fetch_cancels.lock().await.insert(k, c.clone());
+        }
+        let out = crate::http::fetch_http(&self.session, init, cancel).await;
+        if let Some(k) = key {
+            self.fetch_cancels.lock().await.remove(&k);
+        }
+        out
+    }
+
+    /// head 等待期外部取消（index.js 胶水由 fetchHttp request.signal 触发）：
+    /// 即时向对端发 RESET 清理在途请求，pending fetch 以错误结算。晚到/
+    /// 未知 key 为幂等 no-op。
+    #[napi]
+    pub fn abort_fetch(&self, abort_key: f64) {
+        let key = abort_key as u64;
+        let cancel = self
+            .fetch_cancels
+            .blocking_lock()
+            .get(&key)
+            .cloned();
+        if let Some(c) = cancel {
+            c.fire();
+        }
     }
 }
 

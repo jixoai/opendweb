@@ -142,6 +142,37 @@ ai-fly 侧消费（另仓变更）：AUTH grants 按 sessionId 隔离 + 慢任�
 以 250ms 有界 sleep 佐餐 + reset_notify 即时唤醒；终态出口保证退出。
 实测挂起唤醒即时性满足（SDK lifecycle 测试 1s 内收口）。
 
+### D7. fetch 侧取消（消费端对称面，实现期补入）
+
+e2e T8 实证：head 等待期的本地 abort 无任何面能发出 RESET（tunnel 未就位、
+竞态收口只在 head 到达后生效）——慢任务秒停在消费端断裂。补全对称面：
+
+- 内核：`HttpRequestInit.cancel: Option<Arc<FetchCancel>>`（flag+Notify 开关）；
+  head 等待 select 增取消分支（与超时同一 RESET 清理路径）。
+- N-API：`FetchHttpInit.abortKey` + SessionHandle 级注册表 +
+  `abortFetch(key)`（fetch 结算即摘除，晚到 abort 幂等 no-op）。
+- JS 胶水：`fetchHttp(session, { signal })` 自动接线；ai-fly 消费端直接用
+  原生 abortKey/abortFetch 面（不经胶水路径）。
+
+### D8. Session::close 传输终结 + 死通道 canonical 即时替换（实现期补入）
+
+e2e T7 实证同 peer 重开永卡：两层缺陷——
+
+1. `Session::close()` 只停本地 pump，不终结传输——对端至进程退出都视会话
+   存活。修复：close 经 `SessionChannel::terminate()` 发送半 FIN（对端 pump
+   Ended → Recovering）。
+2. provider 侧 Recovering 无放弃机制，canonical 永不释放（新 INIT 永远
+   ALREADY_ACTIVE、客户端 adopt 死 canonical 超时）。修复：
+   - **恢复放弃看门狗**：当前胜者通道死亡进入 Recovering 时启动有界看门狗
+     （默认 90s，测试旋钮可收紧）——到期仍同胜者且仍 Recovering → Dead
+     （reap_terminal 懒清）。
+   - **死通道 canonical 即时替换**：admit 时 Recovering 且通道已死的
+     canonical 允许被新 INIT 替换（客户端 openSession 对 recovering 会话
+     幂等复用不发新 sid，故新 sid INIT ⟹ 客户端已放弃旧会话；通道存活的
+     Recovering——真实瞬断 RESUME 在途——仍保持 canonical）。顺带修复
+     客户端重启后的恢复路径。
+   - campaign 守卫活跃判定同步收紧（只认 Active / 通道存活的 Recovering）。
+
 ## 实现期发现（记录）
 
 1. **tx_probe EOF 回归（已修）**：初版以「writer 持探针 mpsc Sender 观测
