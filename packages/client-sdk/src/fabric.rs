@@ -21,10 +21,31 @@ use tokio::sync::Mutex;
 
 type EventCallbacks = Arc<Mutex<Vec<(u64, ThreadsafeFunction<String>)>>>;
 
+/// `relay.relays` 单条条目（server-access-policy task 2.5）：per-relay
+/// capability 凭证配置。`serverId` 与 `token` 二选一或全无——
+/// - `serverId`：restricted relay 的 ServerId（64 hex；admin 注册 owner 时
+///   转交）——root 据此本地自签 own/bootstrap/member capability
+///   （`ensureRelayCapabilities` / v2 invite / OK2 附发）；
+/// - `token`：现成 `dwebr1.` capability 串（手工/测试用），原样注入本地
+///   RelayMap（Authorization: Bearer 头）。
+/// 全无 = 无凭证条目（等价旧 `urls` 形态的对应项）。
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RelayEntryOptions {
+    /// relay URL（http/https；与 urls 同规构造期校验）
+    pub url: String,
+    /// restricted relay 的 ServerId（64 hex；None = 非 restricted 条目）
+    pub server_id: Option<String>,
+    /// 现成 dwebr1. capability 串（None = 无静态凭证）
+    pub token: Option<String>,
+}
+
 /// relay 配置（判别联合的 napi 投影）：
-/// - `{}` / `{ mode: "n0" }`：n0 官方默认（不接受 urls）
-/// - `{ mode: "disabled" }`：禁用（不接受 urls）
+/// - `{}` / `{ mode: "n0" }`：n0 官方默认（不接受 urls/relays）
+/// - `{ mode: "disabled" }`：禁用（不接受 urls/relays）
 /// - `{ mode: "custom", urls: [..] }`：自托管列表（至少一个；空数组构造 reject）
+/// - `{ mode: "custom", relays: [..] }`：条目级 capability 列表（至少一个；
+///   与 urls 互斥——同时提供构造 reject，spec scenario 冻结）
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
@@ -32,6 +53,9 @@ pub struct RelayOptions {
     pub mode: Option<String>,
     /// mode = "custom" 时的 relay URL 列表（自托管 docker 或其它 iroh relay）
     pub urls: Option<Vec<String>>,
+    /// mode = "custom" 时的 per-relay 条目（url + 可选 serverId/token）；
+    /// 与 urls 互斥（双字段同时给出构造 reject）
+    pub relays: Option<Vec<RelayEntryOptions>>,
 }
 
 /// httpProxy 的 `{ url }` 形态（"none" | "from-env" 为字符串形态）。
@@ -104,6 +128,52 @@ pub struct Member {
     pub since_ms: f64,
 }
 
+/// ensureRelayCapabilities 的返回条目（root 自签/透传的 per-relay 凭证）。
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RelayCapabilityJs {
+    /// relay URL（配置原样形态）
+    pub url: String,
+    /// `dwebr1.` capability 串
+    pub token: String,
+}
+
+/// serverId hex64 → 32B（构造期校验：restricted 条目的 ServerId 形态错
+/// 误会让 root 自签链静默失配，fail-fast 拒绝构造）。
+fn parse_server_id(hex64: &str, url: &str) -> Result<[u8; 32]> {
+    let mut buf = [0u8; 32];
+    hex::decode_to_slice(hex64, &mut buf).map_err(|_| {
+        Error::new(
+            Status::GenericFailure,
+            format!(
+                "relay.relays entry '{url}': serverId must be 64 hex characters (ServerId), \
+                 got {} character{}",
+                hex64.len(),
+                if hex64.len() == 1 { "" } else { "s" }
+            ),
+        )
+    })?;
+    Ok(buf)
+}
+
+/// relays 条目 → RelayEntry（token 原样透传；serverId hex64 解码）。
+fn to_relay_entries(relays: Vec<RelayEntryOptions>) -> Result<Vec<dweb_fabric::RelayEntry>> {
+    relays
+        .into_iter()
+        .map(|e| {
+            let server_id = match &e.server_id {
+                Some(h) => Some(parse_server_id(h, &e.url)?),
+                None => None,
+            };
+            Ok(dweb_fabric::RelayEntry {
+                url: e.url,
+                server_id,
+                token: e.token,
+            })
+        })
+        .collect()
+}
+
 fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
     let bad = |msg: String| Err(Error::new(Status::GenericFailure, msg));
     match relay {
@@ -111,10 +181,14 @@ fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
         Some(r) => {
             let has_urls = r.urls.as_ref().is_some_and(|u| !u.is_empty());
             let urls_empty_array = r.urls.as_ref().is_some_and(|u| u.is_empty());
+            let has_relays = r.relays.as_ref().is_some_and(|v| !v.is_empty());
+            let relays_empty_array = r.relays.as_ref().is_some_and(|v| v.is_empty());
             match r.mode.as_deref().unwrap_or("n0") {
                 "n0" | "" => {
                     if has_urls || urls_empty_array {
                         bad("relay.urls is only valid with mode 'custom'".into())
+                    } else if has_relays || relays_empty_array {
+                        bad("relay.relays is only valid with mode 'custom'".into())
                     } else {
                         Ok(RelayConfig::N0Default)
                     }
@@ -122,14 +196,34 @@ fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
                 "disabled" => {
                     if has_urls || urls_empty_array {
                         bad("relay.urls is not accepted with mode 'disabled'".into())
+                    } else if has_relays || relays_empty_array {
+                        bad("relay.relays is not accepted with mode 'disabled'".into())
                     } else {
                         Ok(RelayConfig::Disabled)
                     }
                 }
-                "custom" => match r.urls {
-                    Some(urls) if !urls.is_empty() => Ok(RelayConfig::Custom(urls)),
-                    _ => bad("relay mode 'custom' requires at least one relay URL".into()),
-                },
+                "custom" => {
+                    // spec scenario 冻结：双字段同时给出显式报错（不静默合并）
+                    if (has_urls || urls_empty_array) && (has_relays || relays_empty_array) {
+                        return bad(
+                            "relay.urls and relay.relays are mutually exclusive: provide \
+                             exactly one of them"
+                                .into(),
+                        );
+                    }
+                    match r.relays {
+                        Some(relays) if !relays.is_empty() => Ok(RelayConfig::CustomWithCaps(
+                            to_relay_entries(relays)?,
+                        )),
+                        Some(_) => bad(
+                            "relay mode 'custom' requires at least one relay entry".into(),
+                        ),
+                        None => match r.urls {
+                            Some(urls) if !urls.is_empty() => Ok(RelayConfig::Custom(urls)),
+                            _ => bad("relay mode 'custom' requires at least one relay URL".into()),
+                        },
+                    }
+                }
                 other => bad(format!(
                     "invalid relay mode '{other}' (expected disabled | custom | n0)"
                 )),
@@ -367,14 +461,22 @@ impl Fabric {
     /// 一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
     /// 令牌前置检查（解码/过期/地址规范化）先于本地数据面加载与身份句柄消费
     ///（D11 冻结顺序：令牌自身错误优先于目录检查）。
+    /// task 2.5：按串前缀分派前置检查——dweb2. 走 v2 precheck（附录 A 全部
+    /// 校验含 capability 一致性），v1 路径零变化；后续 join 由内核按同前缀
+    /// 分派（OK2 兑换 + member capability 持久化）。
     #[napi(factory)]
     pub async fn join_with_token(
         opts: FabricOptions,
         token: String,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        let decoded = dweb_fabric::precheck_join_token(&token).map_err(fabric_err)?;
-        let fabric_id = hex::encode(decoded.invite.fabric_id.as_bytes());
+        let fabric_id = if token.starts_with(dweb_fabric::protocol::TOKEN2_PREFIX) {
+            let decoded = dweb_fabric::precheck_join_token_v2(&token).map_err(fabric_err)?;
+            hex::encode(decoded.invite.fabric_id.as_bytes())
+        } else {
+            let decoded = dweb_fabric::precheck_join_token(&token).map_err(fabric_err)?;
+            hex::encode(decoded.invite.fabric_id.as_bytes())
+        };
         let (cfg, seed) = take_options(&opts, secret)?;
         let fabric = match RustFabric::attach(cfg, &fabric_id).await {
             Ok(f) => f,
@@ -490,6 +592,24 @@ impl Fabric {
     #[napi]
     pub async fn join(&self, token: String) -> Result<()> {
         self.inner.join(&token).await.map_err(fabric_err)
+    }
+
+    /// root 自签 per-relay own capability（server-access-policy task 2.3/2.5）。
+    /// 对 relay.relays 中带 serverId 的条目以 root 身份现签（caps 全位、
+    /// TTL 180d 上限内）注入本地 RelayMap；静态 token 条目原样注入。
+    /// 返回 (url, token) 列表供调用方转交/审计。非 root 调用报名册
+    /// root-only 错误（"operation requires root …"，原生变体无前缀）。
+    #[napi]
+    pub async fn ensure_relay_capabilities(&self) -> Result<Vec<RelayCapabilityJs>> {
+        let caps = self
+            .inner
+            .ensure_relay_capabilities()
+            .await
+            .map_err(fabric_err)?;
+        Ok(caps
+            .into_iter()
+            .map(|(url, token)| RelayCapabilityJs { url, token })
+            .collect())
     }
 
     /// 连接成员（常规通道；双向门控 + 名册同步）。幂等（活跃连接直接成功）。

@@ -30,6 +30,8 @@ test("deriveErrorCode maps kebab prefixes to SCREAMING_SNAKE", () => {
     ["[relay-offline] x", "RELAY_OFFLINE"],
     ["[dial-failed] x", "DIAL_FAILED"],
     ["[dial-timeout] x", "DIAL_TIMEOUT"],
+    // server-access-policy 附录 A2 第九码（task 2.5 收录进映射表）
+    ["[unsupported-invite-version] x", "UNSUPPORTED_INVITE_VERSION"],
     ["[missing-identity] x", "MISSING_IDENTITY"],
     ["[corrupted] x", "CORRUPTED"],
     ["[roster-io] x", "ROSTER_IO"],

@@ -49,6 +49,9 @@ export declare class Fabric {
    *  一步加入：从令牌解析 fabric_id，attach + 兑换 + 持久化名册。
    *  令牌前置检查（解码/过期/地址规范化）先于本地数据面加载与身份句柄消费
    * （D11 冻结顺序：令牌自身错误优先于目录检查）。
+   *  task 2.5：按串前缀分派前置检查——dweb2. 走 v2 precheck（附录 A 全部
+   *  校验含 capability 一致性），v1 路径零变化；后续 join 由内核按同前缀
+   *  分派（OK2 兑换 + member capability 持久化）。
    */
   static joinWithToken(opts: FabricOptions, token: string, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 本节点 EndpointId（z-base-32，52 字符） */
@@ -67,6 +70,14 @@ export declare class Fabric {
   invite(ttlMs: number, recipient?: string | undefined | null, opts?: InviteOptions | undefined | null): Promise<string>
   /** 兑换邀请令牌加入 fabric（issuer-online 单次兑换）。 */
   join(token: string): Promise<void>
+  /**
+   * root 自签 per-relay own capability（server-access-policy task 2.3/2.5）。
+   * 对 relay.relays 中带 serverId 的条目以 root 身份现签（caps 全位、
+   * TTL 180d 上限内）注入本地 RelayMap；静态 token 条目原样注入。
+   * 返回 (url, token) 列表供调用方转交/审计。非 root 调用报名册
+   * root-only 错误（"operation requires root …"，原生变体无前缀）。
+   */
+  ensureRelayCapabilities(): Promise<Array<RelayCapabilityJs>>
   /** 连接成员（常规通道；双向门控 + 名册同步）。幂等（活跃连接直接成功）。 */
   connect(endpointId: string): Promise<void>
   /** 断开与某成员的会话 */
@@ -297,11 +308,40 @@ export interface Member {
 /** SDK 原生层版本 */
 export declare function nativeVersion(): string
 
+/** ensureRelayCapabilities 的返回条目（root 自签/透传的 per-relay 凭证）。 */
+export interface RelayCapabilityJs {
+  /** relay URL（配置原样形态） */
+  url: string
+  /** `dwebr1.` capability 串 */
+  token: string
+}
+
+/**
+ * `relay.relays` 单条条目（server-access-policy task 2.5）：per-relay
+ * capability 凭证配置。`serverId` 与 `token` 二选一或全无——
+ * - `serverId`：restricted relay 的 ServerId（64 hex；admin 注册 owner 时
+ *   转交）——root 据此本地自签 own/bootstrap/member capability
+ *   （`ensureRelayCapabilities` / v2 invite / OK2 附发）；
+ * - `token`：现成 `dwebr1.` capability 串（手工/测试用），原样注入本地
+ *   RelayMap（Authorization: Bearer 头）。
+ * 全无 = 无凭证条目（等价旧 `urls` 形态的对应项）。
+ */
+export interface RelayEntryOptions {
+  /** relay URL（http/https；与 urls 同规构造期校验） */
+  url: string
+  /** restricted relay 的 ServerId（64 hex；None = 非 restricted 条目） */
+  serverId?: string
+  /** 现成 dwebr1. capability 串（None = 无静态凭证） */
+  token?: string
+}
+
 /** relay 配置（判别联合：非法组合构造期拒绝） */
 export type RelayOptions =
   | { mode?: 'n0' }
   | { mode: 'disabled' }
   | { mode: 'custom'; urls: [string, ...string[]] }
+  | { mode: 'custom'; relays: [RelayEntryOptions, ...RelayEntryOptions[]] }
+
 
 /**
  * 会话状态快照（design §3.2 对齐子集）。

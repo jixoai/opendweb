@@ -823,13 +823,58 @@ fn same_relay_url(a: &str, b: &str) -> bool {
     }
 }
 
+/// relay deny reason 提取（task 2.5 透出通道的第一段）：iroh 上游把
+/// `ServerDeniedAuth { reason }` 折进错误链 Display 文本（"The relay denied
+/// our authentication (…)"），本函数按服务端冻结语法
+/// `dweb/[a-z0-9][a-z0-9._-]{0,63}` 从文本中扫描结构化 reason。
+/// reason 由 dweb-server 侧约束生成（ASCII 白名单语法，无凭证/路径段），
+/// 透传不违反 D4 脱敏语义；非 deny 错误返回 None。
+pub(crate) fn extract_deny_reason(err_text: &str) -> Option<&str> {
+    const PREFIX: &str = "dweb/";
+    let bytes = err_text.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = err_text[start..].find(PREFIX) {
+        let at = start + pos;
+        // 词边界：前一个字符不得是 reason 语法字符（拒绝 "adweb/x" 类内嵌
+        // 误命中——deny reason 只以独立 token 出现）
+        let boundary_ok = at == 0 || {
+            let prev = bytes[at - 1];
+            !(prev.is_ascii_alphanumeric() || prev == b'.' || prev == b'_' || prev == b'-')
+        };
+        // reason 主体：首段 [a-z0-9._-]{1,64}（服务端语法整体上限 64 字符）
+        let mut end = at + PREFIX.len();
+        let mut count = 0;
+        while end < bytes.len() && count < 64 {
+            let c = bytes[end];
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'_' || c == b'-' {
+                end += 1;
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        // 至少 1 个合法主体字符（"dweb/" 空 reason 不算）
+        if boundary_ok && count >= 1 {
+            return Some(&err_text[at..end]);
+        }
+        start = at + PREFIX.len();
+    }
+    None
+}
+
 /// 错误脱敏（D4）：仅输出粗粒度错误类别 + relay host，不含 URL 凭证段与完整路径。
+/// server-access-policy task 2.5：`dweb/*` 结构化 deny reason 例外透传——
+/// 受限 relay 拒绝接入时，reason 是排障的唯一信号（no-capability/
+/// capability-expired/not-recipient 语义各不相同），语法由服务端白名单约束。
 fn sanitize_relay_error(err_text: &str) -> String {
     let cleaned: String = err_text
         .chars()
         .filter(|c| c.is_ascii_graphic() || *c == ' ')
         .collect();
     let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(reason) = extract_deny_reason(&cleaned) {
+        return format!("relay denied: {reason}");
+    }
     let lower = cleaned.to_ascii_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
         "connect timeout".to_owned()
@@ -2294,6 +2339,38 @@ impl Fabric {
 
     // ---- 加入与连接 ----
 
+    /// join/connect 拨号错误的 deny reason 附注（task 2.5）：relay watcher 已
+    /// 把 `dweb/*` deny reason 记入快照 last_error（sanitize 例外透传）——
+    /// 拨号失败分类时若存在，附在错误 message 尾部（结构化 reason 是唯一
+    /// 可操作信号：无票/过期/转借的修复路径各不相同，不得折叠进泛化类别）。
+    fn relay_deny_note(&self) -> Option<String> {
+        let snap = self.inner.relay_snapshot.lock().unwrap().clone();
+        snap.last_error
+            .as_deref()
+            .and_then(extract_deny_reason)
+            .map(|r| format!("relay denied: {r}"))
+    }
+
+    /// Connect 错误分类的 deny 附注（task 2.5）：iroh ConnectError 的错误链
+    /// 可能内嵌 relay 握手拒绝文本（`ServerDeniedAuth` Display 折进 reason）；
+    /// 快照侧 watcher 记录可能晚于 connect 失败（首次握手拒绝的竞态窗口），
+    /// 1s 宽限轮询收敛——无 deny 的常规失败最多多等 1s（探针路径同量级）。
+    async fn connect_deny_note(&self, connect_reason: &str) -> Option<String> {
+        if let Some(r) = extract_deny_reason(connect_reason) {
+            return Some(format!("relay denied: {r}"));
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            if let Some(note) = self.relay_deny_note() {
+                return Some(note);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// 兑换邀请令牌（joiner 侧）。成功后本节点是成员且持有完整名册。
     ///
     /// 失败按 D11 分类总函数有序判定（互斥穷尽）：
@@ -2387,6 +2464,15 @@ impl Fabric {
             // connect 立即错误的归因需要探针（不解析 iroh ConnectError 内部）。
             Err(JoinPhaseError::Connect(e)) => {
                 let reason = e.to_string();
+                // task 2.5：relay deny（受限 server 拒接入）优先于探针归因
+                // 附进 message——TCP 探针只会报"端口活着"，deny reason 才是
+                // 真因（无票/过期/转借）
+                if let Some(note) = self.connect_deny_note(&reason).await {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::DialFailed,
+                        message: format!("could not reach the issuer: {reason} ({note})"),
+                    });
+                }
                 if probe_applies(&token, self.inner.proxy_is_none) {
                     let relay_url = token.invite.issuer_relay_url.clone();
                     if !run_relay_probe(&relay_url).await {
@@ -2406,17 +2492,23 @@ impl Fabric {
             }
             Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
             Err(JoinPhaseError::DeadlineElapsed) => {
-                let note = if probe_applies(&token, self.inner.proxy_is_none)
-                    && run_relay_probe(&token.invite.issuer_relay_url).await
-                {
-                    "relay online: issuer likely offline (invites must be redeemed while the \
-                     inviter is running)"
-                        .to_owned()
-                } else {
-                    format!(
+                let note = match &self.relay_deny_note() {
+                    // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
+                    // 静默退避重试，connect 常以超时面落地）
+                    Some(note) => format!(
+                        "join failed to reach the issuer via relay ({note})"
+                    ),
+                    None if probe_applies(&token, self.inner.proxy_is_none)
+                        && run_relay_probe(&token.invite.issuer_relay_url).await =>
+                    {
+                        "relay online: issuer likely offline (invites must be redeemed while the \
+                         inviter is running)"
+                            .to_owned()
+                    }
+                    None => format!(
                         "join deadline exceeded after {}ms",
                         self.inner.join_timeout_ms
-                    )
+                    ),
                 };
                 Err(FabricError::Join {
                     code: JoinErrorCode::DialTimeout,
@@ -2527,6 +2619,14 @@ impl Fabric {
             }
             Err(JoinPhaseError::Connect(e)) => {
                 let reason = e.to_string();
+                // task 2.5：relay deny（受限 server 拒接入，如 bootstrap
+                // capability 过期/转借）优先于探针归因附进 message
+                if let Some(note) = self.connect_deny_note(&reason).await {
+                    return Err(FabricError::Join {
+                        code: JoinErrorCode::DialFailed,
+                        message: format!("could not reach the issuer: {reason} ({note})"),
+                    });
+                }
                 // 探针适用条件同 v1 probe_applies：relay-only 令牌（无直连
                 // 地址）且无代理——直连路径存在时 relay 探针不构成归因依据
                 let probe_applies = !first_relay.is_empty() && token.invite.direct_addrs.is_empty();
@@ -2547,16 +2647,22 @@ impl Fabric {
             }
             Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
             Err(JoinPhaseError::DeadlineElapsed) => {
-                let note = if !first_relay.is_empty()
-                    && token.invite.direct_addrs.is_empty()
-                    && self.inner.proxy_is_none
-                    && run_relay_probe(&first_relay).await
-                {
-                    "relay online: issuer likely offline (invites must be redeemed while the \
+                let note = match &self.relay_deny_note() {
+                    // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
+                    // 静默退避重试，connect 常以超时面落地）
+                    Some(note) => {
+                        format!("join failed to reach the issuer via relay ({note})")
+                    }
+                    None if !first_relay.is_empty()
+                        && token.invite.direct_addrs.is_empty()
+                        && self.inner.proxy_is_none
+                        && run_relay_probe(&first_relay).await =>
+                    {
+                        "relay online: issuer likely offline (invites must be redeemed while the \
                      inviter is running)"
-                        .to_owned()
-                } else {
-                    format!(
+                            .to_owned()
+                    }
+                    None => format!(
                         "join deadline exceeded after {}ms",
                         self.inner.join_timeout_ms
                     )
@@ -3954,6 +4060,46 @@ mod tests {
         assert_eq!(sanitize_relay_error("dns resolution failed"), "dns error");
         assert_eq!(sanitize_relay_error("invalid certificate"), "tls error");
         assert_eq!(sanitize_relay_error(""), "connection error");
+    }
+
+    // ---- task 2.5：deny reason 提取/透传 -------------------------------------------
+
+    #[test]
+    fn extract_deny_reason_scans_structured_tokens() {
+        // iroh ServerDeniedAuth Display 形态（错误链折进文本）
+        assert_eq!(
+            extract_deny_reason("The relay denied our authentication (dweb/no-capability)"),
+            Some("dweb/no-capability")
+        );
+        assert_eq!(
+            extract_deny_reason("handshake: relay denied: dweb/capability-expired, retrying"),
+            Some("dweb/capability-expired")
+        );
+        // 多段 reason（服务端语法允许 . _ -）
+        assert_eq!(
+            extract_deny_reason("x dweb/policy.denied_2-a y"),
+            Some("dweb/policy.denied_2-a")
+        );
+        // 非 deny 文本 / 空 reason / 前缀不完整
+        assert_eq!(extract_deny_reason("tcp connect timed out"), None);
+        assert_eq!(extract_deny_reason("dweb/ (empty reason)"), None);
+        assert_eq!(extract_deny_reason("adweb/no-capability"), None);
+    }
+
+    #[test]
+    fn sanitize_relay_error_passes_deny_reason_through() {
+        // D4 脱敏的 task 2.5 例外：结构化 deny reason 不折叠进泛化类别
+        assert_eq!(
+            sanitize_relay_error(
+                "The relay denied our authentication (dweb/not-recipient)"
+            ),
+            "relay denied: dweb/not-recipient"
+        );
+        // deny 优先于类别映射（含 timeout 字样的 deny 文本）
+        assert_eq!(
+            sanitize_relay_error("denied dweb/capability-expired after timeout"),
+            "relay denied: dweb/capability-expired"
+        );
     }
 
     // ---- HB 3.1 拨号候选合并（learned 不遮蔽 relay，冻结语义） ----------------------

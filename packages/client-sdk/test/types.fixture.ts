@@ -42,12 +42,26 @@ const optsCustom: FabricOptions = {
   advertiseAddrs: ["127.0.0.1:10000"],
   joinTimeoutMs: 60_000,
 };
+// server-access-policy task 2.5：relays 判别分支（per-relay capability；
+// serverId hex64 / token 二选一或全无；与 urls 互斥由 native 构造期拒绝）
+const optsCaps: FabricOptions = {
+  dataDir: "/tmp/dweb-e",
+  relay: {
+    mode: "custom",
+    relays: [
+      { url: "https://relay1.example", serverId: "ab".repeat(32) },
+      { url: "https://relay2.example", token: "dwebr1.material" },
+      { url: "https://relay3.example" },
+    ],
+  },
+};
 const optsDefault: FabricOptions = { dataDir: "/tmp/dweb-d" }; // 全缺省
 
 // 非法形态必须编译失败（取消注释任一行即应红灯——契约的负向形态）：
 // const badProxy: FabricOptions = { dataDir: "x", httpProxy: "socks5" };
 // const badRelay: FabricOptions = { dataDir: "x", relay: { mode: "custom" } }; // 缺 urls
 // const badRelayUrls: FabricOptions = { dataDir: "x", relay: { mode: "custom", urls: [] } }; // 空数组
+// const badBoth: FabricOptions = { dataDir: "x", relay: { mode: "custom", urls: ["https://r"], relays: [{ url: "https://r" }] } }; // 双字段（native 运行期拒）
 
 // ---- Fabric 工厂签名 -------------------------------------------------------------
 
@@ -211,3 +225,5 @@ type ActiveUrlOnEvent = POST_INTEGRATION extends true
 // constraint 'true'" 编译失败——这就是收紧后的门禁。
 
 export type { ActiveUrlOnEvent, ActiveUrlOnStatus };
+
+void optsCaps;
