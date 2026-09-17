@@ -56,25 +56,40 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::fabric::{Fabric, FabricError};
-use crate::identity::{endpoint_id_parse};
+use crate::identity::endpoint_id_parse;
 use crate::session::SessionError;
 
 use super::frame::{self, Direction, Frame, FrameType};
-use super::model::{JournalLimits, JournalError, RecvWindow, SegmentAction, StreamJournal};
+use super::model::{JournalError, JournalLimits, RecvWindow, SegmentAction, StreamJournal};
 use super::state::ConnectionPhase;
 use super::transport::{TransportError, TransportRecv, TransportSend};
 
 pub const PROTOCOL_VERSION: u8 = 1;
 /// gap buffer 容量（§2.7 有界）。
 pub const GAP_CAP: usize = 64;
+/// gap buffer 字节上限（单流）。段数上限不能单独 bound memory，因为每段
+/// 可以接近 MAX_FRAME。
+pub const GAP_BYTE_CAP: usize = 2 * 1024 * 1024;
+/// gap buffer 字节上限（整个 session）。单流上限不能阻止多个 stream
+/// 各自持有大 gap；超限 DATA 按协议违例终结该流，不把数据抛给上层。
+pub const GAP_SESSION_BYTE_CAP: usize = 8 * 1024 * 1024;
 /// 重放每流每轮段数上限（§5：防单流垄断恢复通道）。
 const REPLAY_PER_ROUND: usize = 4;
 /// 交付队列软上限（P0-3 记账面）：超过即「慢消费者」状态。硬上界由发送侧
 /// journal 上限闭合——未消费 ⟹ 未 ACK ⟹ 仍在发送方 journal（2MiB/流、
 /// 8MiB/会话），接收队列因此天然有界，无需丢帧。
 pub const DELIVER_QUEUE_CAP: usize = 256 * 1024;
+/// 交付队列硬上限（单流/会话）。超限按协议违例处置并丢弃数据，绝不把
+/// 恶意 DATA 继续向上层排队造成 OOM；`DELIVER_QUEUE_CAP` 仍是软观测阈值。
+pub const DELIVER_QUEUE_STREAM_CAP: usize = 2 * 1024 * 1024;
+pub const DELIVER_QUEUE_SESSION_CAP: usize = 8 * 1024 * 1024;
 /// 活跃逻辑流上限（design §2.6：超限拒绝 OPEN）。
 pub const MAX_ACTIVE_STREAMS: usize = 128;
+
+/// 单帧发送的取消/超时预算。transition 请求 stop 时会先取消发送；超时
+/// 是 QUIC 实现不及时响应取消的最终有界兜底。
+const SEND_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// RESUME_REJECT reason（design §2.3 冻结表）。
 pub mod reject_reason {
@@ -204,6 +219,15 @@ impl TokenWindow {
     fn current_token_is(&self, token: &[u8; 16]) -> bool {
         &self.current.1 == token
     }
+
+    fn generation_for_token(&self, token: &[u8; 16]) -> Option<u64> {
+        if &self.current.1 == token {
+            return Some(self.current.0);
+        }
+        self.previous
+            .as_ref()
+            .and_then(|(generation, candidate)| (candidate == token).then_some(*generation))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +264,7 @@ impl StreamCtx {
 
     /// 流是否完全终结（名额可回收）：双方向终局 + 本端 journal 已排空。
     fn quota_reapable(&self) -> bool {
-        self.remote_final.is_some()
-            && self.final_sent.is_some()
-            && self.journal.held_bytes() == 0
+        self.remote_final.is_some() && self.final_sent.is_some() && self.journal.held_bytes() == 0
     }
 }
 
@@ -253,16 +275,39 @@ struct DeliverQueue {
     bytes: usize,
 }
 
+/// 恢复裁决值。它是 install CAS 的不可变身份：仅凭 generation/token 不足以
+/// 证明这是当前 decision，因为另一个 nonce 可能已经用 previous 串行胜出。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResumeDecision {
+    nonce: [u8; 16],
+    from_generation: u64,
+    from_token: [u8; 16],
+    result_generation: u64,
+    result_token: [u8; 16],
+    /// ResumeCtl 内单调 lease；不同 nonce 的 previous winner 会 supersede
+    /// 旧 lease，旧 transport 只能半关。
+    lease_id: u64,
+    remote_epoch: u64,
+    cached: bool,
+}
+
 /// 恢复裁决的幂等缓存（R3-1）：胜出 attempt 呈交的 (nonce, 前代凭据) 与
 /// 轮换结果的绑定——同 campaign 重试（OK 丢失）重发缓存结果，不二次轮换。
 struct PendingResume {
-    nonce: [u8; 16],
-    /// 胜出 attempt 呈交的凭据（轮换前）——幂等重发的匹配键。
-    from_generation: u64,
-    from_token: [u8; 16],
-    /// 轮换结果缓存（RESUME_OK 载荷重发值）。
-    result_generation: u64,
-    result_token: [u8; 16],
+    decision: ResumeDecision,
+    /// 成功安装后绑定的 channel owner。安装前为 None，旧 owner 不能在
+    /// supersede 期间提前清理 previous/pending。
+    installed_owner: Option<u64>,
+}
+
+fn decision_matches_pending(pending: &ResumeDecision, decision: &ResumeDecision) -> bool {
+    pending.lease_id == decision.lease_id
+        && pending.nonce == decision.nonce
+        && pending.from_generation == decision.from_generation
+        && pending.from_token == decision.from_token
+        && pending.result_generation == decision.result_generation
+        && pending.result_token == decision.result_token
+        && pending.remote_epoch == decision.remote_epoch
 }
 
 /// 恢复控制（R3-1：**单锁内聚**）——恢复裁决（token 窗口）、phase 迁移、
@@ -282,6 +327,12 @@ struct ResumeCtl {
     /// current/previous 窗口是否仍可用于恢复。与 `tokens.clear_previous`
     /// 在同一把 ResumeCtl 锁内切换，避免确认与下一次 RESUME 交错。
     previous_live: bool,
+    /// 远端在 RESUME_INIT 中声明的 local_connection_epoch，严格单调。
+    last_seen_remote_epoch: u64,
+    /// decision lease 分配器。
+    next_lease: u64,
+    /// token 轮换后等待新 owner 首次确认的 owner。
+    confirmation_owner: Option<u64>,
 }
 
 /// barrier 测试钩子（R3-1，Codex 步骤 6）：`accept_resume` 在**轮换完成、
@@ -305,7 +356,8 @@ impl ResumeGate {
 
     /// 启用并订阅状态（测试面：先订阅再注入，防错过 reached 边沿）。
     pub fn enable(&self) -> tokio::sync::watch::Receiver<u8> {
-        self.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.enabled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.state.subscribe()
     }
 
@@ -321,19 +373,16 @@ impl ResumeGate {
         }
         self.state.send_modify(|v| *v = 1);
         let mut rx = self.state.subscribe();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            async {
-                loop {
-                    if *rx.borrow() >= 2 {
-                        return;
-                    }
-                    if rx.changed().await.is_err() {
-                        return;
-                    }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if *rx.borrow() >= 2 {
+                    return;
                 }
-            },
-        )
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
         .await;
     }
 }
@@ -414,6 +463,9 @@ impl SessionShared {
                 channel: None,
                 pending: None,
                 previous_live: false,
+                last_seen_remote_epoch: 0,
+                next_lease: 0,
+                confirmation_owner: None,
             }),
             frame_gate: tokio::sync::RwLock::new(()),
             channel_transition: tokio::sync::Mutex::new(()),
@@ -460,8 +512,38 @@ impl SessionShared {
         mut send: TransportSend,
         recv: TransportRecv,
         policy: InstallPolicy,
+        decision: Option<ResumeDecision>,
+        expected_generation: Option<u64>,
     ) -> Option<Arc<SessionChannel>> {
         let _transition = self.channel_transition.lock().await;
+
+        // Validate the immutable decision before touching the current channel.
+        // A superseded RESUME can arrive after its OK was sent but before its
+        // transport is installed; it must only close its own candidate stream,
+        // never stop the newer owner that won while this task was suspended.
+        if let Some(decision) = decision {
+            let valid = self
+                .resume_control
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    decision_matches_pending(&pending.decision, &decision)
+                        && (decision.cached || pending.installed_owner.is_none())
+                });
+            if !valid {
+                let _ = send.finish();
+                return None;
+            }
+        }
+        if let Some(expected) = expected_generation {
+            if self.current_generation() != expected {
+                let _ = send.finish();
+                return None;
+            }
+        }
+
         let old = self.current_channel();
         if policy == InstallPolicy::IfVacant {
             if let Some(chan) = old.as_ref() {
@@ -474,23 +556,44 @@ impl SessionShared {
                     return None;
                 }
             }
-            // A RESUME winner has already reserved the owner while its OK is
-            // in flight. A cached duplicate must not become an interim owner
-            // merely because the previous pump has just died.
-            if self.resume_control.lock().unwrap().pending.is_some() {
-                let _ = send.finish();
-                return None;
-            }
         }
         if let Some(chan) = old {
             chan.request_stop();
-            chan.wait_stopped().await;
+            if tokio::time::timeout(STOP_WAIT_TIMEOUT, chan.wait_stopped())
+                .await
+                .is_err()
+            {
+                // A transport implementation which ignores cancellation must
+                // not hold recovery forever. The candidate is closed and no
+                // ownership is committed.
+                let _ = send.finish();
+                return None;
+            }
         }
         // The pump normally drains before this point. The write guard is the
         // final lease barrier for a handler that was between fence and commit.
         let _frame_barrier = self.frame_gate.write().await;
         let epoch = send.epoch;
         let mut ctl = self.resume_control.lock().unwrap();
+        if let Some(expected) = expected_generation {
+            if ctl.tokens.current_generation() != expected {
+                let _ = send.finish();
+                return None;
+            }
+        }
+        if let Some(decision) = decision {
+            let valid = ctl.pending.as_ref().is_some_and(|pending| {
+                decision_matches_pending(&pending.decision, &decision)
+                    && (decision.cached || pending.installed_owner.is_none())
+            });
+            if !valid {
+                // The decision was superseded (usually by a different nonce
+                // using previous) or was already installed. Never let a stale
+                // Force path overwrite the newer owner.
+                let _ = send.finish();
+                return None;
+            }
+        }
         let owner = ctl.channel_owner + 1;
         ctl.channel_owner = owner;
         ctl.active_epoch = epoch;
@@ -507,12 +610,17 @@ impl SessionShared {
             epoch,
             owner,
         });
-        if ctl
-            .channel
-            .as_ref()
-            .is_none_or(|(o, _)| owner > *o)
-        {
+        if ctl.channel.as_ref().is_none_or(|(o, _)| owner > *o) {
             ctl.channel = Some((owner, Arc::downgrade(&chan)));
+        }
+        if let Some(decision) = decision {
+            if let Some(pending) = ctl.pending.as_mut() {
+                debug_assert_eq!(pending.decision.lease_id, decision.lease_id);
+                pending.installed_owner = Some(owner);
+            }
+        }
+        if ctl.previous_live {
+            ctl.confirmation_owner = Some(owner);
         }
         Some(chan)
     }
@@ -523,8 +631,14 @@ impl SessionShared {
         if ctl.tokens.current() == (new_generation, new_token) {
             return;
         }
+        // A late RESUME_OK must never move credentials backwards. The caller
+        // treats this as a stale response and will not install its transport.
+        if new_generation <= ctl.tokens.current_generation() {
+            return;
+        }
         ctl.tokens.rotate(new_generation, new_token);
         ctl.previous_live = true;
+        ctl.confirmation_owner = None;
     }
 
     fn current_token(&self) -> (u64, [u8; 16]) {
@@ -540,6 +654,24 @@ impl SessionShared {
             .current_generation()
     }
 
+    fn last_seen_remote_epoch(&self) -> u64 {
+        self.resume_control.lock().unwrap().last_seen_remote_epoch
+    }
+
+    /// Record the epoch carried by SESSION_INIT. Equal epochs are idempotent;
+    /// a lower one is stale and must not replace a newer peer connection.
+    fn observe_remote_epoch(&self, epoch: u64) -> bool {
+        if epoch == 0 {
+            return false;
+        }
+        let mut ctl = self.resume_control.lock().unwrap();
+        if epoch < ctl.last_seen_remote_epoch {
+            return false;
+        }
+        ctl.last_seen_remote_epoch = epoch;
+        true
+    }
+
     /// RESUME 原子裁决（R3-1：裁决+轮换+pending 记账在同一 ResumeCtl
     /// 临界区）：
     /// - nonce+凭据命中 pending（轮换已发生、新通道未确认——OK-lost 重试
@@ -547,32 +679,105 @@ impl SessionShared {
     /// - 否则按当前窗口裁决：current 或 previous 均可精确匹配；只有同一
     ///   nonce+来源凭据才是缓存重发。不同 campaign 即使使用 previous，也
     ///   是新的串行 winner，由 transition/owner lease 收口。
-    /// 返回 (generation, token, cached)。
+    /// 返回一个绑定 nonce/generation/epoch 的 decision。`decide_resume` 保留
+    /// 无 epoch 的单测便利面；生产入口使用 `decide_resume_with_epoch`。
+    #[cfg(test)]
     fn decide_resume(
         &self,
         nonce: [u8; 16],
         generation: u64,
         token: &[u8; 16],
         new_token: [u8; 16],
-    ) -> Option<(u64, [u8; 16], bool)> {
+    ) -> Option<ResumeDecision> {
+        self.decide_resume_with_epoch(nonce, generation, token, new_token, 0)
+    }
+
+    fn decide_resume_with_epoch(
+        &self,
+        nonce: [u8; 16],
+        generation: u64,
+        token: &[u8; 16],
+        new_token: [u8; 16],
+        remote_epoch: u64,
+    ) -> Option<ResumeDecision> {
         let mut ctl = self.resume_control.lock().unwrap();
+        // The frozen RESUME_INIT wire carries connection epochs, not a second
+        // token-generation field. Resolve the generation from the exact token
+        // in the two-generation window; the epoch-less unit-test facade keeps
+        // accepting its explicit generation hint.
+        let effective_generation = if remote_epoch != 0 {
+            ctl.tokens.generation_for_token(token)?
+        } else {
+            generation
+        };
         if let Some(p) = &ctl.pending {
-            if p.nonce == nonce && p.from_generation == generation && &p.from_token == token {
-                return Some((p.result_generation, p.result_token, true));
+            if p.decision.nonce == nonce
+                && p.decision.from_generation == effective_generation
+                && &p.decision.from_token == token
+                && (remote_epoch == 0 || p.decision.remote_epoch == remote_epoch)
+            {
+                let mut cached = p.decision;
+                cached.cached = true;
+                return Some(cached);
             }
         }
-        let Some((g, t)) = ctl.tokens.try_rotate(generation, token, new_token) else {
+        if remote_epoch != 0 {
+            if remote_epoch < ctl.last_seen_remote_epoch {
+                return None;
+            }
+        }
+        let Some((g, t)) = ctl
+            .tokens
+            .try_rotate(effective_generation, token, new_token)
+        else {
             return None;
         };
-        ctl.pending = Some(PendingResume {
+        ctl.next_lease = ctl.next_lease.saturating_add(1);
+        let decision = ResumeDecision {
             nonce,
-            from_generation: generation,
+            from_generation: effective_generation,
             from_token: *token,
             result_generation: g,
             result_token: t,
+            lease_id: ctl.next_lease,
+            remote_epoch,
+            cached: false,
+        };
+        ctl.pending = Some(PendingResume {
+            decision,
+            installed_owner: None,
         });
+        if remote_epoch != 0 {
+            ctl.last_seen_remote_epoch = remote_epoch;
+        }
         ctl.previous_live = true;
-        Some((g, t, false))
+        ctl.confirmation_owner = None;
+        Some(decision)
+    }
+
+    fn resume_epoch_is_stale(
+        &self,
+        nonce: [u8; 16],
+        generation: u64,
+        token: &[u8; 16],
+        remote_epoch: u64,
+    ) -> bool {
+        let ctl = self.resume_control.lock().unwrap();
+        let effective_generation = if remote_epoch != 0 {
+            ctl.tokens.generation_for_token(token).unwrap_or(generation)
+        } else {
+            generation
+        };
+        if let Some(pending) = &ctl.pending {
+            if pending.decision.nonce == nonce
+                && pending.decision.from_generation == effective_generation
+                && &pending.decision.from_token == token
+                && (remote_epoch == 0 || pending.decision.remote_epoch == remote_epoch)
+            {
+                return false;
+            }
+        }
+        remote_epoch != 0 && remote_epoch < ctl.last_seen_remote_epoch
     }
 
     /// SESSION_INIT 幂等裁决用：INIT token 与登记代是否一致。
@@ -587,12 +792,19 @@ impl SessionShared {
     /// 新代确认（R3-1c / P1-5 / design §2.3.0 R5）：新代首次成功 Deliver 或
     /// 合法 ACK 推进 → pending 幂等缓存与 previous 代在 ResumeCtl 同一临界区
     /// 内清除（R2 的 clear_previous 与 rotate 交错竞态由此闭合）。
-    fn note_confirmed(&self) {
+    fn note_confirmed(&self, owner: Option<u64>) {
         let mut ctl = self.resume_control.lock().unwrap();
-        if ctl.previous_live {
+        let owner_matches = owner.is_some_and(|owner| {
+            ctl.channel_owner == owner && ctl.confirmation_owner == Some(owner)
+        });
+        // The owner-less path is retained only for the in-module model tests;
+        // every production pump supplies its channel owner. This keeps the
+        // old pure-state tests useful without reopening the old-pump race.
+        if ctl.previous_live && (owner_matches || owner.is_none()) {
             ctl.pending = None;
             ctl.tokens.clear_previous();
             ctl.previous_live = false;
+            ctl.confirmation_owner = None;
         }
     }
 
@@ -834,7 +1046,11 @@ impl SessionShared {
     /// P0-3：先聚合**全部流** held_bytes 做 session 级字节上限检查
     /// （`max_session_bytes`），再走单流 journal 检查。
     /// R3-4d：session 级段数上限（4096——聚合全部流段计数；design §2.6 表）。
-    pub(crate) async fn record_send(&self, stream_id: u64, payload: &Bytes) -> Result<u64, FabricError> {
+    pub(crate) async fn record_send(
+        &self,
+        stream_id: u64,
+        payload: &Bytes,
+    ) -> Result<u64, FabricError> {
         let mut streams = self.streams.lock().await;
         let session_held: usize = streams.values().map(|c| c.journal.held_bytes()).sum();
         if session_held + payload.len() > self.limits.max_session_bytes {
@@ -868,16 +1084,15 @@ impl SessionShared {
     /// （双向终局 + journal 排空）后自然回收）。
     async fn reserve_stream_slot(&self, stream_id: u64) -> Result<(), FabricError> {
         let mut streams = self.streams.lock().await;
-        let active = streams
-            .values()
-            .filter(|c| !c.quota_reapable())
-            .count();
+        let active = streams.values().filter(|c| !c.quota_reapable()).count();
         if active >= MAX_ACTIVE_STREAMS {
             return Err(FabricError::Session(SessionError::Connect(format!(
                 "active stream cap exceeded: {active} >= {MAX_ACTIVE_STREAMS}"
             ))));
         }
-        streams.entry(stream_id).or_insert_with(|| StreamCtx::new(stream_id, self.limits));
+        streams
+            .entry(stream_id)
+            .or_insert_with(|| StreamCtx::new(stream_id, self.limits));
         Ok(())
     }
 
@@ -887,6 +1102,10 @@ impl SessionShared {
     /// R3-4：入站资源门——direction/奇偶校验（§2.2）、未见流帧丢弃、
     /// OPEN 原子预占 128 名额、终结流幂等丢弃（§2.7 规则 4）。
     async fn handle_frame(&self, f: &Frame) -> FrameOutcome {
+        self.handle_frame_with_owner(f, None).await
+    }
+
+    async fn handle_frame_with_owner(&self, f: &Frame, owner: Option<u64>) -> FrameOutcome {
         if f.session_id != self.session_id {
             self.stale_frame_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -929,6 +1148,9 @@ impl SessionShared {
             FrameType::Data => {
                 let sid = self.resolve_stream(f.stream_id).await;
                 let mut streams = self.streams.lock().await;
+                let session_gap_bytes = streams.values().fold(0usize, |total, ctx| {
+                    total.saturating_add(ctx.recv.gap_bytes())
+                });
                 // R3-4b：未见过的流（无 OPEN 预占/非本端发送流）不 or_insert
                 // ——违规计数丢弃，恶意/失常对端无法凭 DATA 无限造流。
                 let Some(ctx) = streams.get_mut(&sid) else {
@@ -938,37 +1160,81 @@ impl SessionShared {
                 };
                 // §2.7 规则 4 语义：已终结流的越界 DATA（超出已宣告 final
                 // offset）违规丢弃；final 内的重复段走下方正常去重幂等。
+                let Some(frame_end) = f.byte_offset.checked_add(f.payload.len() as u64) else {
+                    drop(streams);
+                    self.count_violation();
+                    return FrameOutcome {
+                        reply: Some(mk_reset(self.session_id, sid, self.send_direction())),
+                        new_open: None,
+                    };
+                };
                 if let Some(final_off) = ctx.remote_final {
-                    if f.byte_offset + f.payload.len() as u64 > final_off {
+                    if frame_end > final_off {
                         drop(streams);
                         self.count_violation();
                         return FrameOutcome::drop();
                     }
                 }
-                let action = ctx.recv.feed(f.byte_offset, f.payload.clone(), GAP_CAP);
+                let incoming_gap_bytes = ctx.recv.incoming_gap_bytes(f.byte_offset, &f.payload);
+                if session_gap_bytes.saturating_add(incoming_gap_bytes) > GAP_SESSION_BYTE_CAP {
+                    // Session-level gap memory is a hard protocol boundary. The
+                    // frame is rejected before RecvWindow insertion; terminate
+                    // this logical stream and never surface attacker-controlled
+                    // bytes to an unbounded application queue.
+                    ctx.remote_final = Some(ctx.recv.expected_offset());
+                    drop(streams);
+                    self.count_violation();
+                    return FrameOutcome {
+                        reply: Some(mk_reset(self.session_id, sid, self.send_direction())),
+                        new_open: None,
+                    };
+                }
+                let action = ctx.recv.feed_with_limits(
+                    f.byte_offset,
+                    f.payload.clone(),
+                    GAP_CAP,
+                    GAP_BYTE_CAP,
+                );
                 match action {
                     Ok(SegmentAction::Deliver(payload)) => {
                         // P0-3 commit point：ACK 只携带应用消费水位
                         // （committed_offset——DATA 入队不推进）
-                        let ack = mk_ack(
-                            self.session_id,
-                            sid,
-                            f.direction,
-                            ctx.committed_offset,
-                        );
+                        let ack = mk_ack(self.session_id, sid, f.direction, ctx.committed_offset);
                         if ctx.committed_offset > ctx.last_acked_offset {
                             ctx.last_acked_offset = ctx.committed_offset;
                         }
                         drop(streams);
                         let queued_len = payload.len();
                         let mut q = self.delivered.lock().await;
+                        let session_bytes: usize = q.values().map(|queue| queue.bytes).sum();
+                        let stream_bytes = q.get(&sid).map(|queue| queue.bytes).unwrap_or(0);
+                        if stream_bytes.saturating_add(queued_len) > DELIVER_QUEUE_STREAM_CAP
+                            || session_bytes.saturating_add(queued_len) > DELIVER_QUEUE_SESSION_CAP
+                        {
+                            drop(q);
+                            // DATA has already crossed the receive window, so
+                            // terminate this logical stream and count a
+                            // protocol violation. The payload is intentionally
+                            // dropped: bounded memory is preferable to
+                            // surfacing an OOM-prone unbounded queue.
+                            let mut streams = self.streams.lock().await;
+                            if let Some(ctx) = streams.get_mut(&sid) {
+                                ctx.remote_final = Some(ctx.recv.expected_offset());
+                            }
+                            drop(streams);
+                            self.count_violation();
+                            return FrameOutcome {
+                                reply: Some(mk_reset(self.session_id, sid, self.send_direction())),
+                                new_open: None,
+                            };
+                        }
                         let dq = q.entry(sid).or_default();
                         dq.frames.push_back(payload);
                         dq.bytes += queued_len;
                         drop(q);
                         self.delivered_notify.notify_waiters();
                         // 新代首次成功交付 → pending/previous 失效（R3-1c）
-                        self.note_confirmed();
+                        self.note_confirmed(owner);
                         FrameOutcome {
                             reply: Some(ack),
                             new_open: None,
@@ -977,12 +1243,7 @@ impl SessionShared {
                     Ok(SegmentAction::Duplicate) => {
                         // 幂等丢弃；仍回 ACK（对端可能未收到上次 ACK）——值恒为
                         // committed（消费水位）
-                        let ack = mk_ack(
-                            self.session_id,
-                            sid,
-                            f.direction,
-                            ctx.committed_offset,
-                        );
+                        let ack = mk_ack(self.session_id, sid, f.direction, ctx.committed_offset);
                         if ctx.committed_offset > ctx.last_acked_offset {
                             ctx.last_acked_offset = ctx.committed_offset;
                         }
@@ -1026,7 +1287,7 @@ impl SessionShared {
                     } else {
                         ctx.journal.advance_ack(f.byte_offset);
                         // 新代首次合法 ACK → pending/previous 失效（R3-1c）
-                        self.note_confirmed();
+                        self.note_confirmed(owner);
                     }
                 } else {
                     // R3-4b：未见过的流的 ACK——违规计数丢弃
@@ -1047,7 +1308,14 @@ impl SessionShared {
                     self.count_violation();
                     return FrameOutcome::drop();
                 };
-                let incoming_final = f.byte_offset + f.payload.len() as u64;
+                let Some(incoming_final) = f.byte_offset.checked_add(f.payload.len() as u64) else {
+                    drop(streams);
+                    self.count_violation();
+                    return FrameOutcome {
+                        reply: Some(mk_reset(self.session_id, sid, self.send_direction())),
+                        new_open: None,
+                    };
+                };
                 // §2.7 规则 4：已终结流——相同 terminal 幂等丢弃；不同
                 // final offset 视为协议错误（计数丢弃）
                 if let Some(existing) = ctx.remote_final {
@@ -1088,10 +1356,7 @@ impl SessionShared {
                     }
                 } else if canonical != f.stream_id {
                     // P1-4：同幂等键不同 stream_id → 建立 canonical 别名
-                    self.aliases
-                        .lock()
-                        .await
-                        .insert(f.stream_id, canonical);
+                    self.aliases.lock().await.insert(f.stream_id, canonical);
                     FrameOutcome {
                         reply: None,
                         new_open: None,
@@ -1168,7 +1433,15 @@ impl SessionShared {
         let mut streams = self.streams.lock().await;
         for s in summaries {
             if let Some(ctx) = streams.get_mut(&s.stream_id) {
-                ctx.journal.advance_ack(s.recv_ack);
+                // Reuse the normal forged-ACK upper-bound rule for recovery
+                // summaries. A peer cannot release journal bytes by claiming
+                // an offset beyond what this side actually sent.
+                if s.recv_ack > ctx.journal.next_offset() {
+                    self.ack_violation_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    ctx.journal.advance_ack(s.recv_ack);
+                }
             }
         }
     }
@@ -1228,7 +1501,7 @@ impl SessionShared {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamSummary {
     pub stream_id: u64,
     pub recv_ack: u64,
@@ -1410,7 +1683,7 @@ impl SessionChannel {
         recv: TransportRecv,
         policy: InstallPolicy,
     ) -> Option<Arc<Self>> {
-        shared.install_channel(send, recv, policy).await
+        shared.install_channel(send, recv, policy, None, None).await
     }
 
     /// 通道是否已终结（pump 退出）——IfVacant 策略的存活判定。
@@ -1419,7 +1692,8 @@ impl SessionChannel {
     }
 
     fn request_stop(&self) {
-        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.stop_notify.notify_waiters();
     }
 
@@ -1448,7 +1722,24 @@ impl SessionChannel {
     }
 
     pub async fn send_frame(&self, f: &Frame) -> Result<(), FabricError> {
-        self.send.lock().await.send(f).await.map_err(map_transport_err)
+        let mut send = self.send.lock().await;
+        // Register the stop waiter before the atomic recheck. A transition
+        // can therefore cancel a QUIC write blocked by peer flow control.
+        let stop = self.stop_notify.notified();
+        tokio::pin!(stop);
+        stop.as_mut().enable();
+        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(map_transport_err(TransportError::Ended));
+        }
+        let result = tokio::time::timeout(SEND_FRAME_TIMEOUT, async {
+            tokio::select! {
+                _ = stop.as_mut() => Err(TransportError::Ended),
+                result = send.send(f) => result,
+            }
+        })
+        .await
+        .map_err(|_| map_transport_err(TransportError::Io("send frame timeout".into())))?;
+        result.map_err(map_transport_err)
     }
 
     /// 发送数据（journal 前置闸门 → DATA 帧）。
@@ -1492,16 +1783,20 @@ impl SessionChannel {
     /// 开新逻辑流（OPEN 帧；幂等键供对端副作用归并）。
     pub async fn open_stream(&self, idem_key: &str) -> Result<u64, FabricError> {
         let stream_id = self.shared.alloc_stream_id();
-        let open_json = format!(
-            "{{\"requestId\":\"{stream_id}\",\"idempotencyKey\":\"{idem_key}\"}}"
-        );
-        self.send_open(stream_id, idem_key, Bytes::from(open_json)).await?;
+        let open_json =
+            format!("{{\"requestId\":\"{stream_id}\",\"idempotencyKey\":\"{idem_key}\"}}");
+        self.send_open(stream_id, idem_key, Bytes::from(open_json))
+            .await?;
         Ok(stream_id)
     }
 
     /// 开新逻辑流（OPEN payload 全量由调用方给出——HTTP 引擎携带 §2.4
     /// 元数据；payload 原样上 wire，requestId 由调用方自定）。
-    pub async fn open_stream_raw(&self, idem_key: &str, payload: Bytes) -> Result<u64, FabricError> {
+    pub async fn open_stream_raw(
+        &self,
+        idem_key: &str,
+        payload: Bytes,
+    ) -> Result<u64, FabricError> {
         let stream_id = self.shared.alloc_stream_id();
         self.send_open(stream_id, idem_key, payload).await?;
         Ok(stream_id)
@@ -1621,23 +1916,32 @@ impl SessionChannel {
     /// control reply, so a channel transition cannot replace the owner in the
     /// middle of this dispatch.
     async fn dispatch_frame(&self, f: &Frame) -> Result<(), FabricError> {
-        let _frame_lease = self.shared.frame_gate.read().await;
-        if !self.is_current() {
-            self.shared
-                .stale_frame_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(());
-        }
-        let outcome = self.shared.handle_frame(f).await;
-        if let Some(stream_id) = outcome.new_open {
-            self.arrivals.lock().await.push_back(stream_id);
-            self.arrivals_notify.notify_waiters();
-        }
+        // The read lease covers the fence check and semantic commit only.
+        // Reply writes are deliberately outside it: QUIC flow control must not
+        // prevent a transition from draining the old pump.
+        let outcome = {
+            let _frame_lease = self.shared.frame_gate.read().await;
+            if !self.is_current() {
+                self.shared
+                    .stale_frame_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            let outcome = self
+                .shared
+                .handle_frame_with_owner(f, Some(self.owner))
+                .await;
+            if let Some(stream_id) = outcome.new_open {
+                self.arrivals.lock().await.push_back(stream_id);
+                self.arrivals_notify.notify_waiters();
+            }
+            outcome
+        };
         if let Some(ctrl) = outcome.reply {
             if let Err(e) = self.send_frame(&ctrl).await {
                 // Connection death also enters Recovering (the receive side
                 // may never run again), but only while this channel remains
-                // the winner under the same frame lease.
+                // the winner. A newer owner cannot be pulled back to recovery.
                 if self.is_current() {
                     self.shared.set_phase(SessionPhase::Recovering).await;
                 }
@@ -1672,6 +1976,18 @@ pub struct Session {
     pump: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            channel: std::sync::RwLock::new(self.channel.read().unwrap().clone()),
+            // The pump is owned by the original handle. Clones are sending /
+            // receiving views and must never abort or double-join that task.
+            pump: std::sync::Mutex::new(None),
+        }
+    }
+}
+
 impl Session {
     pub fn shared(&self) -> &Arc<SessionShared> {
         &self.shared
@@ -1695,11 +2011,7 @@ impl Session {
 
     /// 记录发送段（journal 一次；引擎断线重发用——定 offset 裸帧重发由
     /// [`Session::send_data_at`] 承接，对端 RecvWindow 去重闭合）。
-    pub async fn prepare_send(
-        &self,
-        stream_id: u64,
-        payload: &Bytes,
-    ) -> Result<u64, FabricError> {
+    pub async fn prepare_send(&self, stream_id: u64, payload: &Bytes) -> Result<u64, FabricError> {
         self.shared.record_send(stream_id, payload).await
     }
 
@@ -1795,10 +2107,7 @@ impl Session {
 /// 并发 INIT 败方收敛（R3-3c）：从本地注册表采纳 canonical 会话——等待
 /// 本端 accept 侧把胜方 INIT 登记进注册表并装好通道，返回复用句柄
 /// （不重复 pump；发送面经 shared 解析当前代通道）。
-async fn adopt_session(
-    fabric: &Fabric,
-    canonical: [u8; 16],
-) -> Result<Session, FabricError> {
+async fn adopt_session(fabric: &Fabric, canonical: [u8; 16]) -> Result<Session, FabricError> {
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
         if let Some(shared) = fabric.inner.continuity_sessions.get(&canonical).await {
@@ -1834,6 +2143,8 @@ pub(crate) enum InitAdmission {
     /// 同 sid 但 token 不符（伪造/竞态）→ REJECT 0x02 MALFORMED（INIT 表
     /// ——数值与旧 TOKEN_INVALID 相同，语义按 §2.3.0 冻结表）。
     TokenMismatch,
+    /// session 已进入 tombstone（dead/closed）；旧凭据不可重新建会话。
+    TokenRevoked,
     /// 同 peer 已有 canonical 会话，当前 INIT 是败方。
     Canonical(Arc<SessionShared>),
     /// 新候选按全序胜出，旧的 negotiating shared 已从 per-peer index 撤回。
@@ -1847,11 +2158,17 @@ struct RegistryEntry {
     initiator: Option<crate::identity::EndpointId>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SessionTombstone;
+
 #[derive(Default)]
 struct RegistryState {
     sessions: HashMap<[u8; 16], RegistryEntry>,
     /// per-peer canonical index，保证同 peer 不并存不同 session。
     peers: HashMap<String, [u8; 16]>,
+    /// terminal session 的撤销锚。新 sid 可复用该 peer；旧 sid 的 RESUME
+    /// 明确返回 TOKEN_REVOKED，而不是把状态丢失误报 REQUEST_STATE_LOST。
+    tombstones: HashMap<[u8; 16], SessionTombstone>,
 }
 
 #[derive(Default)]
@@ -1859,9 +2176,37 @@ pub struct SessionRegistry {
     inner: tokio::sync::Mutex<RegistryState>,
 }
 
+pub(crate) enum ResumeLookup {
+    Active(Arc<SessionShared>),
+    Revoked,
+    Missing,
+}
+
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn reap_terminal(state: &mut RegistryState) {
+        let terminal: Vec<[u8; 16]> = state
+            .sessions
+            .iter()
+            .filter_map(|(sid, entry)| {
+                matches!(
+                    entry.shared.phase_sync(),
+                    SessionPhase::Dead | SessionPhase::Closed
+                )
+                .then_some(*sid)
+            })
+            .collect();
+        for sid in terminal {
+            if let Some(entry) = state.sessions.remove(&sid) {
+                if state.peers.get(&entry.shared.peer_id) == Some(&sid) {
+                    state.peers.remove(&entry.shared.peer_id);
+                }
+                state.tombstones.insert(sid, SessionTombstone);
+            }
+        }
     }
 
     /// Test-only legacy admission helper; production INIT uses the ordered
@@ -1875,6 +2220,10 @@ impl SessionRegistry {
         limits: JournalLimits,
     ) -> InitAdmission {
         let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        if state.tombstones.contains_key(&session_id) {
+            return InitAdmission::TokenRevoked;
+        }
         if let Some(existing) = state.sessions.get(&session_id) {
             if existing.shared.peer_id != peer_id {
                 return InitAdmission::PeerMismatch;
@@ -1908,6 +2257,10 @@ impl SessionRegistry {
         limits: JournalLimits,
     ) -> InitAdmission {
         let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        if state.tombstones.contains_key(&session_id) {
+            return InitAdmission::TokenRevoked;
+        }
         if let Some(existing) = state.sessions.get(&session_id) {
             if existing.shared.peer_id != peer_id {
                 return InitAdmission::PeerMismatch;
@@ -1928,7 +2281,10 @@ impl SessionRegistry {
                 if !incoming_wins {
                     return InitAdmission::Canonical(Arc::clone(&existing.shared));
                 }
-                replaced = state.sessions.remove(&canonical_sid).map(|entry| entry.shared);
+                replaced = state
+                    .sessions
+                    .remove(&canonical_sid)
+                    .map(|entry| entry.shared);
                 state.peers.remove(&peer_id);
             }
         }
@@ -1955,14 +2311,27 @@ impl SessionRegistry {
         shared: Arc<SessionShared>,
         peer_id: String,
         initiator: crate::identity::EndpointId,
-    ) {
+    ) -> (Arc<SessionShared>, bool) {
         let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        if let Some(&canonical_sid) = state.peers.get(&peer_id) {
+            if let Some(existing) = state.sessions.get(&canonical_sid) {
+                return (Arc::clone(&existing.shared), false);
+            }
+            // Defensive cleanup for an index left behind by an interrupted
+            // admission; the next caller may safely become the owner.
+            state.peers.remove(&peer_id);
+        }
         let sid = shared.session_id;
-        state.sessions.entry(sid).or_insert(RegistryEntry {
-            shared,
-            initiator: Some(initiator),
-        });
-        state.peers.entry(peer_id).or_insert(sid);
+        state.sessions.insert(
+            sid,
+            RegistryEntry {
+                shared: Arc::clone(&shared),
+                initiator: Some(initiator),
+            },
+        );
+        state.peers.insert(peer_id, sid);
+        (shared, true)
     }
 
     pub(crate) async fn remove_if(&self, session_id: &[u8; 16]) {
@@ -1970,20 +2339,55 @@ impl SessionRegistry {
         let Some(entry) = state.sessions.remove(session_id) else {
             return;
         };
+        // Wake local single-flight waiters before dropping the registry entry;
+        // they can then retry with a new session instead of waiting forever on
+        // a removed Negotiating shared state.
+        entry.shared.set_phase_sync(SessionPhase::Dead);
+        // Explicit removal is still terminal: retain a revocation anchor so a
+        // late INIT/RESUME for the superseded sid cannot recreate the ghost
+        // session while a new sid for the same peer is admitted normally.
+        state.tombstones.insert(*session_id, SessionTombstone);
         if state.peers.get(&entry.shared.peer_id) == Some(session_id) {
             state.peers.remove(&entry.shared.peer_id);
         }
     }
 
     pub(crate) async fn get(&self, session_id: &[u8; 16]) -> Option<Arc<SessionShared>> {
-        self.inner
-            .lock()
-            .await
+        let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        state
             .sessions
             .get(session_id)
             .map(|entry| Arc::clone(&entry.shared))
     }
 
+    pub(crate) async fn lookup_resume(&self, session_id: &[u8; 16]) -> ResumeLookup {
+        let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        if let Some(entry) = state.sessions.get(session_id) {
+            return ResumeLookup::Active(Arc::clone(&entry.shared));
+        }
+        if state.tombstones.contains_key(session_id) {
+            ResumeLookup::Revoked
+        } else {
+            ResumeLookup::Missing
+        }
+    }
+
+    /// Find an existing local session for a peer. Negotiating is included so
+    /// concurrent `open_session` calls wait on the first campaign instead of
+    /// allocating a second sid.
+    pub(crate) async fn reusable_for_peer(&self, peer_id: &str) -> Option<Arc<SessionShared>> {
+        let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        let sid = *state.peers.get(peer_id)?;
+        let entry = state.sessions.get(&sid)?;
+        (!matches!(
+            entry.shared.phase_sync(),
+            SessionPhase::Dead | SessionPhase::Closed
+        ))
+        .then(|| Arc::clone(&entry.shared))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2068,12 +2472,13 @@ pub fn decode_session_init_reject(p: &[u8]) -> Option<(u8, [u8; 16], u64, u64)> 
 }
 
 /// RESUME_INIT payload：
-/// [ver u8][flags u8][count u16][local_gen u64][last_seen_gen u64][nonce 16]
-/// [token_len u16=16][token 16] + count × [sid u64][dir u8][rsv u8][rsv2 u16]
+/// [ver u8][flags u8][count u16][local_connection_epoch u64]
+/// [last_seen_remote_epoch u64][nonce 16][token_len u16=16][token 16]
+/// + count × [sid u64][dir u8][flags u8][reserved u16]
 /// [recv_ack u64][send_next u64][final_sent u64（无终局 = u64::MAX）]。
 pub fn encode_resume_init(
-    generation: u64,
-    last_seen_generation: u64,
+    local_connection_epoch: u64,
+    last_seen_remote_epoch: u64,
     nonce: &[u8; 16],
     token: &[u8; 16],
     summaries: &[StreamSummary],
@@ -2082,8 +2487,8 @@ pub fn encode_resume_init(
     p.push(PROTOCOL_VERSION);
     p.push(0);
     p.extend_from_slice(&(summaries.len() as u16).to_be_bytes());
-    put_u64(&mut p, generation);
-    put_u64(&mut p, last_seen_generation);
+    put_u64(&mut p, local_connection_epoch);
+    put_u64(&mut p, last_seen_remote_epoch);
     p.extend_from_slice(nonce);
     p.extend_from_slice(&(token.len() as u16).to_be_bytes());
     p.extend_from_slice(token);
@@ -2101,6 +2506,10 @@ pub fn encode_resume_init(
 
 /// 解析后的 RESUME_INIT。
 pub struct ResumeInitParsed {
+    pub local_connection_epoch: u64,
+    pub last_seen_remote_epoch: u64,
+    /// Deprecated aliases retained for consumers compiled against the R4
+    /// generation-named fields. They carry the exact same wire values.
     pub local_generation: u64,
     pub last_seen_generation: u64,
     pub nonce: [u8; 16],
@@ -2116,18 +2525,24 @@ pub fn decode_resume_init(p: &[u8]) -> Option<ResumeInitParsed> {
     if p.len() < 38 || p[0] != PROTOCOL_VERSION {
         return None;
     }
+    if p[1] != 0 {
+        return None;
+    }
     let count = u16::from_be_bytes([p[2], p[3]]) as usize;
-    let local_generation = get_u64(p, 4)?;
-    let last_seen_generation = get_u64(p, 12)?;
+    let local_connection_epoch = get_u64(p, 4)?;
+    let last_seen_remote_epoch = get_u64(p, 12)?;
     let mut nonce = [0u8; 16];
     nonce.copy_from_slice(&p[20..36]);
     let token_len = u16::from_be_bytes([p[36], p[37]]) as usize;
     let summaries_at = 54usize.checked_add(count.checked_mul(36)?)?;
-    if token_len != 16 || p.len() < summaries_at {
+    if token_len != 16 || p.len() != summaries_at || local_connection_epoch == 0 {
         return None;
     }
     let mut token = [0u8; 16];
     token.copy_from_slice(&p[38..54]);
+    if token == [0u8; 16] {
+        return None;
+    }
     let mut summaries = Vec::with_capacity(count);
     let mut at = 54;
     for _ in 0..count {
@@ -2137,6 +2552,9 @@ pub fn decode_resume_init(p: &[u8]) -> Option<ResumeInitParsed> {
         let mut sid = [0u8; 8];
         sid.copy_from_slice(&p[at..at + 8]);
         let stream_id = u64::from_be_bytes(sid);
+        if stream_id == 0 || p[at + 10] != 0 || p[at + 11] != 0 {
+            return None;
+        }
         let recv_ack = get_u64(p, at + 12)?;
         let send_next = get_u64(p, at + 20)?;
         let final_raw = get_u64(p, at + 28)?;
@@ -2149,36 +2567,136 @@ pub fn decode_resume_init(p: &[u8]) -> Option<ResumeInitParsed> {
         at += 36;
     }
     Some(ResumeInitParsed {
-        local_generation,
-        last_seen_generation,
+        local_connection_epoch,
+        last_seen_remote_epoch,
+        local_generation: local_connection_epoch,
+        last_seen_generation: last_seen_remote_epoch,
         nonce,
         token,
         summaries,
     })
 }
 
-/// RESUME_OK payload：[accepted sid 16][new_generation u64][new_token 16][status u16]。
+/// RESUME_OK full payload：[accepted sid 16][accepted_epoch u64]
+/// [peer_epoch u64][new_generation u64][new_token 16][replay_count u16]
+/// [status_flags u16] + replay summaries (36B each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeOkParsed {
+    pub accepted_session_id: [u8; 16],
+    pub accepted_epoch: u64,
+    pub peer_epoch: u64,
+    pub new_generation: u64,
+    pub new_resume_token: [u8; 16],
+    pub replay_stream_count: u16,
+    pub status_flags: u16,
+    pub replay_summaries: Vec<StreamSummary>,
+}
+
+/// Encode the complete RESUME_OK payload. `replay_summaries` is a bounded
+/// snapshot of the sender's outstanding streams, not an unbounded journal dump.
+pub fn encode_resume_ok_full(
+    session_id: &[u8; 16],
+    accepted_epoch: u64,
+    peer_epoch: u64,
+    new_generation: u64,
+    new_token: &[u8; 16],
+    replay_summaries: &[StreamSummary],
+    status_flags: u16,
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(60 + 36 * replay_summaries.len());
+    p.extend_from_slice(session_id);
+    put_u64(&mut p, accepted_epoch);
+    put_u64(&mut p, peer_epoch);
+    put_u64(&mut p, new_generation);
+    p.extend_from_slice(new_token);
+    p.extend_from_slice(&(replay_summaries.len() as u16).to_be_bytes());
+    p.extend_from_slice(&status_flags.to_be_bytes());
+    for s in replay_summaries {
+        p.extend_from_slice(&s.stream_id.to_be_bytes());
+        p.push(0);
+        p.push(0);
+        p.extend_from_slice(&[0, 0]);
+        put_u64(&mut p, s.recv_ack);
+        put_u64(&mut p, s.send_next);
+        put_u64(&mut p, s.final_sent.unwrap_or(u64::MAX));
+    }
+    p
+}
+
+/// Compatibility convenience encoder. It still emits the full wire shape;
+/// callers that know the epochs/replay plan should use `encode_resume_ok_full`.
 pub fn encode_resume_ok(
     session_id: &[u8; 16],
     new_generation: u64,
     new_token: &[u8; 16],
 ) -> Vec<u8> {
-    let mut p = Vec::with_capacity(42);
-    p.extend_from_slice(session_id);
-    put_u64(&mut p, new_generation);
-    p.extend_from_slice(new_token);
-    p.extend_from_slice(&0u16.to_be_bytes());
-    p
+    encode_resume_ok_full(session_id, 1, 1, new_generation, new_token, &[], 0)
 }
 
-pub fn decode_resume_ok(p: &[u8]) -> Option<(u64, [u8; 16])> {
-    if p.len() < 42 {
+/// Strict RESUME_OK decoder. Header/payload session-id equality is checked by
+/// the handshake caller; this parser validates the payload's exact shape,
+/// reserved fields and absence of trailing garbage.
+pub fn decode_resume_ok_full(p: &[u8]) -> Option<ResumeOkParsed> {
+    if p.len() < 60 {
         return None;
     }
-    let new_generation = get_u64(p, 16)?;
-    let mut new_token = [0u8; 16];
-    new_token.copy_from_slice(&p[24..40]);
-    Some((new_generation, new_token))
+    let mut accepted_session_id = [0u8; 16];
+    accepted_session_id.copy_from_slice(&p[..16]);
+    if accepted_session_id == [0u8; 16] {
+        return None;
+    }
+    let accepted_epoch = get_u64(p, 16)?;
+    let peer_epoch = get_u64(p, 24)?;
+    let new_generation = get_u64(p, 32)?;
+    if accepted_epoch == 0 || peer_epoch == 0 || new_generation == 0 {
+        return None;
+    }
+    let mut new_resume_token = [0u8; 16];
+    new_resume_token.copy_from_slice(&p[40..56]);
+    if new_resume_token == [0u8; 16] {
+        return None;
+    }
+    let replay_stream_count = u16::from_be_bytes([p[56], p[57]]) as usize;
+    let status_flags = u16::from_be_bytes([p[58], p[59]]);
+    let expected = 60usize.checked_add(replay_stream_count.checked_mul(36)?)?;
+    if p.len() != expected {
+        return None;
+    }
+    let mut replay_summaries = Vec::with_capacity(replay_stream_count);
+    let mut at = 60;
+    for _ in 0..replay_stream_count {
+        let stream_id = get_u64(p, at)?;
+        if stream_id == 0 || p[at + 10] != 0 || p[at + 11] != 0 {
+            return None;
+        }
+        let recv_ack = get_u64(p, at + 12)?;
+        let send_next = get_u64(p, at + 20)?;
+        let final_raw = get_u64(p, at + 28)?;
+        replay_summaries.push(StreamSummary {
+            stream_id,
+            recv_ack,
+            send_next,
+            final_sent: (final_raw != u64::MAX).then_some(final_raw),
+        });
+        at += 36;
+    }
+    Some(ResumeOkParsed {
+        accepted_session_id,
+        accepted_epoch,
+        peer_epoch,
+        new_generation,
+        new_resume_token,
+        replay_stream_count: replay_stream_count as u16,
+        status_flags,
+        replay_summaries,
+    })
+}
+
+/// Legacy projection used by the existing SDK/test surface. Strictness comes
+/// from `decode_resume_ok_full`; only the additional fields are discarded.
+pub fn decode_resume_ok(p: &[u8]) -> Option<(u64, [u8; 16])> {
+    let parsed = decode_resume_ok_full(p)?;
+    Some((parsed.new_generation, parsed.new_resume_token))
 }
 
 /// RESUME_REJECT payload：[reason u8]。
@@ -2214,7 +2732,20 @@ async fn mk_session(
     recv: TransportRecv,
     policy: InstallPolicy,
 ) -> Option<Session> {
-    let channel = SessionChannel::install(&shared, send, recv, policy).await?;
+    mk_session_with_expectation(shared, send, recv, policy, None, None).await
+}
+
+async fn mk_session_with_expectation(
+    shared: Arc<SessionShared>,
+    send: TransportSend,
+    recv: TransportRecv,
+    policy: InstallPolicy,
+    decision: Option<ResumeDecision>,
+    expected_generation: Option<u64>,
+) -> Option<Session> {
+    let channel = shared
+        .install_channel(send, recv, policy, decision, expected_generation)
+        .await?;
     let pump = channel.spawn_pump();
     Some(Session {
         shared,
@@ -2234,6 +2765,36 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 const CONVERGENCE_RETRY: usize = 3;
 const CONVERGENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Wait for a local per-peer campaign to publish its channel. A waiter never
+/// starts a second dial; if the owner terminates before publishing, propagate
+/// the owner's failure boundary and let the caller explicitly retry.
+async fn wait_for_existing_session(shared: Arc<SessionShared>) -> Result<Session, FabricError> {
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    loop {
+        if let Some(channel) = shared.current_channel() {
+            return Ok(Session {
+                shared,
+                channel: std::sync::RwLock::new(channel),
+                pump: std::sync::Mutex::new(None),
+            });
+        }
+        if matches!(
+            shared.phase_sync(),
+            SessionPhase::Dead | SessionPhase::Closed
+        ) {
+            return Err(FabricError::Session(SessionError::Connect(
+                "concurrent session owner terminated; retry to open".into(),
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FabricError::Session(SessionError::Connect(
+                "existing session negotiation timeout".into(),
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// client：建立新会话（收敛感知——传输竞速失败自动换新流重试；拒绝不重试）。
 /// P0-2：session_id/token **重试循环外一次生成**、各 attempt 复用——重试
 /// 对 provider 幂等（同 sid+token → OK 重发既有会话），ghost 会话不再累积。
@@ -2244,31 +2805,52 @@ pub async fn open_session(
     peer_id: &str,
     opts: SessionOptions,
 ) -> Result<Session, FabricError> {
+    // Per-peer idempotency/single-flight: an active, recovering, or currently
+    // negotiating campaign is the canonical local session. A second caller
+    // waits for its channel instead of creating a competing sid.
+    if let Some(existing) = fabric
+        .inner
+        .continuity_sessions
+        .reusable_for_peer(peer_id)
+        .await
+    {
+        return wait_for_existing_session(existing).await;
+    }
     let session_id = rand_16().ok_or_else(entropy_err)?;
     let token = rand_16().ok_or_else(entropy_err)?;
-    let shared = SessionShared::new(session_id, token, peer_id.to_string(), true, opts.limits);
-    fabric
+    let candidate = SessionShared::new(session_id, token, peer_id.to_string(), true, opts.limits);
+    let (shared, is_owner) = fabric
         .inner
         .continuity_sessions
         .register_local(
-            Arc::clone(&shared),
+            Arc::clone(&candidate),
             peer_id.to_string(),
             fabric.inner.identity.endpoint_id(),
         )
         .await;
-    fabric.inner.continuity_campaigns.lock().await.insert(
-        peer_id.to_string(),
-        InitCampaign {
-            session_id,
-        },
-    );
+    if !is_owner {
+        // The registry lock linearizes the check with the insertion above. A
+        // concurrent caller reuses the canonical shared state and never sends
+        // its freshly generated sid on the wire.
+        return wait_for_existing_session(shared).await;
+    }
+    fabric
+        .inner
+        .continuity_campaigns
+        .lock()
+        .await
+        .insert(peer_id.to_string(), InitCampaign { session_id });
     let mut last: Option<FabricError> = None;
     for _ in 0..CONVERGENCE_RETRY {
         match open_session_attempt(fabric, peer_id, session_id, token, Arc::clone(&shared)).await {
             Ok(s) => return Ok(s),
             Err(TryAgain::Definitive(e)) => {
                 cleanup_campaign(fabric, peer_id, session_id).await;
-                fabric.inner.continuity_sessions.remove_if(&session_id).await;
+                fabric
+                    .inner
+                    .continuity_sessions
+                    .remove_if(&session_id)
+                    .await;
                 return Err(e);
             }
             Err(TryAgain::Transport(e)) => {
@@ -2280,17 +2862,18 @@ pub async fn open_session(
         }
     }
     cleanup_campaign(fabric, peer_id, session_id).await;
-    fabric.inner.continuity_sessions.remove_if(&session_id).await;
+    fabric
+        .inner
+        .continuity_sessions
+        .remove_if(&session_id)
+        .await;
     Err(last.expect("至少一次尝试"))
 }
 
 /// 移除本 campaign 登记（仅当仍指向自己的 sid——防误删并发的新 campaign）。
 async fn cleanup_campaign(fabric: &Fabric, peer_id: &str, session_id: [u8; 16]) {
     let mut map = fabric.inner.continuity_campaigns.lock().await;
-    if map
-        .get(peer_id)
-        .is_some_and(|c| c.session_id == session_id)
-    {
+    if map.get(peer_id).is_some_and(|c| c.session_id == session_id) {
         map.remove(peer_id);
     }
 }
@@ -2383,10 +2966,7 @@ async fn open_session_attempt(
                     && canonical != [0u8; 16]
                     && canonical != session_id
                 {
-                    strace!(
-                        "open lost race, adopting canonical {}",
-                        hex8(&canonical)
-                    );
+                    strace!("open lost race, adopting canonical {}", hex8(&canonical));
                     // 收敛锚更新为 canonical（自身 campaign 撤回语义）
                     fabric.inner.continuity_campaigns.lock().await.insert(
                         peer_id.to_string(),
@@ -2394,7 +2974,11 @@ async fn open_session_attempt(
                             session_id: canonical,
                         },
                     );
-                    fabric.inner.continuity_sessions.remove_if(&session_id).await;
+                    fabric
+                        .inner
+                        .continuity_sessions
+                        .remove_if(&session_id)
+                        .await;
                     let session = adopt_session(fabric, canonical)
                         .await
                         .map_err(TryAgain::Definitive)?;
@@ -2402,9 +2986,7 @@ async fn open_session_attempt(
                 }
                 if reason == init_reason::MALFORMED || reason == init_reason::POLICY_DENIED {
                     return Err(TryAgain::Definitive(FabricError::Session(
-                        SessionError::Connect(format!(
-                            "session init rejected: reason={reason:#x}"
-                        )),
+                        SessionError::Connect(format!("session init rejected: reason={reason:#x}")),
                     )));
                 }
             }
@@ -2514,9 +3096,17 @@ async fn accept_session_init(
 ) -> Result<Session, FabricError> {
     let p = &init.payload;
     if p.len() != 41 || p.first().copied() != Some(PROTOCOL_VERSION) {
-        send_init_reject(&mut transport, init.session_id, init_reason::MALFORMED, None).await?;
+        send_init_reject(
+            &mut transport,
+            init.session_id,
+            init_reason::MALFORMED,
+            None,
+        )
+        .await?;
         let _ = transport.finish();
-        return Err(FabricError::Session(SessionError::Connect("malformed SESSION_INIT".into())));
+        return Err(FabricError::Session(SessionError::Connect(
+            "malformed SESSION_INIT".into(),
+        )));
     }
     let mut sid = [0u8; 16];
     sid.copy_from_slice(&p[1..17]);
@@ -2524,7 +3114,13 @@ async fn accept_session_init(
     token.copy_from_slice(&p[17..33]);
     let local_epoch = get_u64(p, 33).unwrap_or(0);
     if sid != init.session_id || sid == [0u8; 16] || token == [0u8; 16] || local_epoch == 0 {
-        send_init_reject(&mut transport, init.session_id, init_reason::MALFORMED, None).await?;
+        send_init_reject(
+            &mut transport,
+            init.session_id,
+            init_reason::MALFORMED,
+            None,
+        )
+        .await?;
         let _ = transport.finish();
         return Err(FabricError::Session(SessionError::Connect(
             "malformed SESSION_INIT identity fields".into(),
@@ -2590,8 +3186,7 @@ async fn accept_session_init(
             incoming_endpoint,
             opts.limits,
         )
-        .await
-    ;
+        .await;
     let (shared, fresh) = match admission {
         InitAdmission::Admitted(shared, is_new) => (shared, is_new),
         InitAdmission::Replaced(shared, _old) => (shared, true),
@@ -2622,6 +3217,13 @@ async fn accept_session_init(
                 "session init rejected: MALFORMED".into(),
             )));
         }
+        InitAdmission::TokenRevoked => {
+            send_init_reject(&mut transport, sid, init_reason::MALFORMED, None).await?;
+            let _ = transport.finish();
+            return Err(FabricError::Session(SessionError::Connect(
+                "session init rejected: revoked session".into(),
+            )));
+        }
     };
     transport
         .send(&Frame {
@@ -2631,7 +3233,11 @@ async fn accept_session_init(
             stream_id: 0,
             direction: Direction::ProviderToClient,
             byte_offset: 0,
-            payload: Bytes::from(encode_session_init_ok(&sid, transport.epoch, 1)),
+            payload: Bytes::from(encode_session_init_ok(
+                &sid,
+                transport.epoch,
+                shared.current_generation(),
+            )),
         })
         .await
         .map_err(map_transport_err)?;
@@ -2660,6 +3266,24 @@ async fn accept_resume(
     mut transport: super::transport::ContinuityTransport,
     resume: Frame,
 ) -> Result<Session, FabricError> {
+    if resume.session_id == [0u8; 16] {
+        transport
+            .send(&Frame {
+                frame_type: FrameType::ResumeReject,
+                flags: 0,
+                session_id: resume.session_id,
+                stream_id: 0,
+                direction: Direction::ProviderToClient,
+                byte_offset: 0,
+                payload: Bytes::from(encode_resume_reject(reject_reason::TOKEN_INVALID)),
+            })
+            .await
+            .map_err(map_transport_err)?;
+        let _ = transport.finish();
+        return Err(FabricError::Session(SessionError::Connect(
+            "resume rejected: zero session id".into(),
+        )));
+    }
     let Some(parsed) = decode_resume_init(&resume.payload) else {
         transport
             .send(&Frame {
@@ -2687,29 +3311,68 @@ async fn accept_resume(
         byte_offset: 0,
         payload: Bytes::from(encode_resume_reject(reason)),
     };
-    let Some(shared) = fabric.inner.continuity_sessions.get(&sid).await else {
-        // 内存注册表无此会话：副作用状态已丢——统一 REQUEST_STATE_LOST
-        transport
-            .send(&reject(reject_reason::REQUEST_STATE_LOST))
-            .await
-            .map_err(map_transport_err)?;
-        return Err(FabricError::Session(SessionError::Connect(
-            "resume rejected: REQUEST_STATE_LOST".into(),
-        )));
+    let shared = match fabric.inner.continuity_sessions.lookup_resume(&sid).await {
+        ResumeLookup::Active(shared) => shared,
+        ResumeLookup::Revoked => {
+            transport
+                .send(&reject(reject_reason::TOKEN_REVOKED))
+                .await
+                .map_err(map_transport_err)?;
+            let _ = transport.finish();
+            return Err(FabricError::Session(SessionError::Connect(
+                "resume rejected: TOKEN_REVOKED".into(),
+            )));
+        }
+        ResumeLookup::Missing => {
+            // 内存注册表无此会话：副作用状态已丢——统一 REQUEST_STATE_LOST
+            transport
+                .send(&reject(reject_reason::REQUEST_STATE_LOST))
+                .await
+                .map_err(map_transport_err)?;
+            let _ = transport.finish();
+            return Err(FabricError::Session(SessionError::Connect(
+                "resume rejected: REQUEST_STATE_LOST".into(),
+            )));
+        }
     };
     // R3-1：原子裁决（单锁：nonce 幂等 + token 窗口——previous 可用性判定
     // 在锁内由 pending 推导，Codex 指出的锁外相位窗口不复存在）
-    let new_token = rand_16().ok_or_else(entropy_err)?;
-    let Some((new_generation, new_token, cached)) =
-        shared.decide_resume(parsed.nonce, parsed.local_generation, &parsed.token, new_token)
-    else {
+    if parsed.last_seen_remote_epoch > transport.epoch {
         transport
-            .send(&reject(reject_reason::TOKEN_INVALID))
+            .send(&reject(reject_reason::STALE_EPOCH))
             .await
             .map_err(map_transport_err)?;
+        let _ = transport.finish();
         return Err(FabricError::Session(SessionError::Connect(
-            "resume rejected: TOKEN_INVALID".into(),
+            "resume rejected: STALE_EPOCH (peer saw future epoch)".into(),
         )));
+    }
+    let new_token = rand_16().ok_or_else(entropy_err)?;
+    let Some(decision) = shared.decide_resume_with_epoch(
+        parsed.nonce,
+        parsed.local_connection_epoch,
+        &parsed.token,
+        new_token,
+        parsed.local_connection_epoch,
+    ) else {
+        let reason = if shared.resume_epoch_is_stale(
+            parsed.nonce,
+            parsed.local_connection_epoch,
+            &parsed.token,
+            parsed.local_connection_epoch,
+        ) {
+            reject_reason::STALE_EPOCH
+        } else {
+            reject_reason::TOKEN_INVALID
+        };
+        transport
+            .send(&reject(reason))
+            .await
+            .map_err(map_transport_err)?;
+        let _ = transport.finish();
+        return Err(FabricError::Session(SessionError::Connect(format!(
+            "resume rejected: reason={reason:#x}"
+        ))));
     };
     // barrier 测试钩子（R3-1）：轮换完成、OK 未发/Active 未置位窗口——
     // 测试在此注入并发第二 RESUME 验证单胜与幂等（生产零开销）
@@ -2722,7 +3385,15 @@ async fn accept_resume(
             stream_id: 0,
             direction: Direction::ProviderToClient,
             byte_offset: 0,
-            payload: Bytes::from(encode_resume_ok(&sid, new_generation, &new_token)),
+            payload: Bytes::from(encode_resume_ok_full(
+                &sid,
+                transport.epoch,
+                parsed.local_connection_epoch,
+                decision.result_generation,
+                &decision.result_token,
+                &shared.summaries().await,
+                0,
+            )),
         })
         .await
         .map_err(map_transport_err)?;
@@ -2731,15 +3402,22 @@ async fn accept_resume(
     // P1-5：**先 split + 建通道（pump 立即排水对端重放/ACK）**，重放转后台
     // 任务经 channel 发送——恢复握手里不再有大数据量同步发送，与对端的
     // 反向重放并发进行（QUIC 流控互等死锁闭合）。
-    let policy = if cached {
+    let policy = if decision.cached {
         InstallPolicy::IfVacant
     } else {
         InstallPolicy::Force
     };
     let (send, recv) = transport.into_split();
-    let session = mk_session(Arc::clone(&shared), send, recv, policy)
-        .await
-        .ok_or_else(channel_superseded_err)?;
+    let session = mk_session_with_expectation(
+        Arc::clone(&shared),
+        send,
+        recv,
+        policy,
+        Some(decision),
+        None,
+    )
+    .await
+    .ok_or_else(channel_superseded_err)?;
     {
         let replay_shared = Arc::clone(&shared);
         let replay_chan = session.channel();
@@ -2779,7 +3457,7 @@ async fn accept_resume(
             }
         });
     }
-    if !cached {
+    if !decision.cached {
         shared.set_phase(SessionPhase::Active).await;
     }
     Ok(session)
@@ -2831,10 +3509,12 @@ async fn resume_attempt(
         .continuity_open_transport(&peer)
         .await
         .map_err(TryAgain::Transport)?;
-    let (generation, token) = session.shared.current_token();
+    let local_connection_epoch = transport.epoch;
+    let last_seen_remote_epoch = session.shared.last_seen_remote_epoch();
+    let (_generation, token) = session.shared.current_token();
     let payload = encode_resume_init(
-        generation,
-        generation,
+        local_connection_epoch,
+        last_seen_remote_epoch,
         &nonce,
         &token,
         &session.shared.summaries().await,
@@ -2857,21 +3537,70 @@ async fn resume_attempt(
         .map_err(map_transport_err_try)?;
     match resp.frame_type {
         FrameType::ResumeOk => {
-            let Some((new_generation, new_token)) = decode_resume_ok(&resp.payload) else {
+            if resp.session_id != session.shared.session_id {
+                return Err(TryAgain::Definitive(FabricError::Session(
+                    SessionError::Connect("RESUME_OK header sid mismatch".into()),
+                )));
+            }
+            let Some(ok) = decode_resume_ok_full(&resp.payload) else {
                 return Err(TryAgain::Definitive(FabricError::Session(
                     SessionError::Connect("malformed RESUME_OK".into()),
                 )));
             };
-            session.shared.rotate_token(new_generation, new_token);
+            let current_generation = session.shared.current_generation();
+            if ok.accepted_session_id != session.shared.session_id
+                || ok.peer_epoch != local_connection_epoch
+                || ok.accepted_epoch == 0
+                || ok.new_generation <= current_generation
+            {
+                // A response from an older attempt must not replace a newer
+                // owner/credential. Close only this transport and let the
+                // already-successful attempt remain authoritative.
+                let _ = transport.finish();
+                if session.shared.phase().await == SessionPhase::Active {
+                    return Ok(());
+                }
+                return Err(TryAgain::Transport(channel_superseded_err()));
+            }
+            if !session.shared.observe_remote_epoch(ok.accepted_epoch) {
+                // A response from an older provider epoch is stale even when
+                // its token/generation still parses. It must not rotate the
+                // local window or replace the current channel.
+                let _ = transport.finish();
+                if session.shared.phase().await == SessionPhase::Active {
+                    return Ok(());
+                }
+                return Err(TryAgain::Transport(channel_superseded_err()));
+            }
+            session
+                .shared
+                .rotate_token(ok.new_generation, ok.new_resume_token);
             // P1-5：**先 split + 装通道（pump 立即排水对端重放）**，此后
             // OPEN/DATA/FIN 重发经 channel 与接收并发——双向大 replay 不在
             // 握手路径互等（QUIC 流控死锁闭合）。
             let (send, recv) = transport.into_split();
-            let chan = session
+            let Some(chan) = session
                 .shared
-                .install_channel(send, recv, InstallPolicy::Force)
+                .install_channel(
+                    send,
+                    recv,
+                    InstallPolicy::Force,
+                    None,
+                    Some(ok.new_generation),
+                )
                 .await
-                .expect("client 恢复轮换接管恒成功");
+            else {
+                // A newer response may have won while this attempt was
+                // waiting for the old pump to drain. The candidate transport
+                // was half-closed by install_channel; preserve the newer
+                // owner instead of panicking or forcing a rollback.
+                if session.shared.phase().await == SessionPhase::Active
+                    && session.shared.current_generation() >= ok.new_generation
+                {
+                    return Ok(());
+                }
+                return Err(TryAgain::Transport(channel_superseded_err()));
+            };
             session.install_channel(Arc::clone(&chan));
             session.shared.set_phase(SessionPhase::Active).await;
             // 重发 OPEN（幂等归并，不占数据 offset 空间）
@@ -2947,6 +3676,85 @@ async fn resume_attempt(
 mod tests {
     use super::*;
 
+    const TEST_ALPN: &[u8] = b"/dweb/session-unit-test/1";
+
+    struct RawLink {
+        endpoint: iroh::Endpoint,
+        conn: iroh::endpoint::Connection,
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        server_task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn raw_link() -> RawLink {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("unit-test server endpoint");
+        let server_id = server.id();
+        let socket = *server
+            .bound_sockets()
+            .first()
+            .expect("unit-test server socket");
+        let ip = if socket.ip().is_unspecified() {
+            std::net::IpAddr::from([127, 0, 0, 1])
+        } else {
+            socket.ip()
+        };
+        let addr = std::net::SocketAddr::new(ip, socket.port());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let Some(incoming) = server.accept().await else {
+                return;
+            };
+            let Ok(connecting) = incoming.accept() else {
+                return;
+            };
+            let Ok(conn) = connecting.await else {
+                return;
+            };
+            // Deliberately do not accept/read bidi streams. The client send
+            // side therefore reaches QUIC flow control for the cancellation
+            // test while the connection itself stays alive.
+            let _ = stop_rx.await;
+            conn.close(0u32.into(), b"unit-test done");
+        });
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(iroh::RelayMode::Disabled)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .bind()
+            .await
+            .expect("unit-test client endpoint");
+        let conn = endpoint
+            .connect(
+                iroh::EndpointAddr::new(server_id).with_ip_addr(addr),
+                TEST_ALPN,
+            )
+            .await
+            .expect("unit-test connection");
+        RawLink {
+            endpoint,
+            conn,
+            stop_tx,
+            server_task,
+        }
+    }
+
+    impl RawLink {
+        async fn transport(&self, epoch: u64) -> crate::continuity::ContinuityTransport {
+            crate::continuity::ContinuityTransport::open(&self.conn, epoch)
+                .await
+                .expect("unit-test continuity stream")
+        }
+
+        async fn close(self) {
+            let _ = self.stop_tx.send(());
+            self.endpoint.close().await;
+            let _ = self.server_task.await;
+        }
+    }
+
     fn data_frame(sid: [u8; 16], stream: u64, off: u64, data: &[u8]) -> Frame {
         Frame {
             frame_type: FrameType::Data,
@@ -3010,6 +3818,124 @@ mod tests {
         assert!(w.try_rotate(1, &[3u8; 16], [4u8; 16]).is_none());
         // 新 current 恒可用
         assert!(w.try_rotate(4, &[4u8; 16], [5u8; 16]).is_some());
+    }
+
+    /// P0-1 regression: if a second nonce supersedes the first previous-token
+    /// decision, installing the first decision in reverse order must close only
+    /// its candidate transport and leave the newer owner untouched.
+    #[tokio::test]
+    async fn install_rejects_superseded_decision_without_stopping_new_owner() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA1u8; 16],
+            [0xB1u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let first = shared
+            .decide_resume([1u8; 16], 1, &[0xB1u8; 16], [0xC1u8; 16])
+            .expect("first decision");
+        let newer = shared
+            .decide_resume([2u8; 16], 1, &[0xB1u8; 16], [0xD1u8; 16])
+            .expect("previous-token decision supersedes first");
+
+        let (send_new, recv_new) = link.transport(2).await.into_split();
+        let new_channel = shared
+            .install_channel(send_new, recv_new, InstallPolicy::Force, Some(newer), None)
+            .await
+            .expect("newer decision installs");
+        let new_pump = new_channel.spawn_pump();
+
+        let (send_old, recv_old) = link.transport(1).await.into_split();
+        let stale = shared
+            .install_channel(send_old, recv_old, InstallPolicy::Force, Some(first), None)
+            .await;
+        assert!(stale.is_none(), "superseded decision must not install");
+        assert_eq!(
+            shared.debug_channel_owner(),
+            1,
+            "new owner remains canonical"
+        );
+        assert!(!new_channel
+            .stopping
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !new_channel.is_dead(),
+            "reverse install must not kill new pump"
+        );
+
+        new_channel.request_stop();
+        let _ = new_pump.await;
+        link.close().await;
+    }
+
+    /// P0-2 regression: a pump blocked in an outbound QUIC write is cancelled
+    /// by transition, allowing the new owner to install within a bounded time.
+    #[tokio::test]
+    async fn transition_cancels_blocked_send_before_install() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA2u8; 16],
+            [0xB2u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (send_old, recv_old) = link.transport(1).await.into_split();
+        let old_channel = shared
+            .install_channel(send_old, recv_old, InstallPolicy::Force, None, None)
+            .await
+            .expect("old channel installs");
+        let old_pump = old_channel.spawn_pump();
+        let frame = Frame {
+            frame_type: FrameType::Data,
+            flags: 0,
+            session_id: shared.session_id,
+            stream_id: 1,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            // The raw peer intentionally never reads this stream, so the
+            // repeated send reaches QUIC flow control and remains pending.
+            payload: Bytes::from(vec![0x5Au8; crate::continuity::frame::MAX_FRAME]),
+        };
+        let sender = {
+            let old_channel = Arc::clone(&old_channel);
+            tokio::spawn(async move {
+                loop {
+                    old_channel.send_frame(&frame).await?;
+                }
+                #[allow(unreachable_code)]
+                Ok::<(), FabricError>(())
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !sender.is_finished(),
+            "send must still be blocked before stop"
+        );
+
+        let (send_new, recv_new) = link.transport(2).await.into_split();
+        let started = std::time::Instant::now();
+        let new_channel = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            shared.install_channel(send_new, recv_new, InstallPolicy::Force, None, None),
+        )
+        .await
+        .expect("transition must be bounded")
+        .expect("new channel installs");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "transition exceeded its bound"
+        );
+        let send_result = tokio::time::timeout(std::time::Duration::from_secs(2), sender)
+            .await
+            .expect("stop must release blocked sender")
+            .expect("sender task join");
+        assert!(send_result.is_err(), "stopped channel must reject send");
+        let _ = old_pump.await;
+        new_channel.request_stop();
+        link.close().await;
     }
 
     /// P1-5 / R5：previous 清除后旧代凭据立即失效。
@@ -3139,7 +4065,138 @@ mod tests {
         // 流 3 全量 ACK 释放后名额恢复
         let ack = mk_ack([1u8; 16], 3, Direction::ClientToProvider, 32 * 1024);
         shared.handle_frame(&ack).await;
-        assert!(shared.record_send(5, &Bytes::from(vec![0u8; 1])).await.is_ok());
+        assert!(shared
+            .record_send(5, &Bytes::from(vec![0u8; 1]))
+            .await
+            .is_ok());
+    }
+
+    /// P0-3 regression: the receive queue has a byte cap independent of frame
+    /// count; crossing it resets the stream and does not enqueue the payload.
+    #[tokio::test]
+    async fn deliver_queue_byte_cap_resets_stream_without_growth() {
+        let shared = SessionShared::new(
+            [1u8; 16],
+            [2u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        shared.handle_frame(&open_frame([1u8; 16], 1)).await;
+        let half = vec![0xAB; DELIVER_QUEUE_STREAM_CAP / 2];
+        assert!(matches!(
+            shared
+                .handle_frame(&data_frame([1u8; 16], 1, 0, &half))
+                .await
+                .reply,
+            Some(Frame {
+                frame_type: FrameType::Ack,
+                ..
+            })
+        ));
+        assert!(matches!(
+            shared
+                .handle_frame(&data_frame(
+                    [1u8; 16],
+                    1,
+                    (DELIVER_QUEUE_STREAM_CAP / 2) as u64,
+                    &half,
+                ))
+                .await
+                .reply,
+            Some(Frame {
+                frame_type: FrameType::Ack,
+                ..
+            })
+        ));
+        assert_eq!(
+            shared.deliver_queue_bytes(1).await,
+            DELIVER_QUEUE_STREAM_CAP,
+            "exact cap is still admissible"
+        );
+        let over = shared
+            .handle_frame(&data_frame(
+                [1u8; 16],
+                1,
+                DELIVER_QUEUE_STREAM_CAP as u64,
+                &[0xCD],
+            ))
+            .await;
+        assert!(matches!(
+            over.reply,
+            Some(Frame {
+                frame_type: FrameType::Reset,
+                ..
+            })
+        ));
+        assert_eq!(
+            shared.deliver_queue_bytes(1).await,
+            DELIVER_QUEUE_STREAM_CAP,
+            "over-cap DATA must be dropped"
+        );
+        assert_eq!(shared.protocol_violations(), 1);
+    }
+
+    /// R5：gap memory is bounded at the session level, not only per stream.
+    /// 128 streams may each hold one admissible gap, but the next byte over
+    /// the aggregate cap is rejected before it reaches `RecvWindow`.
+    #[tokio::test]
+    async fn gap_session_byte_cap_resets_without_growth() {
+        let shared = SessionShared::new(
+            [1u8; 16],
+            [2u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        let chunk = vec![0xBC; GAP_SESSION_BYTE_CAP / MAX_ACTIVE_STREAMS];
+        for index in 0..MAX_ACTIVE_STREAMS {
+            let stream_id = (index as u64) * 2 + 1;
+            shared.handle_frame(&open_frame([1u8; 16], stream_id)).await;
+            assert!(matches!(
+                shared
+                    .handle_frame(&data_frame([1u8; 16], stream_id, 1, &chunk))
+                    .await
+                    .reply,
+                Some(Frame {
+                    frame_type: FrameType::Ack,
+                    ..
+                })
+            ));
+        }
+        let held: usize = shared
+            .streams
+            .lock()
+            .await
+            .values()
+            .map(|ctx| ctx.recv.gap_bytes())
+            .sum();
+        assert_eq!(held, GAP_SESSION_BYTE_CAP);
+
+        let over = shared
+            .handle_frame(&data_frame(
+                [1u8; 16],
+                1,
+                (GAP_SESSION_BYTE_CAP as u64) + 1,
+                &[0xCD],
+            ))
+            .await;
+        assert!(matches!(
+            over.reply,
+            Some(Frame {
+                frame_type: FrameType::Reset,
+                ..
+            })
+        ));
+        let held_after: usize = shared
+            .streams
+            .lock()
+            .await
+            .values()
+            .map(|ctx| ctx.recv.gap_bytes())
+            .sum();
+        assert_eq!(held_after, GAP_SESSION_BYTE_CAP, "拒绝不得增长 gap");
+        assert_eq!(shared.protocol_violations(), 1);
     }
 
     /// P0-3d：活跃流上限 128——第 129 个 OPEN 拒绝；流完全终结后名额回收。
@@ -3308,9 +4365,12 @@ mod tests {
         assert!(shared
             .decide_resume([9u8; 16], 1, &[2u8; 16], [4u8; 16])
             .is_none());
-        assert!(shared
-            .decide_resume([10u8; 16], 2, &[3u8; 16], [5u8; 16])
-            .is_some(), "current 不受影响");
+        assert!(
+            shared
+                .decide_resume([10u8; 16], 2, &[3u8; 16], [5u8; 16])
+                .is_some(),
+            "current 不受影响"
+        );
     }
 
     /// P1-4：同幂等键双流 DATA 归并到 canonical 流交付。
@@ -3342,7 +4402,10 @@ mod tests {
             .await;
         assert_eq!(shared.deliver_queue_bytes(7).await, 7, "交付到 canonical");
         assert_eq!(shared.deliver_queue_bytes(21).await, 0, "别名无独立队列");
-        assert_eq!(shared.recv(7).await.unwrap(), Bytes::from_static(b"payload"));
+        assert_eq!(
+            shared.recv(7).await.unwrap(),
+            Bytes::from_static(b"payload")
+        );
     }
 
     /// P1-4：try_mark_started CAS——并发双调恰一 true；Completed 终态不回退。
@@ -3356,10 +4419,7 @@ mod tests {
             JournalLimits::default(),
         );
         shared.on_open(1, "k").await;
-        let (a, b) = tokio::join!(
-            shared.try_mark_started(1),
-            shared.try_mark_started(1)
-        );
+        let (a, b) = tokio::join!(shared.try_mark_started(1), shared.try_mark_started(1));
         assert_eq!(a as u8 + b as u8, 1, "并发双调恰一胜出: {a}/{b}");
         assert!(!shared.try_mark_started(1).await, "后续调用 false");
         // Completed 终态：迟到 started/completed 不回退
@@ -3414,6 +4474,62 @@ mod tests {
                 .await,
             InitAdmission::TokenMismatch
         ));
+    }
+
+    /// R5：registry admission is the local `open_session` single-flight
+    /// boundary. Two candidates for one peer must share the first canonical
+    /// `SessionShared`; the loser must not reach transport dialing.
+    #[tokio::test]
+    async fn registry_register_local_returns_canonical_single_flight() {
+        let reg = SessionRegistry::new();
+        let initiator = crate::identity::NodeIdentity::from_seed([7u8; 32]).endpoint_id();
+        let first = SessionShared::new(
+            [1u8; 16],
+            [2u8; 16],
+            "peer-a".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let second = SessionShared::new(
+            [3u8; 16],
+            [4u8; 16],
+            "peer-a".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (canonical, first_owner) = reg
+            .register_local(Arc::clone(&first), "peer-a".into(), initiator)
+            .await;
+        assert!(first_owner);
+        assert!(Arc::ptr_eq(&canonical, &first));
+        let (reused, second_owner) = reg
+            .register_local(Arc::clone(&second), "peer-a".into(), initiator)
+            .await;
+        assert!(!second_owner, "第二个 caller 不得成为拨号 owner");
+        assert!(
+            Arc::ptr_eq(&reused, &first),
+            "必须返回首个 canonical shared"
+        );
+        assert!(reg.reusable_for_peer("peer-a").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn registry_remove_leaves_tombstone_but_releases_peer() {
+        let reg = SessionRegistry::new();
+        let lim = JournalLimits::default();
+        let sid = [0x71u8; 16];
+        let token = [0x72u8; 16];
+        let shared = match reg.admit_init(sid, token, "peer-a".into(), lim).await {
+            InitAdmission::Admitted(shared, true) => shared,
+            _ => panic!("initial admission must succeed"),
+        };
+        reg.remove_if(&sid).await;
+        assert!(matches!(
+            reg.admit_init(sid, token, "peer-a".into(), lim).await,
+            InitAdmission::TokenRevoked
+        ));
+        assert!(reg.reusable_for_peer("peer-a").await.is_none());
+        assert_eq!(shared.phase_sync(), SessionPhase::Dead);
     }
 
     #[tokio::test]

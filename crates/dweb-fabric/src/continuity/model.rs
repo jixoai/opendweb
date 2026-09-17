@@ -30,6 +30,9 @@ pub struct RecvWindow {
     expected_offset: u64,
     /// gap buffer：乱序提前到达的段（offset -> payload）；容量有界。
     gaps: BTreeMap<u64, Bytes>,
+    /// gap buffer byte accounting. Segment count alone is not a memory bound:
+    /// a peer can otherwise submit 64 maximum-sized segments.
+    gap_bytes: usize,
     /// 校验历史（有界滑动窗口：覆盖 [history_start, expected_offset)）。
     history: Vec<u8>,
     /// history[0] 对应的流 offset。
@@ -58,6 +61,9 @@ pub enum SegmentAction {
 pub struct GapOverflow {
     pub held: usize,
     pub cap: usize,
+    pub held_bytes: usize,
+    pub incoming_bytes: usize,
+    pub byte_cap: usize,
 }
 
 impl RecvWindow {
@@ -65,6 +71,7 @@ impl RecvWindow {
         Self {
             expected_offset: 0,
             gaps: BTreeMap::new(),
+            gap_bytes: 0,
             history: Vec::new(),
             history_start: 0,
             delivered_total: 0,
@@ -99,13 +106,27 @@ impl RecvWindow {
     pub fn sack_ranges(&self) -> Vec<(u64, u64)> {
         let mut out: Vec<(u64, u64)> = Vec::new();
         for (&off, payload) in &self.gaps {
-            let end = off + payload.len() as u64;
+            let end = off.saturating_add(payload.len() as u64);
             match out.last_mut() {
                 Some((_, e)) if off <= *e => *e = (*e).max(end),
                 _ => out.push((off, end)),
             }
         }
         out
+    }
+
+    /// Bytes currently held in the out-of-order gap buffer.
+    pub fn gap_bytes(&self) -> usize {
+        self.gap_bytes
+    }
+
+    /// Bytes that would be added by this frame if it takes the out-of-order
+    /// insertion path. Existing entries (including mismatching duplicates)
+    /// never grow the gap buffer and therefore return zero.
+    pub(crate) fn incoming_gap_bytes(&self, offset: u64, payload: &Bytes) -> usize {
+        (offset > self.expected_offset && !self.gaps.contains_key(&offset))
+            .then_some(payload.len())
+            .unwrap_or(0)
     }
 
     /// 喂入一段 (offset, payload)。
@@ -122,7 +143,25 @@ impl RecvWindow {
         payload: Bytes,
         gap_cap: usize,
     ) -> Result<SegmentAction, GapOverflow> {
-        let end = offset + payload.len() as u64;
+        self.feed_with_limits(offset, payload, gap_cap, 2 * 1024 * 1024)
+    }
+
+    /// Variant with an explicit byte cap. The legacy `feed` API keeps the
+    /// protocol default; production callers pass the same cap explicitly so
+    /// the stream/session memory policy is visible at the call site.
+    pub fn feed_with_limits(
+        &mut self,
+        offset: u64,
+        payload: Bytes,
+        gap_cap: usize,
+        gap_byte_cap: usize,
+    ) -> Result<SegmentAction, GapOverflow> {
+        let Some(end) = offset.checked_add(payload.len() as u64) else {
+            return Ok(SegmentAction::OverlapMismatch {
+                expected: self.expected_offset,
+                got: offset,
+            });
+        };
         if offset < self.expected_offset {
             let overlap_end = end.min(self.expected_offset);
             if offset < self.history_start {
@@ -134,9 +173,10 @@ impl RecvWindow {
             if verify_start < overlap_end {
                 let hs = (verify_start - self.history_start) as usize;
                 let he = (overlap_end - self.history_start) as usize;
-                let hist_slice = self.history.get(hs..he).expect(
-                    "history 必须覆盖 [history_start, expected) 区间（append 记账不变量）",
-                );
+                let hist_slice = self
+                    .history
+                    .get(hs..he)
+                    .expect("history 必须覆盖 [history_start, expected) 区间（append 记账不变量）");
                 let ps = (verify_start - offset) as usize;
                 let pe = ps + (overlap_end - verify_start) as usize;
                 if hist_slice != &payload[ps..pe] {
@@ -166,12 +206,34 @@ impl RecvWindow {
             out.extend_from_slice(&self.drain_gaps());
             return Ok(SegmentAction::Deliver(Bytes::from(out)));
         }
+        if let Some(existing) = self.gaps.get(&offset) {
+            if existing == &payload {
+                return Ok(SegmentAction::Duplicate);
+            }
+            return Ok(SegmentAction::OverlapMismatch {
+                expected: self.expected_offset,
+                got: offset,
+            });
+        }
         if self.gaps.len() >= gap_cap {
             return Err(GapOverflow {
                 held: self.gaps.len(),
                 cap: gap_cap,
+                held_bytes: self.gap_bytes,
+                incoming_bytes: payload.len(),
+                byte_cap: gap_byte_cap,
             });
         }
+        if self.gap_bytes.saturating_add(payload.len()) > gap_byte_cap {
+            return Err(GapOverflow {
+                held: self.gaps.len(),
+                cap: gap_cap,
+                held_bytes: self.gap_bytes,
+                incoming_bytes: payload.len(),
+                byte_cap: gap_byte_cap,
+            });
+        }
+        self.gap_bytes += payload.len();
         self.gaps.insert(offset, payload);
         Ok(SegmentAction::Buffered)
     }
@@ -196,6 +258,7 @@ impl RecvWindow {
             }
             let payload = payload.clone();
             self.gaps.remove(&off);
+            self.gap_bytes = self.gap_bytes.saturating_sub(payload.len());
             self.append_delivered(&payload);
             drained.extend_from_slice(&payload);
             self.expected_offset += payload.len() as u64;
@@ -399,7 +462,12 @@ mod tests {
         let mut w = RecvWindow::new();
         w.feed(0, b(1, 10), 8).unwrap();
         // 重放段 5..15：前 5B 与历史一致，后 5B 是新数据
-        let seg = Bytes::from(vec![1u8; 5].into_iter().chain(vec![3u8; 5]).collect::<Vec<_>>());
+        let seg = Bytes::from(
+            vec![1u8; 5]
+                .into_iter()
+                .chain(vec![3u8; 5])
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(w.feed(5, seg, 8).unwrap(), SegmentAction::Deliver(b(3, 5)));
         assert_eq!(w.expected_offset(), 15);
     }
@@ -429,6 +497,26 @@ mod tests {
             w.feed(10 + i * 10, b(1, 5), 4).unwrap();
         }
         assert!(w.feed(100, b(1, 5), 4).is_err());
+    }
+
+    /// Byte cap is independent of segment count: a peer cannot hold a small
+    /// number of large out-of-order segments past the configured memory bound.
+    #[test]
+    fn recv_gap_byte_cap_rejects_without_growth() {
+        let mut w = RecvWindow::new();
+        assert_eq!(
+            w.feed_with_limits(10, b(1, 8), 64, 12).unwrap(),
+            SegmentAction::Buffered
+        );
+        let err = w
+            .feed_with_limits(30, b(2, 8), 64, 12)
+            .expect_err("byte cap must reject before inserting the segment");
+        assert_eq!(err.held, 1);
+        assert_eq!(err.held_bytes, 8);
+        assert_eq!(err.incoming_bytes, 8);
+        assert_eq!(err.byte_cap, 12);
+        assert_eq!(w.gap_bytes(), 8, "rejected segment must not grow the gap");
+        assert_eq!(w.sack_ranges(), vec![(10, 18)]);
     }
 
     /// 有界校验历史：窗口只保留最近 HISTORY_CAP 字节。
@@ -468,10 +556,7 @@ mod tests {
         assert_eq!(w.history_start, 32768);
         // 完全低于视界的重放段：丢弃 + unverifiable 计数
         assert_eq!(w.unverifiable_duplicates(), 0);
-        assert_eq!(
-            w.feed(0, b(1, 32768), 8).unwrap(),
-            SegmentAction::Duplicate
-        );
+        assert_eq!(w.feed(0, b(1, 32768), 8).unwrap(), SegmentAction::Duplicate);
         assert_eq!(w.unverifiable_duplicates(), 1);
         assert_eq!(w.delivered_bytes(), 3 * 32768);
         // 跨界段（前缀低于视界、中间与历史一致、后缀是新数据）：跳过前缀交付后缀

@@ -250,7 +250,8 @@ SESSION_INIT 时均已持有 token（发起方生成、接收方从 INIT payload
 
 **header/payload 校验**：SESSION_INIT 的公共头 `session_id` 必须等于 payload
 `session_id` 且非零；INIT_OK/INIT_REJECT 回显同一 id。零 sessionId/空 token
-非法，直接终结连接。
+非法，返回 `SESSION_INIT_REJECT(MALFORMED)` 后半关当前 transport（不建立会话，
+不把畸形输入静默当作成功）。
 
 **幂等与并发收敛**：接收方无该 peer 会话 → 登记并回 OK；已有（含并发刚建立）
 → `SESSION_INIT_REJECT(ALREADY_ACTIVE)` + canonical 三元组，发起方收敛到既有
@@ -312,7 +313,10 @@ previous 二者之一。previous 的清除条件（先到者）：新代 token �
 RESUME，或恢复窗口结束。发送方于发出 RESUME_OK 时切换 current（旧代降为
 previous）；接收方于收到 OK 时切换。效果：OK 丢失（紧接再断线）→ 旧代仍在
 previous 窗口内，可恢复并再次轮换；generation 前移且新代完成首次 RESUME 后，
-旧 token 拒绝——轮换防未来重放，不作立即吊销。
+旧 token 拒绝——轮换防未来重放，不作立即吊销。若两个不同 nonce 在 previous
+窗口内并发到达，后者是合法的新串行 winner：它 supersede 前一个 pending
+decision；前 decision 即使已得到 `RESUME_OK` 也只能半关其 transport，不能安装
+或覆盖新 owner，直到新 winner 完成安装并确认。
 
 `RESUME_REJECT` 使用固定 reason：
 
@@ -891,4 +895,3 @@ SSE 以网络错误关闭、WS 发 CLOSE(1012)；**session 继续恢复至 90s �
 4. direct/relay path change 不会误触发 logical death；
 5. provider/consumer 双端均有真实断线故障注入，而不是只用可靠 loopback；
 6. 进程重启边界明确为支持或不支持，并有对应测试断言。
-
