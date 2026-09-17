@@ -10,6 +10,7 @@ const Native = require("../index.js");
 /**
  * 发起 HTTP 请求（design §3.4）。本阶段 body 为静态分块（AsyncIterable 请求
  * 体后续 phase）；响应经 pull-first bodyNext() 消费，亦可 for-await 迭代。
+ * headTimeoutMs 可配（默认 30s——长轮询/慢上游按需放宽）。
  * @param {import("../index.js").SessionHandle} session
  * @param {{
  *   method: string;
@@ -17,6 +18,7 @@ const Native = require("../index.js");
  *   headers?: Array<{ name: string; value: string }>;
  *   body?: Array<Uint8Array> | null;
  *   keepOpen?: boolean;
+ *   headTimeoutMs?: number;
  * }} request
  */
 async function fetchHttp(session, request) {
@@ -28,6 +30,7 @@ async function fetchHttp(session, request) {
   };
   if (request.body != null) init.body = request.body;
   if (request.keepOpen != null) init.keepOpen = request.keepOpen;
+  if (request.headTimeoutMs != null) init.headTimeoutMs = request.headTimeoutMs;
   const resp = await session.fetchHttp(init);
   // §3.4 HttpResponse.body AsyncIterable 投影：迭代逐块 pull（EOF 结束）
   Object.defineProperty(resp, Symbol.asyncIterator, {
@@ -47,8 +50,11 @@ async function fetchHttp(session, request) {
 
 /**
  * provider 侧 HTTP 引擎（design §3.4）。handler 收到类型化请求
- * （bodyNext 拉取请求体，EOF = null），返回 { status, headers?, bodyChunks? }。
- * 本阶段响应体为静态分块（引擎有界背压承接）；流式供给后续 phase。
+ * （bodyNext 拉取请求体，EOF = null；respondStreaming 流式回响应）：
+ * - 返回 { status, headers?, bodyChunks? } —— 一次性静态响应；
+ * - 调用 req.respondStreaming(status, headers) —— 响应头立即发出，返回
+ *   { write(chunk), finish() }（SSE/长连接/WS 101 早发等真实流式；对端
+ *   abort/RESET 时 write 报错，调用方据此提前收敛上游）。
  * @param {import("../index.js").Fabric} fabric
  * @param {string} peerId
  * @param {(req: {
@@ -58,7 +64,8 @@ async function fetchHttp(session, request) {
  *   path: string;
  *   headers: Array<{ name: string; value: string }>;
  *   bodyNext: () => Promise<Buffer | null>;
- * }) => Promise<{ status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> }> | { status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> }} handler
+ *   respondStreaming: (status: number, headers?: Array<{ name: string; value: string }>) => { write: (chunk: Uint8Array) => Promise<void>; finish: () => void; finished: boolean } | null;
+ * }) => Promise<{ status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void> | { status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void} handler
  */
 async function serveHttp(fabric, peerId, handler) {
   const server = await fabric.serveHttp(peerId, (err, json) => {
@@ -71,6 +78,8 @@ async function serveHttp(fabric, peerId, handler) {
       return;
     }
     if (ev?.type !== "request") return;
+    /** @type {Set<number>} 已流式结算的请求（返回值兜底结算需跳过） */
+    const streamed = new Set();
     Promise.resolve()
       .then(() =>
         handler({
@@ -80,9 +89,28 @@ async function serveHttp(fabric, peerId, handler) {
           path: ev.path,
           headers: ev.headers ?? [],
           bodyNext: () => server.requestBodyNext(ev.requestId),
+          respondStreaming(status, headers) {
+            const writer = server.respondStreaming(
+              ev.requestId,
+              status,
+              headers ?? [],
+            );
+            if (writer == null) return null; // 已结算/晚到：幂等 null
+            streamed.add(ev.requestId);
+            return {
+              write: (chunk) => writer.write(Buffer.from(chunk)),
+              finish: () => {
+                writer.finish();
+              },
+              get finished() {
+                return writer.finished;
+              },
+            };
+          },
         }),
       )
       .then((res) => {
+        if (streamed.has(ev.requestId)) return; // 流式路径已结算
         if (!res || typeof res.status !== "number") {
           throw new Error("handler must resolve { status, headers?, bodyChunks? }");
         }
@@ -105,8 +133,8 @@ async function serveHttp(fabric, peerId, handler) {
     },
     /**
      * 内部桥句柄（native HttpServerJs）——/http/internals 的观测/结算原语
-     * （pendingRequestCount/requestBodyNext/resolveRequest/rejectRequest）。
-     * semver 宽松：不构成稳定承诺。
+     * （pendingRequestCount/requestBodyNext/resolveRequest/rejectRequest/
+     * respondStreaming）。semver 宽松：不构成稳定承诺。
      */
     native: server,
   };

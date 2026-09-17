@@ -121,6 +121,8 @@ pub struct HttpRequestInit {
     pub body: Vec<Bytes>,
     /// WS 隧道模式：不半关请求方向（101 后双向持续）。
     pub keep_open: bool,
+    /// 响应头等待上限（默认 30s；长轮询场景按需放宽/收紧）。
+    pub head_timeout: Option<std::time::Duration>,
 }
 
 impl HttpRequestInit {
@@ -131,6 +133,7 @@ impl HttpRequestInit {
             headers: Vec::new(),
             body: Vec::new(),
             keep_open: false,
+            head_timeout: None,
         }
     }
 
@@ -141,6 +144,7 @@ impl HttpRequestInit {
             headers: vec![Header::new("content-type", "application/json")],
             body: vec![body],
             keep_open: false,
+            head_timeout: None,
         }
     }
 }
@@ -184,6 +188,22 @@ impl HttpClientResponse {
     pub async fn send_tunnel(&self, data: Bytes) -> Result<(), FabricError> {
         self.session.channel().send_data(self.stream_id, data).await
     }
+
+    /// per-request 取消：向对端发 RESET（serve 响应循环止付、流式供给面随
+    /// Drop 关闭——上游 handler 提前收敛）。失败仅意味着通道已死（取消目的
+    /// 已达成），故映射为 Ok。幂等语义由调用方（SDK）标志位保证。
+    pub async fn abort(&self) {
+        let frame = crate::continuity::Frame {
+            frame_type: crate::continuity::FrameType::Reset,
+            flags: 0,
+            session_id: self.session.shared().session_id,
+            stream_id: self.stream_id,
+            direction: self.session.shared().send_direction(),
+            byte_offset: 0,
+            payload: Bytes::new(),
+        };
+        let _ = self.session.channel().send_frame(&frame).await;
+    }
 }
 
 /// 发起 HTTP 请求（请求方向默认 FIN；keep_open 隧道不关）。
@@ -220,21 +240,23 @@ pub async fn fetch_http(
     if !init.keep_open {
         channel.finish(stream_id).await?;
     }
-    // 等 meta 行（首块；有界）
+    // 等 meta 行（首块；有界——head_timeout 可配，默认 30s）
+    let head_timeout = init
+        .head_timeout
+        .unwrap_or(std::time::Duration::from_secs(30));
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + head_timeout;
     let (status, headers, rest) = loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(FabricError::Session(SessionError::Connect(
                 "response head timeout".into(),
             )));
         }
-        let chunk =
-            tokio::time::timeout(std::time::Duration::from_secs(30), channel.recv(stream_id))
-                .await
-                .map_err(|_| {
-                    FabricError::Session(SessionError::Connect("response head timeout".into()))
-                })??;
+        let chunk = tokio::time::timeout(head_timeout, channel.recv(stream_id))
+            .await
+            .map_err(|_| {
+                FabricError::Session(SessionError::Connect("response head timeout".into()))
+            })??;
         buf.extend_from_slice(&chunk);
         if let Some((status, headers, rest)) = peel_meta_line(&buf) {
             break (status, headers, rest);
@@ -417,6 +439,11 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
             }
             if let Some(mut body) = resp.body {
                 while let Some(chunk) = body.recv().await {
+                    // 对端 RESET（per-request cancel）：止付并丢弃接收器——
+                    // 流式供给面随 Drop 关闭，handler 侧写失败提前收敛。
+                    if shared.peer_reset(stream_id).await {
+                        return;
+                    }
                     if !send_resilient(&session, stream_id, chunk).await {
                         return;
                     }

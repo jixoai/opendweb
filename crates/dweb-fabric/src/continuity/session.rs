@@ -253,6 +253,9 @@ struct StreamCtx {
     committed_offset: u64,
     /// 已发出的最高 ACK 水位（补发 ACK 判定：committed 越过才补发）。
     last_acked_offset: u64,
+    /// 对端已发 RESET（per-request cancel 链）：serve 响应循环据此止付，
+    /// 流式 body 供给面随接收器 Drop 关闭——上游 handler 得以提前收敛。
+    peer_reset: bool,
 }
 
 impl StreamCtx {
@@ -264,6 +267,7 @@ impl StreamCtx {
             remote_final: None,
             committed_offset: 0,
             last_acked_offset: 0,
+            peer_reset: false,
         }
     }
 
@@ -895,6 +899,16 @@ impl SessionShared {
             .unwrap_or(0)
     }
 
+    /// 观测面：对端是否已对本流发 RESET（per-request cancel）——serve 响应
+    /// 循环据此止付，流式供给面随接收器 Drop 关闭。
+    pub async fn peer_reset(&self, stream_id: u64) -> bool {
+        self.streams
+            .lock()
+            .await
+            .get(&stream_id)
+            .is_some_and(|c| c.peer_reset)
+    }
+
     /// 测试观测面：当前恢复凭据（集成测试注入合法 RESUME 用）。
     #[doc(hidden)]
     pub fn debug_current_token(&self) -> (u64, [u8; 16]) {
@@ -933,7 +947,7 @@ impl SessionShared {
             .fetch_add(2, std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn send_direction(&self) -> Direction {
+    pub(crate) fn send_direction(&self) -> Direction {
         if self.is_client {
             Direction::ClientToProvider
         } else {
@@ -1443,6 +1457,7 @@ impl SessionShared {
                 let mut streams = self.streams.lock().await;
                 if let Some(ctx) = streams.get_mut(&sid) {
                     ctx.remote_final = Some(ctx.recv.expected_offset());
+                    ctx.peer_reset = true;
                     drop(streams);
                     self.delivered_notify.notify_waiters();
                 } else {

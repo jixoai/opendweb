@@ -144,6 +144,12 @@ export declare class HttpClientResponseJs {
    * 整消息边界 ABI（WsMessage，§3.4）归 Phase 4——本面是字节隧道级，如实标注。
    */
   sendTunnel(data: Buffer): Promise<void>
+  /**
+   * per-request 取消（幂等）：向 provider 发 RESET——serve 响应循环止付、
+   * 流式 body 供给面关闭，上游 handler 提前收敛（本地断开 → 上游关闭）。
+   * 通道已死时发送失败即取消目的已达，静默成功。
+   */
+  abort(): Promise<void>
 }
 
 /**
@@ -163,6 +169,12 @@ export declare class HttpServerJs {
    * （静态数组；流式供给由引擎有界背压承接）。
    */
   resolveRequest(requestId: number, status: number, headers?: Array<HeaderJs> | undefined | null, bodyChunks?: Array<Buffer> | undefined | null): void
+  /**
+   * （内部面）流式结算：立即回状态行（响应头此刻发出——SSE 首包/WS 101
+   * 早发），body 经返回的 StreamWriterJs 持续 write/finish。与
+   * resolveRequest 互斥（先到者胜）。unknown id 幂等返回 null。
+   */
+  respondStreaming(requestId: number, status: number, headers?: Array<HeaderJs> | undefined | null): StreamWriterJs | null
   /** （内部面）JS handler 抛错/拒绝：引擎按未发头前失败处置（500）。 */
   rejectRequest(requestId: number, message: string): void
   /** （内部面）请求体拉取（pull-first；EOF = null；unknown id / 会话终态 → 错误）。 */
@@ -222,6 +234,23 @@ export declare class SessionHandle {
 }
 
 /**
+ * 流式响应写句柄（respondStreaming 返回）：write 逐块供给（有界通道背压
+ * ——消费速度传导到内核发送面）；finish 半关（EOF）。对端 RESET/引擎丢弃
+ * 时 write 报错——调用方据此提前收敛上游（本地断开 → 上游关闭链路）。
+ */
+export declare class StreamWriterJs {
+  /** 是否已 finish（幂等面；对端关闭经 write 的错误暴露）。 */
+  get finished(): boolean
+  /**
+   * 写入一块 body（背压：通道满即等待——内核发送面/对端消费速度传导）。
+   * finish 后写、或对端已取消（RESET/引擎丢弃）→ 错误。
+   */
+  write(chunk: Buffer): Promise<void>
+  /** 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。 */
+  finish(): void
+}
+
+/**
  * continuity 连接状态快照（design §3.1；Phase 1 task 2.3 补课投影）。
  * epoch/stateSeq 按 napi 习惯映射为 number（工作区 napi 特性集为 napi4——
  * BigInt 需 napi6；f64 精确到 2^53，epoch/seq 单调计数远不及）。
@@ -266,6 +295,8 @@ export interface FetchHttpInit {
   body?: Array<Buffer>
   /** WS 隧道模式：不半关请求方向（101 后双向持续；配合 sendTunnel）。 */
   keepOpen?: boolean
+  /** 响应头等待上限毫秒（默认 30s——长轮询/慢上游按需放宽）。 */
+  headTimeoutMs?: number
 }
 
 /** HTTP 头（数组形态保重复项，§3.4）。 */

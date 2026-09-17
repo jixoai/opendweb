@@ -16,10 +16,9 @@
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    Header, HttpEngineError, HttpHandler, HttpRequest as KernelHttpRequest,
-    HttpRequestInit as KernelHttpRequestInit,
-    HttpResponse as KernelHttpResponse, RequestBody, fetch_http as kernel_fetch_http,
-    serve_http as kernel_serve_http,
+    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, Header, HttpEngineError,
+    HttpHandler, HttpRequest as KernelHttpRequest, HttpRequestInit as KernelHttpRequestInit,
+    HttpResponse as KernelHttpResponse, RequestBody,
 };
 use dweb_fabric::continuity::session::{Session, SessionOptions, SessionPhase, SessionShared};
 use dweb_fabric::Fabric as RustFabric;
@@ -29,7 +28,7 @@ use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{oneshot, Mutex};
 
 use crate::session::session_err;
 
@@ -61,6 +60,8 @@ pub struct FetchHttpInit {
     pub body: Option<Vec<Buffer>>,
     /// WS 隧道模式：不半关请求方向（101 后双向持续；配合 sendTunnel）。
     pub keep_open: Option<bool>,
+    /// 响应头等待上限毫秒（默认 30s——长轮询/慢上游按需放宽）。
+    pub head_timeout_ms: Option<f64>,
 }
 
 /// fetchHttp 响应：status/headers/streamId + bodyNext（pull-first）。
@@ -72,6 +73,7 @@ pub struct HttpClientResponseJs {
     stream_id: u64,
     resp: Mutex<dweb_fabric::continuity::http::HttpClientResponse>,
     shared: Arc<SessionShared>,
+    aborted: std::sync::atomic::AtomicBool,
 }
 
 #[napi]
@@ -97,6 +99,12 @@ impl HttpClientResponseJs {
     /// 会话 Dead/Closed 时有界失败。
     #[napi]
     pub async fn body_next(&self) -> Result<Option<Buffer>> {
+        if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "[session] response aborted by caller",
+            ));
+        }
         loop {
             match self.shared.phase().await {
                 SessionPhase::Dead | SessionPhase::Closed => {
@@ -125,12 +133,29 @@ impl HttpClientResponseJs {
     /// 整消息边界 ABI（WsMessage，§3.4）归 Phase 4——本面是字节隧道级，如实标注。
     #[napi]
     pub async fn send_tunnel(&self, data: Buffer) -> Result<()> {
+        if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "[session] response aborted by caller",
+            ));
+        }
         self.resp
             .lock()
             .await
             .send_tunnel(Bytes::from(data.as_ref().to_vec()))
             .await
             .map_err(session_err)
+    }
+
+    /// per-request 取消（幂等）：向 provider 发 RESET——serve 响应循环止付、
+    /// 流式 body 供给面关闭，上游 handler 提前收敛（本地断开 → 上游关闭）。
+    /// 通道已死时发送失败即取消目的已达，静默成功。
+    #[napi]
+    pub async fn abort(&self) -> Result<()> {
+        if !self.aborted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.resp.lock().await.abort().await;
+        }
+        Ok(())
     }
 }
 
@@ -157,6 +182,10 @@ pub(crate) async fn fetch_http(
             .map(|b| Bytes::from(b.as_ref().to_vec()))
             .collect(),
         keep_open: init.keep_open.unwrap_or(false),
+        head_timeout: init
+            .head_timeout_ms
+            .filter(|ms| *ms > 0.0)
+            .map(|ms| std::time::Duration::from_millis(ms as u64)),
     };
     let resp = kernel_fetch_http(session, rin).await.map_err(session_err)?;
     let shared = Arc::clone(session.shared());
@@ -173,6 +202,7 @@ pub(crate) async fn fetch_http(
         stream_id: resp.stream_id,
         resp: Mutex::new(resp),
         shared,
+        aborted: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -180,18 +210,27 @@ pub(crate) async fn fetch_http(
 // serveHttp：TSFN handler 桥
 // ---------------------------------------------------------------------------
 
-/// JS handler 结算载荷（bridge 内部）。
-struct HandlerOutcome {
-    status: u16,
-    headers: Vec<Header>,
-    chunks: Vec<Bytes>,
+/// JS handler 结算载荷（bridge 内部）：
+/// - Static：一次性状态行+全量 chunks（resolveRequest——简单响应）。
+/// - Streaming：先回状态行（respondStreaming），body 经 StreamWriterJs
+///   持续 write——SSE/长连接/WS 101 早发等真实流式响应。
+enum HandlerOutcome {
+    Static {
+        status: u16,
+        headers: Vec<Header>,
+        chunks: Vec<Bytes>,
+    },
+    Streaming {
+        status: u16,
+        headers: Vec<Header>,
+        body: tokio::sync::mpsc::Receiver<Bytes>,
+    },
 }
 
 type BoxHttpFuture = std::pin::Pin<
     Box<
-        dyn std::future::Future<
-                Output = std::result::Result<KernelHttpResponse, HttpEngineError>,
-            > + Send,
+        dyn std::future::Future<Output = std::result::Result<KernelHttpResponse, HttpEngineError>>
+            + Send,
     >,
 >;
 
@@ -261,19 +300,33 @@ impl HttpHandler for HandlerBridge {
             }
             match rx.await {
                 Ok(Ok(out)) => {
-                    // 静态 chunks → 有界 mpsc 供给（断线窗口引擎侧背压承接）
-                    let (btx, brx) = tokio::sync::mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
-                    tokio::spawn(async move {
-                        for c in out.chunks {
-                            if btx.send(c).await.is_err() {
-                                break;
-                            }
+                    let (status, headers, body) = match out {
+                        HandlerOutcome::Static {
+                            status,
+                            headers,
+                            chunks,
+                        } => {
+                            // 静态 chunks → 有界 mpsc 供给（断线窗口引擎侧背压承接）
+                            let (btx, brx) = tokio::sync::mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
+                            tokio::spawn(async move {
+                                for c in chunks {
+                                    if btx.send(c).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
+                            (status, headers, Some(brx))
                         }
-                    });
+                        HandlerOutcome::Streaming {
+                            status,
+                            headers,
+                            body,
+                        } => (status, headers, Some(body)),
+                    };
                     Ok(KernelHttpResponse {
-                        status: out.status,
-                        headers: out.headers,
-                        body: Some(brx),
+                        status,
+                        headers,
+                        body,
                     })
                 }
                 Ok(Err(msg)) => Err(HttpEngineError(msg)),
@@ -353,7 +406,7 @@ impl HttpServerJs {
         }
         let mut pending = self.bridge.pending.blocking_lock();
         if let Some(tx) = pending.remove(&id) {
-            let out = HandlerOutcome {
+            let out = HandlerOutcome::Static {
                 status: status as u16,
                 headers: headers
                     .unwrap_or_default()
@@ -373,6 +426,43 @@ impl HttpServerJs {
             // 不抛错——防 server.close 后 unhandledRejection
             Ok(())
         }
+    }
+
+    /// （内部面）流式结算：立即回状态行（响应头此刻发出——SSE 首包/WS 101
+    /// 早发），body 经返回的 StreamWriterJs 持续 write/finish。与
+    /// resolveRequest 互斥（先到者胜）。unknown id 幂等返回 null。
+    #[napi]
+    pub fn respond_streaming(
+        &self,
+        request_id: f64,
+        status: f64,
+        headers: Option<Vec<HeaderJs>>,
+    ) -> Result<Option<StreamWriterJs>> {
+        let id = request_id as u64;
+        if status.fract() != 0.0 || !(100.0..=599.0).contains(&status) {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "[session] handler status must be an integer in 100..=599",
+            ));
+        }
+        let mut pending = self.bridge.pending.blocking_lock();
+        let Some(tx) = pending.remove(&id) else {
+            return Ok(None);
+        };
+        let (btx, brx) = tokio::sync::mpsc::channel::<Bytes>(BODY_CHANNEL_CAP);
+        let out = HandlerOutcome::Streaming {
+            status: status as u16,
+            headers: headers
+                .unwrap_or_default()
+                .iter()
+                .map(|h| h.to_kernel())
+                .collect(),
+            body: brx,
+        };
+        let _ = tx.send(Ok(out));
+        Ok(Some(StreamWriterJs {
+            tx: std::sync::Mutex::new(Some(btx)),
+        }))
     }
 
     /// （内部面）JS handler 抛错/拒绝：引擎按未发头前失败处置（500）。
@@ -440,6 +530,54 @@ impl HttpServerJs {
             let _ = tx.send(Err("server closed".into()));
         }
         self.bridge.bodies.lock().await.clear();
+        Ok(())
+    }
+}
+
+/// 流式响应写句柄（respondStreaming 返回）：write 逐块供给（有界通道背压
+/// ——消费速度传导到内核发送面）；finish 半关（EOF）。对端 RESET/引擎丢弃
+/// 时 write 报错——调用方据此提前收敛上游（本地断开 → 上游关闭链路）。
+#[napi]
+pub struct StreamWriterJs {
+    tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
+}
+
+#[napi]
+impl StreamWriterJs {
+    /// 是否已 finish（幂等面；对端关闭经 write 的错误暴露）。
+    #[napi(getter)]
+    pub fn finished(&self) -> bool {
+        self.tx.lock().unwrap().is_none()
+    }
+
+    /// 写入一块 body（背压：通道满即等待——内核发送面/对端消费速度传导）。
+    /// finish 后写、或对端已取消（RESET/引擎丢弃）→ 错误。
+    #[napi]
+    pub async fn write(&self, chunk: Buffer) -> Result<()> {
+        let sender = {
+            let guard = self.tx.lock().unwrap();
+            guard.as_ref().cloned().ok_or_else(|| {
+                Error::new(
+                    Status::GenericFailure,
+                    "[session] stream writer already finished",
+                )
+            })?
+        };
+        sender
+            .send(Bytes::from(chunk.as_ref().to_vec()))
+            .await
+            .map_err(|_| {
+                Error::new(
+                    Status::GenericFailure,
+                    "[session] stream closed by peer or engine (request cancelled)",
+                )
+            })
+    }
+
+    /// 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。
+    #[napi]
+    pub fn finish(&self) -> Result<()> {
+        *self.tx.lock().unwrap() = None;
         Ok(())
     }
 }
