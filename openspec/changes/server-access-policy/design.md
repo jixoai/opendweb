@@ -606,7 +606,7 @@ Content-Type: application/json；请求体 ≤4KiB；响应体 ≤4KiB
   "event": "relay.connect",
   "endpoint_id": "<z-base-32>",
   "capability": null | { "fabric_id": "<hex>", "issuer": "<z-base-32>",
-    "caps": ["relay"], "issued_at_ms": 0, "expires_at_ms": 0 },
+    "caps": ["relay", "rdz-announce", "rdz-resolve"], "issued_at_ms": 0, "expires_at_ms": 0 },
   "connection_id": "<opaque>"
 }
 响应（HTTP 200，JSON）：
@@ -626,18 +626,21 @@ Content-Type: application/json；请求体 ≤4KiB；响应体 ≤4KiB
   + 有界等待队列（默认 256，队满即 DENY `dweb/policy-unavailable`）
   ——防回调风暴耗尽 relay executor（client_rx 限流在连接注册后的
   数据面，保护不到此处）。
-- **缓存冻结（R4 P1-4 补 schema）**：键 = (registry_generation,
-  endpoint_id, BLAKE3(hash_input), event)，其中 hash_input 为**固定
-  二进制投影**：`caps u8 || issued_at u64 BE || expires_at u64 BE ||
-  fabric_id 32B || issuer 32B || recipient 32B`（113B 定长；无票时用
-  32 字节全零 sentinel 代替后三段，即 `caps=0 || issued_at=0 ||
-  expires_at=0 || zero×96`）；digest 为内部 32B 值（不出现在日志）。
-  registry 变更（文件重载/unregister）即 generation+1 并清空全部缓存
-  （撤销即时生效窗口 = 0）；TTL = min(响应 cache_ttl_s,
-  callback_cache_ttl_ms 配置，上限 60s)；**cache_ttl_s 省略 = 使用
-  配置默认；非整数/负数/浮点/超 60 一律按 0（不缓存）；响应未知字段
-  忽略（不拒绝）**。缓存仅作用于**新连接准入**，不作为存量连接撤销
-  机制（§13）。
+- **缓存冻结（R4 P1-4 补 schema；实现期裁定见附录 B 末）**：键 =
+  (registry_generation, endpoint_id, hash_input, event)，其中
+  hash_input 为**固定 113B 二进制投影**：`caps u8 || issued_at u64 BE
+  || expires_at u64 BE || fabric_id 32B || issuer 32B || recipient 32B`
+  （投影单射无碰撞，直接作键——语义等同摘要且省一次哈希；不出现在
+  日志）；无票时用等长 sentinel `caps=0 || issued_at=0 ||
+  expires_at=0 || zero×96`。registry 变更（文件重载/unregister）即
+  generation+1（旧键自然不命中）并清空缓存容量（撤销即时生效窗口
+  = 0）；TTL = min(响应 cache_ttl_s, callback_cache_ttl_ms 配置，
+  上限 60s)；**cache_ttl_s 省略 = 使用配置默认；非整数/负数/浮点/
+  超 60 一律按 0（不缓存）；响应未知字段忽略（不拒绝）**。缓存仅
+  作用于**新连接准入**，不作为存量连接撤销机制（§13）。**缓存范围
+  细化**：webhook 交互侧失败（非 200/超时/解析失败）的 deny 入缓存；
+  负载侧拒绝（队列耗尽/并发超限）为瞬时条件**不入缓存**——过载恢复
+  后下一接入立即重试回调，不毒化后续准入。
 - **传输与 SSRF 边界（R4 P1-8 补解析原子性）**：生产强制 `https://`
   （`--allow-loopback-callback` 显式豁免本机 loopback 供开发）；
   **解析-校验-连接原子语义**：实现 MUST 自行解析 callback_url 主机
