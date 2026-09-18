@@ -102,9 +102,10 @@ jobs:
         with:
           node-version: 22
       # npm trusted publishing 需要 npm >= 11.5（OIDC 免 token）。钉 11 大版本：
-      # npm@latest 已升 12.0（2026-09），npm pack --json 输出结构变化曾致
-      # ext-cf pack:dry 门禁空数组崩溃（v0.5.0 首跑实证）——升 12 须先全链验证。
-      - run: npm install -g npm@11
+      # npm@12 解钉（v0.6.0）：pack-dry.mjs 已形状无关归一（数组|对象双形
+      # 实测：npm@11 数组形 / npm@12 包名索引对象形，filename/size/entryCount
+      # 字段一致）；client-sdk pack --dry-run 的 grep 为文本面不受形状影响。
+      - run: npm install -g npm@latest
       - name: Download CI-built Windows binaries
         uses: actions/download-artifact@v4
         with:

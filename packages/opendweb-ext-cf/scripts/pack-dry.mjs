@@ -70,9 +70,13 @@ if (kb > 2048 * 1024) {
 // ---- 3) clean-tar 消费者导入 ----
 const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "cf-packdry-"));
 try {
-  const manifest = JSON.parse(
+  // npm@12（2026-09）把 pack --json 从数组改为按包名索引的对象——形状
+  // 无关归一（v0.6.0 解钉 @11 前置；两种形状实测字段 filename/size/
+  // entryCount 一致）。
+  const raw = JSON.parse(
     execFileSync("npm", ["pack", "--json", `--pack-destination=${tmp}`], { cwd: pkgDir, encoding: "utf8" }),
-  )[0];
+  );
+  const manifest = Array.isArray(raw) ? raw[0] : Object.values(raw)[0];
   const tgz = path.join(tmp, manifest.filename);
   console.log(`packed ${manifest.filename} (${Math.round(manifest.size / 1024)} KB, ${manifest.entryCount} files)`);
 
