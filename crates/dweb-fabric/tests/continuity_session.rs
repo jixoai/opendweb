@@ -840,6 +840,14 @@ async fn session_abandoned_resume_then_cross_nonce_recovers() {
 /// reap 释放 canonical）+ campaign 守卫活跃判定只认 Active/Recovering。
 #[tokio::test]
 async fn session_reopen_after_giveup_releases_canonical() {
+    // 全局旋钮的 panic 安全复位（断言失败不毒化同二进制后续测试）
+    struct GiveupGuard;
+    impl Drop for GiveupGuard {
+        fn drop(&mut self) {
+            session::set_resume_giveup_for_test(0);
+        }
+    }
+    let _giveup = GiveupGuard;
     session::set_resume_giveup_for_test(300);
     let (a, b, _da, _db) = pair().await;
     let b_id = b.endpoint_id();
@@ -864,7 +872,7 @@ async fn session_reopen_after_giveup_releases_canonical() {
     assert_ne!(sid1, sid2, "重开必须得到新 session（canonical 已释放）");
     s2.close().await;
     provider.abort();
-    session::set_resume_giveup_for_test(0);
+    drop(_giveup);
 }
 
 /// s7（硬化 P0-2）：SESSION_INIT 幂等（同 sid+token 重发 OK——ghost 收敛）；
