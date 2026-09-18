@@ -50,9 +50,9 @@
 - [x] 4.1 SDK lifecycle 3 钉（test/http-lifecycle.test.mjs）：sessionId
       hex 会话稳定；挂起 handler 收 signal abort + writer.cancelled +
       write 拒绝；正常完成 signal 静默 + closed 翻转 + cancelled 保持 false
-- [ ] 4.2 全量门禁（串行）：fabric lib + 3 continuity 套件 + SDK release
-      重建 + SDK 全量测试（39）+ tsc typecheck；clippy -D warnings
-      （fabric/sdk 范围）
+- [x] 4.2 全量门禁（串行，实跑两轮）：fabric lib 178/178 + session 19/19
+      + http 7/7 + state 5/5 + SDK release 重建 + SDK 全量 40/40 +
+      tsc typecheck 净；clippy 警告零新增（既有 type_complexity 遗留不含）
 - [x] 4.3 版本 0.6.0 + CHANGELOG
 
 ## 5. 评审与发布
