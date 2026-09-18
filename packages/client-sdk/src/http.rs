@@ -298,6 +298,15 @@ impl HttpHandler for HandlerBridge {
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(request_id, tx);
             bodies.lock().await.insert(request_id, request.body.clone());
+            // R3-P1d：插入后复查 closed——close 的 drain 可能刚好错过本批
+            // 插入（检查在前、drain 在后的交错）：自摘除并以 server closed
+            // 拒绝（不留无人结算的 pending/bodies/cancels）。
+            if closed.load(std::sync::atomic::Ordering::SeqCst) {
+                pending.lock().await.remove(&request_id);
+                bodies.lock().await.remove(&request_id);
+                cancels.lock().await.remove(&request_id);
+                return Err(HttpEngineError("server closed".into()));
+            }
             // per-request 取消 watcher：终裁 Cancelled → 置 cancelled + 发
             // TSFN cancel 事件（best-effort 信号；write 错误仍是真相面）；
             // 任一终裁 → 置 closed（内核此后不再消费 write）。watcher 生命
@@ -316,17 +325,19 @@ impl HttpHandler for HandlerBridge {
                 let closed_flag = Arc::clone(&closed);
                 let rid = request_id;
                 tokio::spawn(async move {
-                    // R2-P1d：server.close 唤醒面与终裁竞速——close 先到则
-                    // 置 closed 静默退出（不发 cancel：server 已死，JS 侧
-                    // close() 同步 abort controllers）。closed 旗前置检查兜底
-                    // Notify 无保留语义的未注册窗口（spawn 未首 poll 时）。
+                    // R3-P1d：先注册 notified 再读 closed 旗（enable-then-check）
+                    //——Notify 不保留许可，注册与检查的交错窗口由此闭合：
+                    // 旗在注册前置位 → 检查命中；旗在注册后置位 → 唤醒命中。
+                    let notified = close_notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
                     if closed_flag.load(std::sync::atomic::Ordering::Acquire) {
                         cancels.lock().await.remove(&rid);
                         return;
                     }
                     let outcome = tokio::select! {
                         out = cancel.wait() => out,
-                        _ = close_notify.notified() => CancelOutcome::Completed,
+                        _ = &mut notified => CancelOutcome::Completed,
                     };
                     flags
                         .closed

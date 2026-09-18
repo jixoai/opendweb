@@ -66,12 +66,13 @@ impl RequestCancel {
 - **顺序敏感**：取消复查在完成复查之前——FIN 与 RESET 竞速时宁可多发一次
   cancel（JS 侧 signal abort 对已结束请求无害）也不漏发（漏发 = 挂起任务
   永不停止）。
-- **无泄漏**（R1 收敛口径）：正常路径 dispatch `mark_completed` → watcher
+- **无泄漏**（R3 收敛口径）：正常路径 dispatch `mark_completed` → watcher
   退出；异常路径 peer_reset/session 终态 → 发射后退出；内核 400/500 错误
   出口同样 `mark_completed`（错误响应即终局）；桥层初始 TSFN 投递失败
-  显式 `watcher.abort()` 双保险。watcher 挂起面 = reset_notify / 有界
-  sleep；终态出口（Completed/Cancelled/Dead/Closed）保证退出。
-- session.rs 若无 phase 变化 Notify，则以 100ms 有界轮询 phase 佐餐
+  显式 `watcher.abort()`；server.close 经 close_notify 唤醒（watcher 先
+  enable 注册再查 closed 旗——Notify 无保留语义的交错窗口闭合）。挂起面
+  = reset_notify / 有界 sleep / close_notify；终态出口保证退出。
+- session.rs 无 phase 变化 Notify——以 250ms 有界 sleep 佐餐（定稿口径）
   （wait_active 同款模式，终态出口仍保证退出）。
 
 ### D3. cancel 事件走既有 TSFN（JSON String 通道）
@@ -181,9 +182,13 @@ e2e T7 实证同 peer 重开永卡：两层缺陷——
 - **终局提交条件化**：complete_resume_install 仅在 phase ∈ {Active,
   Recovering} 且未置 closing 时置 Active——迟到恢复不得复活 Dead/Closed；
   90s 窗口内合法慢恢复不受影响（到达时仍 Recovering）。
-- **closing 闸门（客户端实例）**：close 先置 closing（CAS），此后本端
-  新 OPEN 拒绝、本端 resume install 拒绝、终局提交拒绝 Active；通道终结
-  循环（≤3 轮再解析当前代）覆盖 close await 期间并发安装的新代通道。
+- **closing 闸门（R3 定稿）**：close 先置 closing（CAS）再持
+  channel_transition 串行化——此后本端新 OPEN 拒绝（reserve_stream_slot
+  锁内复查——与 close 的「先置旗再快照」构成全序）、**所有路径**的
+  install 拒绝（客户端 resume 的 decision:None 路径同样设闸）、客户端
+  恢复激活走 complete_resume_install_checked（失败即撤销安装按
+  superseded 收敛）；通道终结循环持 transition 锁（≤3 轮再解析当前代，
+  锁下无新安装插入）。
   provider 侧（异实例）的迟到恢复防线 = 放弃看门狗转 Dead + install
   Dead 拒绝 + 条件化终局（s6e 钉：Dead 后放行的在途恢复被拒，无成功帧）。
 - **accept_resume 终态复核**：安装与归属栅栏之后、OK 发送之前复核

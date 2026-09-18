@@ -118,8 +118,11 @@ async function serveHttp(fabric, peerId, handler) {
   const finalizeRequest = (requestId) => {
     liveRequests.delete(requestId);
   };
+  /** R3-P1d：close 后迟到 TSFN 事件闸门（队列滞留的 request/cancel 直接丢弃） */
+  let serverClosed = false;
   const server = await fabric.serveHttp(peerId, (err, json) => {
     if (err) return;
+    if (serverClosed) return;
     /** @type {any} */
     let ev;
     try {
@@ -212,6 +215,7 @@ async function serveHttp(fabric, peerId, handler) {
      * controller 一并 abort + liveRequests 全清（server.close 的 native 面
      * 只 drain pending——流式请求不在其中）。 */
     close(_reason) {
+      serverClosed = true; // 先置闸：TSFN 队列滞留的迟到事件直接丢弃
       for (const { controller } of liveRequests.values()) {
         try {
           controller.abort();

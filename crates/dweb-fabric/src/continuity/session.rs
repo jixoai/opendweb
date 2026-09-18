@@ -553,6 +553,12 @@ impl SessionShared {
     /// closing 刻意关闭时，不得被无条件拉回 Active（迟到恢复不得复活终态
     /// 会话；90s 窗口内的合法慢恢复不受影响——它们到达时仍 Recovering）。
     fn complete_resume_install(&self) {
+        let _ = self.complete_resume_install_checked();
+    }
+
+    /// 条件激活（返回是否成功）：仅 Active/Recovering 且未 closing 时置
+    /// Active。调用方（客户端恢复路径）失败时撤销安装按 superseded 收敛。
+    fn complete_resume_install_checked(&self) -> bool {
         let mut ctl = self.resume_control.lock().unwrap();
         if !self.closing.load(std::sync::atomic::Ordering::Acquire)
             && matches!(
@@ -561,7 +567,9 @@ impl SessionShared {
             )
         {
             ctl.phase = SessionPhase::Active;
+            return true;
         }
+        false
     }
 
     /// 当前代通道（经 ResumeCtl 解析——owner 单调，恢复轮换后指向新代；
@@ -644,6 +652,17 @@ impl SessionShared {
         // P1-4/R2-P1c：Dead 会话（canonical 已被替换/看门狗放弃）与刻意
         // 关闭中（closing）不得再安装——在途旧 RESUME 就此出局（失归属/
         // 已关闭语义由对端重开承接）。
+        // R3-P1a：closing/Dead 复查覆盖**所有**安装路径（客户端 resume 传
+        // decision: None——此前仅 decision 分支设闸，客户端路径绕过）。
+        {
+            let phase = self.phase_sync();
+            let closing = self.closing.load(std::sync::atomic::Ordering::Acquire);
+            if closing || phase == SessionPhase::Dead || phase == SessionPhase::Closed {
+                let _ = send.finish();
+                // 终局终态：候选传输半关出局（迟到安装不得复活）
+                return None;
+            }
+        }
         if let Some(decision) = decision {
             let ctl = self.resume_control.lock().unwrap();
             let valid = ctl.phase != SessionPhase::Dead
@@ -1260,6 +1279,13 @@ impl SessionShared {
     /// （双向终局 + journal 排空）后自然回收）。
     async fn reserve_stream_slot(&self, stream_id: u64) -> Result<(), FabricError> {
         let mut streams = self.streams.lock().await;
+        // R3-P1c：closing 复查在登记锁内——与 close 的「先置旗再快照」构成
+        // 全序（检查在旗前 → 登记完成于快照前；检查在旗后 → 拒绝）。
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(FabricError::Session(SessionError::Connect(
+                "session closing".into(),
+            )));
+        }
         let active = streams.values().filter(|c| !c.quota_reapable()).count();
         if active >= MAX_ACTIVE_STREAMS {
             return Err(FabricError::Session(SessionError::Connect(format!(
@@ -2321,19 +2347,17 @@ impl Session {
         if let Some(old) = self.pump.lock().unwrap().take() {
             old.abort();
         }
-        // 当前胜者通道终结循环（P2-3 + R2-P1c）：close 的 await 期间并发
-        // resume 可能安装新代——循环再解析再终结，直至无存活通道（install
-        // 侧的 closing 拒绝保证竞态者有限；3 轮有界防自旋）。
-        for _ in 0..3 {
-            let Some(current) = self.shared.current_channel() else {
-                break;
-            };
-            self.shared.reset_open_streams(&current).await;
-            current.terminate().await;
-            if current.is_dead() {
-                // current_channel 的 Weak 在 Arc 释放前仍可解析——以 dead 旗
-                // 判定本轮已终结，避免对同一通道重复 RESET。
-                break;
+        // 当前胜者通道终结循环（P2-3 + R2/R3-P1）：持有 channel_transition
+        // 与 install 串行化——循环期间不会有新安装插入；再解析再终结直至
+        // 无存活通道（transition 锁下 ≤2 轮收敛：当前代 + None）。
+        {
+            let _transition = self.shared.channel_transition.lock().await;
+            for _ in 0..3 {
+                let Some(current) = self.shared.current_channel() else {
+                    break;
+                };
+                self.shared.reset_open_streams(&current).await;
+                current.terminate().await;
             }
         }
         // 本 handle 自持代幂等兜底（先 clone 再 await——读守卫不得跨 await，
@@ -3953,7 +3977,13 @@ async fn resume_attempt(
                 return Err(TryAgain::Transport(channel_superseded_err()));
             };
             session.install_channel(Arc::clone(&chan));
-            session.shared.set_phase(SessionPhase::Active).await;
+            // R3-P1a：条件激活——closing 窗口内迟到完成的客户端恢复不得把
+            // Closed 拉回 Active（complete_resume_install 的 ResumeCtl 单锁
+            // 条件化语义复用）；激活失败即撤销安装并按 superseded 收敛。
+            if !session.shared.complete_resume_install_checked() {
+                let _ = chan.terminate().await;
+                return Err(TryAgain::Transport(channel_superseded_err()));
+            }
             // 重发 OPEN（幂等归并，不占数据 offset 空间）
             for (stream_id, idem) in session.shared.open_resend_list().await {
                 chan.send_frame(&Frame {
@@ -4169,6 +4199,59 @@ mod tests {
         assert!(w.try_rotate(1, &[3u8; 16], [4u8; 16]).is_none());
         // 新 current 恒可用
         assert!(w.try_rotate(4, &[4u8; 16], [5u8; 16]).is_some());
+    }
+
+    /// R3-P1a：closing 闸门覆盖**所有** install 路径（客户端 resume 传
+    /// decision: None——此前仅 decision 分支设闸被绕过）+ 条件激活不复活
+    /// Closed + reserve_stream_slot 锁内 closing 拒绝。
+    #[tokio::test]
+    async fn install_all_paths_rejected_while_closing_and_no_reactivation() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA3u8; 16],
+            [0xB3u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        // decision: None 路径（客户端 resume 形态）
+        let (send_none, recv_none) = link.transport(1).await.into_split();
+        shared.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            shared
+                .install_channel(send_none, recv_none, InstallPolicy::Force, None, None)
+                .await
+                .is_none(),
+            "closing 中 decision:None 安装必须被拒"
+        );
+        // 条件激活：closing 下不得置 Active（客户端迟到恢复路径的终局防线）
+        shared.set_phase_sync(SessionPhase::Recovering);
+        assert!(
+            !shared.complete_resume_install_checked(),
+            "closing 中条件激活必须失败"
+        );
+        assert_eq!(shared.phase_sync(), SessionPhase::Recovering);
+        // 流登记拒绝（send_open 的闸门锚点）
+        assert!(shared.reserve_stream_slot(1).await.is_err(), "closing 中新流登记必须被拒");
+        // 对照：清旗后同路径恢复可用（合法恢复不受误拒）
+        shared.closing.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (send_ok, recv_ok) = link.transport(2).await.into_split();
+        assert!(
+            shared
+                .install_channel(send_ok, recv_ok, InstallPolicy::Force, None, None)
+                .await
+                .is_some(),
+            "非 closing 的 decision:None 安装应成功"
+        );
+        assert!(shared.complete_resume_install_checked(), "合法恢复激活成功");
+        assert_eq!(shared.phase_sync(), SessionPhase::Active);
+        // Closed 终态同样不得被条件激活复活
+        shared.set_phase_sync(SessionPhase::Closed);
+        assert!(
+            !shared.complete_resume_install_checked(),
+            "Closed 不得被复活"
+        );
+        assert_eq!(shared.phase_sync(), SessionPhase::Closed);
     }
 
     /// P0-1 regression: if a second nonce supersedes the first previous-token
