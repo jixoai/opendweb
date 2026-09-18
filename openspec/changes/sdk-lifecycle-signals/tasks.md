@@ -81,6 +81,15 @@
       - server.close 流式收敛（native close_notify + cancels 清空；JS
         controllers abort + liveRequests 清空）——SDK 钉 7/7
       - design D2 伪码定稿口径（250ms）+ D9 段
-- [ ] 5.1c R3 复核 → 处置 → 复验
+- [x] 5.1c R3 处置（NO-GO 7.1 → 两残余 P1）：install 全路径 closing/终态
+      复查（decision:None 不再绕过）；客户端 resume 条件激活（失败撤安装
+      superseded）；close 持 transition 串行化（移除 is_dead 错误提前退
+      出）；reserve_stream_slot 锁内 closing 复查；SDK watcher enable-
+      then-check + handle 插入后复查 + JS serverClosed 闸门；白盒钉。
+- [x] 5.1d R4 复核：**GO 8.8/10**——两个核心竞态获得明确线性化点
+      （close/install→transition；close/open→streams lock；watcher/close
+      →Notify enable+recheck；insert/close→terminal recheck；JS→闸门）。
+      发布后 P2 加固建议（留档决策项）：barrier 型跨任务锁边界交错测试；
+      CLI e2e 负载稳定性持续观测。
 - [ ] 5.2 tag v0.6.0 走 CI 发布（npm pinned @11）；npm@12 空跑验证后解钉
 - [ ] 5.3 archive 本 change
