@@ -398,6 +398,22 @@ fn parse_proxy_url(u: &str) -> Result<iroh::RelayUrl, FabricError> {
 
 // ==== 成员 relay capability 持久化（server-access-policy task 2.3 / §7.3） ====
 
+/// join_v2 起点 deny 记录清零（云端实证 2026-09-18 加固）：bootstrap 注入
+/// 后，join 之前记录的 deny 形态 last_error 已被新凭证作废——清零避免
+/// deadline 归因误引用（iroh 对 deny 静默退避，connect 常以超时面落地）。
+/// 非 deny 形态（transport 错误等）与已空值不受影响；join 窗口内 watcher
+/// 重新记录的 deny 不经过本函数。
+fn clear_stale_deny_note(snapshot: &std::sync::Mutex<RelayStatusSnapshot>) {
+    let mut snap = snapshot.lock().unwrap();
+    if snap
+        .last_error
+        .as_deref()
+        .is_some_and(|e| extract_deny_reason(e).is_some())
+    {
+        snap.last_error = None;
+    }
+}
+
 /// data_dir 内的成员 capability 存储文件（REDEEM_OK2 附发令牌的落盘点；
 /// 形态：`[{"url":"...","capability":"dwebr1...."}]`，同 url 以新兑换覆盖）。
 pub const RELAY_CAPS_FILE: &str = "relay.caps.json";
@@ -2587,18 +2603,9 @@ impl Fabric {
         }
         if !bootstrap.is_empty() {
             // 新邀请语义：join 起点已用新 bootstrap 覆盖 RelayMap——构造期由
-            // 残留旧票握手记录的 deny 随之作废，清零避免 deadline 归因引用
-            // join 之前的 deny（云端实证：过期 member cap 的构造期 deny 让
-            // join 超时被误归因为 capability-expired；deny 只在 join 窗口内
-            // 由 watcher 重新记录，非 deny 形态的 last_error 不受影响）。
-            let mut snap = self.inner.relay_snapshot.lock().unwrap();
-            if snap
-                .last_error
-                .as_deref()
-                .is_some_and(|e| extract_deny_reason(e).is_some())
-            {
-                snap.last_error = None;
-            }
+            // 残留旧票握手记录的 deny 随之作废，避免 deadline 归因引用
+            // join 之前的 deny（deny 只在 join 窗口内由 watcher 重新记录）。
+            clear_stale_deny_note(&self.inner.relay_snapshot);
         }
         // c1 同款：本地 relay 配置追加为拨号候选
         let addr = Self::with_local_relay_candidates(
@@ -3838,6 +3845,39 @@ mod tests {
         };
         let ordered = invite_v2_relay_order(&entries, &offline);
         assert_eq!(ordered[0].url, "https://dead.example");
+    }
+
+    #[test]
+    fn clear_stale_deny_note_drops_deny_form_only() {
+        // P1 补测（复核意见）：join_v2 起点清零分支——deny 形态清零、
+        // 非 deny 形态与空值保留
+        let mk = |last_error: Option<&str>| {
+            std::sync::Mutex::new(RelayStatusSnapshot {
+                mode: "custom",
+                urls: vec!["https://r.example".into()],
+                online: Some(false),
+                active_url: None,
+                last_error: last_error.map(str::to_owned),
+            })
+        };
+        // deny 形态（watcher sanitize 例外透传的 `dweb/*` reason）→ 清零
+        let snap = mk(Some(
+            "handshake denied: dweb/capability-expired (host 39.107.213.167)",
+        ));
+        clear_stale_deny_note(&snap);
+        assert_eq!(snap.lock().unwrap().last_error, None, "deny 形态清零");
+        // 非 deny 形态（transport 归因）→ 保留
+        let snap = mk(Some("connect timeout (host 39.107.213.167)"));
+        clear_stale_deny_note(&snap);
+        assert_eq!(
+            snap.lock().unwrap().last_error.as_deref(),
+            Some("connect timeout (host 39.107.213.167)"),
+            "非 deny 形态不受影响"
+        );
+        // 空值 → 无操作
+        let snap = mk(None);
+        clear_stale_deny_note(&snap);
+        assert_eq!(snap.lock().unwrap().last_error, None);
     }
 
     #[test]
