@@ -259,6 +259,9 @@ pub(crate) struct HandlerBridge {
     bodies: Arc<Mutex<HashMap<u64, RequestBody>>>,
     /// per-request 生命周期旗（watcher 置位；StreamWriterJs 观测用）。
     cancels: Arc<Mutex<HashMap<u64, Arc<RequestFlags>>>>,
+    /// server.close 唤醒面（R2-P1d：未 finish 的流式请求不在 pending——
+    /// drain 触不到其 watcher；close 通知让全部 watcher 立即收敛）。
+    close_notify: Arc<tokio::sync::Notify>,
     next_request_id: std::sync::atomic::AtomicU64,
     closed: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -270,6 +273,7 @@ impl HandlerBridge {
             pending: Arc::new(Mutex::new(HashMap::new())),
             bodies: Arc::new(Mutex::new(HashMap::new())),
             cancels: Arc::new(Mutex::new(HashMap::new())),
+            close_notify: Arc::new(tokio::sync::Notify::new()),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
@@ -283,6 +287,7 @@ impl HttpHandler for HandlerBridge {
         let bodies = Arc::clone(&self.bodies);
         let cancels = Arc::clone(&self.cancels);
         let closed = Arc::clone(&self.closed);
+        let close_notify = Arc::clone(&self.close_notify);
         let request_id = self
             .next_request_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -307,9 +312,22 @@ impl HttpHandler for HandlerBridge {
                 let cancels = Arc::clone(&cancels);
                 let flags = Arc::clone(&flags);
                 let cancel = request.cancel.clone();
+                let close_notify = Arc::clone(&close_notify);
+                let closed_flag = Arc::clone(&closed);
                 let rid = request_id;
                 tokio::spawn(async move {
-                    let outcome = cancel.wait().await;
+                    // R2-P1d：server.close 唤醒面与终裁竞速——close 先到则
+                    // 置 closed 静默退出（不发 cancel：server 已死，JS 侧
+                    // close() 同步 abort controllers）。closed 旗前置检查兜底
+                    // Notify 无保留语义的未注册窗口（spawn 未首 poll 时）。
+                    if closed_flag.load(std::sync::atomic::Ordering::Acquire) {
+                        cancels.lock().await.remove(&rid);
+                        return;
+                    }
+                    let outcome = tokio::select! {
+                        out = cancel.wait() => out,
+                        _ = close_notify.notified() => CancelOutcome::Completed,
+                    };
                     flags
                         .closed
                         .store(true, std::sync::atomic::Ordering::Release);
@@ -608,6 +626,10 @@ impl HttpServerJs {
             let _ = tx.send(Err("server closed".into()));
         }
         self.bridge.bodies.lock().await.clear();
+        // R2-P1d：流式请求不在 pending（respond_streaming 已摘除）——close
+        // 通知唤醒其 watcher 立即收敛，并清空生命周期注册表。
+        self.bridge.close_notify.notify_waiters();
+        self.bridge.cancels.lock().await.clear();
         Ok(())
     }
 }

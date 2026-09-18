@@ -73,6 +73,14 @@
       - 诚实留白：TSFN 队列满注入不可从黑盒确定性构造（以显式 abort +
         内核终裁双保险覆盖，未加直接注入测试）；JS liveRequests 大小无
         外部观测面（以单一 Map 全出口删除的简单性 + 代码评审覆盖）
-- [ ] 5.1b R2 复核（sdk-lc-review 二轮）→ 处置 → 复验
+- [x] 5.1b R2 处置（Codex NO-GO 6.8/10 → 四残余 P1 修复）：
+      - 终局提交条件化（Dead/Closed/closing 不得拉回 Active）
+      - closing CAS 闸门（close 先行置位：新 OPEN/install/终局三拒绝 +
+        通道终结循环 ≤3 轮）——s6e 钉（Dead 后放行在途恢复被拒）
+      - accept_resume OK 前终态复核（Dead/Closed/closing → superseded）
+      - server.close 流式收敛（native close_notify + cancels 清空；JS
+        controllers abort + liveRequests 清空）——SDK 钉 7/7
+      - design D2 伪码定稿口径（250ms）+ D9 段
+- [ ] 5.1c R3 复核 → 处置 → 复验
 - [ ] 5.2 tag v0.6.0 走 CI 发布（npm pinned @11）；npm@12 空跑验证后解钉
 - [ ] 5.3 archive 本 change

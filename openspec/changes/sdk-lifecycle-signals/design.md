@@ -51,10 +51,11 @@ impl RequestCancel {
                 }
                 _ => {}
             }
-            // 4. 挂起等唤醒（reset_notify 全会话级——唤醒后回 1 复查本流）
+            // 4. 挂起等唤醒（reset_notify 全会话级——唤醒后回 1 复查本流；
+            //    无 phase 变化唤醒面：250ms 有界 sleep 佐餐（实现定稿口径））
             tokio::select! {
                 _ = self.shared.reset_notify.notified() => continue,
-                _ = self.shared.phase_notify.notified() => continue, // 若无此项则退化为有限轮询
+                _ = tokio::time::sleep(Duration::from_millis(250)) => continue,
             }
         }
     }
@@ -174,6 +175,23 @@ e2e T7 实证同 peer 重开永卡：两层缺陷——
      Recovering——真实瞬断 RESUME 在途——仍保持 canonical）。顺带修复
      客户端重启后的恢复路径。
    - campaign 守卫活跃判定同步收紧（只认 Active / 通道存活的 Recovering）。
+
+### D9. R2 复核收敛（终态提交/关闭串行化）
+
+- **终局提交条件化**：complete_resume_install 仅在 phase ∈ {Active,
+  Recovering} 且未置 closing 时置 Active——迟到恢复不得复活 Dead/Closed；
+  90s 窗口内合法慢恢复不受影响（到达时仍 Recovering）。
+- **closing 闸门（客户端实例）**：close 先置 closing（CAS），此后本端
+  新 OPEN 拒绝、本端 resume install 拒绝、终局提交拒绝 Active；通道终结
+  循环（≤3 轮再解析当前代）覆盖 close await 期间并发安装的新代通道。
+  provider 侧（异实例）的迟到恢复防线 = 放弃看门狗转 Dead + install
+  Dead 拒绝 + 条件化终局（s6e 钉：Dead 后放行的在途恢复被拒，无成功帧）。
+- **accept_resume 终态复核**：安装与归属栅栏之后、OK 发送之前复核
+  Dead/Closed/closing——终态会话不发成功 OK；栅栏与发送之间的残余交错
+  由条件化终局兜底（旧会话收到一次多余 OK 但对端已死，自愈重开）。
+- **server.close 流式收敛**：native close_notify 唤醒全部 watcher（流式
+  请求不在 pending——drain 触不到）+ cancels 清空；JS close 同步 abort
+  全部 controllers + liveRequests 清空（SDK 钉：挂起流式 handler 秒收）。
 
 ## 实现期发现（记录）
 

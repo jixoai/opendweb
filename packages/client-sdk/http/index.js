@@ -208,8 +208,18 @@ async function serveHttp(fabric, peerId, handler) {
       });
   });
   return {
-    /** 停引擎循环 + 未决 handler 以取消结算（幂等） */
+    /** 停引擎循环 + 未决 handler 以取消结算（幂等）。R2-P1d：流式请求的
+     * controller 一并 abort + liveRequests 全清（server.close 的 native 面
+     * 只 drain pending——流式请求不在其中）。 */
     close(_reason) {
+      for (const { controller } of liveRequests.values()) {
+        try {
+          controller.abort();
+        } catch {
+          // 已中止：忽略
+        }
+      }
+      liveRequests.clear();
       return server.close();
     },
     /**

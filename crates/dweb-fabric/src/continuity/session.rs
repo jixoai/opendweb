@@ -464,6 +464,10 @@ pub struct SessionShared {
     protocol_violation_count: std::sync::atomic::AtomicU64,
     /// client resume single-flight（P0-1：并发 resume 恰一执行者）。
     resume_in_flight: std::sync::atomic::AtomicBool,
+    /// 刻意关闭中（R2-P1c：close 与 resume/open 并发串行化）——置位后：
+    /// 新 OPEN 拒绝、resume install 拒绝、终局提交拒绝 Active；close 的
+    /// 通道终结循环据此收敛。
+    closing: std::sync::atomic::AtomicBool,
     /// barrier 测试钩子（R3-1；生产零开销）。
     #[doc(hidden)]
     pub resume_gate: ResumeGate,
@@ -514,6 +518,7 @@ impl SessionShared {
             ack_violation_count: std::sync::atomic::AtomicU64::new(0),
             protocol_violation_count: std::sync::atomic::AtomicU64::new(0),
             resume_in_flight: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::atomic::AtomicBool::new(false),
             resume_gate: ResumeGate::new(),
             #[cfg(test)]
             stop_wait_timeout_ms: std::sync::atomic::AtomicU64::new(0),
@@ -544,8 +549,19 @@ impl SessionShared {
 
     /// The second phase of a provider-side RESUME. Call this only after the
     /// candidate channel is installed and its RESUME_OK was sent successfully.
+    /// R2 收敛：终局提交条件化——会话在发送窗口内进入 Dead/Closed 或已置
+    /// closing 刻意关闭时，不得被无条件拉回 Active（迟到恢复不得复活终态
+    /// 会话；90s 窗口内的合法慢恢复不受影响——它们到达时仍 Recovering）。
     fn complete_resume_install(&self) {
-        self.set_phase_sync(SessionPhase::Active);
+        let mut ctl = self.resume_control.lock().unwrap();
+        if !self.closing.load(std::sync::atomic::Ordering::Acquire)
+            && matches!(
+                ctl.phase,
+                SessionPhase::Active | SessionPhase::Recovering
+            )
+        {
+            ctl.phase = SessionPhase::Active;
+        }
     }
 
     /// 当前代通道（经 ResumeCtl 解析——owner 单调，恢复轮换后指向新代；
@@ -625,11 +641,13 @@ impl SessionShared {
         // A superseded RESUME can arrive after its OK was sent but before its
         // transport is installed; it must only close its own candidate stream,
         // never stop the newer owner that won while this task was suspended.
-        // P1-4：Dead 会话（canonical 已被替换/看门狗放弃）不得再安装——
-        // 在途旧 RESUME 就此出局（REQUEST_STATE_LOST 语义由对端重开承接）。
+        // P1-4/R2-P1c：Dead 会话（canonical 已被替换/看门狗放弃）与刻意
+        // 关闭中（closing）不得再安装——在途旧 RESUME 就此出局（失归属/
+        // 已关闭语义由对端重开承接）。
         if let Some(decision) = decision {
             let ctl = self.resume_control.lock().unwrap();
             let valid = ctl.phase != SessionPhase::Dead
+                && !self.closing.load(std::sync::atomic::Ordering::Acquire)
                 && ctl
                     .pending
                     .as_ref()
@@ -1994,6 +2012,12 @@ impl SessionChannel {
         idem_key: &str,
         payload: Bytes,
     ) -> Result<(), FabricError> {
+        // R2-P1c：刻意关闭中拒绝新流（close 快照后新开的流不得逃过 RESET）
+        if self.shared.closing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(FabricError::Session(SessionError::Connect(
+                "session closing".into(),
+            )));
+        }
         // P0-3d：活跃流上限闸门（超限拒绝 OPEN）
         self.shared.reserve_stream_slot(stream_id).await?;
         self.shared
@@ -2289,18 +2313,31 @@ impl Session {
     /// 死亡，P1-5），并终结传输（发送半 FIN——对端 pump 感知 Ended →
     /// Recovering → 看门狗放弃/新 INIT 替换）。
     pub async fn close(&self) {
+        // R2-P1c：closing CAS 先行——此后新 OPEN 拒绝、resume install 拒绝、
+        // 终局提交拒绝 Active（并发 resume 不得把 Closed 拉回 Active）。
+        self.shared
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(old) = self.pump.lock().unwrap().take() {
             old.abort();
         }
-        // P2-3：经 shared 解析**当前胜者**通道再终结（句柄自持 channel 可能
-        // 是被 resume 轮换取代的旧代——对旧代发 FIN 远端无感）。
-        if let Some(current) = self.shared.current_channel() {
+        // 当前胜者通道终结循环（P2-3 + R2-P1c）：close 的 await 期间并发
+        // resume 可能安装新代——循环再解析再终结，直至无存活通道（install
+        // 侧的 closing 拒绝保证竞态者有限；3 轮有界防自旋）。
+        for _ in 0..3 {
+            let Some(current) = self.shared.current_channel() else {
+                break;
+            };
             self.shared.reset_open_streams(&current).await;
             current.terminate().await;
+            if current.is_dead() {
+                // current_channel 的 Weak 在 Arc 释放前仍可解析——以 dead 旗
+                // 判定本轮已终结，避免对同一通道重复 RESET。
+                break;
+            }
         }
-        // 本 handle 自持代若非当前代也已随 transition 处置；幂等再终结一次
-        // 防御句柄陈旧但 shared 解析失败的窗口。（先 clone 再 await——读守卫
-        // 不得跨 await 持有，否则 close future 失去 Send。）
+        // 本 handle 自持代幂等兜底（先 clone 再 await——读守卫不得跨 await，
+        // 否则 close future 失去 Send）。
         let own = self.channel.read().unwrap().clone();
         own.terminate().await;
         self.shared.set_phase(SessionPhase::Closed).await;
@@ -3702,6 +3739,18 @@ async fn accept_resume(
     {
         session.close().await;
         return Err(channel_superseded_err());
+    }
+    // R2-P1a：终态复核——安装与栅栏之间会话可能已 Dead/Closed（看门狗/
+    // 刻意 close）。终态会话不发成功 OK（对端以失败/重开收敛）；即便
+    // 与下方发送窗口内的替换交错，complete_resume_install 的条件化提交
+    // 兜底不复活。
+    {
+        let phase = shared.phase_sync();
+        let closing = shared.closing.load(std::sync::atomic::Ordering::Acquire);
+        if matches!(phase, SessionPhase::Dead | SessionPhase::Closed) || closing {
+            session.close().await;
+            return Err(channel_superseded_err());
+        }
     }
     // Two-phase RESUME commit: the client must not observe RESUME_OK until the
     // provider has installed the candidate channel. If installation failed,

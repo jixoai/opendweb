@@ -325,3 +325,48 @@ maybeTest("lifecycle: session.close() cancels hanging provider handler promptly 
     await b.shutdown();
   }
 });
+
+maybeTest("lifecycle: server.close() aborts hanging streaming handler + converges registries", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    let handlerSawAbort = false;
+    /** @type {((v: void) => void) | undefined} */
+    let resolveHandler;
+    const handlerDone = new Promise((resolve) => {
+      resolveHandler = resolve;
+    });
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        const writer = req.respondStreaming(200, [{ name: "content-type", value: "text/plain" }]);
+        assert.ok(writer, "writer must exist");
+        // 挂起：不 write 不 finish（流式请求不在 native pending——R2-P1d 面）
+        await new Promise((resolve) => {
+          if (req.signal.aborted) resolve(undefined);
+          else req.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+        });
+        handlerSawAbort = true;
+        resolveHandler?.();
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const resp = await withTimeout(
+      fetchHttp(session, { method: "GET", path: "/hang-server-close" }),
+      20_000,
+      "fetchHttp head",
+    );
+    assert.equal(resp.status, 200);
+    // server.close：JS controllers abort（handler signal 触发）+ native
+    // watcher 收敛（close_notify）
+    await withTimeout(server.close(), 10_000, "server.close");
+    await withTimeout(handlerDone, 5_000, "hanging stream handler aborted by server.close");
+    assert.ok(handlerSawAbort, "server.close 必须 abort 流式挂起 handler 的 signal");
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});

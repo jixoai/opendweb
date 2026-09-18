@@ -1582,3 +1582,106 @@ async fn session_replaced_canonical_not_resurrected_by_inflight_resume() {
     drop(p2);
     provider.abort();
 }
+
+/// s6e（R2-P1c）：close 与在途 RESUME 并发串行化——closing 闸门后迟到的
+/// 恢复不得安装/复活（终局提交条件化 + install closing 拒绝双保险）。
+/// 交错（resume_gate 注入）：R1 决策后被 gate 拦截 → 客户端刻意 close →
+/// 放行 R1 → install 因 closing 被拒 → 无 RESUME_OK、会话保持 Closed。
+#[tokio::test]
+async fn session_close_gates_inflight_resume_from_reactivating() {
+    // 旋钮加速 provider 侧放弃（Recovering → Dead 300ms）+ panic 安全复位
+    struct GiveupGuard;
+    impl Drop for GiveupGuard {
+        fn drop(&mut self) {
+            session::set_resume_giveup_for_test(0);
+        }
+    }
+    let _giveup = GiveupGuard;
+    session::set_resume_giveup_for_test(300);
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let b_loop = b.clone();
+    let a_loop = a_id.clone();
+    let provider = tokio::spawn(async move {
+        let initial = session::accept_any(&b_loop, &a_loop, opts)
+            .await
+            .expect("initial accept");
+        let gate_rx = initial.shared().resume_gate.enable();
+        let shared = initial.shared().clone();
+        ready_tx
+            .send((shared, gate_rx))
+            .unwrap_or_else(|_| panic!("handoff"));
+        loop {
+            let _ = session::accept_any(&b_loop, &a_loop, opts).await;
+        }
+    });
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let (shared, gate_rx) = ready_rx.await.expect("handoff");
+    let (generation, token) = client.shared().debug_current_token();
+    let sid1 = client.shared().session_id;
+
+    // R1 上线（决策后被 gate 拦截——未安装）
+    let t1 = a.continuity_open_transport(&b_id).await.unwrap();
+    let mut t1 = t1;
+    t1.send(&Frame {
+        frame_type: FrameType::ResumeInit,
+        flags: 0,
+        session_id: sid1,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(encode_resume_init(
+            generation,
+            generation,
+            &[0xD1u8; 16],
+            &token,
+            &[],
+        )),
+    })
+    .await
+    .unwrap();
+    let mut gate_rx = gate_rx;
+    tokio::time::timeout(Duration::from_secs(10), gate_rx.changed())
+        .await
+        .expect("R1 到达 gate 有界")
+        .expect("gate 保持打开");
+
+    // 客户端刻意 close：provider 侧（异实例）经通道终结进入 Recovering，
+    // 旋钮加速的放弃看门狗 300ms 后转 Dead（closing 旗在客户端实例——
+    // provider 侧的迟到恢复防线是 Dead 拒绝 + 条件化终局提交）。
+    client.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while shared.phase().await != session::SessionPhase::Dead {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "close 后 provider 侧应经看门狗转 Dead（当前 {:?}）",
+            shared.phase().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // 放行 R1：Dead 拒绝安装——无成功帧、Dead 不被拉回 Active
+    shared.resume_gate.release();
+    let r1 = tokio::time::timeout(Duration::from_secs(10), t1.recv()).await;
+    match r1 {
+        Ok(Ok(f)) => panic!("Dead 会话的迟到恢复不得收到成功帧（{:?}）", f.frame_type),
+        Ok(Err(_)) | Err(_) => {}
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert_eq!(
+            shared.phase().await,
+            session::SessionPhase::Dead,
+            "Dead 不得被迟到恢复复活"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(_giveup);
+    provider.abort();
+}
