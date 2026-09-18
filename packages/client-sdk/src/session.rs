@@ -251,6 +251,15 @@ impl SessionHandle {
     /// 未知 key 为幂等 no-op。
     #[napi]
     pub fn abort_fetch(&self, abort_key: f64) {
+        // 严格输入校验（P1-7，同 journal_bytes 口径）：NaN/Infinity/负数/
+        // 小数/超出 JS 安全整数域一律拒绝——静默截断会造成错误 entry 命中。
+        if !abort_key.is_finite()
+            || abort_key < 0.0
+            || abort_key.fract() != 0.0
+            || abort_key > 9_007_199_254_740_991.0
+        {
+            return; // 无效 key：幂等 no-op（公共 N-API 边界不静默截断）
+        }
         let key = abort_key as u64;
         let cancel = self
             .fetch_cancels

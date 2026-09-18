@@ -24,7 +24,7 @@ forward——spec 3.2 的会话级隔离在产品层根本无从实现。
 ## What Changes
 
 - **内核**（crates/dweb-fabric/src/continuity/http.rs）：
-  - `HttpRequest` 新增 `session_id: u64` 与 `cancel: RequestCancel`；
+  - `HttpRequest` 新增 `session_id: [u8;16]`（桥/JS 面投影为 32 字符小写 hex `string`）与 `cancel: RequestCancel`；
   - 新增 `RequestCancel` 句柄：`wait() -> CancelOutcome`（Cancelled |
     Completed）——事件驱动（peer_reset 持久标志 + reset_notify 唤醒 +
     终态复查），不轮询；
@@ -35,7 +35,7 @@ forward——spec 3.2 的会话级隔离在产品层根本无从实现。
   - `StreamWriterJs` 三拆：`finished`（本地半关意图）/ `cancelled`
     （对端取消事件已触发）/ `closed`（底层投递通道已关）；
 - **JS 投影**（packages/client-sdk/http/index.js）：
-  - handler 请求对象增 `sessionId: number` 与 `signal: AbortSignal`
+  - handler 请求对象增 `sessionId: string`（32 字符小写 hex）与 `signal: AbortSignal`
     （per-request AbortController，cancel 事件触发 abort）；
   - respondStreaming 返回的 writer 增 `cancelled` / `closed` getter；
 - **测试**：内核 session_id 传播 / cancel 事件驱动唤醒 / 完成不误报取消；

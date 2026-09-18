@@ -565,6 +565,34 @@ impl SessionShared {
         ctl.active_epoch == epoch && ctl.channel_owner == owner
     }
 
+    /// 刻意关闭前的在途流取消（P1-5）：逐流 best-effort RESET（整体 2s 有
+    /// 界——close 不得悬挂）。对端 dispatch 循环头的 peer_reset 检查与
+    /// RequestCancel watcher 即时命中——挂起 handler 秒停，不等待会话级
+    /// 死亡/看门狗。
+    async fn reset_open_streams(&self, chan: &Arc<SessionChannel>) {
+        let ids: Vec<u64> = self.streams.lock().await.keys().copied().collect();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        for id in ids {
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            let frame = super::frame::Frame {
+                frame_type: super::frame::FrameType::Reset,
+                flags: 0,
+                session_id: self.session_id,
+                stream_id: id,
+                direction: self.send_direction(),
+                byte_offset: 0,
+                payload: Bytes::new(),
+            };
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                chan.send_frame(&frame),
+            )
+            .await;
+        }
+    }
+
     /// 通道死亡进入 Recovering 时启动的有界放弃看门狗：到期仍是同一胜者
     /// 且仍 Recovering → Dead（canonical 释放，reap_terminal 懒清注册表）。
     /// 恢复成功（新通道安装）则 owner 已变——看门狗空转退出。
@@ -597,17 +625,19 @@ impl SessionShared {
         // A superseded RESUME can arrive after its OK was sent but before its
         // transport is installed; it must only close its own candidate stream,
         // never stop the newer owner that won while this task was suspended.
+        // P1-4：Dead 会话（canonical 已被替换/看门狗放弃）不得再安装——
+        // 在途旧 RESUME 就此出局（REQUEST_STATE_LOST 语义由对端重开承接）。
         if let Some(decision) = decision {
-            let valid = self
-                .resume_control
-                .lock()
-                .unwrap()
-                .pending
-                .as_ref()
-                .is_some_and(|pending| {
-                    decision_matches_pending(&pending.decision, &decision)
-                        && (decision.cached || pending.installed_owner.is_none())
-                });
+            let ctl = self.resume_control.lock().unwrap();
+            let valid = ctl.phase != SessionPhase::Dead
+                && ctl
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        decision_matches_pending(&pending.decision, &decision)
+                            && (decision.cached || pending.installed_owner.is_none())
+                    });
+            drop(ctl);
             if !valid {
                 let _ = send.finish();
                 return None;
@@ -954,6 +984,16 @@ impl SessionShared {
     /// 在自己仍是当前胜者时才允许回落 phase）。
     pub(crate) fn current_channel_owner(&self) -> u64 {
         self.resume_control.lock().unwrap().channel_owner
+    }
+
+    /// 原子守卫回落（P1-3）：owner 匹配且当前为 Active 才置 Recovering——
+    /// 检查与写入在同一 ResumeCtl 锁内（消除「检查后新 owner 安装、旧失败
+    /// 随后覆盖新 Active」的 TOCTOU）。
+    pub(crate) fn downgrade_to_recovering_if_owner(&self, expected_owner: u64) {
+        let mut ctl = self.resume_control.lock().unwrap();
+        if ctl.channel_owner == expected_owner && ctl.phase == SessionPhase::Active {
+            ctl.phase = SessionPhase::Recovering;
+        }
     }
 
     /// 测试观测面：当前胜者通道 transport epoch（fence 测试）。
@@ -2243,16 +2283,26 @@ impl Session {
         out
     }
 
-    /// 显式关闭（Shutdown 语义第一步，SDK task 4.2）：置 Closed + 终止 pump
-    /// + **终结传输**（发送半 FIN——对端 pump 感知 Ended → Recovering →
-    /// 看门狗放弃/新 INIT 替换；0.6.0 前只停本地 pump，对端至进程退出都
-    /// 视会话存活，canonical 永不释放）。
+    /// 显式关闭（Shutdown 语义第一步，SDK task 4.2）：置 Closed、终止 pump、
+    /// 取消全部在途流（逐流 RESET——对端 dispatch 止付/RequestCancel 即时
+    /// 触发；仅 FIN 会被对端当作可恢复断线，挂起中的 handler 只能等看门狗/
+    /// 死亡，P1-5），并终结传输（发送半 FIN——对端 pump 感知 Ended →
+    /// Recovering → 看门狗放弃/新 INIT 替换）。
     pub async fn close(&self) {
         if let Some(old) = self.pump.lock().unwrap().take() {
             old.abort();
         }
-        let chan = self.channel.read().unwrap().clone();
-        chan.terminate().await;
+        // P2-3：经 shared 解析**当前胜者**通道再终结（句柄自持 channel 可能
+        // 是被 resume 轮换取代的旧代——对旧代发 FIN 远端无感）。
+        if let Some(current) = self.shared.current_channel() {
+            self.shared.reset_open_streams(&current).await;
+            current.terminate().await;
+        }
+        // 本 handle 自持代若非当前代也已随 transition 处置；幂等再终结一次
+        // 防御句柄陈旧但 shared 解析失败的窗口。（先 clone 再 await——读守卫
+        // 不得跨 await 持有，否则 close future 失去 Send。）
+        let own = self.channel.read().unwrap().clone();
+        own.terminate().await;
         self.shared.set_phase(SessionPhase::Closed).await;
     }
 
@@ -2485,6 +2535,11 @@ impl SessionRegistry {
                 .remove(&canonical_sid)
                 .map(|entry| entry.shared);
             state.peers.remove(&peer_id);
+            // P1-4：被替换的旧 shared 立即置 Dead——迟到的在途 RESUME（已持有
+            // 旧 Arc）在 install 校验处被拒，不得复活旧会话（双活/孤儿）。
+            if let Some(old) = replaced.as_ref() {
+                old.set_phase_sync(SessionPhase::Dead);
+            }
         }
         let shared = SessionShared::new(session_id, token, peer_id.clone(), false, limits);
         state.sessions.insert(
@@ -2575,6 +2630,15 @@ impl SessionRegistry {
     /// Find an existing local session for a peer. Negotiating is included so
     /// concurrent `open_session` calls wait on the first campaign instead of
     /// allocating a second sid.
+    /// peer 当前 canonical sid（P1-4 归属栅栏：accept_resume 安装后、OK 前
+    /// 复核——被替换的在途恢复不得发送 RESUME_OK）。
+    pub(crate) async fn canonical_sid_for_peer(&self, peer_id: &str) -> Option<[u8; 16]> {
+        let mut state = self.inner.lock().await;
+        Self::reap_terminal(&mut state);
+        let sid = *state.peers.get(peer_id)?;
+        state.sessions.get(&sid).map(|_| sid)
+    }
+
     pub(crate) async fn reusable_for_peer(&self, peer_id: &str) -> Option<Arc<SessionShared>> {
         let mut state = self.inner.lock().await;
         Self::reap_terminal(&mut state);
@@ -3626,6 +3690,19 @@ async fn accept_resume(
     )
     .await
     .ok_or_else(channel_superseded_err)?;
+    // P1-4 归属栅栏：安装成功 ≠ 仍拥有 canonical——决策与安装之间可能有
+    // 新 INIT 走死通道替换路径移除了本会话。已失归属则半关候选（close 含
+    // 流 RESET + FIN），不发送 RESUME_OK——对端以失败/重开收敛，无双活。
+    if fabric
+        .inner
+        .continuity_sessions
+        .canonical_sid_for_peer(&shared.peer_id)
+        .await
+        != Some(shared.session_id)
+    {
+        session.close().await;
+        return Err(channel_superseded_err());
+    }
     // Two-phase RESUME commit: the client must not observe RESUME_OK until the
     // provider has installed the candidate channel. If installation failed,
     // mk_session_with_expectation already half-closed the candidate transport;
@@ -3633,18 +3710,15 @@ async fn accept_resume(
     //
     // owner 守卫：OK 发送失败只在「本通道仍是当前胜者」时回落 phase——
     // 被更晚恢复超替的失败不得把新胜者刚置的 Active 打回 Recovering
-    // （0.6.0 s6b 实证：废弃 RESUME 的迟到失败覆盖了后续成功轮的相位）。
+    // （0.6.0 s6b 实证：废弃 RESUME 的迟到失败覆盖了后续成功轮的相位；
+    // P1-3：检查+写入原子化于 ResumeCtl 单锁内）。
     let installed_owner = shared.current_channel_owner();
     session
         .channel()
         .send_frame(&resume_ok)
         .await
         .inspect_err(|_e| {
-            if shared.current_channel_owner() == installed_owner
-                && shared.phase_sync() == SessionPhase::Active
-            {
-                shared.set_phase_sync(SessionPhase::Recovering);
-            }
+            shared.downgrade_to_recovering_if_owner(installed_owner);
         })?;
     {
         let replay_shared = Arc::clone(&shared);

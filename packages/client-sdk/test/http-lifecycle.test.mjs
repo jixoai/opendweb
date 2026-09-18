@@ -250,3 +250,78 @@ maybeTest("lifecycle: fetchHttp signal aborts head-pending request (RESET to pro
     await b.shutdown();
   }
 });
+
+maybeTest("lifecycle: pre-aborted fetchHttp signal rejects immediately (no wire request)", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    let requests = 0;
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async () => {
+        requests += 1;
+        return { status: 200, bodyChunks: [Buffer.from("x")] };
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const ctrl = new AbortController();
+    ctrl.abort(); // 先中止，再发起
+    const t0 = Date.now();
+    await assert.rejects(
+      fetchHttp(session, { method: "GET", path: "/pre", signal: ctrl.signal }),
+      (e) => e.name === "AbortError",
+    );
+    const elapsed = Date.now() - t0;
+    assert.ok(elapsed < 500, `预中止应同步失败（${elapsed}ms）`);
+    // 无 wire 请求：provider handler 不得被触达
+    await sleep(300);
+    assert.equal(requests, 0, "pre-aborted fetch 不得上线");
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});
+
+maybeTest("lifecycle: session.close() cancels hanging provider handler promptly (stream RESETs)", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    let handlerSawAbort = false;
+    /** @type {((v: void) => void) | undefined} */
+    let resolveHandler;
+    const handlerDone = new Promise((resolve) => {
+      resolveHandler = resolve;
+    });
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        await new Promise((resolve) => {
+          if (req.signal.aborted) resolve(undefined);
+          else req.signal.addEventListener("abort", () => resolve(undefined), { once: true });
+        });
+        handlerSawAbort = true;
+        resolveHandler?.();
+        return { status: 200, bodyChunks: [] };
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    // 挂起请求（head 等待形态——handler 不返回）
+    const pending = fetchHttp(session, { method: "GET", path: "/hang-close" });
+    void pending.catch(() => undefined);
+    await sleep(300); // 请求上线
+    const t0 = Date.now();
+    await session.close(); // 刻意关闭：逐流 RESET + FIN
+    await withTimeout(handlerDone, 5_000, "provider handler cancel after close");
+    const elapsed = Date.now() - t0;
+    assert.ok(handlerSawAbort, "close 后 provider signal 必须触发");
+    assert.ok(elapsed < 5_000, `close 取消应有界即时（${elapsed}ms）`);
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});

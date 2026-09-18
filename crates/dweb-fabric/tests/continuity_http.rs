@@ -648,3 +648,109 @@ async fn http_lifecycle_completion_not_reported_as_cancel() {
     client.close().await;
     provider.abort();
 }
+
+/// h8（R1 P1-1）：handler 错误出口的终裁同步——respond_error(500) 后
+/// mark_completed，RequestCancel::wait() 收敛 Completed（修复前：活跃会话上
+/// watcher 悬挂至会话终态）。
+#[tokio::test]
+async fn http_handler_error_settles_cancel_as_completed() {
+    use dweb_fabric::continuity::http::CancelOutcome;
+
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<CancelOutcome>(4);
+    let h = handler(move |req: HttpRequest| {
+        let seen_tx = seen_tx.clone();
+        Box::pin(async move {
+            let cancel = req.cancel.clone();
+            tokio::spawn(async move {
+                let _ = seen_tx.send(cancel.wait().await).await;
+            });
+            // handler 失败 → 引擎 500 → 修复后 mark_completed
+            Err(HttpEngineError("boom".into()))
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    // 500 响应也是合法 meta——fetch 正常返回 status 500
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/err")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 500, "handler 失败回 500");
+    let out = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+        .await
+        .expect("终裁有界")
+        .expect("watcher 汇报");
+    assert_eq!(out, CancelOutcome::Completed, "错误出口终裁 Completed");
+    client.close().await;
+    provider.abort();
+}
+
+/// h9（R1 P1-5）：刻意 close 的流级取消——挂起 handler（无 write）在客户端
+/// session.close() 后有界收到 Cancelled（仅 FIN 会被当可恢复断线，修复前
+/// 只能等会话死亡/看门狗）。
+#[tokio::test]
+async fn http_session_close_cancels_hanging_handler() {
+    use dweb_fabric::continuity::http::CancelOutcome;
+
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel::<CancelOutcome>(4);
+    let h = handler(move |req: HttpRequest| {
+        let seen_tx = seen_tx.clone();
+        Box::pin(async move {
+            let cancel = req.cancel.clone();
+            tokio::spawn(async move {
+                let _ = seen_tx.send(cancel.wait().await).await;
+            });
+            let (tx, rx) = body_channel(1);
+            std::mem::forget(tx); // 挂起形态：body 永不供给
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/hang")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    drop(resp);
+    // 刻意关闭（非 abort 单流）：close 枚举在途流发 RESET → 对端 watcher 即时
+    let t0 = std::time::Instant::now();
+    client.close().await;
+    let out = tokio::time::timeout(Duration::from_secs(10), seen_rx.recv())
+        .await
+        .expect("close 后终裁有界")
+        .expect("watcher 汇报");
+    assert_eq!(out, CancelOutcome::Cancelled, "close 刻意取消 → Cancelled");
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "close 取消应有界即时（实际 {:?}）",
+        t0.elapsed()
+    );
+    provider.abort();
+}

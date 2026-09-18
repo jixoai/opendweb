@@ -527,6 +527,9 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
         Ok(v) => v,
         Err(_) => {
             let _ = respond_error(&session, stream_id, 400, "bad request meta").await;
+            // 错误响应仍是该流的终局（P1-1）：RequestCancel waiter 据此收敛
+            // Completed——否则活跃会话上的 watcher 悬挂至会话终态。
+            shared.mark_completed(stream_id).await;
             return;
         }
     };
@@ -617,8 +620,11 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
         }
         Err(_e) => {
             // 未发头前 handler 失败 → 500（已发头后失败由 body 流 Drop 时
-            // 「未 FIN 即通道终结」暴露；§3.4 RESET 映射在 4.2 冻结）
+            // 「未 FIN 即通道终结」暴露；§3.4 RESET 映射在 4.2 冻结）。
+            // 500 已构成终局响应（P1-1）：mark_completed 让 watcher/
+            // RequestCancel 收敛——lifecycle terminal 必须与响应终局同步。
             let _ = respond_error(&session, stream_id, 500, "upstream failed").await;
+            shared.mark_completed(stream_id).await;
         }
     }
 }

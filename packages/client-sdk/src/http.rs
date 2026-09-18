@@ -302,7 +302,7 @@ impl HttpHandler for HandlerBridge {
                 closed: std::sync::atomic::AtomicBool::new(false),
             });
             cancels.lock().await.insert(request_id, Arc::clone(&flags));
-            {
+            let watcher = {
                 let tsfn = Arc::clone(&tsfn);
                 let cancels = Arc::clone(&cancels);
                 let flags = Arc::clone(&flags);
@@ -329,8 +329,8 @@ impl HttpHandler for HandlerBridge {
                         );
                     }
                     cancels.lock().await.remove(&rid);
-                });
-            }
+                })
+            };
             let event = serde_json::json!({
                 "type": "request",
                 "requestId": request_id,
@@ -352,6 +352,10 @@ impl HttpHandler for HandlerBridge {
                 pending.lock().await.remove(&request_id);
                 bodies.lock().await.remove(&request_id);
                 cancels.lock().await.remove(&request_id);
+                // P1-1：信号投递失败 = 请求在桥层即死——显式中止 watcher，
+                // 不依赖内核侧终裁时序（内核 dispatch Err 臂的 mark_completed
+                // 兜底之外的双保险）。
+                watcher.abort();
                 return Err(HttpEngineError(format!(
                     "handler signal failed: {call_status:?}"
                 )));

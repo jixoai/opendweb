@@ -57,6 +57,22 @@
 
 ## 5. 评审与发布
 
-- [ ] 5.1 Codex 复核（herdr）→ 处置结论 → 复验
+- [x] 5.1 R1 复核处置（Codex NO-GO 6.2/10 → 全部 P1/P2 修复）：
+      - P1-1：内核 400/500 错误出口 mark_completed（h8 钉）+ 桥初始 TSFN
+        失败显式 watcher.abort()（双保险）
+      - P1-2：JS 统一 liveRequests Map（controller+streamed 单 entry；
+        finalizeRequest 全出口删除）
+      - P1-3：downgrade_to_recovering_if_owner 原子 CAS（ResumeCtl 单锁）
+      - P1-4：Replaced 臂置旧 shared Dead + install 拒绝 Dead 会话 +
+        accept_resume 安装后/OK 前归属栅栏 + s6d barrier 竞态钉
+      - P1-5：close 逐流 RESET（挂起 handler 秒停——h9/SDK 钉均 <1.4s）
+      - P1-6：fetchHttp 预中止同步失败（不上线，SDK 钉）
+      - P1-7：abort_fetch 严格输入校验（finite/非负/整数/安全整数域）
+      - P2：sessionId 合同统一 hex string；D4/D8 措辞与实现期发现 3 收敛；
+        JSDoc @param signal；P2-3 close 经 current_channel 解析当前代
+      - 诚实留白：TSFN 队列满注入不可从黑盒确定性构造（以显式 abort +
+        内核终裁双保险覆盖，未加直接注入测试）；JS liveRequests 大小无
+        外部观测面（以单一 Map 全出口删除的简单性 + 代码评审覆盖）
+- [ ] 5.1b R2 复核（sdk-lc-review 二轮）→ 处置 → 复验
 - [ ] 5.2 tag v0.6.0 走 CI 发布（npm pinned @11）；npm@12 空跑验证后解钉
 - [ ] 5.3 archive 本 change

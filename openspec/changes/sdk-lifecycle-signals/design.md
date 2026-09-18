@@ -65,10 +65,11 @@ impl RequestCancel {
 - **顺序敏感**：取消复查在完成复查之前——FIN 与 RESET 竞速时宁可多发一次
   cancel（JS 侧 signal abort 对已结束请求无害）也不漏发（漏发 = 挂起任务
   永不停止）。
-- **无泄漏**：正常路径 dispatch `mark_completed` → watcher 退出；异常路径
-  peer_reset/session 终态 → 发射后退出。watcher 挂起面 = reset_notify /
-  phase 变化，二者在会话对象 Drop 前都可能长期静默——由 Completed/终态
-  出口兜底。
+- **无泄漏**（R1 收敛口径）：正常路径 dispatch `mark_completed` → watcher
+  退出；异常路径 peer_reset/session 终态 → 发射后退出；内核 400/500 错误
+  出口同样 `mark_completed`（错误响应即终局）；桥层初始 TSFN 投递失败
+  显式 `watcher.abort()` 双保险。watcher 挂起面 = reset_notify / 有界
+  sleep；终态出口（Completed/Cancelled/Dead/Closed）保证退出。
 - session.rs 若无 phase 变化 Notify，则以 100ms 有界轮询 phase 佐餐
   （wait_active 同款模式，终态出口仍保证退出）。
 
@@ -90,7 +91,8 @@ handle():
   // 出口不 abort watcher——D2 的 Completed/终态出口保证自然退出
 ```
 
-- `cancels` 注册表（Mutex<HashMap<u64, Arc<AtomicBool>>>）供
+- `cancels` 注册表（Mutex<HashMap<u64, Arc<RequestFlags>>>——实现期为
+  cancelled/closed 双旗结构，writer 不得持探针 sender，见实现期发现 1）供
   respond_streaming 时给 StreamWriterJs 挂 `cancelled` getter；entry 在
   watcher 退出时移除（writer 已持 clone，只影响观察面）。
 - close() 时：closed 置位 → 后续 handle 直接拒绝；既有 pending drain 走
@@ -185,7 +187,8 @@ e2e T7 实证同 peer 重开永卡：两层缺陷——
    置的 Active 打回 Recovering。加 current_channel_owner() 代次守卫。
    （s6b 钉不变量：废弃 RESUME + 异 nonce 恢复后 provider 必须回到
    Active；具体迟到失败交错由竞态决定，守卫为原则性加固。）
-3. **双拨收敛已知边缘（未修，非本面）**：同 peer close 旧会话后立即
-   open_session，客户端可能卡 adopt canonical（"not observed locally"）
-   直至握手超时——0.5.0 malformed INIT_OK 测试同族现象。h6 因之改用
-   fresh pair 断言跨会话差异。遗留至传输层专项（见收尾决策项）。
+3. **双拨收敛边缘（已修，D8）**：同 peer close 旧会话后立即 open_session
+   曾卡 adopt canonical 直至握手超时——根因两层（close 不终结传输 +
+   Recovering canonical 永不释放），由 D8 三个机制收口（s6c/e2e T7 钉）。
+   残余已知窗口：栅栏与新 INIT 替换之间的极窄交错下旧会话可能短暂孤儿
+   活跃（客户端仍在用）——新 canonical 语义不受影响；详见 D8 注记。

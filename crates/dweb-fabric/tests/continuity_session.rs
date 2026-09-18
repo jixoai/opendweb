@@ -1462,3 +1462,123 @@ async fn session_resume_single_flight() {
     );
     provider.abort();
 }
+
+/// s6d（R1 P1-4）：INIT 替换 vs 在途 RESUME 竞态——被替换会话不得复活。
+/// 交错（resume_gate 确定性注入）：R1 决策完成被 gate 拦截（未安装）→
+/// 客户端刻意 close（S1 → 死通道 Recovering）→ 新 INIT I1 走死通道替换
+/// （S1 置 Dead、S2 上位）→ 放行 R1 → install 因 S1 已 Dead 被拒 →
+/// 无 RESUME_OK、S1 永不重新 Active（单 canonical 收敛）。
+#[tokio::test]
+async fn session_replaced_canonical_not_resurrected_by_inflight_resume() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let b_loop = b.clone();
+    let a_loop = a_id.clone();
+    let provider = tokio::spawn(async move {
+        let initial = session::accept_any(&b_loop, &a_loop, opts)
+            .await
+            .expect("initial accept");
+        let gate_rx = initial.shared().resume_gate.enable();
+        let shared = initial.shared().clone();
+        ready_tx
+            .send((shared, gate_rx))
+            .unwrap_or_else(|_| panic!("handoff"));
+        loop {
+            let _ = session::accept_any(&b_loop, &a_loop, opts).await;
+        }
+    });
+    let client = open_session_bounded(&a, &b_id, opts).await;
+    let (shared, gate_rx) = ready_rx.await.expect("handoff");
+    let (generation, token) = client.shared().debug_current_token();
+    let sid1 = client.shared().session_id;
+
+    // R1：RESUME 于 t1，决策后被 gate 拦截（未安装）
+    let t1 = a.continuity_open_transport(&b_id).await.unwrap();
+    let mut t1 = t1;
+    t1.send(&Frame {
+        frame_type: FrameType::ResumeInit,
+        flags: 0,
+        session_id: sid1,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(encode_resume_init(
+            generation,
+            generation,
+            &[0xC1u8; 16],
+            &token,
+            &[],
+        )),
+    })
+    .await
+    .unwrap();
+    // 并发第二 accept 承接 I1（串行 loop 会被 gated R1 阻塞）
+    let b2 = b.clone();
+    let a2 = a_id.clone();
+    let p2 = tokio::spawn(async move { session::accept_any(&b2, &a2, opts).await });
+    let mut gate_rx = gate_rx;
+    tokio::time::timeout(Duration::from_secs(10), gate_rx.changed())
+        .await
+        .expect("R1 到达 gate 有界")
+        .expect("gate 保持打开");
+
+    // 客户端刻意 close：S1（provider 侧）→ 死通道 Recovering
+    client.close().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while shared.phase().await != session::SessionPhase::Recovering {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "close 后 S1 应进入 Recovering（当前 {:?}）",
+            shared.phase().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // I1：fresh INIT（新 sid）——死通道 Recovering canonical 即时替换
+    let sid2 = [0x77u8; 16];
+    let t2 = a.continuity_open_transport(&b_id).await.unwrap();
+    let mut t2 = t2;
+    t2.send(&Frame {
+        frame_type: FrameType::SessionInit,
+        flags: 0,
+        session_id: sid2,
+        stream_id: 0,
+        direction: Direction::ClientToProvider,
+        byte_offset: 0,
+        payload: Bytes::from(encode_session_init(&sid2, &[0x99u8; 16], 1)),
+    })
+    .await
+    .unwrap();
+    let ok2 = tokio::time::timeout(Duration::from_secs(10), t2.recv())
+        .await
+        .expect("INIT_OK 有界")
+        .expect("recv ok");
+    assert_eq!(ok2.frame_type, FrameType::SessionInitOk, "I1 替换成功");
+
+    // 放行 R1：install 因 S1 已 Dead 被拒——无 RESUME_OK、S1 不复活
+    shared.resume_gate.release();
+    let r1_resp = tokio::time::timeout(Duration::from_secs(10), t1.recv()).await;
+    match r1_resp {
+        Ok(Ok(f)) => panic!("R1 不得收到成功帧（得到 {:?}）", f.frame_type),
+        Ok(Err(_)) | Err(_) => {} // 半关候选：连接终结/无帧
+    }
+    // 终态：S1 保持 Dead（不因 R1 的任何后续步骤复活）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let phase = shared.phase().await;
+        assert_eq!(
+            phase,
+            session::SessionPhase::Dead,
+            "被替换会话必须保持 Dead"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(p2);
+    provider.abort();
+}

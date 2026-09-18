@@ -4,7 +4,7 @@
 
 `/http` 的 serveHttp handler 请求对象 SHALL 携带会话与取消生命周期信号：
 
-- `sessionId: number` — 请求所属逻辑会话 id（内核本地派生事实，非 wire
+- `sessionId: string` — 请求所属逻辑会话 id（32 字符小写 hex；内核本地派生事实，非 wire
   字段，不可被对端伪造）；授权缓存 SHALL 以 session_id 为隔离键（同 peer
   不同 session 不继承授权——spec fabric §3.2 的会话级隔离前提）。
 - `signal: AbortSignal` — 对端取消（RESET / 会话终态遗弃）事件驱动触发；
