@@ -135,6 +135,33 @@ curl http://localhost:8787/services.json  # -> machine-readable service manifest
 
 Precedence is `flag > env > default`. Invalid public URLs are hard errors at startup.
 
+## Device identity and tenant self-service (`opendweb id` / `opendweb join`)
+
+**One default key per device.** The CLI keeps a single default device key at `<DWEB_HOME>/identity.key` (default `~/.opendweb/identity.key`, file mode 0600, atomic insert-if-absent creation): the key *is* the device's identity, and its public half is the address other parties deal with — the public key is the address. The key is created automatically on first `opendweb join` and is never printed or exported.
+
+- **Reinstalling or switching machines means a new identity.** v1 has no key migration: a fresh device key is a fresh identity, and the server admin must re-admit it (a new invite code, or a visitor grant). Treat `~/.opendweb/identity.key` as device-local secret material.
+- **Multiple keypairs (switching the "device fingerprint") are an advanced feature and are not provided yet.**
+
+```bash
+opendweb id
+# endpoint_id  d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+# short        d75***11a
+# key          /Users/you/.opendweb/identity.key
+
+opendweb join --server https://opendweb.example.com --code dwebc1.xxxx-xxxx-xxxx-xxxx
+# joined https://opendweb.example.com as a tenant
+#   endpoint_id  9f31...c2a4
+#   short        9f3***2a4
+#   fabric_id    7ba1...e09d (newly generated)
+#   expires      2026-10-23
+#   receipt      verified (generation 7)
+#   state        /Users/you/.opendweb/registration.json
+```
+
+`opendweb id` is read-only and idempotent: it prints the endpoint_id (64 hex), the anti-phishing short form (first 3 + `***` + last 3) and the key path — no private key material, no state changes; without a key it exits non-zero and points at `join`.
+
+`opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--allow-insecure]` is the tenant self-service entry (tenants never hand-craft the HTTP): it uses the default device key as the fabric root, generates a local fabric when none exists and **reuses** the existing one afterwards (a second fabric is never silently created; `--fabric` selects explicitly), signs the canonical registration payload as proof of possession, redeems the invite code at the server's public `POST /register`, verifies the returned receipt against the server's `server_id` (published at `/services.json`), and saves the registration (server / fabric_id / root / expiry / receipt) to `<DWEB_HOME>/registration.json`. The invite code and the private key never appear in any output or error. Failures (`code-invalid` / `code-expired` / `code-exhausted` / `bad-signature` / `stale-ts` / `rate-limited` ...) exit non-zero and leave no partial local state; retrying an already-redeemed code replays the first result (idempotent — renewal requires a fresh valid code). `https` is the default expectation; plaintext `http` is only allowed to loopback addresses unless `--allow-insecure` is passed.
+
 ## Deployment without a public IP: reverse proxy / tunnel (vendor-neutral, Cloudflare Tunnel as reference)
 
 When the host has no public IP, any front-end that terminates TLS and forwards plain HTTP/WS upstream works (Cloudflare Tunnel, ngrok, frp, Caddy on a VPS...). There are only two requirements:

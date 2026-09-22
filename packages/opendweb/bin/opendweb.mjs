@@ -27,6 +27,8 @@ import { pluginAdd, pluginRemove, pluginList, pluginUpdate, latestVersion, loadL
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
 import { loadDeclaredPlugins, fireHook } from "../src/plugin-runtime.mjs";
 import { CliExit, asciiEscape } from "../src/util.mjs";
+import { runId } from "../src/identity.mjs";
+import { runJoin } from "../src/join.mjs";
 
 const require = createRequire(import.meta.url);
 const PLATFORMS = ["darwin-arm64", "win32-x64"];
@@ -930,6 +932,13 @@ async function main() {
   if (command === "marketplace") return await runMarketplace(rest);
   if (command === "plugin") return await runPlugin(rest);
   if (command === "setup") return await runSetup(rest);
+  // server-access-roles Phase 3：设备身份/租户自助注册（builtin，恒优先于
+  // 自适应插件解析）
+  if (command === "id") {
+    if (rest.length > 0) throw new CliExit(`id takes no arguments (got ${rest[0]})`, 2);
+    return await runId({ home: dwebHome() });
+  }
+  if (command === "join") return await runJoin(rest, { home: dwebHome() });
   if (command === "use") {
     const [name, ...restAfterUse] = rest;
     if (!name) throw new CliExit("usage: opendweb use <plugin-name> [command]", 2);
@@ -969,6 +978,29 @@ Usage:
       section carries mode/policy/owners/callback settings; the data
       directory stays a deployment concern (DWEB_DATA_DIR env, default
       dweb-data/).
+
+  opendweb id
+      Read-only device identity view: prints the endpoint_id (64 hex) of
+      this machine's default device key, the anti-phishing short form
+      (abc***xyz) and the key storage path. One default key per device; it
+      is created on first "opendweb join". Private key material is never
+      printed and no state is modified (repeat runs print the same output).
+
+  opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--allow-insecure]
+      Tenant self-service registration (invite-code redemption). Uses the
+      default device key as the fabric root, generates a local fabric when
+      none exists (reuses the existing one otherwise; --fabric selects
+      explicitly - a second fabric is never silently created), signs the
+      canonical register payload as proof of possession, and exchanges it
+      at POST /register. On success the receipt is verified against the
+      server's server_id (from /services.json) and the registration
+      (server/fabric_id/root/expiry/receipt) is saved to
+      <DWEB_HOME>/registration.json. The invite code and the private key
+      never appear in any output. Failures exit non-zero and leave no
+      partial local state; retrying an already-redeemed code replays the
+      first result (idempotent - renewal requires a fresh valid code).
+      https is the default expectation; plaintext http is only allowed to
+      loopback addresses unless --allow-insecure is passed.
 
   opendweb marketplace add|list|remove "npm:<glob>, ..."
       Manage plugin candidate globs. Default: npm:@jixo/opendweb-ext-*,
@@ -1022,7 +1054,9 @@ Environment:
   DWEB_DATA_DIR             data directory for server.key/owners.jsonl (default dweb-data)
   DWEB_ACCESS_POLICY        L2 policy: static (default) | callback (needs
                             DWEB_CALLBACK_URL + DWEB_CALLBACK_TOKEN)
-  DWEB_HOME                 CLI state directory (default ~/.opendweb)
+  DWEB_HOME                 CLI state directory (default ~/.opendweb):
+                            marketplace.json, plugins.json, the device
+                            identity.key and registration.json
 
 Clients need a single config entry: pick any Network address from the startup
 banner (e.g. http://192.168.2.13:8787). The gateway exposes the

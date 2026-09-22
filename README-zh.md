@@ -110,6 +110,33 @@ curl http://localhost:8787/services.json  # -> 机器可读服务清单
 
 优先级 `flag > env > default`；非法公网 URL 启动即硬错误。
 
+## 设备身份与租户自助（`opendweb id` / `opendweb join`）
+
+**一台设备一个默认 key。** CLI 在 `<DWEB_HOME>/identity.key`（默认 `~/.opendweb/identity.key`，文件权限 0600，原子 insert-if-absent 创建）保管唯一的默认设备 key：key 即设备身份，其公钥部分就是对外交往的地址——公钥即地址。key 在首次 `opendweb join` 时自动创建，任何命令都不打印、不导出它。
+
+- **重装/换机 = 新身份。** v1 不做 key 迁移：新的设备 key 就是新的身份，需要管理员重新准入（新邀请码或访客授权）。请把 `~/.opendweb/identity.key` 当作设备本地机密材料对待。
+- **多密钥对（切换「设备指纹」）属于高级功能，暂未提供。**
+
+```bash
+opendweb id
+# endpoint_id  d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+# short        d75***11a
+# key          /Users/you/.opendweb/identity.key
+
+opendweb join --server https://opendweb.example.com --code dwebc1.xxxx-xxxx-xxxx-xxxx
+# joined https://opendweb.example.com as a tenant
+#   endpoint_id  9f31...c2a4
+#   short        9f3***2a4
+#   fabric_id    7ba1...e09d (newly generated)
+#   expires      2026-10-23
+#   receipt      verified (generation 7)
+#   state        /Users/you/.opendweb/registration.json
+```
+
+`opendweb id` 只读且幂等：输出 endpoint_id（64 hex）、防钓鱼缩写（首 3 + `***` + 尾 3）与 key 存储路径——无私钥材料、零状态变更；尚无 key 时非零退出并指引 `join`。
+
+`opendweb join --server <URL> --code <dwebc1 码> [--fabric <hex64>] [--allow-insecure]` 是租户自助注册入口（租户无需手工构造 HTTP）：以默认设备 key 为 fabric root，本地无 fabric 则生成、之后恒复用（绝不静默生成第二个；`--fabric` 显式指定），对 canonical 注册载荷做持有性证明签名，到服务器公开的 `POST /register` 兑换邀请码，用服务器的 `server_id`（经 `/services.json` 公告）验证回执，并把注册结果（server / fabric_id / root / 到期 / 回执）保存到 `<DWEB_HOME>/registration.json`。邀请码与私钥不会出现在任何输出或错误里。失败（`code-invalid` / `code-expired` / `code-exhausted` / `bad-signature` / `stale-ts` / `rate-limited` 等）非零退出且不产生半提交本地状态；对已兑换过的码重试会幂等回放首次结果（幂等回放≠续期——续期唯一入口是持新的有效码）。默认期望 `https`；明文 `http` 仅允许 loopback 地址，非 loopback 需显式 `--allow-insecure`。
+
 ## 无公网 IP 部署：反向代理 / 隧道（厂商中立，以 Cloudflare Tunnel 为参考）
 
 家用主机无公网 IP 时，任意「终结 TLS、回源 HTTP/WS」的 front-end 都可用
