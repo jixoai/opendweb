@@ -53,6 +53,11 @@ struct Record {
     /// 备注（管理面展示用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    /// 促成本次注册的邀请码哈希（server-access-roles Phase 1b 跨台账提交
+    /// 协议 r2-P0-1：/register 兑换路径写入；CLI/admin 直加行不带。
+    /// `serde(default)` 兼容旧行——无此字段的行解析为非兑换注册）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    via_code_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -103,6 +108,10 @@ struct SnapshotInner {
     /// 事件的完整元数据；归并语义与 HashSet 时代一致（register 插入/覆盖、
     /// unregister 移除）
     active: HashMap<OwnerKey, EntryMeta>,
+    /// 带 via_code_hash 的 register 三元组全集（append-only 事实，不随后续
+    /// unregister 移除）——codes 台账 reconciliation 的孤儿事实源
+    /// （server-access-roles Phase 1b，r3-P0-2 每次加载同锁补齐）
+    via_code: std::collections::BTreeSet<super::codes::RedeemKey>,
 }
 
 impl RegistrySnapshot {
@@ -131,6 +140,21 @@ impl RegistrySnapshot {
     /// 活跃 Owner 数（空 registry 启动告警与 CLI 回显用）
     pub fn len(&self) -> usize {
         self.inner.active.len()
+    }
+
+    /// 带 via_code_hash 的 register 三元组全集（确定性排序——BTreeSet 字节
+    /// 序；codes 台账 reconciliation 的孤儿匹配键，Phase 1b）
+    pub fn code_orphans(&self) -> Vec<super::codes::RedeemKey> {
+        self.inner.via_code.iter().copied().collect()
+    }
+
+    /// 指定键的持久租期（None = 条目缺失或永久）——/register 幂等回落在
+    /// 重启后的 expires_at 事实源（consume 行不带租期，Phase 1b）
+    pub fn entry_expires_at(&self, fabric_id: &[u8; 32], root: &[u8; 32]) -> Option<u64> {
+        self.inner
+            .active
+            .get(&(*fabric_id, *root))
+            .and_then(|meta| meta.expires_at)
     }
 
     /// 是否为空（restricted+static+空 registry 启动告警，task 1.3）
@@ -185,22 +209,30 @@ impl OwnerRegistry {
     /// 读全量 jsonl 归并活跃集合；文件不存在 = 空集合（首次启动合法形态）。
     /// 每次 load 消耗一个新 generation（恒非零，可作缓存键成分）。
     pub fn load(path: &Path) -> Result<Self> {
-        let active = Self::load_active(path)?;
+        let (active, via_code) = Self::load_active(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             state: Mutex::new(State {
                 current: Arc::new(SnapshotInner {
                     generation: ledger::next_generation(),
                     active,
+                    via_code,
                 }),
             }),
         })
     }
 
     /// jsonl 全量归并（load 与 reload 共享；坏行硬错误，见模块注释）。
-    /// 值 = 该键最后一次 register 事件的完整元数据。
-    fn load_active(path: &Path) -> Result<HashMap<OwnerKey, EntryMeta>> {
+    /// 值 = 该键最后一次 register 事件的完整元数据；同时收集全部带
+    /// via_code_hash 的 register 三元组（Phase 1b 孤儿事实源）。
+    fn load_active(
+        path: &Path,
+    ) -> Result<(
+        HashMap<OwnerKey, EntryMeta>,
+        std::collections::BTreeSet<super::codes::RedeemKey>,
+    )> {
         let mut active: HashMap<OwnerKey, EntryMeta> = HashMap::new();
+        let mut via_code = std::collections::BTreeSet::new();
         for (line_no, record) in ledger::read_records::<Record>(path, "owners")? {
             let fabric_id = parse_owner_hex(&record.fabric_id)
                 .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
@@ -208,6 +240,11 @@ impl OwnerRegistry {
                 .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
             match record.op {
                 Op::Register => {
+                    if let Some(hash_hex) = &record.via_code_hash {
+                        let hash = parse_owner_hex(hash_hex)
+                            .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
+                        via_code.insert((hash, fabric_id, root));
+                    }
                     active.insert(
                         (fabric_id, root),
                         EntryMeta {
@@ -223,7 +260,7 @@ impl OwnerRegistry {
                 }
             }
         }
-        Ok(active)
+        Ok((active, via_code))
     }
 
     /// 注册 Owner：append+fsync 后更新内存快照与 generation。
@@ -249,10 +286,61 @@ impl OwnerRegistry {
                 expires_at: None,
                 alias: None,
                 note: None,
+                via_code_hash: None,
             },
             *fabric_id,
             *root,
         )
+    }
+
+    /// 邀请码兑换注册（server-access-roles Phase 1b 跨台账提交协议 ①：
+    /// 唯一调用方 = codes::CodeLedger::redeem，codes 锁内执行）。事件携带
+    /// `via_code_hash` + 兑换租期；**同键已活跃 = 续期语义**——刷新
+    /// expires_at 与 registered_at、**保留既有 alias/note**（spec 冻结，
+    /// 与 mutate 的覆盖语义有意不同）、不重复建条目。
+    pub fn register_via_code(
+        &self,
+        fabric_id: &[u8; 32],
+        root: &[u8; 32],
+        expires_at: Option<u64>,
+        via_code_hash: &[u8; 32],
+    ) -> Result<()> {
+        let record = Record {
+            op: Op::Register,
+            fabric_id: encode_key(&hex::encode(fabric_id)),
+            root: encode_key(&hex::encode(root)),
+            ts: now_ms(),
+            expires_at,
+            alias: None,
+            note: None,
+            via_code_hash: Some(hex::encode(via_code_hash)),
+        };
+        let mut state = self.state.lock().unwrap();
+        let line = ledger::record_line(&record).context("serialize owners record")?;
+        ledger::append_line(&self.path, "owners", &line)?;
+        // 续期合并：alias/note 取既有条目（无则空），租期/时间戳刷新
+        let mut active = state.current.active.clone();
+        let existing = active
+            .get(&(*fabric_id, *root))
+            .cloned()
+            .unwrap_or_default();
+        active.insert(
+            (*fabric_id, *root),
+            EntryMeta {
+                registered_at: record.ts,
+                expires_at: record.expires_at,
+                alias: existing.alias,
+                note: existing.note,
+            },
+        );
+        let mut via_code = state.current.via_code.clone();
+        via_code.insert((*via_code_hash, *fabric_id, *root));
+        state.current = Arc::new(SnapshotInner {
+            generation: ledger::next_generation(),
+            active,
+            via_code,
+        });
+        Ok(())
     }
 
     /// 事件落地公共核：先落盘（append + fsync），成功后才更新内存——磁盘
@@ -282,6 +370,7 @@ impl OwnerRegistry {
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             active,
+            via_code: state.current.via_code.clone(),
         });
         Ok(())
     }
@@ -305,13 +394,23 @@ impl OwnerRegistry {
     /// 文件缺失 = 空集合（与 load 同语义：admin 删除文件即移除全部 owner，
     /// fail-closed）。
     pub fn reload(&self) -> Result<()> {
-        let fresh = Self::load_active(&self.path)?;
+        let (fresh, via_code) = Self::load_active(&self.path)?;
         let mut state = self.state.lock().unwrap();
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             active: fresh,
+            via_code,
         });
         Ok(())
+    }
+
+    /// reload 并返回孤儿集合（codes 台账热重载看护的原子事实源，Phase 1b）：
+    /// 孤儿与快照出自**同一次**磁盘归并——消除「codes 看护先于 owners 看护
+    /// reload」读到旧快照（孤儿缺失）的竞态窗口。失败保留旧快照并上抛，
+    /// 由调用方回落上一轮孤儿集合（保守）。
+    pub fn reload_for_orphans(&self) -> Result<Vec<super::codes::RedeemKey>> {
+        self.reload()?;
+        Ok(self.snapshot().code_orphans())
     }
 }
 
@@ -722,6 +821,109 @@ mod tests {
         assert!(parse_owner_hex(&"a".repeat(63)).is_err());
         assert!(parse_owner_hex(&"a".repeat(65)).is_err());
         assert!(parse_owner_hex(&"g".repeat(64)).is_err());
+    }
+
+    // ---- server-access-roles Phase 1b：via_code_hash + 兑换注册 ----
+
+    /// 兑换注册事件落行形状：via_code_hash 与 expires_at 落行、不带
+    /// alias/note；旧行（无 via_code_hash）解析不变
+    #[test]
+    fn register_via_code_line_shape_and_old_rows_parse() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        let reg = OwnerRegistry::load(&path).unwrap();
+        reg.register_via_code(&[0x11; 32], &[0x22; 32], Some(9_999), &[0x33; 32])
+            .unwrap();
+        let line = std::fs::read_to_string(&path).unwrap();
+        let line = line.trim_end();
+        assert!(
+            line.starts_with("{\"op\":\"register\",\"fabric_id\":\""),
+            "{line}"
+        );
+        assert!(line.contains(&format!("\"root\":\"{}\"", "22".repeat(32))));
+        assert!(line.contains("\"expires_at\":9999"));
+        assert!(line.contains(&format!("\"via_code_hash\":\"{}\"", "33".repeat(32))));
+        assert!(!line.contains("alias") && !line.contains("note"));
+        // 重启 load：via_code 孤儿集合 + 快照租期恢复
+        let reloaded = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(
+            reloaded.snapshot().code_orphans(),
+            vec![([0x33; 32], [0x11; 32], [0x22; 32])]
+        );
+        assert_eq!(
+            reloaded
+                .snapshot()
+                .entry_expires_at(&[0x11; 32], &[0x22; 32]),
+            Some(9_999)
+        );
+        // 旧行（无 via_code_hash）不产生孤儿；永久条目 entry_expires_at=None
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":5}}\n",
+                "44".repeat(32),
+                "55".repeat(32)
+            ),
+        )
+        .unwrap();
+        let plain = OwnerRegistry::load(&path).unwrap();
+        assert!(
+            plain.snapshot().code_orphans().is_empty(),
+            "旧行永不触发补写"
+        );
+        assert_eq!(
+            plain.snapshot().entry_expires_at(&[0x44; 32], &[0x55; 32]),
+            None,
+            "永久条目（缺省租期）"
+        );
+        // 非法 via_code_hash = 坏行硬错误
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":5,\"via_code_hash\":\"zz\"}}\n",
+                "44".repeat(32),
+                "55".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(OwnerRegistry::load(&path).is_err());
+    }
+
+    /// 兑换注册的续期合并语义：同键再兑换刷新租期/registered_at、保留
+    /// 既有 alias/note、不重复建条目；unregister 后 via_code 孤儿仍保留
+    /// （append-only 事实，reconciliation 不因注销而漏补）
+    #[test]
+    fn register_via_code_renewal_preserves_metadata() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        // 既有租户带 alias（文件入口）
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":200,\"alias\":\"a\",\"note\":\"n\"}}\n",
+                "66".repeat(32),
+                "77".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.register_via_code(&[0x66; 32], &[0x77; 32], Some(900), &[0x88; 32])
+            .unwrap();
+        let entries = reg.snapshot().entries();
+        assert_eq!(entries.len(), 1, "续期不重复建条目");
+        assert_eq!(entries[0].expires_at, Some(900));
+        assert_eq!(entries[0].alias.as_deref(), Some("a"), "续期保留 alias");
+        assert_eq!(entries[0].note.as_deref(), Some("n"), "续期保留 note");
+        assert!(entries[0].registered_at > 100, "registered_at 刷新");
+        assert_eq!(
+            reg.snapshot().code_orphans(),
+            vec![([0x88; 32], [0x66; 32], [0x77; 32])],
+            "同键重复兑换的孤儿按三元组去重"
+        );
+        // 注销后孤儿事实仍在（崩溃恢复以事件为准，不以活跃集合为准）
+        reg.unregister(&[0x66; 32], &[0x77; 32]).unwrap();
+        assert_eq!(reg.snapshot().code_orphans().len(), 1);
     }
 
     /// task 3.1：entries() 暴露 registered_at（最后 register 事件 ts），

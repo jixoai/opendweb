@@ -24,6 +24,14 @@ pub const OWNERS_FILE_NAME: &str = "owners.jsonl";
 pub const VISITORS_FILE_NAME: &str = "visitors.jsonl";
 /// data_dir 内的黑名单文件名（server-access-roles Phase 1a，spec 冻结）
 pub const BLOCKLIST_FILE_NAME: &str = "blocklist.jsonl";
+/// data_dir 内的邀请码台账文件名（server-access-roles Phase 1b，spec 冻结）
+pub const CODES_FILE_NAME: &str = "codes.jsonl";
+/// /register per-IP 限流默认：10 次/分钟（spec 冻结；突发 = rate/2 = 5）
+pub const DEFAULT_REGISTER_RATE_PER_MIN: u32 = 10;
+/// rendezvous resolve 限流默认：60 次/分钟（spec 冻结；突发 = rate/2）
+pub const DEFAULT_RDZ_RATE_RESOLVE_PER_MIN: u32 = 60;
+/// rendezvous announce 限流默认：20 次/分钟（spec 冻结；突发 = rate/2）
+pub const DEFAULT_RDZ_RATE_ANNOUNCE_PER_MIN: u32 = 20;
 /// 访客两级配额默认：per-endpoint（spec 冻结默认 4）
 pub const DEFAULT_MAX_CONNECTIONS_PER_VISITOR: usize = 4;
 /// 访客两级配额默认：全局（spec 冻结默认 64，防多 key 女巫聚合 r1-P1-4）
@@ -86,6 +94,14 @@ pub struct AccessConfig {
     pub visitors_file: PathBuf,
     /// 黑名单文件（server-access-roles Phase 1a；缺省派生自 data_dir）
     pub blocklist_file: PathBuf,
+    /// 邀请码台账文件（server-access-roles Phase 1b；缺省派生自 data_dir）
+    pub codes_file: PathBuf,
+    /// /register per-IP 限流：每分钟许可数（spec 默认 10；突发 = rate/2）
+    pub register_rate_per_min: u32,
+    /// rendezvous resolve per-IP 限流（spec 默认 60；突发 = rate/2）
+    pub rdz_rate_resolve_per_min: u32,
+    /// rendezvous announce per-IP 限流（spec 默认 20；突发 = rate/2）
+    pub rdz_rate_announce_per_min: u32,
     /// per-owner 在线连接配额（task 3.2 前半，Phase 3）：None = 无上限
     /// （默认）。仅 restricted 模式的 relay gate 消费——配额按
     /// capability.fabric_id 计数，open 模式无验证链可归因。
@@ -148,6 +164,10 @@ pub fn resolve_access_config(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join(BLOCKLIST_FILE_NAME));
+    let codes_file = get_env("DWEB_CODES_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(CODES_FILE_NAME));
 
     // policy：env（static|callback，默认 static）。config.toml 的 policy 字段
     // 随 TS 映射接线（不在本棒）；flag 面暂不设——策略是低频部署决策。
@@ -180,6 +200,22 @@ pub fn resolve_access_config(
             "DWEB_RELAY_MAX_VISITOR_CONNECTIONS",
             DEFAULT_MAX_VISITOR_CONNECTIONS,
         )?,
+        register_rate_per_min: parse_positive_env_usize(
+            get_env,
+            "DWEB_REGISTER_RATE_PER_MIN",
+            DEFAULT_REGISTER_RATE_PER_MIN as usize,
+        )? as u32,
+        rdz_rate_resolve_per_min: parse_positive_env_usize(
+            get_env,
+            "DWEB_RDZ_RATE_RESOLVE_PER_MIN",
+            DEFAULT_RDZ_RATE_RESOLVE_PER_MIN as usize,
+        )? as u32,
+        rdz_rate_announce_per_min: parse_positive_env_usize(
+            get_env,
+            "DWEB_RDZ_RATE_ANNOUNCE_PER_MIN",
+            DEFAULT_RDZ_RATE_ANNOUNCE_PER_MIN as usize,
+        )? as u32,
+        codes_file,
     };
     validate(&config, get_env)?;
     Ok(config)
@@ -354,6 +390,14 @@ mod tests {
             cfg.blocklist_file,
             PathBuf::from(DEFAULT_DATA_DIR).join(BLOCKLIST_FILE_NAME)
         );
+        assert_eq!(
+            cfg.codes_file,
+            PathBuf::from(DEFAULT_DATA_DIR).join(CODES_FILE_NAME)
+        );
+        // 限流默认（spec 冻结 10/60/20；突发 = rate/2 由装配层计算）
+        assert_eq!(cfg.register_rate_per_min, 10);
+        assert_eq!(cfg.rdz_rate_resolve_per_min, 60);
+        assert_eq!(cfg.rdz_rate_announce_per_min, 20);
         // 访客两级配额默认（spec 冻结 4/64）
         assert_eq!(cfg.max_connections_per_visitor, 4);
         assert_eq!(cfg.max_visitor_connections, 64);
@@ -404,6 +448,40 @@ mod tests {
         let getter = env(&[("DWEB_RELAY_MAX_VISITOR_CONNECTIONS", "")]);
         let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
         assert_eq!(cfg.max_visitor_connections, 64);
+    }
+
+    /// server-access-roles Phase 1b：codes 文件名 env 覆盖 + 三个限流 env
+    /// 矩阵（合法覆盖 / 0 / 非数字 fail-fast）
+    #[test]
+    fn codes_file_and_rate_envs_matrix() {
+        let getter = env(&[
+            ("DWEB_DATA_DIR", "/env-data"),
+            ("DWEB_CODES_FILE", "/custom/codes.jsonl"),
+            ("DWEB_REGISTER_RATE_PER_MIN", "30"),
+            ("DWEB_RDZ_RATE_RESOLVE_PER_MIN", "120"),
+            ("DWEB_RDZ_RATE_ANNOUNCE_PER_MIN", "40"),
+        ]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.codes_file, PathBuf::from("/custom/codes.jsonl"));
+        assert_eq!(cfg.register_rate_per_min, 30);
+        assert_eq!(cfg.rdz_rate_resolve_per_min, 120);
+        assert_eq!(cfg.rdz_rate_announce_per_min, 40);
+        // 派生默认
+        let getter = env(&[("DWEB_DATA_DIR", "/env-data")]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.codes_file, PathBuf::from("/env-data/codes.jsonl"));
+        // 0 / 非数字 → fail-fast（限流是防滥用硬限，无 0 形态）
+        for key in [
+            "DWEB_REGISTER_RATE_PER_MIN",
+            "DWEB_RDZ_RATE_RESOLVE_PER_MIN",
+            "DWEB_RDZ_RATE_ANNOUNCE_PER_MIN",
+        ] {
+            for bad in ["0", "many"] {
+                let err = resolve_access_config(&AccessCliInputs::default(), &env(&[(key, bad)]))
+                    .unwrap_err();
+                assert!(err.contains(key), "{err}");
+            }
+        }
     }
 
     #[test]

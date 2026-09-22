@@ -326,6 +326,28 @@ async fn main() -> Result<()> {
     let owners = std::sync::Arc::new(access::registry::OwnerRegistry::load(
         &access_cfg.owners_file,
     )?);
+    // 邀请码台账（server-access-roles Phase 1b）：加载 + reconciliation 同锁
+    // 步骤——坏行/归并失败 = 整服务 fail-fast（r4-P1-3 分级 (a)，错误含台账
+    // 路径与原因）；补写失败在 load 内消化为 deny-set（分级 (b)），不阻断
+    // 启动。/register 挂 gateway 根路径（公开端点，两种 access mode 均装配
+    // ——码兑换与门禁正交；open 模式下注册入册但 gate 不消费）
+    let codes = std::sync::Arc::new(access::codes::CodeLedger::load(
+        &access_cfg.codes_file,
+        &owners.snapshot().code_orphans(),
+    )?);
+    tracing::info!(
+        "code ledger: {} codes (generation {}, file {})",
+        codes.snapshot().len(),
+        codes.snapshot().generation(),
+        access_cfg.codes_file.display()
+    );
+    // codes 台账热重载看护（Phase 1b）：codes.jsonl 与 owners.jsonl 双指纹
+    // ——孤儿补齐覆盖两侧变更（文件入口追加带 via_code_hash 的 register
+    // 在下次 reload 补齐 consume，r3-P0-2）
+    access::codes::spawn_codes_ledger_watcher(
+        std::sync::Arc::clone(&codes),
+        std::sync::Arc::clone(&owners),
+    );
     let owners_snapshot = owners.snapshot();
     if let Some(warning) =
         access::config::restricted_static_empty_warning(&access_cfg, owners_snapshot.is_empty())
@@ -519,12 +541,35 @@ async fn main() -> Result<()> {
         server_id: identity.server_id().to_string(),
     });
 
-    let app = rendezvous::router_with_access(rdz_gate).merge(services::router(info));
+    let app = rendezvous::router_with_access_and_limits(
+        rdz_gate,
+        rendezvous::RdzLimits::from_rates(
+            access_cfg.rdz_rate_resolve_per_min,
+            access_cfg.rdz_rate_announce_per_min,
+        ),
+    )
+    .merge(services::router(info));
     let app = match admin_router {
         Some(admin) => app.merge(admin),
         None => app,
     };
-    let http = axum::serve(listener, app);
+    // POST /register 公开自助注册（Phase 1b：码门控，不走 admin auth_guard；
+    // 直连 peer 限流，默认 10/min 突发 5 = rate/2）
+    let app = app.merge(access::register::router(access::register::RegisterState {
+        identity: std::sync::Arc::clone(&identity),
+        owners: std::sync::Arc::clone(&owners),
+        codes: std::sync::Arc::clone(&codes),
+        limiter: std::sync::Arc::new(access::ratelimit::IpRateLimiter::new(
+            access_cfg.register_rate_per_min,
+            (access_cfg.register_rate_per_min / 2).max(1),
+        )),
+    }));
+    // ConnectInfo 注入：限流键 = 直连 TCP peer（/register 与 rendezvous 面；
+    // XFF/Forwarded 一律不采信——spec 冻结）
+    let http = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
     tokio::select! {
         res = http => res?,
         _ = tokio::signal::ctrl_c() => {

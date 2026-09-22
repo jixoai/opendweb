@@ -9,14 +9,20 @@
 //!   （C7 绑定；窃取 token 者无对应私钥无法以他人身份登记）
 //! - resolve：bearer-only 明示降级（无 HTTP 面身份证明，仅验密码学有效性）
 //! - rendezvous 不接 callback webhook（design §8.5 R3 P0-B2 冻结：
-//!   动态策略另立 change）——main 侧恒以 Static 策略构造 gate 装入本路由
+//!   动态策略另立 change）——main 侧恒以 Static 策略 gate 装入本路由
 //! - open 模式（gate = None）：announce/resolve 与现状逐字节一致
 //!   （签名 announce / 匿名 resolve）
+//! - 基础限流（server-access-roles Phase 1b，spec「rendezvous 访问控制」）：
+//!   resolve 60/min、announce 20/min（`DWEB_RDZ_RATE_RESOLVE_PER_MIN`/
+//!   `DWEB_RDZ_RATE_ANNOUNCE_PER_MIN` 可配，突发 = 速率一半），per 直连
+//!   TCP peer（ConnectInfo——XFF/Forwarded 一律不采信），与 access mode
+//!   正交（open 同样生效）；超限 429 + `{"error":"rate-limited"}`
 
 use crate::access::gate::{AccessGate, GateDecision, GateInput, Op};
+use crate::access::ratelimit::IpRateLimiter;
 use axum::{
     Json, Router,
-    extract::{Path, RawQuery, State},
+    extract::{ConnectInfo, Path, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
@@ -26,6 +32,7 @@ use ed25519_dalek::Verifier;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -35,6 +42,38 @@ use thiserror::Error;
 const TIMESTAMP_WINDOW_MS: u64 = 120_000;
 /// TTL 上限（秒）
 const MAX_TTL_SECS: u64 = 3600;
+/// 限流默认速率（spec 冻结）
+const DEFAULT_RATE_RESOLVE_PER_MIN: u32 = 60;
+const DEFAULT_RATE_ANNOUNCE_PER_MIN: u32 = 20;
+
+/// rendezvous 双面限流器（main 按 env 配置构造；突发 = rate/2）
+#[derive(Clone)]
+pub struct RdzLimits {
+    pub resolve: Arc<IpRateLimiter>,
+    pub announce: Arc<IpRateLimiter>,
+}
+
+impl RdzLimits {
+    /// 速率 → 限流器对（突发 = 速率一半——spec 冻结规则；钳位 ≥1）
+    pub fn from_rates(resolve_per_min: u32, announce_per_min: u32) -> Self {
+        Self {
+            resolve: Arc::new(IpRateLimiter::new(
+                resolve_per_min,
+                (resolve_per_min / 2).max(1),
+            )),
+            announce: Arc::new(IpRateLimiter::new(
+                announce_per_min,
+                (announce_per_min / 2).max(1),
+            )),
+        }
+    }
+}
+
+impl Default for RdzLimits {
+    fn default() -> Self {
+        Self::from_rates(DEFAULT_RATE_RESOLVE_PER_MIN, DEFAULT_RATE_ANNOUNCE_PER_MIN)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RendezvousError {
@@ -118,9 +157,11 @@ pub struct Registry {
 
 /// 路由共享状态：登记表 + 可选 AccessGate（None = open 模式，行为与
 /// 现状一致；Some = restricted 模式静态 ACL——恒 Static 策略，design §8.5）
+/// + 双面 per-IP 限流器（与 access mode 正交，open 同样生效）
 pub struct AppState {
     registry: Registry,
     gate: Option<Arc<AccessGate>>,
+    limits: RdzLimits,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -161,22 +202,32 @@ pub fn announce_canonical_bytes(
     buf
 }
 
-/// open 模式路由（gate = None）。主路径经 [`router_with_access`]（main
-/// 以 rdz_gate=None 达同语义）；本别名保留给测试与嵌入方直接构造。
+/// open 模式路由（gate = None，默认限流 60/20）。主路径经
+/// [`router_with_access_and_limits`]（main 以 rdz_gate=None + env 限流达同
+/// 语义）；本别名保留给测试与嵌入方直接构造。
 #[allow(dead_code)]
 pub fn router() -> Router {
     router_with_access(None)
 }
 
 /// 带 ACL 的路由构造（task 1.6）：`gate = None` 时与 [`router`]（open
-/// 现状）完全一致；restricted 模式由 main 传入 Static 策略 gate。
+/// 现状 + 默认限流）一致；restricted 模式由 main 传入 Static 策略 gate。
 pub fn router_with_access(gate: Option<Arc<AccessGate>>) -> Router {
+    router_with_access_and_limits(gate, RdzLimits::default())
+}
+
+/// 带 ACL + 限流配置的路由构造（server-access-roles Phase 1b：main 按
+/// `DWEB_RDZ_RATE_RESOLVE_PER_MIN`/`DWEB_RDZ_RATE_ANNOUNCE_PER_MIN` 装配）。
+/// 需以 `into_make_service_with_connect_info::<SocketAddr>()` 服务（限流键 =
+/// 直连 TCP peer；XFF 不采信）。
+pub fn router_with_access_and_limits(gate: Option<Arc<AccessGate>>, limits: RdzLimits) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/rendezvous/{id}", post(announce).get(resolve))
         .with_state(Arc::new(AppState {
             registry: Registry::default(),
             gate,
+            limits,
         }))
 }
 
@@ -237,13 +288,30 @@ async fn acl_check(
     }
 }
 
+/// 限流拒绝响应（429 + `{"error":"rate-limited"}`——rendezvous 面的
+/// envelope 家族与 ACL deny 同为扁平形态）
+fn rate_limited_response() -> (StatusCode, String) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::to_string(&AclErrorBody {
+            error: "rate-limited".to_string(),
+        })
+        .expect("serde_json 序列化 String 恒成功"),
+    )
+}
+
 async fn announce(
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
     raw_query: RawQuery,
     Json(req): Json<AnnounceRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    // per-IP 限流先于一切（与凭证有效性无关；直连 peer，XFF 不采信）
+    if !state.limits.announce.take(peer.ip()) {
+        return Err(rate_limited_response());
+    }
     // path/body 身份一致性 + id 解码先行（既有 400 语义保留），随后
     // restricted ACL（C0 先行序：无票/坏票/缺位/未注册 → 401，先于
     // 对签名与载荷细节的验证——不给未认证方验证 oracle）
@@ -304,10 +372,15 @@ fn handle_announce(
 
 async fn resolve(
     State(state): State<SharedState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(id): Path<String>,
     headers: HeaderMap,
     raw_query: RawQuery,
 ) -> Result<Json<ResolveResponse>, (StatusCode, String)> {
+    // per-IP 限流先于 ACL（与凭证有效性无关；直连 peer，XFF 不采信）
+    if !state.limits.resolve.take(peer.ip()) {
+        return Err(rate_limited_response());
+    }
     let id_bytes = decode_endpoint_id(&id).map_err(|e| (e.status(), e.body()))?;
     // restricted：resolve bearer-only（C7 不适用）；endpoint_id 字段承载
     // 解析目标 id（不参与 recipient 绑定，仅 shape 校验需要合法 hex）
@@ -339,6 +412,28 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    /// 测试 shim：注入 ConnectInfo（oneshot 无真实 TCP peer；生产路径由
+    /// main 的 into_make_service_with_connect_info 提供）
+    fn peer_shim(app: Router, ip: [u8; 4]) -> Router {
+        use axum::middleware::Next;
+        use std::net::{IpAddr, Ipv4Addr};
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 0);
+        app.layer(axum::middleware::from_fn(
+            move |mut req: Request<Body>, next: Next| async move {
+                req.extensions_mut().insert(ConnectInfo(addr));
+                next.run(req).await
+            },
+        ))
+    }
+
+    /// 高限流测试路由（既有矩阵用例不触发限流语义）
+    fn open_app() -> Router {
+        peer_shim(
+            router_with_access_and_limits(None, RdzLimits::from_rates(1_000_000, 1_000_000)),
+            [127, 0, 0, 1],
+        )
+    }
 
     fn signed_request(key: &SigningKey, addrs: Vec<&str>, ttl: u64, ts: u64) -> AnnounceRequest {
         let id_bytes = key.verifying_key().to_bytes();
@@ -376,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn announce_then_resolve() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
-        let app = router();
+        let app = open_app();
         let req = signed_request(&key, vec!["127.0.0.1:9000"], 60, now_ms());
         let id = req.endpoint_id.clone();
 
@@ -419,7 +514,7 @@ mod tests {
             announce_canonical_bytes(&id_bytes, req.timestamp_ms, &req.addrs, req.ttl_secs as u32);
         req.signature = URL_SAFE_NO_PAD.encode(other.sign(&canonical).to_bytes());
 
-        let app = router();
+        let app = open_app();
         let res = app
             .oneshot(
                 Request::post(format!("/rendezvous/{}", req.endpoint_id))
@@ -441,7 +536,7 @@ mod tests {
     async fn stale_timestamp_rejected() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let req = signed_request(&key, vec!["127.0.0.1:9000"], 60, now_ms() - 600_000);
-        let app = router();
+        let app = open_app();
         let res = app
             .oneshot(
                 Request::post(format!("/rendezvous/{}", req.endpoint_id))
@@ -460,6 +555,7 @@ mod tests {
         let state = Arc::new(AppState {
             registry: Registry::default(),
             gate: None,
+            limits: RdzLimits::from_rates(1_000_000, 1_000_000),
         });
         let id_bytes = key.verifying_key().to_bytes();
         state.registry.entries.lock().unwrap().insert(
@@ -469,9 +565,12 @@ mod tests {
                 expires_at_ms: now_ms() - 1,
             },
         );
-        let app = Router::new()
-            .route("/rendezvous/{id}", get(resolve))
-            .with_state(state);
+        let app = peer_shim(
+            Router::new()
+                .route("/rendezvous/{id}", get(resolve))
+                .with_state(state),
+            [127, 0, 0, 1],
+        );
         let res = app
             .oneshot(
                 Request::get(format!("/rendezvous/{}", hex::encode(id_bytes)))
@@ -488,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn open_mode_gate_none_keeps_anonymous_paths() {
         let key = SigningKey::from_bytes(&[10u8; 32]);
-        for app in [router(), router_with_access(None)] {
+        for app in [open_app(), open_app()] {
             let req = signed_request(&key, vec!["127.0.0.1:9000"], 60, now_ms());
             let res = app
                 .clone()
@@ -539,7 +638,16 @@ mod tests {
                 .register(&f.fabric_id, &f.issuer.verifying_key().to_bytes())
                 .unwrap();
             let gate = AccessGate::new(f.server_id, registry, PolicyConfig::Static).unwrap();
-            (f, router_with_access(Some(Arc::new(gate))))
+            (
+                f,
+                peer_shim(
+                    router_with_access_and_limits(
+                        Some(Arc::new(gate)),
+                        RdzLimits::from_rates(1_000_000, 1_000_000),
+                    ),
+                    [127, 0, 0, 1],
+                ),
+            )
         }
 
         fn token_for(&self, recipient: &[u8; 32], caps: u8) -> String {
@@ -851,5 +959,113 @@ mod tests {
             .await
             .unwrap();
         assert_acl_deny(res, "dweb/malformed-capability").await;
+    }
+
+    // ---- server-access-roles Phase 1b：rendezvous per-IP 限流 ----
+
+    /// resolve 限流独立生效（spec Scenario）：同 IP 超配额 → 429 +
+    /// `{"error":"rate-limited"}`，与凭证有效性无关（open 模式同样生效）
+    #[tokio::test]
+    async fn resolve_rate_limit_returns_429() {
+        // rate 2/min → burst 1：首个请求消费突发，第二个即 429
+        let app = peer_shim(
+            router_with_access_and_limits(None, RdzLimits::from_rates(2, 1_000_000)),
+            [127, 0, 0, 1],
+        );
+        let target = hex::encode([0xAB; 32]);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/rendezvous/{target}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "首请求不限流（404 无登记）"
+        );
+        let res = app
+            .oneshot(
+                Request::get(format!("/rendezvous/{target}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"{\"error\":\"rate-limited\"}");
+    }
+
+    /// announce 限流（独立桶）：伪造 X-Forwarded-For 不分裂限流键；
+    /// 不同直连 peer 各自独立
+    #[tokio::test]
+    async fn announce_rate_limit_and_xff_not_trusted() {
+        let key = SigningKey::from_bytes(&[0x30; 32]);
+        let mk_req = |key: &SigningKey| {
+            let req = signed_request(key, vec!["127.0.0.1:9000"], 60, now_ms());
+            Request::post(format!("/rendezvous/{}", req.endpoint_id))
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "1.2.3.4")
+                .body(announce_body(&req))
+                .unwrap()
+        };
+        // 同 peer：rate 2 → burst 1，首请求成功、第二请求 429（XFF 换值无效）
+        let app = peer_shim(
+            router_with_access_and_limits(None, RdzLimits::from_rates(1_000_000, 2)),
+            [127, 0, 0, 1],
+        );
+        let res = app.clone().oneshot(mk_req(&key)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = app.oneshot(mk_req(&key)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        // 另一直连 peer：独立桶不受影响
+        let app2 = peer_shim(
+            router_with_access_and_limits(None, RdzLimits::from_rates(1_000_000, 2)),
+            [127, 0, 0, 2],
+        );
+        let res = app2.oneshot(mk_req(&key)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// 限流与 ACL 正交：429 先于 401（restricted 无票 resolve 连打超限后
+    /// 得到 429 而非 ACL 401——限流是资源硬限）
+    #[tokio::test]
+    async fn rate_limit_precedes_acl_denial() {
+        let dir = TempDir::new().unwrap();
+        let registry = Arc::new(OwnerRegistry::load(&dir.path().join("owners.jsonl")).unwrap());
+        let gate = AccessGate::new([0x41; 32], registry, PolicyConfig::Static).unwrap();
+        let app = peer_shim(
+            router_with_access_and_limits(
+                Some(Arc::new(gate)),
+                RdzLimits::from_rates(2, 1_000_000),
+            ),
+            [127, 0, 0, 1],
+        );
+        let target = hex::encode([0xCD; 32]);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/rendezvous/{target}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_acl_deny(res, "dweb/no-capability").await;
+        let res = app
+            .oneshot(
+                Request::get(format!("/rendezvous/{target}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS, "限流先于 ACL");
     }
 }

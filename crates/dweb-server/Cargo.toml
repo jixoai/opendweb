@@ -11,7 +11,7 @@ name = "dweb-server"
 path = "src/main.rs"
 
 [dependencies]
-nix = { version = "0.29", features = ["net"] }
+nix = { version = "0.29", features = ["net", "user"] }
 # net 为 relay/callback 接线新增（TcpStream/lookup_host）；其余沿用 workspace 集合
 tokio = { workspace = true, features = ["net"] }
 iroh-relay = { workspace = true }
@@ -22,6 +22,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 hex = "0.4"
+# 邀请码哈希（server-access-roles Phase 1b，spec 冻结 blake3）
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

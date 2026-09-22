@@ -16,6 +16,12 @@
 //! - [`blocklist`]：blocklist.jsonl 黑名单双维（R8 拒绝半边，design §1.5）
 //! - [`knock`]：KnockLog 敲门台账（R3 敲门台内核；relay E1 身份红线，
 //!   design §1.2）
+//! - [`codes`]：codes.jsonl 邀请码台账与兑换状态机（R4 租户邀请码；跨台账
+//!   提交协议/pending 预留/reconciliation/deny-set，SAR 1b design §1.4）
+//! - [`ratelimit`]：per-IP 令牌桶限流组件（/register 与 rendezvous 共用，
+//!   SAR 1b design §1.4/§1.6——直连 peer，XFF 不采信）
+//! - [`register`]：POST /register 公开自助注册端点（R4 兑换面；校验序/
+//!   PoP 验签/回执签名，SAR 1b）
 //! - [`cap`]：RelayCapV1 逐字节编解码与 L1 验证纯函数（task 1.4，design
 //!   §8.2/§11.1）
 //! - [`config`]：配置面 flag > env > default 与 fail-fast 校验（task 1.3，design §11.2）
@@ -35,10 +41,13 @@ pub mod admin;
 pub mod blocklist;
 pub mod callback;
 pub mod cap;
+pub mod codes;
 pub mod config;
 pub mod gate;
 pub mod identity;
 pub mod knock;
 pub mod ledger;
+pub mod ratelimit;
+pub mod register;
 pub mod registry;
 pub mod visitor;
