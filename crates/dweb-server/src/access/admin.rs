@@ -380,19 +380,39 @@ fn kick_existing_connections(state: &AdminState, fabric_id: &[u8; 32]) -> (usize
 /// 共享断连原语（task 1.3 抽取）：unregister 踢存量与 disconnect 路由的
 /// 唯一下发路径——对单次快照筛出的在线条目逐个
 /// `Clients::disconnect(ep, None)`（iroh-relay 异步 start_shutdown，该
-/// endpoint 的全部连接 active+inactive；OnDisconnectGuard drop 触发 gate
-/// on_disconnect → 配额自动释放）。返回 disconnect 返回 true 的条目
-/// （「已下发」清单——返回 false = 连接表已无此 endpoint，诚实不计入）。
+/// 物理断连按 endpoint 去重（r4-P0-1）：`Clients::disconnect(endpoint, None)`
+/// 的 None 语义 = 断该 endpoint 的**全部**连接——同 endpoint 多 fabric 的
+/// 多个 pair 只能调用一次，重复调用第二张 pair 恒 false、会丢 pair 与回执。
+/// 动作成功（任一物理 endpoint 下发成功）后，该 endpoint 在快照中的**全部**
+/// 匹配 pair 均计入已下发清单（各 pair 各自生成回执，共享 ts/generation）。
+/// 返回 false = 连接表已无此 endpoint（诚实整 endpoint 不计入）。
 fn disconnect_endpoints(clients: &Clients, entries: &[OnlineEndpoint]) -> Vec<OnlineEndpoint> {
+    disconnect_endpoints_with(entries, |endpoint_id| clients.disconnect(endpoint_id, None))
+}
+
+/// 断连原语的纯决策核（dispatch 注入便于单测伪造「一次成功覆盖全 endpoint」
+/// 的 None 语义）：dispatch 每 endpoint 至多被调用一次；成功过的 endpoint 的
+/// 全部 pair 计入返回。
+fn disconnect_endpoints_with(
+    entries: &[OnlineEndpoint],
+    dispatch: impl Fn(EndpointId) -> bool,
+) -> Vec<OnlineEndpoint> {
+    let mut dispatched: Vec<[u8; 32]> = Vec::new();
+    for e in entries {
+        if dispatched.contains(&e.endpoint_id) {
+            continue; // 同 endpoint 物理动作只做一次
+        }
+        // 在线表条目源自握手认证身份（合法曲线点）；构造失败 = 该 endpoint
+        // 整体诚实跳过
+        if let Ok(endpoint_id) = EndpointId::from_bytes(&e.endpoint_id)
+            && dispatch(endpoint_id)
+        {
+            dispatched.push(e.endpoint_id);
+        }
+    }
     entries
         .iter()
-        .filter(|e| {
-            // 在线表条目源自握手认证身份（合法曲线点）；防御性跳过构造失败
-            let Ok(endpoint_id) = EndpointId::from_bytes(&e.endpoint_id) else {
-                return false;
-            };
-            clients.disconnect(endpoint_id, None)
-        })
+        .filter(|e| dispatched.contains(&e.endpoint_id))
         .cloned()
         .collect()
 }
@@ -404,6 +424,36 @@ fn endpoints_of_fabric(view: &OnlineView, fabric_id: &[u8; 32]) -> Vec<OnlineEnd
         .iter()
         .filter(|e| e.fabric_id == *fabric_id)
         .cloned()
+        .collect()
+}
+
+/// status 的 endpoint 级投影（r4-P1-1）：per-pair 视图按 endpoint 聚合——
+/// connections 求和、fabric_id 取该 endpoint 名下字典序最小（确定性）。
+/// 聚合不依赖输入次序（防御调用方排序不变量变化）。
+fn endpoint_level_projection(view: &OnlineView) -> Vec<EndpointOnlineInfo> {
+    let mut agg: std::collections::BTreeMap<[u8; 32], ([u8; 32], usize)> =
+        std::collections::BTreeMap::new();
+    for e in &view.per_endpoint {
+        match agg.get_mut(&e.endpoint_id) {
+            Some((fabric, count)) => {
+                *count += e.connections;
+                if e.fabric_id < *fabric {
+                    *fabric = e.fabric_id;
+                }
+            }
+            None => {
+                agg.insert(e.endpoint_id, (e.fabric_id, e.connections));
+            }
+        }
+    }
+    agg.into_iter()
+        .map(
+            |(endpoint_id, (fabric_id, connections))| EndpointOnlineInfo {
+                endpoint_id: hex::encode(endpoint_id),
+                fabric_id: hex::encode(fabric_id),
+                connections,
+            },
+        )
         .collect()
 }
 
@@ -471,14 +521,11 @@ async fn status(State(state): State<AdminState>) -> Json<Status> {
             let view = gate.online_view();
             (
                 gate.max_connections_per_owner(),
-                view.per_endpoint
-                    .into_iter()
-                    .map(|e| EndpointOnlineInfo {
-                        endpoint_id: hex::encode(e.endpoint_id),
-                        fabric_id: hex::encode(e.fabric_id),
-                        connections: e.connections,
-                    })
-                    .collect(),
+                // status wire 冻结为 endpoint 级聚合（r4-P1-1）：per-pair 是
+                // /admin/connections 的详细视图；同 endpoint 多 fabric 在此
+                // 聚合为一条——connections 求和、fabric_id 取字典序最小
+                // （确定性规则，不依赖视图对内的次序之外的任何东西）。
+                endpoint_level_projection(&view),
                 view.per_owner
                     .into_iter()
                     .map(|(fabric_id, connections)| OwnerOnlineInfo {
@@ -1582,6 +1629,79 @@ mod tests {
     /// （client-sdk ./admin）只读该文件对拍 receiptCanonical。绝不使用本地
     /// 时钟——任何环境重跑同结果。
     #[test]
+    fn disconnect_endpoints_mixed_pairs_keeps_all_pairs_per_dispatched_endpoint() {
+        // r4-P0-1 回归：同 endpoint 两 fabric 的 pair——物理断连（None 语义
+        // = 一次成功覆盖全 endpoint）只 dispatch 一次，两张 pair 都必须保留
+        //（回执映射按 pair 生成，丢 pair = 丢审计条目）。
+        let endpoint = *iroh_base::SecretKey::from_bytes(&[0x53; 32])
+            .public()
+            .as_bytes();
+        let entries = vec![
+            OnlineEndpoint {
+                endpoint_id: endpoint,
+                fabric_id: [0x11; 32],
+                connections: 1,
+            },
+            OnlineEndpoint {
+                endpoint_id: endpoint,
+                fabric_id: [0x22; 32],
+                connections: 2,
+            },
+        ];
+        let calls = std::cell::Cell::new(0);
+        let hits = disconnect_endpoints_with(&entries, |_| {
+            calls.set(calls.get() + 1);
+            true // 首调即成功（None 语义下第二次调用本会 false——不应发生）
+        });
+        assert_eq!(calls.get(), 1, "同 endpoint 物理动作只做一次");
+        assert_eq!(hits.len(), 2, "两张 pair 全保留");
+        assert_eq!(hits[0].fabric_id, [0x11; 32]);
+        assert_eq!(hits[1].fabric_id, [0x22; 32]);
+        // dispatch false（连接表已无该 endpoint）→ 整 endpoint 诚实不计入
+        let hits = disconnect_endpoints_with(&entries, |_| false);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn status_projection_aggregates_pairs_to_endpoint_level() {
+        // r4-P1-1：status 的 active_connections 是 endpoint 级聚合 wire——
+        // 同 endpoint 多 fabric 聚合为一条（connections 求和、fabric 取
+        // 字典序最小），与 connections 的 per-pair 详细视图分工。
+        let endpoint = [0x33; 32];
+        let view = OnlineView {
+            per_endpoint: vec![
+                OnlineEndpoint {
+                    endpoint_id: endpoint,
+                    fabric_id: [0x22; 32],
+                    connections: 2,
+                },
+                OnlineEndpoint {
+                    endpoint_id: endpoint,
+                    fabric_id: [0x11; 32],
+                    connections: 1,
+                },
+                OnlineEndpoint {
+                    endpoint_id: [0x44; 32],
+                    fabric_id: [0x99; 32],
+                    connections: 5,
+                },
+            ],
+            per_owner: vec![],
+        };
+        let proj = endpoint_level_projection(&view);
+        assert_eq!(proj.len(), 2, "同 endpoint 聚合一条");
+        assert_eq!(proj[0].endpoint_id, hex::encode(endpoint));
+        assert_eq!(
+            proj[0].fabric_id,
+            hex::encode([0x11; 32]),
+            "字典序最小 fabric"
+        );
+        assert_eq!(proj[0].connections, 3, "connections 求和");
+        assert_eq!(proj[1].endpoint_id, hex::encode([0x44; 32]));
+        assert_eq!(proj[1].connections, 5);
+    }
+
+    #[test]
     fn receipt_vector_fixture_is_frozen() {
         // 固定输入（Ed25519 seed 与真实 server.key 同为 32B 裸 seed）
         let key = SigningKey::from_bytes(&[0x5D; 32]);
@@ -1719,7 +1839,7 @@ mod tests {
         let read = std::fs::read_to_string(&path);
         let on_disk: serde_json::Value = match read {
             Ok(text) => serde_json::from_str(&text).unwrap(),
-            Err(_) if std::env::var("DWEB_REGEN_FIXTURES").is_ok() => {
+            Err(_) if std::env::var("DWEB_REGEN_FIXTURES").as_deref() == Ok("1") => {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
                 std::fs::write(&path, serde_json::to_vec_pretty(&vector).unwrap()).unwrap();
                 eprintln!("regenerated {}", path.display());

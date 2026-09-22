@@ -7,7 +7,7 @@
 管理面 SHALL 覆盖：
 
 - **owners registry CRUD**：`GET /admin/owners`（活跃集合列表）、`POST /admin/owners`（注册 (fabric_id, root) 二元组）、`DELETE /admin/owners/{fabric_id}/{root}`（注销；新连接即时拒绝，存量连接由注销语义处理）。
-- **运行状态**：`GET /admin/status`（access mode、policy、registry generation、owner 数等投影；既有 wire 冻结不变）。
+- **运行状态**：`GET /admin/status`（access mode、policy、registry generation、owner 数等投影；既有 wire 冻结——active_connections 为 endpoint 级聚合：同 endpoint 多 fabric 聚合为一条，connections 求和、fabric_id 取字典序最小，确定性规则）。
 - **在线连接视图**：`GET /admin/connections` 返回按 endpoint 与按 owner 的在线投影及配额。响应 JSON（snake_case，与既有 admin 面一致）MUST 为：
 
 ```jsonc

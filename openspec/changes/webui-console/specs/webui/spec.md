@@ -37,13 +37,18 @@
 
 #### Scenario: 入站路径越界零出站
 
-- **WHEN** 浏览器请求 `/api/../status`、`/api/%2e%2e/status`、`/api/a%2fb`、`/api//x`、`/api/x/` 等含 dot-segment/编码分隔符/空段/重复斜杠的路径
+- **WHEN** 以原始 HTTP 请求行（绕过浏览器 URL 规范化的 raw fixture）请求 `/api/../status`、`/api/%2e%2e/status`、`/api/a%2fb`、`/api//x`、`/api/x/` 等含 dot-segment/编码分隔符/空段/重复斜杠的路径
 - **THEN** 全部返回 404 且 sidecar **不向上游发出任何请求**（以假上游零收包断言）；拼接后最终远端 pathname 必须再次断言以 `/admin/` 开头
 
-#### Scenario: 上游资源超限的失败 wire
+#### Scenario: 上游响应超限的失败 wire
 
-- **WHEN** 上游响应 body 超过 1 MiB（或请求 body 超 64 KiB）
-- **THEN** sidecar abort 上游连接（socket 回收）并返回 502 + `{"error":{"code":"upstream-too-large"}}` envelope
+- **WHEN** 上游响应 body 超过 1 MiB
+- **THEN** sidecar abort 上游连接（socket 回收，假上游不再被读写）并返回 502 + `Content-Type: application/json` + `{"error":{"code":"upstream-too-large","message":"…"}}` envelope
+
+#### Scenario: 请求体超限的失败 wire
+
+- **WHEN** 浏览器请求 body 超过 64 KiB
+- **THEN** sidecar 拒收（不向上游发送）并返回 413 + `Content-Type: application/json` + `{"error":{"code":"request-too-large","message":"…"}}` envelope
 
 #### Scenario: 逐请求连接不跨目标复用
 

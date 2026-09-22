@@ -59,8 +59,9 @@ active_connections/per_owner_connections，admin.rs:389-399）：
   投影。**per_endpoint 条目粒度 = (endpoint_id, fabric_id) 对（r3-P1-3），
   按 (endpoint_id, fabric_id) 双键字典序**——同 endpoint 持多 fabric 连接
   时逐对成条，无 first() 类不确定聚合。
-- **与 /admin/status 的分工**（P2-3）：status 的 active_connections/
-  per_owner_connections 是既有冻结 wire（旧消费者依赖），保持不动；
+- **与 /admin/status 的分工**（P2-3 + r4-P1-1）：status 的 active_connections
+  是 endpoint 级聚合 wire（同 endpoint 多 fabric 聚合为一条：connections
+  求和、fabric_id 取字典序最小——确定性规则）；per_owner_connections 不变；
   connections 是新详细视图（含 fabric 绑定、mode/relay 拆分、quota 结构）。
   两路并存是有意的，SDK 只面向 connections 详细视图抽象。
 
@@ -132,7 +133,7 @@ body 形态）。既有 401/400 路由响应改造为 envelope 形态（微调�
   （./token 同形）；**`files` 数组增 `admin`、`token` 目录**；tasks 2.2 的
   最终 exports 断言逐字冻结这两条路径。
 - **隔离规则**：两目录源码 MUST NOT import 包内 root/`net`/`http`（无传递
-  native 加载）；`.d.ts` 自包含。
+  native 加载）；`.d.mts` 自包含。
 - **pack 门禁（tasks 2.4）**：干净临时目录 `npm pack` → 解包安装 → 无
   `.node` 环境 self-reference import（`import "@jixo/opendweb-client-sdk/admin"`）
   + 类型检查双过。纳入 CI 面（与 app-protocol-layer 的 pack 验收同款）。
@@ -144,7 +145,7 @@ new AdminClient({ baseUrl, token, timeoutMs?: 10_000 })
 .status() / .listOwners() / .registerOwner(fabricId, root) / .unregisterOwner(fabricId, root)
 .connections()                                // GET /admin/connections（详细视图）
 .disconnect({ endpointId? , fabricId? })      // POST /admin/connections/disconnect
-.probeEnabled()                               // GET /admin/status → boolean / AdminError
+.probeEnabled()                               // GET /admin/status → Promise<true>（非 200 全 reject AdminError）
 ```
 
 - fetch + `AbortSignal.timeout`；Bearer 注入；baseUrl 尾斜杠归一。
@@ -157,7 +158,8 @@ new AdminClient({ baseUrl, token, timeoutMs?: 10_000 })
   code 枚举含 `http-<status>` 形态（AdminError.code: string）。
   mock-fetch + e2e 双矩阵测试（502/503/未知 5xx 显式用例）。
 - 错误归一 `AdminError{status, code, message}`；code 表：`admin-not-enabled`、
-  `unauthorized`、`invalid-request`、`no-match`、`network`、`timeout`。
+  `unauthorized`、`invalid-request`、`no-match`、`network`、`timeout`、
+  `http-<status>`（任意非 200 的兜底形态，含 502/503/未知 5xx）。
 - 回执：`receiptCanonical(receipt)` 输出 §1.1 冻结 canonical（disconnect 的
   target=endpoint_id）；`verifyReceipt(receipt, verifier)` 注入式（包内无
   ed25519 依赖；调用方可自带 @noble/ed25519，公钥 = services.json 的

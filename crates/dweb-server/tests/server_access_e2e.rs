@@ -1708,3 +1708,135 @@ async fn http_request(
         .unwrap_or_default();
     (status, resp_body)
 }
+
+/// e2e e19（r4-P0-1 回归）：同一 endpoint 持两个 fabric 的连接——
+/// 1. connections 视图 per_endpoint 两条 pair（同 endpoint_id、fabric 字典序）
+/// 2. status 的 active_connections 聚合为一条（connections 求和、fabric 取最小）
+/// 3. disconnect by endpoint：物理断连只一次、两张 pair 全保留、两张回执
+///    共享 ts/generation 且逐张验签
+/// 4. 有界轮询收敛：两 fabric 的 per_owner 计数双双归零
+#[tokio::test]
+async fn e19_admin_disconnect_mixed_fabric_same_endpoint() {
+    let dir = TempDir::new().unwrap();
+    let fabric1 = [0xF4; 32];
+    let fabric2 = [0xF5; 32];
+    let issuer1 = SigningKey::from_bytes(&[0x74; 32]);
+    let issuer2 = SigningKey::from_bytes(&[0x75; 32]);
+    for (fabric, issuer) in [(fabric1, &issuer1), (fabric2, &issuer2)] {
+        owners_cli(
+            dir.path(),
+            "register",
+            &fabric,
+            &issuer.verifying_key().to_bytes(),
+        );
+    }
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "8"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 同一 endpoint 身份、两张不同 fabric 的票（recipient 相同）
+    let e = SecretKey::generate();
+    let now = now_ms();
+    let token1 = relay_cap_token(
+        &issuer1,
+        &fabric1,
+        &server_id,
+        e.public().as_bytes(),
+        CAP_RELAY,
+        now,
+        now + TOKEN_TTL_MS,
+    );
+    let token2 = relay_cap_token(
+        &issuer2,
+        &fabric2,
+        &server_id,
+        e.public().as_bytes(),
+        CAP_RELAY,
+        now,
+        now + TOKEN_TTL_MS,
+    );
+    let _c1 = raw_relay_client(relay, &e, Some(token1)).await;
+    let _c2 = raw_relay_client(relay, &e, Some(token2)).await;
+    poll_connections_until(
+        server.gateway,
+        |c| {
+            let eps = c["per_endpoint"].as_array();
+            eps.is_some_and(|x| x.len() == 2)
+                && x_all_same_endpoint(eps.unwrap())
+                && c["per_owner"].as_array().map(|a| a.len()) == Some(2)
+        },
+        "同 endpoint 双 fabric 上线（两条 pair）",
+    )
+    .await;
+
+    // 视图分工：connections per-pair vs status endpoint 级聚合
+    let view = admin_connections(server.gateway).await;
+    let pairs = view["per_endpoint"].as_array().unwrap();
+    assert_eq!(pairs.len(), 2, "per-pair 两条");
+    let endpoint_hex = e.public().to_string();
+    assert!(pairs.iter().all(|p| p["endpoint_id"] == endpoint_hex));
+    let fabrics: Vec<&str> = pairs.iter().map(|p| p["fabric_id"].as_str().unwrap()).collect();
+    let mut sorted = fabrics.clone();
+    sorted.sort();
+    assert_eq!(fabrics, sorted, "同 endpoint 内按 fabric 字典序");
+    let (status_code, body) =
+        http_get_with_auth(server.gateway, "/admin/status", "Bearer e2e-admin-token").await;
+    assert_eq!(status_code, 200);
+    let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let active = st["active_connections"].as_array().unwrap();
+    let mine: Vec<&serde_json::Value> = active
+        .iter()
+        .filter(|a| a["endpoint_id"] == endpoint_hex)
+        .collect();
+    assert_eq!(mine.len(), 1, "status 聚合为一条（r4-P1-1）");
+    assert_eq!(mine[0]["connections"], 2_u64, "connections 求和");
+    assert_eq!(
+        mine[0]["fabric_id"],
+        sorted[0],
+        "聚合条目 fabric 取字典序最小"
+    );
+
+    // disconnect by endpoint：一次物理动作、两 pair 两回执共享 ts/generation
+    let (status_code, body) = http_post_json(
+        server.gateway,
+        "/admin/connections/disconnect",
+        &serde_json::json!({ "endpoint_id": endpoint_hex }),
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status_code, 200, "disconnect by endpoint: {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let disconnected = resp["disconnected"].as_array().unwrap();
+    let receipts = resp["receipts"].as_array().unwrap();
+    assert_eq!(disconnected.len(), 2, "两张 pair 全保留（r4-P0-1）");
+    assert_eq!(receipts.len(), 2, "每 pair 一张回执");
+    let ts_set: Vec<u64> = receipts.iter().map(|r| r["ts"].as_u64().unwrap()).collect();
+    let gen_set: Vec<u64> = receipts
+        .iter()
+        .map(|r| r["generation"].as_u64().unwrap())
+        .collect();
+    assert!(ts_set.windows(2).all(|w| w[0] == w[1]), "ts 全回执共享");
+    assert!(gen_set.windows(2).all(|w| w[0] == w[1]), "generation 全回执共享");
+    for (r, fabric) in receipts.iter().zip([fabric1, fabric2]) {
+        verify_disconnect_receipt(r, &server_id, &fabric, e.public().as_bytes());
+    }
+
+    // 收敛：两 fabric 的 per_owner 计数归零
+    poll_connections_until(
+        server.gateway,
+        |c| c["per_endpoint"].as_array().map(|a| a.len()) == Some(0),
+        "混合 fabric 断连后视图清空",
+    )
+    .await;
+}
+
+/// per_endpoint 数组内全部条目同 endpoint_id（e19 辅助）
+fn x_all_same_endpoint(arr: &[serde_json::Value]) -> bool {
+    let first = arr.first().and_then(|v| v["endpoint_id"].as_str());
+    first.is_some_and(|f| arr.iter().all(|v| v["endpoint_id"].as_str() == Some(f)))
+}
