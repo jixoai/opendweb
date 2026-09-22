@@ -14,9 +14,9 @@
 - [ ] registry：owners 条目增 `expires_at/alias/note`（serde(default)，旧条目=永久无别名）+ `contains_active(f,root,now)`；快照携带元数据
 - [ ] 共享 ledger 基座（r1-P1-5）：owners/visitors/codes/blocklist 四台账统一矩阵——startup 坏行 fail-fast、reload 失败保留旧快照、每台账独立 generation、mtime 指纹、admin API+文件两入口（CLI 不新增，spec 明示）、旧行兼容；逐台账坏行/重载/并发写测试
 - [ ] visitor registry（visitors.jsonl）+ gate 无票路径裁决次序接线（blocklist endpoint → visitor → callback → 拒+敲门）；**访客 Allow 不进 webhook**
-- [ ] blocklist（blocklist.jsonl）+ 双维挂点（endpoint 先于 C0；fabric 于 L1 后 L1b 前）+ `dweb/blocked`
+- [ ] blocklist（blocklist.jsonl）+ 双维挂点（endpoint 先于 C0；fabric 于 L1 后 L1b 前）+ `dweb/blocked` + **open 模式不生效负向测试（O-9 已裁决：open 不装 gate）**
 - [ ] L1b 过期拒绝 `dweb/owner-expired`（gate.rs:311 contains→contains_active）
-- [ ] KnockLog（r1-P0-1 收窄）：**仅 relay Deny 臂**（E1 认证身份；rendezvous 匿名面不入台账）；聚合 {seq/count/…}、4096 上限 (last_at,seq) 逐出、blocked 排除、count 饱和递增、dismiss/undismiss 幂等 + 新 deny 复位 dismissed
+- [ ] KnockLog（r1-P0-1 收窄）：**仅 relay Deny 臂**（E1 认证身份；rendezvous 匿名面不入台账）；聚合 {seq/count/…}、4096 上限 seq 最小者逐出（last_at 仅展示——r3-P1-1）、blocked 排除、count 饱和递增、dismiss/undismiss 幂等 + 新 deny 复位 dismissed
 - [ ] 访客两级配额（r1-P1-4）：per-endpoint 4（`DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR`）+ 全局 64（`DWEB_RELAY_MAX_VISITOR_CONNECTIONS`），`dweb/visitor-quota-exceeded`
 - [ ] 在线投影（r1-P1-7）：在线表键 `(endpoint, Option<fabric>)`（无 sentinel）；`per_endpoint` 仅租户对 + 新增 `per_visitor` 数组 + status `visitors_online`
 - [ ] callback 缓存复合 generation（r1-P1-6）：owners+visitors 世代组合入缓存键；revoke-after-cached-allow 回归测试
@@ -27,9 +27,10 @@
 - [ ] codes.jsonl 台账（issue/revoke/**consume** 三事件，serde(default)；used_count=consume 计数归并推导）
 - [ ] 码生成：OS CSPRNG `dwebc1.`+base32×16；哈希输入=码本体小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（r1-P1-3）
 - [ ] `POST /register` 公开端点：直连 TCP peer 限流（10/min 突发 5，**XFF 不采信**——r1-P1-2）→ 形状 → ts±120s → 码校验 → PoP 验签（域含 root）；**兑换判定+consume 追加同临界区按 code_hash 串行、fsync 成功前零响应**（r1-P0-2）→ 回执域 `dweb/register-receipt/v1\0`（generation=owners 世代）
-- [ ] **跨台账提交协议（r2-P0-1）**：① owners register 事件带 `via_code_hash`（serde(default)）先 fsync → ② codes consume 后 fsync → ③ 双成功才响应；**启动恢复**=归并时补齐带 via_code_hash 且无匹配 consume 的缺失事件（恒「完整兑换」或「码完好」，无烧码无租户）；②失败存活=500+挂起补写（同码重试幂等完成）
+- [ ] **跨台账提交协议（r2-P0-1）**：① owners register 事件带 `via_code_hash`（serde(default)）先 fsync → ② codes consume 后 fsync → ③ 双成功才响应；恢复=每次加载（启动+热重载）补齐孤儿 consume（同锁，r3-P0-2）
+- [ ] **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：幂等键=(code_hash,fabric_id,root)；pending 期间他键 409 `code-pending`；同键重试幂等（durable 后重试 200 不重复 consume）；孤儿匹配/去重按完整三元组；旧行永不补写
 - [ ] rendezvous per-IP 限流（resolve 60/min、announce 20/min，429 envelope；直连 peer；令牌桶组件与 /register 共用）
-- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/续期/回执验签/**并发双兑恰一成功**/**register 后崩溃恢复补 consume 故障注入**）+ 旧格式 codes/owners 条目兼容（含 via_code 缺省）
+- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/续期/回执验签/**并发双兑恰一成功**/**崩溃恢复补 consume 故障注入**/**pending 第二键 409**/**durable 后重试幂等**/**热重载孤儿补齐+fail-closed**）+ 旧格式兼容（含 via_code 缺省）+ 部署红线（反代禁记 /register 请求体）
 
 ## 4. Phase 1c —— 三角色管理面 API
 

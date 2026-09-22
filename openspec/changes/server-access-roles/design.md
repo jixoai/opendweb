@@ -60,7 +60,8 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 - 内存台账（不落盘，重启清空——O-2 默认裁决：敲门是运营提示不是审计
   事实，审计靠 admin 操作回执）：`Mutex<HashMap<endpoint_id, KnockAgg>>`
-  + 全局容量上限 4096 endpoint（按 (last_at, seq) 最久逐出），照
+  + 全局容量上限 4096 endpoint（按 seq 最小者逐出——与排序键同源；
+  last_at 仅展示，r3-P1-1），照
   OnlineTable 投影模式。
 - **身份来源红线（r1-P0-1）**：只记 **relay 握手认证**（E1 链）的
   endpoint——rendezvous HTTP 面（匿名 resolve 无调用方身份；announce
@@ -133,6 +134,16 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   存活）=500 且内存挂起补写：同码重试幂等完成（register 续期 +
   consume 补写）。回执 generation=**owners 世代**（r2-P1-5，客户端
   不透明）。故障注入 e2e：① 后崩溃→重启→码已消费且租户在册。
+- **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：幂等键=(code_hash,
+  fabric_id, root) 三元组；pending 期间他键 409 `code-pending`（零
+  used_count 误放行）、同键重试幂等完成（durable 后重试 200 不重复
+  consume）；孤儿匹配/去重按完整三元组，旧行永不触发补写。
+- **reconciliation 覆盖热重载（r3-P0-2）**：孤儿补齐=每次加载（启动
+  +mtime reload）的同锁步骤；补写失败=保旧快照+该码 fail-closed
+  禁兑+告警，不影响其他台账。
+- **重放/代理日志（r3-P2-2）**：同键重放幂等 200；跨键重放被 PoP
+  结构性阻止（签名绑定 fabric/root）——无需 nonce；部署红线：反代
+  /access-log/tracing 禁记 /register 请求体。
 - **码生成与脱敏（r1-P1-3）**：OS CSPRNG；哈希输入=码本体 16 字符
   小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（对齐
   callback_token 纪律）；错误码状态区分为明示产品取舍（排障需要）。
@@ -241,7 +252,7 @@ nodes/{id}；当前连接节点不可删（先切走）。
 |---|---|
 | gate 单测 | 访客矩阵（命中/过期/revoked/无票非访客/callback 分流/访客配额）、blocklist（endpoint 早判/fabric 晚判/open 不生效）、owner-expired 边界（到期当日/续期恢复） |
 | registry 单测 | 旧格式条目（无 expires_at/alias）解析=永久无 alias；坏行硬错误；generation 递增 |
-| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/重复注册=续期/回执验签/**register 后崩溃恢复补 consume**（故障注入）/unknown endpoint dismiss/undismiss=404/pending_count 恒为未处置数 |
+| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/重复注册=续期/回执验签/**崩溃恢复补 consume**（故障注入）/**pending 第二键 409 code-pending**/**durable 后重试幂等**/**热重载孤儿补齐+fail-closed**/unknown dismiss/undismiss=404/pending_count 恒为未处置数/时钟回拨排序稳定 |
 | KnockLog 单测 | 聚合/LRU/排除 blocked/dismiss+undismiss 幂等/新 deny 复位/seq tie-break（每次 deny 分配新 seq，排序键 seq desc，last_at 仅展示——时钟回拨免疫） |
 | admin e2e | 敲门→定位访客→raw client 重连放行全链路；邀请码签发→兑换→名册出现带 alias/到期；到期租户 deny reason；黑名单同票拒 |
 | rendezvous | 无票 resolve/announce 维持 401（访客可达面为空）；限流触发 429 |
@@ -251,12 +262,19 @@ nodes/{id}；当前连接节点不可删（先切走）。
 | CLI | `opendweb id` 幂等无私钥；`opendweb join` 端到端（新 fabric/复用/失效码三种） |
 | 回归 | sdk-mgmt-surface/webui-console 全部既有测试零改动全绿（owners wire 增量字段不破坏旧断言；基线数字以当日实跑为准） |
 
-## 6. r1 评审处置与遗留开放项
+## 6. 评审处置记录与遗留开放项
 
-r1（docs/codex-review-sar-r1.md，5.0/10）22 条全处置：P0×6（rendezvous
+- r1（codex-review-sar-r1.md，5.0/10）22 条全处置：P0×6（rendezvous
 敲门身份→relay-only；consume 事件/CAS/fsync；节点簿两条版本化例外；
 R8 延期裁决链入 requirements 范围修订记录；访客可达面矛盾句清除）、
-P1×12、P2×4 均已落入 spec/design/tasks。遗留（非阻塞、实现期观察）：
+P1×12、P2×4 均已落入 spec/design/tasks。
+- r2（codex-review-sar-r2.md，6.3/10）8 条全处置：跨台账提交协议/
+  design 旧语义/webui 路径/CLI 入口/supersedes 优先级/generation+
+  pending_count/seq 时钟/测试表。
+- r3（codex-review-sar-r3.md，6.8/10）：码级 pending 预留+幂等键、
+  热重载 reconciliation、KnockLog seq 主键统一、PM resolve 残留
+  清除、O-9 收敛、重放/代理日志红线、webui-console 基座增补落地。
+遗留（非阻塞、实现期观察）：
 - fabric_id 自声明残余：UI 钓鱼警示 + 二元组呈现已冻结；genesis 绑定
   proof（FabricId 可验派生）列 Phase 2 候选
 - sybil key 对全局访客上限 64 的压力：Phase 2 IP 级 admission

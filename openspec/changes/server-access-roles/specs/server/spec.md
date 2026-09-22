@@ -156,7 +156,7 @@
 
 ### Requirement: 敲门日志（KnockLog）
 
-`restricted` 模式下，被拒绝的接入尝试 MUST 记入服务端内存敲门台账供管理面观察。**身份来源冻结（P0 红线）**：台账只接受 **relay 握手密码学认证的 endpoint_id**（E1 链）——rendezvous HTTP 面的 deny（匿名 resolve 无调用方身份；announce 签名验证前的 ACL 拒绝同样无已验身份）**MUST NOT 记入 endpoint 台账**（仅结构化 debug 日志；可另设 per-IP abuse 计数器，但不得伪装成"谁在敲门"）。挂点为 relay on_connect 的 Deny 臂。台账按 endpoint_id 聚合：`{endpoint_id, seq, first_at, last_at, count, last_reason, dismissed}`；同一端点重复敲门递增 count（u64 饱和递增，不回绕）并更新 last_at/last_reason；`seq` 为进程内单调序号，**每次 deny 分配新 seq**（排序键 = seq 降序——seq 单调故时钟回拨不影响排序，last_at 仅作展示字段）。dismiss/undismiss/新 deny/容量逐出 MUST 在同一锁内原子完成；并发 dismiss 与新 deny 的胜者 = 后获得锁者（deny 置 dismissed=false，dismiss 置 true，无 CAS 需求）。对不存在条目的 dismiss/undismiss 返回 404 no-match（与 disconnect 判定一致）；**`pending_count` 恒为未 dismissed 条目数**（`include_dismissed` 不改变该字段语义）。**排除项**：deny reason 为 `dweb/blocked` 的尝试 MUST NOT 记入；`dweb/owner-expired` 记入且作为租户到期提醒类别。**dismiss 语义**：dismiss 为幂等管理动作（不删除记录）；**该端点再次发生 deny 时 `dismissed` 自动复位为 false**（重新进入待办）；`undismiss` 为对等管理动作（手动恢复待办，幂等）。容量有界：最多 4096 个 endpoint 条目，超限按 (last_at, seq) 最久者逐出（重启清空——敲门是运营提示而非审计事实，审计以管理操作回执为准；持久化列为未来工作）。
+`restricted` 模式下，被拒绝的接入尝试 MUST 记入服务端内存敲门台账供管理面观察。**身份来源冻结（P0 红线）**：台账只接受 **relay 握手密码学认证的 endpoint_id**（E1 链）——rendezvous HTTP 面的 deny（匿名 resolve 无调用方身份；announce 签名验证前的 ACL 拒绝同样无已验身份）**MUST NOT 记入 endpoint 台账**（仅结构化 debug 日志；可另设 per-IP abuse 计数器，但不得伪装成"谁在敲门"）。挂点为 relay on_connect 的 Deny 臂。台账按 endpoint_id 聚合：`{endpoint_id, seq, first_at, last_at, count, last_reason, dismissed}`；同一端点重复敲门递增 count（u64 饱和递增，不回绕）并更新 last_at/last_reason；`seq` 为进程内单调序号，**每次 deny 分配新 seq**（排序键 = seq 降序——seq 单调故时钟回拨不影响排序，last_at 仅作展示字段）。dismiss/undismiss/新 deny/容量逐出 MUST 在同一锁内原子完成；并发 dismiss 与新 deny 的胜者 = 后获得锁者（deny 置 dismissed=false，dismiss 置 true，无 CAS 需求）。对不存在条目的 dismiss/undismiss 返回 404 no-match（与 disconnect 判定一致）；**`pending_count` 恒为未 dismissed 条目数**（`include_dismissed` 不改变该字段语义）。**排除项**：deny reason 为 `dweb/blocked` 的尝试 MUST NOT 记入；`dweb/owner-expired` 记入且作为租户到期提醒类别。**dismiss 语义**：dismiss 为幂等管理动作（不删除记录）；**该端点再次发生 deny 时 `dismissed` 自动复位为 false**（重新进入待办）；`undismiss` 为对等管理动作（手动恢复待办，幂等）。容量有界：最多 4096 个 endpoint 条目，超限按 **seq 最小者**逐出（与排序键同源，时钟回拨免疫；endpoint_id 升序仅作同 seq 的稳定 tie-break；last_at 仅展示不参与排序/逐出）（重启清空——敲门是运营提示而非审计事实，审计以管理操作回执为准；持久化列为未来工作）。
 
 #### Scenario: 同端点重复敲门聚合计数
 
@@ -186,14 +186,17 @@
 #### Scenario: 排序契约
 
 - **WHEN** 列表排序时两条记录 last_at 相同
-- **THEN** 以进程内 seq 单调序号决出先后（last_at 降序、seq 降序、endpoint_id 升序为最终 tie-break），排序确定可测
+- **THEN** 以进程内 seq 单调序号决出先后（seq 降序，last_at 仅展示；endpoint_id 升序为最终 tie-break），排序确定可测；时钟回拨不改变任何相对顺序
 
 ### Requirement: 租户邀请码与公开自助注册
 
 服务端 SHALL 提供邀请码台账 `<data_dir>/codes.jsonl`（append-only，同一 registry 存储模式：坏行 fail-fast、generation、热重载、`serde(default)` 向后兼容）：事件 `{"op":"issue"|"revoke"|"consume","code_hash":"<blake3 64hex>","alias_hint"?,"max_uses"?,"expires_at","default_ttl_days"?,"fabric_id"?,"root"?,"ts"}`——**`consume` 为消费事件**（携带兑换出的 fabric_id/root），`used_count` 由事件归并推导（= consume 事件计数），MUST NOT 只存在于内存。码本体格式 `dwebc1.` + base32 16 字符（crockford 字符集，4-4-4-4 分组展示）；**生成 MUST 使用 OS CSPRNG**；**哈希输入规范化冻结**：取码本体 16 字符的小写规范化形态（剥离 `dwebc1.` 前缀与分组连字符）后 blake3；**存储与一切列表响应只含哈希，码全文仅出现在签发响应一次；日志/指标/错误消息 MUST NOT 含码全文或其可逆变换**（对齐 callback_token 脱敏纪律）。签发默认 `max_uses=1`、`expires_at=签发+7天`、`default_ttl_days=30`，逐项可自定义（R4）；输入上限：`max_uses ≤ 1000`、`expires_in_days ≥ 1`、`default_ttl_days ≥ 1`、`alias_hint ≤ 32` UTF-8 字节，越界 400 `invalid-request`。**fabric_id 语义（P1 明示）**：fabric_id 是**租户自声明标签**（FabricId 由 Roster 随机生成、无服务端可验的 genesis 绑定），身份键 = (fabric_id, root) 二元组（与 owners registry 既有精确匹配语义一致）；同 fabric_id 多 root 为合法并存条目，管理面 MUST 以二元组呈现租户身份（不可单显 fabric），同 fabric 多 root 时 UI 附钓鱼警示。错误码 `code-invalid`/`code-exhausted`/`code-expired` 的**状态区分为有意的产品取舍**（排障需要），属明示的信息泄露面。
 
 **公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**root PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**；残余面=自声明 fabric_id，见上）。校验序（fail-closed）：per-来源-IP 令牌桶限流（**直连 TCP peer 地址，XFF 不采信**；默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。**消费原子性**：兑换判定与 consume 事件追加 MUST 在同一临界区内按 code_hash 串行（同码并发兑换互斥；`max_uses=1` 时并发双兑 MUST 恰一个成功，另一个 `code-exhausted`）。
-**跨台账提交协议（consume 与 register 分属两个 jsonl，顺序冻结）**：① owners.jsonl 追加 register 事件（携带 `via_code_hash` 字段，`serde(default)` 兼容旧行）并 fsync；② codes.jsonl 追加 consume 事件并 fsync；③ **双 fsync 成功后才允许返回成功响应/签发回执**。**启动恢复**：归并时对每个带 via_code_hash 且无匹配 consume 事件的 register 事件，MUST 自动补齐缺失的 consume 事件（完成提交，相关 generation 递增）——崩溃窗口的结果恒为「完整兑换」或「码完好」，MUST NOT 出现「码已消费但租户不在册」（烧码无租户）。② 落盘失败且进程存活 = 500 且挂起补写（同码重试幂等完成：register 走续期语义 + consume 补写）；回执的 `generation` 字段 = **owners registry 世代**（register 为兑换的主效果；客户端视为不透明 u64）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，checked 运算防溢出；缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at、保留 alias/note，不重复建条目）；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 由 root 侧自行签发——server 只认票据不签票据，identity.rs 域纪律不变）。**客户端入口**：`opendweb join` CLI（见 cli/identity capability）承担 root 选取/fabric 生成/签名/兑换/回执保存，HTTP 面不要求租户手工构造。
+**跨台账提交协议（consume 与 register 分属两个 jsonl，顺序冻结）**：① owners.jsonl 追加 register 事件（携带 `via_code_hash` 字段，`serde(default)` 兼容旧行）并 fsync；② codes.jsonl 追加 consume 事件并 fsync；③ **双 fsync 成功后才允许返回成功响应/签发回执**。**启动恢复**：归并时对每个带 via_code_hash 且无匹配 consume 事件的 register 事件，MUST 自动补齐缺失的 consume 事件（完成提交，相关 generation 递增）——崩溃窗口的结果恒为「完整兑换」或「码完好」，MUST NOT 出现「码已消费但租户不在册」（烧码无租户）。② 落盘失败且进程存活 = 500 且挂起补写（见下「码级 pending 预留」）；回执的 `generation` 字段 = **owners registry 世代**（register 为兑换的主效果；客户端视为不透明 u64）。
+**码级 pending 预留与幂等键（r3-P0-1/P1-2）**：兑换幂等键 = `(code_hash, fabric_id, root)` 三元组。任一兑换通过校验后，该码即在台账锁内进入 pending 状态：pending 期间**其他幂等键的兑换请求一律 409 `code-pending`**（MUST NOT 基于未归并的 used_count 放行第二键——pending 释放以 consume durable 或兑换失败回滚为条件）；**同幂等键重试 = 幂等完成**（register 续期 + consume 补写；consume 已 durable 后响应丢失的重试返回 200、不重复 consume，回执以重试时刻重签）。**恢复/归并不变量**：孤儿匹配键为**完整三元组**（按 code_hash 粗匹配禁止——max_uses>1 同码多租户会漏补）；每个带 `via_code_hash` 的 register 事件至多对应一个同键 consume（重复 consume 事件按键去重）；`used_count` = 去重后的 consume 键数；无 `via_code_hash` 的旧行/管理员直加行**永不触发补写**。
+**reconciliation 覆盖热重载（r3-P0-2）**：孤儿 consume 补齐 MUST 作为**每次加载（启动 + mtime 热重载）的同锁步骤**执行（与 pending 预留同一台账锁协调）；补写失败（IO 错误）= 保留旧快照 + **该码禁止继续兑换**（fail-closed）+ 告警重试，不影响其他台账与码的服务；运行时经文件入口手工追加的带 via_code_hash register 在下次 reload 归并时同样补齐。
+**重放与中间层日志（r3-P2-2）**：同幂等键重放 = 幂等 200（见上）；跨键重放被 PoP 结构性阻止（签名绑定 fabric_id+root，换键即验签失败——无需额外 nonce）；生产部署文档 MUST 明示反向代理/access-log/tracing **禁止记录 `POST /register` 请求体**（与码全文脱敏同级的红线）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，checked 运算防溢出；缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at、保留 alias/note，不重复建条目）；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 由 root 侧自行签发——server 只认票据不签票据，identity.rs 域纪律不变）。**客户端入口**：`opendweb join` CLI（见 cli/identity capability）承担 root 选取/fabric 生成/签名/兑换/回执保存，HTTP 面不要求租户手工构造。
 
 #### Scenario: 正常兑换与回执验签
 
@@ -240,6 +243,21 @@
 - **WHEN** 兑换完成 owners register（含 via_code_hash）fsync 后、consume 落盘前进程崩溃，重启后再次兑换同码
 - **THEN** 启动归并补齐缺失 consume；租户在册且码计数正确（完整兑换）；若重启前有并发重试，同码幂等收敛不产生第二次租户条目
 
+#### Scenario: pending 期间第二幂等键被拒
+
+- **WHEN** 码 H 的兑换（键 K1）consume 落盘失败挂起补写期间，持同码不同 (fabric_id, root) 的键 K2 请求到达
+- **THEN** K2 返回 409 `code-pending`（不得按未归并 used_count 放行）；K1 补写完成后 K2 按码状态正常裁决（max_uses=1 时 `code-exhausted`）
+
+#### Scenario: consume 已 durable 后响应丢失的重试
+
+- **WHEN** 客户端未收到响应（网络中断）后以同键重试 POST /register
+- **THEN** 返回 200（幂等，不重复 consume、不重复建租户条目）；used_count 不因重试增加
+
+#### Scenario: 热重载触发孤儿补齐
+
+- **WHEN** 运行中经文件入口追加一条带 via_code_hash 的 register（无 consume），mtime 热重载发生
+- **THEN** reload 归并补齐对应 consume（同锁、完整三元组匹配）；补写 IO 失败时保留旧快照且该码禁止兑换，其他功能不受影响
+
 #### Scenario: unknown 敲门条目的处置动作
 
 - **WHEN** 对不在台账的 endpoint_id 调用 dismiss 或 undismiss
@@ -269,7 +287,7 @@
 
 **client-sdk 同步义务**：`packages/client-sdk` 的 `./admin` subpath MUST 同步扩展 op 映射（0x04-0x0C）、Receipt 类型 union 与 canonical builder；`receipt-vector.json` fixture MUST 增补新 op 向量（Rust 生成断言 + TS 只读对拍，重生走既有 `DWEB_REGEN_FIXTURES=1` 门）；`register-receipt/v1` 的客户端验签 helper 随 `opendweb join` 提供。输入校验上限（越界 400 `invalid-request`）：`alias ≤ 32` UTF-8 字节、`note ≤ 256`、`alias_hint ≤ 32`、`max_uses ≤ 1000`、`expires_in_days ≥ 1`（0 非法）、`permanent:true` 与 `expires_in_days` 恰好其一；**到期边界冻结**：`now >= expires_at` 即过期（等值=过期）。
 
-- **敲门**：`GET /admin/knocks`（排序冻结：dismissed 在前与否分组——未处置在前、组内 last_at 降序、seq 降序、endpoint_id 升序 tie-break；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss` 与 `POST /admin/knocks/{endpoint_id}/undismiss`（均幂等，回执 op=knock-dismiss/knock-undismiss）。
+- **敲门**：`GET /admin/knocks`（排序冻结：dismissed 在前与否分组——未处置在前、组内 seq 降序（last_at 仅展示）、endpoint_id 升序 tie-break；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss` 与 `POST /admin/knocks/{endpoint_id}/undismiss`（均幂等，回执 op=knock-dismiss/knock-undismiss）。
 - **访客名册**：`GET /admin/visitors`（活跃列表：endpoint_id/alias/note/granted_at/expires_at）；`POST /admin/visitors`（body：endpoint_id 必填、alias/note/expires_in_days 可选，缺省=永久；回执 op=visitor-grant）；`DELETE /admin/visitors/{endpoint_id}`（revoke；回执 op=visitor-revoke）。语义糖路由 `POST /admin/visitors/from-knock`（body 含 endpoint_id，等同 POST，供敲门台一键定位）。
 - **邀请码**：`GET /admin/codes`（列表只含 code_hash/max_uses/used_count/expires_at/alias_hint/revoked/default_ttl_days，**绝不含码全文**）；`POST /admin/codes`（body：alias_hint/max_uses/expires_in_days/default_ttl_days 可选，缺省 1/7/30；**响应含 `code` 全文——仅此一次**；回执 op=code-issue）；`DELETE /admin/codes/{code_hash}`（吊销；回执 op=code-revoke）。
 - **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略。

@@ -10,6 +10,8 @@
 
 **token 途径的 OS 可见性披露**：`--token` flag 与 env 途径在帮助文本与使用文档中 MUST 标注其 OS 级可见性（shell history / ps / 环境读取）；推荐途径为 TTY 交互输入或 setup 配对面。
 
+**节点簿例外（由 server-access-roles 引入，以其 spec 文本为准）**：后继 change `server-access-roles` 的「节点簿与节点切换」requirement 在节点簿场景引入两条对本 requirement 的受控例外——① 管理凭证允许持久化于 0600 的 `~/.opendweb/nodes.json`（临时文件+原子 rename、拒 symlink；单用户工作站威胁模型，帮助文本披露）；② `POST /sidecar/nodes/switch`（仅接受已存储 node_id）为唯一被许可的运行时重指向通道（进程内原子切换，在途请求按开始时 target 快照完成）。除上述两处外，本 requirement 的 token 边界与目标冻结语义不变；该 change 归档时本段落 MUST 随其增补一并并入 webui capability 基线。
+
 #### Scenario: token 不落浏览器
 
 - **WHEN** sidecar 运行中，浏览器开发者工具检视任意页面资源、网络响应与 sidecar 日志
