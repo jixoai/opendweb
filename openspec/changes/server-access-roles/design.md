@@ -81,9 +81,10 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   16 字符（80 bit 熵，仅签发响应显示一次；库存只留哈希）。
 - **兑换端点（公开）**：`POST /register`，body：
   `{code, fabric_id: hex64, root: hex64, ts, sig}`，其中
-  `sig = root_key.sign(b"dweb/register/v1\0" || code || fabric_id || ts)`
-  （**PoP 防 O-4 冒名**：fabric_id 无持有证明的攻击面被 root 签名关死；
-  ts 窗口 ±120s 防重放）。校验链：限流 → 码有效（哈希命中/未吊销/
+  `sig = root_key.sign(b"dweb/register/v1\0" || code || fabric_id ||
+  root || ts u64BE)`（**与 spec 冻结一致：被签载荷含 root**——验签键
+  即 body.root，载荷与验签键同源才构成完整 PoP；**PoP 防 O-4 冒名**：
+  fabric_id 无持有证明的攻击面被 root 签名关死；ts 窗口 ±120s 防重放）。校验链：限流 → 码有效（哈希命中/未吊销/
   used<max/expires 未过）→ PoP 验签（root 由 fabric 的 genesis 推导？
   否——root 即公钥本身，验 sig 用 body.root）→ **fabric_id 一致性**：
   body.fabric_id 与 root 的关系不校验（root 自由声明是新 fabric 的
