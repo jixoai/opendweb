@@ -116,7 +116,8 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   generation——**回执不含 code 本体**）。
 - 限流：/register per-IP 令牌桶（默认 10/min，突发 5；`DWEB_REGISTER_
   RATE_PER_MIN` 可调；无新依赖的 ~40 行实现）。
-- **兑换幂等与续期边界（r4-P1-2）**：幂等键=(code, fabric_id, root)。
+- **兑换幂等与续期边界（r4-P1-2）**：幂等键=(code_hash 规范化,
+  fabric_id, root)——与 spec 一致，以码哈希为键（非码原文）。
   同键 consume 已 durable → **200 幂等回放**（expires_at 不刷新、
   零新副作用——旧码耗尽后同键重试走此路径，**不可续期**）；**续期
   唯一入口=持新有效码**（未耗尽/未过期/未吊销）。幂等命中在码状态
@@ -184,7 +185,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 | 路由 | 语义 |
 |---|---|
-| `GET /admin/knocks` | 敲门聚合列表（未处置优先/最近在前；`?include_dismissed`） |
+| `GET /admin/knocks` | 敲门聚合列表（未处置优先、组内 seq 降序、endpoint_id 升序；last_at 仅展示；`?include_dismissed`） |
 | `POST /admin/knocks/{endpoint_id}/dismiss` / `undismiss` | 处置/恢复待办（均幂等；回执 op=0x0B/0x0C；同端点新 deny 自动复位 dismissed） |
 | `GET/POST/DELETE /admin/visitors` | 名册 CRUD（POST body：endpoint_id/alias/note/expires_in_days?；grant 回执） |
 | `POST /admin/visitors/from-knock` | 敲门台一键定位（body：endpoint_id/alias?——同 POST 语义，语义糖路由） |
@@ -256,7 +257,7 @@ nodes/{id}；当前连接节点不可删（先切走）。
 |---|---|
 | gate 单测 | 访客矩阵（命中/过期/revoked/无票非访客/callback 分流/访客配额）、blocklist（endpoint 早判/fabric 晚判/open 不生效）、owner-expired 边界（到期当日/续期恢复） |
 | registry 单测 | 旧格式条目（无 expires_at/alias）解析=永久无 alias；坏行硬错误；generation 递增 |
-| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/重复注册=续期/回执验签/**崩溃恢复补 consume**（故障注入）/**pending 第二键 409 code-pending**/**durable 后重试幂等**/**热重载孤儿补齐+fail-closed**/unknown dismiss/undismiss=404/pending_count 恒为未处置数/时钟回拨排序稳定 |
+| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/**持新有效码重复注册=续期**/**同键旧码回放不刷新租期**/回执验签/**崩溃恢复补 consume**（故障注入）/**pending 第二键 409 code-pending**/**durable 后重试幂等**/**热重载孤儿补齐+fail-closed**/unknown dismiss/undismiss=404/pending_count 恒为未处置数/时钟回拨排序稳定 |
 | KnockLog 单测 | 聚合/LRU/排除 blocked/dismiss+undismiss 幂等/新 deny 复位/seq tie-break（每次 deny 分配新 seq，排序键 seq desc，last_at 仅展示——时钟回拨免疫） |
 | admin e2e | 敲门→定位访客→raw client 重连放行全链路；邀请码签发→兑换→名册出现带 alias/到期；到期租户 deny reason；黑名单同票拒 |
 | rendezvous | 无票 resolve/announce 维持 401（访客可达面为空）；限流触发 429 |
