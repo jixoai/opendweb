@@ -17,10 +17,11 @@
 //! - 并发防护：per-key singleflight（watch channel 共享结果）+ 全局在途上限
 //!   （默认 64）+ per-source 在途上限（默认 16，source=endpoint_id，R4 P1-3
 //!   冻结：iroh-relay hook 输入无远端地址）+ 有界等待队列（默认 256，队满即拒）
-//! - 缓存：键 = (registry_generation, endpoint_id, 113B 定长二进制投影, event)
-//!   ——投影原文进键、不做摘要（定长键无碰撞面，BLAKE3 摘要是等价替代）；
-//!   deny 也缓存；TTL = min(响应 cache_ttl_s〔省略=配置默认/非法=0〕, 配置
-//!   上限 ≤60s)；registry generation 在键内，变更后旧键自然不命中；
+//! - 缓存：键 = (registry_generation, visitor_generation, endpoint_id,
+//!   113B 定长二进制投影, event)——投影原文进键、不做摘要（定长键无碰撞面，
+//!   BLAKE3 摘要是等价替代）；deny 也缓存；TTL = min(响应 cache_ttl_s
+//!   〔省略=配置默认/非法=0〕, 配置上限 ≤60s)；owners 与 visitors 两台账
+//!   generation 都在键内（复合世代，r1-P1-6），任一变更后旧键自然不命中；
 //!   `invalidate_all()` 供 reload 清容量。缓存仅作用于新连接准入。
 //! - SSRF 解析-校验-连接原子语义（R4 P1-8）：tokio lookup_host 解析全部
 //!   A/AAAA → IPv4-mapped 归一化为 IPv4 → 逐个校验（任一非法整体拒绝，
@@ -109,14 +110,20 @@ impl Decision {
     }
 }
 
-/// 决策缓存键（design §8.5 R4 P1-4 冻结）：generation 在键内，registry
-/// 变更后旧键自然不命中；投影为 113B 定长原文（无票 = 全零 sentinel）。
+/// 决策缓存键（design §8.5 R4 P1-4 冻结 + server-access-roles Phase 1a
+/// 复合 generation r1-P1-6）：owners 与 visitors 两台账世代都在键内，任一
+/// 台账变更后旧键自然不命中（防「访客 revoke 后仍命中 revoke 前的 allow
+/// 缓存」）；投影为 113B 定长原文（无票 = 全零 sentinel）。
 /// 注（实现复核 R1 P2-5）：spec 键式含 event 字段——当前唯一入缓存的事件
 /// 是 relay.connect（disconnect 明确不入缓存），event 省略语义等价；
 /// 将来若有新事件入缓存，MUST 先把 event 补进本结构体。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
+    /// owner registry 世代（快照携带）
     generation: u64,
+    /// 访客名册世代（无票路径 webhook 裁决的名册联动成分；visitor
+    /// grant/revoke 即 +1 → 相关缓存失效）
+    visitor_generation: u64,
     endpoint_id: [u8; 32],
     projection: [u8; HASH_INPUT_LEN],
 }
@@ -275,16 +282,20 @@ impl CallbackProvider {
 
     /// `relay.connect` 准入决策（缓存 + singleflight + 并发防护）。
     /// - `cap`：已过 L1+L1b 的有效票（None = 无票，A_cb(S) 语义交 webhook）
-    /// - `generation`：本次接入看到的 registry generation（来自快照）
+    /// - `generation`：本次接入看到的 owner registry generation（来自快照）
+    /// - `visitor_generation`：访客名册世代（复合缓存键成分，r1-P1-6——
+    ///   访客台账变更即相关缓存失效）
     pub async fn decide(
         &self,
         endpoint_id: &[u8; 32],
         cap: Option<&RelayCap>,
         connection_id: u64,
         generation: u64,
+        visitor_generation: u64,
     ) -> Decision {
         let key = CacheKey {
             generation,
+            visitor_generation,
             endpoint_id: *endpoint_id,
             projection: cap.map(hash_input).unwrap_or_else(hash_input_none),
         };
@@ -1014,10 +1025,10 @@ mod tests {
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [0xAB; 32];
         // 无票（capability: null）+ connection_id
-        let d = provider.decide(&ep, None, 42, 7).await;
+        let d = provider.decide(&ep, None, 42, 7, 0).await;
         assert!(d.allow);
         // 缓存命中：同键二次接入零回调（spec Scenario「webhook 允许即接入」）
-        let d2 = provider.decide(&ep, None, 43, 7).await;
+        let d2 = provider.decide(&ep, None, 43, 7, 0).await;
         assert!(d2.allow);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         // 请求形状冻结：Bearer token / event / endpoint_id(z32) / capability
@@ -1039,7 +1050,7 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let cap = sample_cap(CAP_RELAY);
-        let d = provider.decide(&cap.recipient, Some(&cap), 1, 1).await;
+        let d = provider.decide(&cap.recipient, Some(&cap), 1, 1, 0).await;
         assert!(d.allow);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let rec = seen.lock().unwrap()[0].clone();
@@ -1060,11 +1071,11 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [1u8; 32];
-        let d = provider.decide(&ep, None, 1, 1).await;
+        let d = provider.decide(&ep, None, 1, 1, 0).await;
         assert!(!d.allow);
         assert_eq!(d.reason, "dweb/quota-exceeded");
         // deny 同样入缓存：第二次零回调
-        let d2 = provider.decide(&ep, None, 2, 1).await;
+        let d2 = provider.decide(&ep, None, 2, 1, 0).await;
         assert!(!d2.allow);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
@@ -1092,7 +1103,9 @@ mod tests {
             ))
             .await;
             let provider = CallbackProvider::new(&cb_config(url_i)).unwrap();
-            let d = provider.decide(&ep, None, i as u64, 100 + i as u64).await;
+            let d = provider
+                .decide(&ep, None, i as u64, 100 + i as u64, 0)
+                .await;
             assert!(!d.allow, "case {reason:?}");
             assert_eq!(d.reason, POLICY_DENIED_REASON, "case {reason:?}");
         }
@@ -1103,7 +1116,7 @@ mod tests {
         ))
         .await;
         let provider2 = CallbackProvider::new(&cb_config(url2)).unwrap();
-        let d = provider2.decide(&ep, None, 1, 1).await;
+        let d = provider2.decide(&ep, None, 1, 1, 0).await;
         assert_eq!(d.reason, POLICY_DENIED_REASON);
     }
 
@@ -1117,10 +1130,10 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [3u8; 32];
-        let d = provider.decide(&ep, None, 1, 1).await;
+        let d = provider.decide(&ep, None, 1, 1, 0).await;
         assert!(!d.allow);
         assert_eq!(d.reason, UNAVAILABLE_REASON);
-        let d2 = provider.decide(&ep, None, 2, 1).await;
+        let d2 = provider.decide(&ep, None, 2, 1, 0).await;
         assert!(!d2.allow);
         assert_eq!(count.load(Ordering::SeqCst), 1, "失联 deny 入缓存");
 
@@ -1129,7 +1142,7 @@ mod tests {
             spawn_mock(Mock::Respond(axum::http::StatusCode::FOUND, String::new())).await;
         // Location 头：Mock::Respond 不带 —— 直接用 302 空 body 断言不跟随即可
         let provider3 = CallbackProvider::new(&cb_config(url3)).unwrap();
-        let d3 = provider3.decide(&ep, None, 1, 1).await;
+        let d3 = provider3.decide(&ep, None, 1, 1, 0).await;
         assert!(!d3.allow);
         assert_eq!(d3.reason, UNAVAILABLE_REASON);
         assert_eq!(count3.load(Ordering::SeqCst), 1);
@@ -1145,10 +1158,10 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [4u8; 32];
-        let d = provider.decide(&ep, None, 1, 1).await;
+        let d = provider.decide(&ep, None, 1, 1, 0).await;
         assert!(!d.allow);
         assert_eq!(d.reason, UNAVAILABLE_REASON);
-        let d2 = provider.decide(&ep, None, 2, 1).await;
+        let d2 = provider.decide(&ep, None, 2, 1, 0).await;
         assert!(!d2.allow);
         assert_eq!(count.load(Ordering::SeqCst), 1, "超时 deny 入缓存");
     }
@@ -1167,7 +1180,7 @@ mod tests {
             let (url, _c, _s) =
                 spawn_mock(Mock::Respond(axum::http::StatusCode::OK, body.to_string())).await;
             let provider = CallbackProvider::new(&cb_config(url)).unwrap();
-            let d = provider.decide(&ep, None, 1, 100 + i as u64).await;
+            let d = provider.decide(&ep, None, 1, 100 + i as u64, 0).await;
             assert!(!d.allow, "case {body}");
             assert_eq!(d.reason, UNAVAILABLE_REASON, "case {body}");
         }
@@ -1177,7 +1190,7 @@ mod tests {
     async fn oversize_body_fail_closed() {
         let (url, _count, _seen) = spawn_mock(Mock::Oversize).await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
-        let d = provider.decide(&[6u8; 32], None, 1, 1).await;
+        let d = provider.decide(&[6u8; 32], None, 1, 1, 0).await;
         assert!(!d.allow);
         assert_eq!(d.reason, UNAVAILABLE_REASON);
     }
@@ -1199,9 +1212,9 @@ mod tests {
                 spawn_mock(Mock::Respond(axum::http::StatusCode::OK, body.to_string())).await;
             let provider = CallbackProvider::new(&cb_config(url)).unwrap();
             let ep = [7u8; 32];
-            let d1 = provider.decide(&ep, None, 1, 1).await;
+            let d1 = provider.decide(&ep, None, 1, 1, 0).await;
             assert!(d1.allow, "case {body}");
-            let _d2 = provider.decide(&ep, None, 2, 1).await;
+            let _d2 = provider.decide(&ep, None, 2, 1, 0).await;
             let hits = count.load(Ordering::SeqCst);
             assert_eq!(
                 hits,
@@ -1216,7 +1229,7 @@ mod tests {
         ))
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
-        assert!(provider.decide(&[8u8; 32], None, 1, 1).await.allow);
+        assert!(provider.decide(&[8u8; 32], None, 1, 1, 0).await.allow);
     }
 
     #[tokio::test]
@@ -1228,10 +1241,29 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [9u8; 32];
-        assert!(provider.decide(&ep, None, 1, 1).await.allow);
-        assert!(provider.decide(&ep, None, 2, 1).await.allow); // 缓存
+        assert!(provider.decide(&ep, None, 1, 1, 0).await.allow);
+        assert!(provider.decide(&ep, None, 2, 1, 0).await.allow); // 缓存
         // registry 变更：generation+1 → 旧键不命中，产生新回调
-        assert!(provider.decide(&ep, None, 3, 2).await.allow);
+        assert!(provider.decide(&ep, None, 3, 2, 0).await.allow);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// server-access-roles r1-P1-6：访客世代是复合缓存键成分——owners
+    /// 世代不变、visitor_generation 变更（grant/revoke）同样旧键不命中
+    /// （防「访客 revoke 后仍命中 revoke 前的 allow 缓存」）
+    #[tokio::test]
+    async fn visitor_generation_change_misses_cache() {
+        let (url, count, _seen) = spawn_mock(Mock::Respond(
+            axum::http::StatusCode::OK,
+            r#"{"allow":true}"#.into(),
+        ))
+        .await;
+        let provider = CallbackProvider::new(&cb_config(url)).unwrap();
+        let ep = [0xA1u8; 32];
+        assert!(provider.decide(&ep, None, 1, 7, 3).await.allow);
+        assert!(provider.decide(&ep, None, 2, 7, 3).await.allow); // 缓存
+        // 访客台账变更：visitor_generation+1（owners 世代不动）→ 新回调
+        assert!(provider.decide(&ep, None, 3, 7, 4).await.allow);
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
@@ -1247,7 +1279,9 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let p = provider.clone();
-            handles.push(tokio::spawn(async move { p.decide(&ep, None, i, 1).await }));
+            handles.push(tokio::spawn(
+                async move { p.decide(&ep, None, i, 1, 0).await },
+            ));
         }
         for h in handles {
             assert!(h.await.unwrap().allow);
@@ -1276,8 +1310,8 @@ mod tests {
         let p1 = provider.clone();
         let p2 = provider.clone();
         let (a, b) = tokio::join!(
-            async move { p1.decide(&ep1, None, 1, 1).await },
-            async move { p2.decide(&ep2, None, 1, 1).await },
+            async move { p1.decide(&ep1, None, 1, 1, 0).await },
+            async move { p2.decide(&ep2, None, 1, 1, 0).await },
         );
         let decisions = [a, b];
         assert!(decisions.iter().any(|d| d.allow));
@@ -1305,8 +1339,8 @@ mod tests {
         let p1 = provider.clone();
         let p2 = provider.clone();
         let (a, b) = tokio::join!(
-            async move { p1.decide(&ep, None, 1, 1).await },
-            async move { p2.decide(&ep, Some(&cap), 1, 1).await },
+            async move { p1.decide(&ep, None, 1, 1, 0).await },
+            async move { p2.decide(&ep, Some(&cap), 1, 1, 0).await },
         );
         let decisions = [a, b];
         assert!(decisions.iter().any(|d| d.allow));
@@ -1369,10 +1403,10 @@ mod tests {
         // url 指向 127.0.0.1:1（豁免下合法构造）：连接拒绝 → 失联 + 缓存
         let provider = CallbackProvider::new(&cb_config("http://127.0.0.1:1/hook".into())).unwrap();
         let ep = [0x0D; 32];
-        let d = provider.decide(&ep, None, 1, 1).await;
+        let d = provider.decide(&ep, None, 1, 1, 0).await;
         assert!(!d.allow);
         assert_eq!(d.reason, UNAVAILABLE_REASON);
-        let d2 = provider.decide(&ep, None, 2, 1).await;
+        let d2 = provider.decide(&ep, None, 2, 1, 0).await;
         assert!(!d2.allow);
     }
 
@@ -1456,10 +1490,10 @@ mod tests {
         .await;
         let provider = CallbackProvider::new(&cb_config(url)).unwrap();
         let ep = [0x0F; 32];
-        assert!(provider.decide(&ep, None, 1, 1).await.allow);
+        assert!(provider.decide(&ep, None, 1, 1, 0).await.allow);
         // invalidate_all：即使 generation 不变也强制重回调（reload 清容量）
         provider.invalidate_all();
-        assert!(provider.decide(&ep, None, 2, 1).await.allow);
+        assert!(provider.decide(&ep, None, 2, 1, 0).await.allow);
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 

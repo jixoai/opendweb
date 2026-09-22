@@ -20,6 +20,14 @@ use std::path::PathBuf;
 pub const DEFAULT_DATA_DIR: &str = "dweb-data";
 /// data_dir 内的 owner registry 文件名（design §11.2）
 pub const OWNERS_FILE_NAME: &str = "owners.jsonl";
+/// data_dir 内的访客名册文件名（server-access-roles Phase 1a，spec 冻结）
+pub const VISITORS_FILE_NAME: &str = "visitors.jsonl";
+/// data_dir 内的黑名单文件名（server-access-roles Phase 1a，spec 冻结）
+pub const BLOCKLIST_FILE_NAME: &str = "blocklist.jsonl";
+/// 访客两级配额默认：per-endpoint（spec 冻结默认 4）
+pub const DEFAULT_MAX_CONNECTIONS_PER_VISITOR: usize = 4;
+/// 访客两级配额默认：全局（spec 冻结默认 64，防多 key 女巫聚合 r1-P1-4）
+pub const DEFAULT_MAX_VISITOR_CONNECTIONS: usize = 64;
 
 /// access mode（design §0：open 不启用访问控制、行为与现状一致）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +82,19 @@ pub struct AccessConfig {
     pub policy: PolicyConfig,
     pub data_dir: PathBuf,
     pub owners_file: PathBuf,
+    /// 访客名册文件（server-access-roles Phase 1a；缺省派生自 data_dir）
+    pub visitors_file: PathBuf,
+    /// 黑名单文件（server-access-roles Phase 1a；缺省派生自 data_dir）
+    pub blocklist_file: PathBuf,
     /// per-owner 在线连接配额（task 3.2 前半，Phase 3）：None = 无上限
     /// （默认）。仅 restricted 模式的 relay gate 消费——配额按
     /// capability.fabric_id 计数，open 模式无验证链可归因。
     pub max_connections_per_owner: Option<usize>,
+    /// 访客 per-endpoint 在线连接配额（Phase 1a，spec 默认 4；恒为有限值
+    /// ——访客准入是放行面，配额是防滥用硬限）
+    pub max_connections_per_visitor: usize,
+    /// 访客全局在线连接配额（Phase 1a，spec 默认 64——防多 key 女巫聚合）
+    pub max_visitor_connections: usize,
 }
 
 /// CLI flag 输入（main 的 parse_cli 产出后传入；env 由 getter 注入便于测试）
@@ -120,6 +137,17 @@ pub fn resolve_access_config(
         .or_else(|| get_env("DWEB_OWNERS_FILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| data_dir.join(OWNERS_FILE_NAME));
+    // visitors/blocklist 文件（Phase 1a）：env > 派生自 data_dir（无 flag 面
+    // ——与 owners 的 CLI flag 不同，两新台账无 CLI mutation 入口，文件名
+    // 覆盖走 env 即可）
+    let visitors_file = get_env("DWEB_VISITORS_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(VISITORS_FILE_NAME));
+    let blocklist_file = get_env("DWEB_BLOCKLIST_FILE")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data_dir.join(BLOCKLIST_FILE_NAME));
 
     // policy：env（static|callback，默认 static）。config.toml 的 policy 字段
     // 随 TS 映射接线（不在本棒）；flag 面暂不设——策略是低频部署决策。
@@ -139,7 +167,19 @@ pub fn resolve_access_config(
         policy,
         data_dir,
         owners_file,
+        visitors_file,
+        blocklist_file,
         max_connections_per_owner: parse_max_connections_per_owner(get_env)?,
+        max_connections_per_visitor: parse_positive_env_usize(
+            get_env,
+            "DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR",
+            DEFAULT_MAX_CONNECTIONS_PER_VISITOR,
+        )?,
+        max_visitor_connections: parse_positive_env_usize(
+            get_env,
+            "DWEB_RELAY_MAX_VISITOR_CONNECTIONS",
+            DEFAULT_MAX_VISITOR_CONNECTIONS,
+        )?,
     };
     validate(&config, get_env)?;
     Ok(config)
@@ -162,6 +202,25 @@ fn parse_max_connections_per_owner(
         return Err(format!("invalid {key} {raw:?}: must be > 0"));
     }
     Ok(Some(value))
+}
+
+/// 访客两级配额解析（Phase 1a）：未设置/空 = 默认值（4/64，spec 冻结）；
+/// 0/非数字 fail-fast——访客配额是防滥用硬限，无「无上限」形态
+fn parse_positive_env_usize(
+    get_env: &dyn Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: usize,
+) -> Result<usize, String> {
+    let Some(raw) = get_env(key).filter(|v| !v.is_empty()) else {
+        return Ok(default);
+    };
+    let value = raw
+        .parse::<usize>()
+        .map_err(|e| format!("invalid {key} {raw:?}: {e}"))?;
+    if value == 0 {
+        return Err(format!("invalid {key} {raw:?}: must be > 0"));
+    }
+    Ok(value)
 }
 
 fn resolve_callback_config(
@@ -287,6 +346,64 @@ mod tests {
             cfg.owners_file,
             PathBuf::from(DEFAULT_DATA_DIR).join(OWNERS_FILE_NAME)
         );
+        assert_eq!(
+            cfg.visitors_file,
+            PathBuf::from(DEFAULT_DATA_DIR).join(VISITORS_FILE_NAME)
+        );
+        assert_eq!(
+            cfg.blocklist_file,
+            PathBuf::from(DEFAULT_DATA_DIR).join(BLOCKLIST_FILE_NAME)
+        );
+        // 访客两级配额默认（spec 冻结 4/64）
+        assert_eq!(cfg.max_connections_per_visitor, 4);
+        assert_eq!(cfg.max_visitor_connections, 64);
+    }
+
+    /// server-access-roles Phase 1a：visitors/blocklist 文件名 env 覆盖与
+    /// data_dir 派生；访客两级配额 env 矩阵（合法/0/非数字 fail-fast）
+    #[test]
+    fn visitor_blocklist_files_and_quotas_env_matrix() {
+        // env data_dir 派生
+        let getter = env(&[("DWEB_DATA_DIR", "/env-data")]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.visitors_file, PathBuf::from("/env-data/visitors.jsonl"));
+        assert_eq!(
+            cfg.blocklist_file,
+            PathBuf::from("/env-data/blocklist.jsonl")
+        );
+        // 显式 env 覆盖（空串 = 未设置）
+        let getter = env(&[
+            ("DWEB_DATA_DIR", "/env-data"),
+            ("DWEB_VISITORS_FILE", "/custom/visitors.jsonl"),
+            ("DWEB_BLOCKLIST_FILE", "/custom/blocklist.jsonl"),
+        ]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.visitors_file, PathBuf::from("/custom/visitors.jsonl"));
+        assert_eq!(cfg.blocklist_file, PathBuf::from("/custom/blocklist.jsonl"));
+
+        // 配额合法覆盖
+        let getter = env(&[
+            ("DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR", "7"),
+            ("DWEB_RELAY_MAX_VISITOR_CONNECTIONS", "128"),
+        ]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.max_connections_per_visitor, 7);
+        assert_eq!(cfg.max_visitor_connections, 128);
+        // 0 / 非数字 → fail-fast（退出码 2 路径）
+        for bad in ["0", "-1", "many"] {
+            for key in [
+                "DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR",
+                "DWEB_RELAY_MAX_VISITOR_CONNECTIONS",
+            ] {
+                let err = resolve_access_config(&AccessCliInputs::default(), &env(&[(key, bad)]))
+                    .unwrap_err();
+                assert!(err.contains(key), "{err}");
+            }
+        }
+        // 空串 = 未设置（回落默认）
+        let getter = env(&[("DWEB_RELAY_MAX_VISITOR_CONNECTIONS", "")]);
+        let cfg = resolve_access_config(&AccessCliInputs::default(), &getter).unwrap();
+        assert_eq!(cfg.max_visitor_connections, 64);
     }
 
     #[test]

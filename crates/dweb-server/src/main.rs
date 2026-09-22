@@ -340,18 +340,39 @@ async fn main() -> Result<()> {
         owners_snapshot.generation()
     );
 
-    // restricted：构造验证链聚合器并挂 registry 热重载看护（mtime 轮询 5s；
-    // open 模式 relay 走 AllowAll 快路径，无需 gate/看护）
+    // restricted：构造验证链聚合器并挂台账热重载看护（mtime 轮询 5s；
+    // open 模式 relay 走 AllowAll 快路径，无需 gate/看护；visitors/blocklist
+    // 仅 restricted 语义——open 模式不加载，O-9 冻结）。访客名册/黑名单
+    // 坏行与 owners 同纪律：load 失败 fail-fast（? 上抛，退出码非零）。
     let (relay_gate, rdz_gate) = match access_cfg.mode {
         access::config::AccessMode::Restricted => {
+            let visitors = std::sync::Arc::new(access::visitor::VisitorRegistry::load(
+                &access_cfg.visitors_file,
+            )?);
+            let blocklist = std::sync::Arc::new(access::blocklist::Blocklist::load(
+                &access_cfg.blocklist_file,
+            )?);
+            tracing::info!(
+                "visitor registry: {} active (generation {}), blocklist: {} entries",
+                visitors.snapshot().len(),
+                visitors.snapshot().generation(),
+                blocklist.snapshot().len()
+            );
             // per-owner 连接配额（task 3.2 前半）：仅 relay gate 消费
-            // （rendezvous Op 无连接语义）
+            // （rendezvous Op 无连接语义）；访客两级配额（Phase 1a）同位
             let gate = match access::gate::AccessGate::new(
                 *identity.server_id().as_bytes(),
                 std::sync::Arc::clone(&owners),
                 access_cfg.policy.clone(),
             ) {
-                Ok(g) => g.with_max_connections_per_owner(access_cfg.max_connections_per_owner),
+                Ok(g) => g
+                    .with_max_connections_per_owner(access_cfg.max_connections_per_owner)
+                    .with_visitor_ledger(std::sync::Arc::clone(&visitors))
+                    .with_blocklist(std::sync::Arc::clone(&blocklist))
+                    .with_visitor_quotas(
+                        access_cfg.max_connections_per_visitor,
+                        access_cfg.max_visitor_connections,
+                    ),
                 Err(msg) => {
                     eprintln!("error: {msg}");
                     std::process::exit(2);
@@ -359,7 +380,7 @@ async fn main() -> Result<()> {
             };
             let gate = std::sync::Arc::new(gate);
             tracing::info!(
-                "relay access control enabled (policy {}, deny reasons on dweb/ namespace{})",
+                "relay access control enabled (policy {}, deny reasons on dweb/ namespace{}, visitor quotas {}/{})",
                 match access_cfg.policy {
                     access::config::PolicyConfig::Static => "static",
                     access::config::PolicyConfig::Callback(_) => "callback",
@@ -367,29 +388,43 @@ async fn main() -> Result<()> {
                 match access_cfg.max_connections_per_owner {
                     Some(n) => format!(", per-owner connection quota {n}"),
                     None => String::new(),
-                }
+                },
+                access_cfg.max_connections_per_visitor,
+                access_cfg.max_visitor_connections
             );
-            access::gate::spawn_registry_reload_watcher(
+            // 三台账热重载看护（r1-P1-5 统一矩阵；任一台账变更清 callback
+            // 缓存容量——复合 generation 已保证正确性）
+            access::gate::spawn_ledger_reload_watcher(
                 std::sync::Arc::clone(&owners),
+                Some(std::sync::Arc::clone(&gate)),
+            );
+            access::gate::spawn_ledger_reload_watcher(
+                std::sync::Arc::clone(&visitors),
+                Some(std::sync::Arc::clone(&gate)),
+            );
+            access::gate::spawn_ledger_reload_watcher(
+                std::sync::Arc::clone(&blocklist),
                 Some(std::sync::Arc::clone(&gate)),
             );
             // rendezvous gate（task 1.6）：恒 Static 策略——design §8.5 R3
             // P0-B2 冻结 rendezvous 不接 callback（其 HTTP 面无握手身份，
             // 动态策略另立 change）；共享同一 registry/server_id（L1/L1b
-            // 同一套验证器，registry 热重载经 Arc 共享生效）
+            // 同一套验证器，registry 热重载经 Arc 共享生效）。黑名单共享
+            // （endpoint 维度对 announce 生效、fabric 维度对持票面生效）；
+            // 访客名册不接（访客可达面 v1 冻结为 relay 通行，design §1.6）
             let rdz = match access::gate::AccessGate::new(
                 *identity.server_id().as_bytes(),
                 std::sync::Arc::clone(&owners),
                 access::config::PolicyConfig::Static,
             ) {
-                Ok(g) => std::sync::Arc::new(g),
+                Ok(g) => g.with_blocklist(std::sync::Arc::clone(&blocklist)),
                 Err(msg) => {
                     eprintln!("error: {msg}");
                     std::process::exit(2);
                 }
             };
             tracing::info!("rendezvous access control enabled (static ACL: announce/resolve)");
-            (Some(gate), Some(rdz))
+            (Some(gate), Some(std::sync::Arc::new(rdz)))
         }
         access::config::AccessMode::Open => (None, None),
     };

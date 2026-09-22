@@ -22,10 +22,13 @@
 //! static 模式行为与 R2 版十步链完全一致（向后一致）。
 //! open 模式不构造本类型（relay 装配 AllowAll 快路径零开销）。
 
+use crate::access::blocklist::{BlockKind, Blocklist};
 use crate::access::callback::CallbackProvider;
 use crate::access::cap::{self, CAP_RDZ_ANNOUNCE, CAP_RDZ_RESOLVE, CAP_RELAY, CapDeny, RelayCap};
 use crate::access::config::PolicyConfig;
+use crate::access::knock::KnockLog;
 use crate::access::registry::{OwnerRegistry, RegistrySnapshot};
+use crate::access::visitor::VisitorRegistry;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,6 +37,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// per-owner 连接配额超限 deny reason（task 3.2 前半；wire 冻结 slug，
 /// 语法同 dweb/ 家族）
 pub const OWNER_QUOTA_EXCEEDED: &str = "dweb/owner-quota-exceeded";
+
+/// 黑名单拒绝 deny reason（server-access-roles Phase 1a，spec 冻结；
+/// relay 面协议只回 slug——reason 明文经 Phase 1c 管理面呈现）
+pub const BLOCKED_REASON: &str = "dweb/blocked";
+
+/// 租户条目过期 deny reason（L1b 时间维度；与 unknown-owner 区分，spec 冻结）
+pub const OWNER_EXPIRED: &str = "dweb/owner-expired";
+
+/// 访客两级配额超限 deny reason（per-endpoint 与全局共用，spec 冻结）
+pub const VISITOR_QUOTA_EXCEEDED: &str = "dweb/visitor-quota-exceeded";
 
 /// 待验证操作面（L1b B2 的 caps 位选择）。rendezvous announce/resolve 的
 /// Op 变体随 task 1.6 接入（design §8.4：按 HTTP 面能力分别设计）。
@@ -75,6 +88,17 @@ impl Op {
     fn checks_recipient(self) -> bool {
         !matches!(self, Self::RdzResolve)
     }
+
+    /// endpoint_id 是否为本操作面**已认证的请求方身份**（server-access-roles
+    /// Phase 1a 黑名单 endpoint 维度与访客名册的适用面判定）：
+    /// - RelayConnect：iroh-relay 握手认证身份（E1 链）——适用
+    /// - RdzAnnounce：announce 载荷签名的 EndpointId（签名私钥即 PoP）——适用
+    /// - RdzResolve：endpoint_id 字段是**解析目标**而非请求方（bearer-only
+    ///   无调用方身份）——不适用（按目标 id 拉黑会错杀「解析到被拉黑端点」
+    ///   的合法请求，且无法约束请求方）
+    fn authenticates_endpoint(self) -> bool {
+        !matches!(self, Self::RdzResolve)
+    }
 }
 
 /// 验证链输入（由执行点从原始请求要素抽取；connection_id 供 webhook
@@ -113,31 +137,40 @@ enum Policy {
     Callback(Arc<CallbackProvider>),
 }
 
-/// per-owner 在线连接表（task 3.2 前半，Phase 3）：票接入的
-/// (endpoint_id, connection_id) → fabric_id 归属 + owner 维度计数。
+/// 在线连接表（task 3.2 前半 + server-access-roles Phase 1a 访客维度）：
+/// 键 = (endpoint_id, connection_id) → fabric 归属 `Option<[u8; 32]>`。
+/// **无 sentinel**（r1-P1-7）：访客连接的归属为 None（Option 类型隔离
+/// 真实 FabricId 空间，保留字不污染）；租户票接入为 Some(fabric_id)。
 /// 生命周期配对（依赖 iroh-relay 装配语义，handshake.rs authorize_with）：
 /// on_connect 返回 Allow 后 OnDisconnectGuard 立即创建，其 Drop **恒**触发
 /// on_disconnect（恰一次）——reserve 与 release 由此天然配对，连接中途
 /// 死亡（accept 发送失败）也不例外。
-/// 无票接入（A_cb）不计入 owner 维度（无 fabric 可归，配额语义只约束
-/// 票据接入）；open 模式无 gate，零计数。
+/// 无票 A_cb 接入（webhook 放行的非访客）不计入任何维度（无归属可计，
+/// 既有语义保持）；open 模式无 gate，零计数。
 struct OnlineTable(Mutex<OnlineInner>);
 
 #[derive(Default)]
 struct OnlineInner {
-    /// (endpoint_id, connection_id) → fabric_id（on_disconnect 按连接精确定位）
-    conns: HashMap<([u8; 32], u64), [u8; 32]>,
-    /// fabric_id → 在线连接数（配额判定与 admin status 投影）
+    /// (endpoint_id, connection_id) → fabric 归属（None = 访客连接）
+    conns: HashMap<([u8; 32], u64), Option<[u8; 32]>>,
+    /// fabric_id → 租户在线连接数（per-owner 配额判定与 admin status 投影）
     owners: HashMap<[u8; 32], usize>,
+    /// endpoint_id → 访客在线连接数（两级配额的 per-endpoint 维 + 投影）
+    visitors: HashMap<[u8; 32], usize>,
 }
 
-/// admin status 的在线表只读投影（GET /admin/status 消费）
+/// admin status / connections 的在线表只读投影（GET /admin/status 与
+/// GET /admin/connections 消费）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnlineView {
-    /// per endpoint（票接入）：{endpoint_id, fabric_id, connections}
+    /// per (endpoint, fabric) 对（**仅租户票接入**——访客连接无 fabric
+    /// 归属，不混入本表）
     pub per_endpoint: Vec<OnlineEndpoint>,
     /// per owner（fabric_id → 在线连接数）
     pub per_owner: Vec<([u8; 32], usize)>,
+    /// per visitor（endpoint_id → 在线连接数；endpoint_id 字典序——
+    /// server-access-roles spec 冻结）
+    pub per_visitor: Vec<([u8; 32], usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +181,7 @@ pub struct OnlineEndpoint {
 }
 
 impl OnlineTable {
-    /// 原子配额预约（check+incr 同锁，杜绝并发 TOCTOU 超限）。
+    /// 租户票接入的原子配额预约（check+incr 同锁，杜绝并发 TOCTOU 超限）。
     /// 返回 false = 超限（不产生任何计数副作用）。
     fn reserve(
         &self,
@@ -164,31 +197,65 @@ impl OnlineTable {
         }
         // 同键重复预约（ConnectionId 进程内唯一，不应发生——防御性先回退
         // 旧归属再重记，保计数守恒）
-        if let Some(old) = inner.conns.insert((endpoint_id, connection_id), *fabric_id) {
-            decrement_owner(&mut inner.owners, &old);
+        if let Some(old) = inner
+            .conns
+            .insert((endpoint_id, connection_id), Some(*fabric_id))
+        {
+            decrement_by_owner(&mut inner, old, endpoint_id);
         }
         *inner.owners.entry(*fabric_id).or_insert(0) += 1;
+        true
+    }
+
+    /// 访客连接的原子两级配额预约（server-access-roles Phase 1a，r1-P1-4）：
+    /// per-endpoint 上限 + 全局访客上限（防多 key 女巫聚合）。
+    /// 返回 false = 任一超限（不产生任何计数副作用）。
+    fn reserve_visitor(
+        &self,
+        endpoint_id: [u8; 32],
+        connection_id: u64,
+        per_endpoint_limit: usize,
+        global_limit: usize,
+    ) -> bool {
+        let mut inner = self.0.lock().unwrap();
+        let per = inner.visitors.get(&endpoint_id).copied().unwrap_or(0);
+        if per >= per_endpoint_limit {
+            return false;
+        }
+        let global: usize = inner.visitors.values().sum();
+        if global >= global_limit {
+            return false;
+        }
+        // 防御性回退旧归属（计数守恒，与租户路径同逻辑）
+        if let Some(old) = inner.conns.insert((endpoint_id, connection_id), None) {
+            decrement_by_owner(&mut inner, old, endpoint_id);
+        }
+        *inner.visitors.entry(endpoint_id).or_insert(0) += 1;
         true
     }
 
     /// 名额释放（on_disconnect；幂等——未知键零副作用）
     fn release(&self, endpoint_id: [u8; 32], connection_id: u64) {
         let mut inner = self.0.lock().unwrap();
-        if let Some(fabric_id) = inner.conns.remove(&(endpoint_id, connection_id)) {
-            decrement_owner(&mut inner.owners, &fabric_id);
+        if let Some(owner) = inner.conns.remove(&(endpoint_id, connection_id)) {
+            decrement_by_owner(&mut inner, owner, endpoint_id);
         }
     }
 
-    /// 只读投影（admin status 低频调用；双表分别确定性排序）
+    /// 只读投影（admin status 低频调用；三表分别确定性排序）
     fn view(&self) -> OnlineView {
         let inner = self.0.lock().unwrap();
         // 条目粒度 = (endpoint_id, fabric_id) 对（r3-P1-3）：同 endpoint 持
         // 多 fabric 连接时逐对成条，杜绝 first() 类不确定聚合；排序双键
         // （endpoint_id, fabric_id）字典序，消费侧（disconnect 展开/receipts）
-        // 依赖该确定性。
+        // 依赖该确定性。访客连接（None 归属）单独进 per_visitor。
         let mut by_pair: HashMap<([u8; 32], [u8; 32]), usize> = HashMap::new();
-        for ((endpoint, _conn), fabric) in &inner.conns {
-            *by_pair.entry((*endpoint, *fabric)).or_insert(0) += 1;
+        let mut visitors: HashMap<[u8; 32], usize> = HashMap::new();
+        for ((endpoint, _conn), owner) in &inner.conns {
+            match owner {
+                Some(fabric) => *by_pair.entry((*endpoint, *fabric)).or_insert(0) += 1,
+                None => *visitors.entry(*endpoint).or_insert(0) += 1,
+            }
         }
         let mut per_endpoint: Vec<OnlineEndpoint> = by_pair
             .into_iter()
@@ -202,21 +269,39 @@ impl OnlineTable {
         let mut per_owner: Vec<([u8; 32], usize)> =
             inner.owners.iter().map(|(k, v)| (*k, *v)).collect();
         per_owner.sort();
+        let mut per_visitor: Vec<([u8; 32], usize)> = visitors.into_iter().collect();
+        per_visitor.sort();
         OnlineView {
             per_endpoint,
             per_owner,
+            per_visitor,
         }
     }
 }
 
-/// owner 计数递减（归零即删键，防 HashMap 无界增长）
-fn decrement_owner(owners: &mut HashMap<[u8; 32], usize>, fabric_id: &[u8; 32]) {
-    if let Some(count) = owners.get_mut(fabric_id)
-        && *count > 0
-    {
-        *count -= 1;
-        if *count == 0 {
-            owners.remove(fabric_id);
+/// 按归属递减计数（归零即删键，防 HashMap 无界增长）；owner = Some(fabric)
+/// 走租户表，None 走访客表（endpoint 维）
+fn decrement_by_owner(inner: &mut OnlineInner, owner: Option<[u8; 32]>, endpoint_id: [u8; 32]) {
+    match owner {
+        Some(fabric_id) => {
+            if let Some(count) = inner.owners.get_mut(&fabric_id)
+                && *count > 0
+            {
+                *count -= 1;
+                if *count == 0 {
+                    inner.owners.remove(&fabric_id);
+                }
+            }
+        }
+        None => {
+            if let Some(count) = inner.visitors.get_mut(&endpoint_id)
+                && *count > 0
+            {
+                *count -= 1;
+                if *count == 0 {
+                    inner.visitors.remove(&endpoint_id);
+                }
+            }
         }
     }
 }
@@ -231,6 +316,17 @@ pub struct AccessGate {
     online: OnlineTable,
     /// per-owner 在线连接上限（None = 无上限）
     max_connections_per_owner: Option<usize>,
+    /// server-access-roles Phase 1a：无票准入名册（缺省 = 空台账——
+    /// restricted 模式由 main 接线真实台账）
+    visitors: Arc<VisitorRegistry>,
+    /// 黑名单（缺省 = 空名单；endpoint 维度先于 C0、fabric 维度在 L1 后）
+    blocklist: Arc<Blocklist>,
+    /// 敲门台账（内存；唯一生产写入方 = relay Deny 臂，见 record_knock）
+    knocks: KnockLog,
+    /// 访客两级配额：per-endpoint 上限（spec 默认 4）
+    max_connections_per_visitor: usize,
+    /// 访客两级配额：全局上限（spec 默认 64，防多 key 女巫聚合 r1-P1-4）
+    max_visitor_connections: usize,
 }
 
 impl std::fmt::Debug for AccessGate {
@@ -264,6 +360,11 @@ impl AccessGate {
             policy,
             online: OnlineTable(Mutex::new(OnlineInner::default())),
             max_connections_per_owner: None,
+            visitors: Arc::new(VisitorRegistry::ephemeral()),
+            blocklist: Arc::new(Blocklist::ephemeral()),
+            knocks: KnockLog::new(),
+            max_connections_per_visitor: crate::access::config::DEFAULT_MAX_CONNECTIONS_PER_VISITOR,
+            max_visitor_connections: crate::access::config::DEFAULT_MAX_VISITOR_CONNECTIONS,
         })
     }
 
@@ -274,16 +375,56 @@ impl AccessGate {
         self
     }
 
-    /// 执行验证链（C0 → L1 → L1b → L2）。全链 O(1) + 单次验签；唯一网络
-    /// 调用是 callback 模式的 L2 webhook（超时/并发防护见 callback.rs）。
+    /// 访客名册接线（server-access-roles Phase 1a；restricted 模式由 main
+    /// 装配——relay gate 必接；rendezvous gate 不接：访客可达面 v1 冻结为
+    /// relay 通行，rendezvous 无票恒拒）
+    pub fn with_visitor_ledger(mut self, visitors: Arc<VisitorRegistry>) -> Self {
+        self.visitors = visitors;
+        self
+    }
+
+    /// 黑名单接线（relay 与 rendezvous gate 均可接：endpoint 维度仅对
+    /// 已认证请求方身份的面生效、fabric 维度对任何持票面生效）
+    pub fn with_blocklist(mut self, blocklist: Arc<Blocklist>) -> Self {
+        self.blocklist = blocklist;
+        self
+    }
+
+    /// 访客两级配额（per-endpoint / 全局；spec 默认 4/64）
+    pub fn with_visitor_quotas(mut self, per_endpoint: usize, global: usize) -> Self {
+        self.max_connections_per_visitor = per_endpoint;
+        self.max_visitor_connections = global;
+        self
+    }
+
+    /// 执行验证链（C0 → L1 → L1b → L2 + Phase 1a 门禁）。全链 O(1) + 单次
+    /// 验签；唯一网络调用是 callback 模式的 L2 webhook（超时/并发防护见
+    /// callback.rs）。
     pub async fn decide(&self, input: &GateInput) -> GateDecision {
+        // 黑名单 endpoint 维度（spec 冻结：先于 C0 凭证分类——有票无票同样
+        // 生效，有效票不豁免，malformed 凭证同样先吃 blocked）。仅对
+        // endpoint_id 为已认证请求方身份的面生效（RdzResolve 的 endpoint_id
+        // 是解析目标而非请求方，不适用）。
+        if input.op.authenticates_endpoint() {
+            let blocked = self.blocklist.snapshot();
+            if blocked.is_blocked(BlockKind::Endpoint, &input.endpoint_id) {
+                tracing::debug!(
+                    endpoint = %hex::encode(input.endpoint_id),
+                    reason = blocked
+                        .reason(BlockKind::Endpoint, &input.endpoint_id)
+                        .unwrap_or(""),
+                    "access denied by blocklist (endpoint dimension)"
+                );
+                return GateDecision::Deny(Cow::Borrowed(BLOCKED_REASON));
+            }
+        }
         match classify_credential(input.auth_header.as_deref(), input.query_token.as_deref()) {
             // C0：声明了凭证但不可解析——绝不进无票路径（R4 P1-6）
             Credential::Malformed => {
                 GateDecision::Deny(Cow::Borrowed(CapDeny::MalformedCapability.reason()))
             }
-            // 无票：跳过 L1/L1b，直接 L2（static 拒 / callback 交 webhook）
-            Credential::None => self.decide_l2(None, input, self.registry.snapshot()).await,
+            // 无票：跳过 L1/L1b，走访客/策略路径（Phase 1a 次序冻结）
+            Credential::None => self.decide_no_ticket(input).await,
             Credential::Token(token) => {
                 // L1 密码学完整性（C1/C2 形态门在 decode 内）
                 let parsed = match cap::decode(token) {
@@ -307,10 +448,34 @@ impl AccessGate {
                 {
                     return GateDecision::Deny(Cow::Borrowed(e.reason()));
                 }
-                // L1b 票有效性底线（static/callback 共享，不可插拔）
+                // 黑名单 fabric 维度（spec 冻结：L1 解析出 issuer 后、L1b 之前
+                // ——命中的 issuer fabric 拒；L1 失败的坏票已在上一步吃密码学
+                // reason，验证链不回退）
+                {
+                    let blocked = self.blocklist.snapshot();
+                    if blocked.is_blocked(BlockKind::Fabric, &parsed.fabric_id) {
+                        tracing::debug!(
+                            fabric = %hex::encode(parsed.fabric_id),
+                            reason = blocked
+                                .reason(BlockKind::Fabric, &parsed.fabric_id)
+                                .unwrap_or(""),
+                            "access denied by blocklist (fabric dimension)"
+                        );
+                        return GateDecision::Deny(Cow::Borrowed(BLOCKED_REASON));
+                    }
+                }
+                // L1b 票有效性底线（static/callback 共享，不可插拔）：时间
+                // 维度——过期拒 dweb/owner-expired（在册但过期），与未注册的
+                // dweb/unknown-owner 区分（spec「relay capability 验证」冻结）
                 let snapshot = self.registry.snapshot();
-                if !snapshot.contains(&parsed.fabric_id, &parsed.issuer) {
-                    return GateDecision::Deny(Cow::Borrowed("dweb/unknown-owner"));
+                if !snapshot.contains_active(&parsed.fabric_id, &parsed.issuer, now_ms()) {
+                    return GateDecision::Deny(Cow::Borrowed(
+                        if snapshot.contains(&parsed.fabric_id, &parsed.issuer) {
+                            OWNER_EXPIRED
+                        } else {
+                            "dweb/unknown-owner"
+                        },
+                    ));
                 }
                 if !parsed.has_cap(input.op.required_cap()) {
                     return GateDecision::Deny(Cow::Borrowed(input.op.missing_reason()));
@@ -332,7 +497,14 @@ impl AccessGate {
                     }
                     reserved = true;
                 }
-                let decision = self.decide_l2(Some(&parsed), input, snapshot).await;
+                let decision = self
+                    .decide_l2(
+                        Some(&parsed),
+                        input,
+                        snapshot,
+                        self.visitors.snapshot().generation(),
+                    )
+                    .await;
                 // L2 deny 的连接不会注册（iroh-relay 先 authorize 后
                 // register），on_disconnect 永不触发——不回滚即泄漏名额
                 if reserved && matches!(decision, GateDecision::Deny(_)) {
@@ -343,13 +515,45 @@ impl AccessGate {
         }
     }
 
+    /// 无票路径（server-access-roles spec 冻结次序，MUST NOT 重排）：
+    /// ① 黑名单 endpoint 维度已在 C0 前判定（拒 dweb/blocked）；
+    /// ② 访客表命中（活跃）→ 放行（**不咨询 callback webhook**——名册先于
+    ///    webhook；仅 relay 面：E1 握手认证身份即访客身份，rendezvous 可达
+    ///    面 v1 冻结为空，design §1.6）；
+    /// ③ policy=callback → webhook 裁决（A_cb(S)）；
+    /// ④ 拒 dweb/no-capability（+ 记敲门——relay Deny 臂挂点）。
+    /// 访客放行计入两级独立配额（per-endpoint + 全局，超限
+    /// dweb/visitor-quota-exceeded——资源硬限不交 webhook，与 owner 配额
+    /// 同位）；A_cb 放行的非访客无票连接不占任何配额（既有语义）。
+    async fn decide_no_ticket(&self, input: &GateInput) -> GateDecision {
+        let visitors = self.visitors.snapshot();
+        if input.op == Op::RelayConnect && visitors.is_active(&input.endpoint_id, now_ms()) {
+            if !self.online.reserve_visitor(
+                input.endpoint_id,
+                input.connection_id,
+                self.max_connections_per_visitor,
+                self.max_visitor_connections,
+            ) {
+                return GateDecision::Deny(Cow::Borrowed(VISITOR_QUOTA_EXCEEDED));
+            }
+            return GateDecision::Allow;
+        }
+        // ③/④（rendezvous 无票恒 static 拒——rdz gate 不接 callback）。
+        // 缓存键复合 generation：owners+visitors 世代组合（r1-P1-6——访客
+        // grant/revoke 即相关缓存失效，防「revoke 后仍命中旧 allow」）
+        self.decide_l2(None, input, self.registry.snapshot(), visitors.generation())
+            .await
+    }
+
     /// L2 策略决策（design §8.2：static 无票必拒/有效票放行；callback 交
-    /// webhook，无票同样交 = A_cb(S) 独立边界）
+    /// webhook，无票同样交 = A_cb(S) 独立边界）。`visitor_generation` 入
+    /// webhook 缓存复合键（owners+visitors 世代组合）
     async fn decide_l2(
         &self,
         capability: Option<&RelayCap>,
         input: &GateInput,
         snapshot: RegistrySnapshot,
+        visitor_generation: u64,
     ) -> GateDecision {
         match &self.policy {
             Policy::Static => match capability {
@@ -363,6 +567,7 @@ impl AccessGate {
                         capability,
                         input.connection_id,
                         snapshot.generation(),
+                        visitor_generation,
                     )
                     .await;
                 if decision.allow {
@@ -374,13 +579,26 @@ impl AccessGate {
         }
     }
 
-    /// on_disconnect 钩子：per-owner 在线名额释放（task 3.2）+ callback
+    /// on_disconnect 钩子：在线名额释放（租户与访客按归属分流）+ callback
     /// 模式转发 best-effort 观察通知；static 模式后者为空实现（design §8.5）
     pub fn on_disconnect(&self, endpoint_id: [u8; 32], connection_id: u64) {
         self.online.release(endpoint_id, connection_id);
         if let Policy::Callback(provider) = &self.policy {
             provider.notify_disconnect(&endpoint_id, connection_id);
         }
+    }
+
+    /// 敲门台账写入（KnockLog 的**唯一生产入口** = relay Deny 臂；E1 握手
+    /// 认证身份——rendezvous 面身份不可信不入账，r1-P0-1 红线）。
+    /// `dweb/blocked` 排除在 KnockLog 内部处理（已被处置，不是待办）。
+    pub fn record_knock(&self, endpoint_id: [u8; 32], reason: &str) {
+        self.knocks.record(endpoint_id, reason, now_ms());
+    }
+
+    /// 敲门台账只读句柄（Phase 1c `GET /admin/knocks` 消费；1a 由测试驱动）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn knock_log(&self) -> &KnockLog {
+        &self.knocks
     }
 
     /// registry 热重载后的缓存清理（generation 已在缓存键内保证正确性，
@@ -460,24 +678,94 @@ fn strip_bearer(value: &str) -> Option<&str> {
     scheme.eq_ignore_ascii_case("Bearer").then_some(rest)
 }
 
-/// registry 热重载看护（task 1.2 遗留 / task 1.5 接线）：mtime+len 轮询
-/// （5s 间隔，跨平台实现简单——SIGHUP 不便携），文件变化即
-/// OwnerRegistry::reload（快照替换 + generation+1）并清 callback 缓存容量。
+/// mtime 热重载看护的台账抽象（r1-P1-5 统一矩阵：owners/visitors/blocklist
+/// 共用同一看护循环与日志形态）
+pub trait ReloadableLedger: Send + Sync {
+    /// 从磁盘重载（失败保留旧快照并上抛，由看护决定重试节奏）
+    fn reload_from_disk(&self) -> anyhow::Result<()>;
+    /// 台账文件路径（stat 目标）
+    fn ledger_path(&self) -> &std::path::Path;
+    /// 日志标签（"owner registry" / "visitor registry" / "blocklist"）
+    fn ledger_label(&self) -> &'static str;
+    /// 当前世代（重载成功日志）
+    fn ledger_generation(&self) -> u64;
+    /// 当前条目数（重载成功日志）
+    fn ledger_count(&self) -> usize;
+}
+
+impl ReloadableLedger for OwnerRegistry {
+    fn reload_from_disk(&self) -> anyhow::Result<()> {
+        self.reload()
+    }
+    fn ledger_path(&self) -> &std::path::Path {
+        self.path()
+    }
+    fn ledger_label(&self) -> &'static str {
+        "owner registry"
+    }
+    fn ledger_generation(&self) -> u64 {
+        self.snapshot().generation()
+    }
+    fn ledger_count(&self) -> usize {
+        self.snapshot().len()
+    }
+}
+
+impl ReloadableLedger for VisitorRegistry {
+    fn reload_from_disk(&self) -> anyhow::Result<()> {
+        self.reload()
+    }
+    fn ledger_path(&self) -> &std::path::Path {
+        self.path()
+    }
+    fn ledger_label(&self) -> &'static str {
+        "visitor registry"
+    }
+    fn ledger_generation(&self) -> u64 {
+        self.snapshot().generation()
+    }
+    fn ledger_count(&self) -> usize {
+        self.snapshot().len()
+    }
+}
+
+impl ReloadableLedger for Blocklist {
+    fn reload_from_disk(&self) -> anyhow::Result<()> {
+        self.reload()
+    }
+    fn ledger_path(&self) -> &std::path::Path {
+        self.path()
+    }
+    fn ledger_label(&self) -> &'static str {
+        "blocklist"
+    }
+    fn ledger_generation(&self) -> u64 {
+        self.snapshot().generation()
+    }
+    fn ledger_count(&self) -> usize {
+        self.snapshot().len()
+    }
+}
+
+/// 台账热重载看护（原 task 1.5 owners 专用看护的泛化，Phase 1a 三台账
+/// 共用）：mtime+len 轮询（5s 间隔，跨平台实现简单——SIGHUP 不便携），
+/// 文件变化即 reload（快照替换 + generation+1）并清 callback 缓存容量。
 /// 重载失败（admin 正在写/坏行）保留旧快照，stat 再变化时重试。
-pub fn spawn_registry_reload_watcher(
-    registry: Arc<OwnerRegistry>,
+pub fn spawn_ledger_reload_watcher<L: ReloadableLedger + 'static>(
+    ledger: Arc<L>,
     gate: Option<Arc<AccessGate>>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_registry_reload_watcher_every(registry, gate, std::time::Duration::from_secs(5))
+    spawn_ledger_reload_watcher_every(ledger, gate, std::time::Duration::from_secs(5))
 }
 
 /// 可配间隔版本（单测用 50ms 级间隔验证轮换语义）
-pub fn spawn_registry_reload_watcher_every(
-    registry: Arc<OwnerRegistry>,
+pub fn spawn_ledger_reload_watcher_every<L: ReloadableLedger + 'static>(
+    ledger: Arc<L>,
     gate: Option<Arc<AccessGate>>,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let path = registry.path().to_path_buf();
+    let path = ledger.ledger_path().to_path_buf();
+    let label = ledger.ledger_label();
     tokio::spawn(async move {
         let mut last = stat_of(&path);
         loop {
@@ -487,22 +775,19 @@ pub fn spawn_registry_reload_watcher_every(
                 continue;
             }
             last = current;
-            match registry.reload() {
+            match ledger.reload_from_disk() {
                 Ok(()) => {
-                    let snapshot = registry.snapshot();
                     tracing::info!(
-                        generation = snapshot.generation(),
-                        owners = snapshot.len(),
-                        "owner registry reloaded"
+                        generation = ledger.ledger_generation(),
+                        entries = ledger.ledger_count(),
+                        "{label} reloaded"
                     );
                     if let Some(gate) = &gate {
                         gate.invalidate_callback_cache();
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "owner registry reload failed (keeping previous snapshot): {e:#}"
-                    );
+                    tracing::warn!("{label} reload failed (keeping previous snapshot): {e:#}");
                 }
             }
         }
@@ -945,7 +1230,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("owners.jsonl");
         let registry = Arc::new(OwnerRegistry::load(&path).unwrap());
-        let handle = spawn_registry_reload_watcher_every(
+        let handle = spawn_ledger_reload_watcher_every(
             registry.clone(),
             None,
             std::time::Duration::from_millis(30),
@@ -1316,5 +1601,465 @@ mod tests {
         assert!(view.per_endpoint.iter().all(|x| x.connections == 1));
         assert!(view.per_owner.contains(&(f.fabric_id, 1)));
         assert!(view.per_owner.contains(&(other_fabric, 1)));
+    }
+
+    // ---- server-access-roles Phase 1a：访客名册 / 黑名单 / owner-expired /
+    // 访客配额 / 复合缓存 generation ----
+
+    /// Phase 1a 测试 fixture：带 visitors/blocklist 台账的 gate 构造器
+    /// （`_dir` 持有 TempDir 存活——台账文件在 fixture 生命周期内可写）
+    struct Phase1aFixture {
+        _dir: TempDir,
+        visitors: Arc<VisitorRegistry>,
+        blocklist: Arc<Blocklist>,
+    }
+
+    impl Phase1aFixture {
+        fn new() -> Self {
+            let dir = TempDir::new().unwrap();
+            Self {
+                visitors: Arc::new(
+                    VisitorRegistry::load(&dir.path().join("visitors.jsonl")).unwrap(),
+                ),
+                blocklist: Arc::new(Blocklist::load(&dir.path().join("blocklist.jsonl")).unwrap()),
+                _dir: dir,
+            }
+        }
+
+        fn gate(&self, f: &Fixture, policy: PolicyConfig) -> AccessGate {
+            AccessGate::new(f.server_id, f.registry.clone(), policy)
+                .unwrap()
+                .with_visitor_ledger(std::sync::Arc::clone(&self.visitors))
+                .with_blocklist(std::sync::Arc::clone(&self.blocklist))
+        }
+
+        fn no_ticket(&self, endpoint: [u8; 32], connection_id: u64) -> GateInput {
+            GateInput {
+                endpoint_id: endpoint,
+                auth_header: None,
+                query_token: None,
+                connection_id,
+                op: Op::RelayConnect,
+            }
+        }
+    }
+
+    /// 访客矩阵（spec Scenario「访客裁决次序——名册先于 webhook」「访客过期
+    /// 或吊销后回落原路径」）：命中放行不咨询 webhook；过期/吊销回落
+    #[tokio::test]
+    async fn visitor_matrix_hit_expiry_revoke_and_fallthrough() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        // callback 策略 + webhook 恒 deny：验证「名册先于 webhook」
+        let mock = callback_mock_json(r#"{"allow":false,"reason":"dweb/cb-no"}"#).await;
+        let gate = p1a.gate(&f, PolicyConfig::Callback(cb_cfg(mock.url.clone())));
+
+        let visitor = [0xE1; 32];
+        // 未授予：无票 → webhook 裁决（次序 ③，reason 透传）
+        assert_eq!(
+            deny_reason(gate.decide(&p1a.no_ticket(visitor, 1)).await),
+            "dweb/cb-no"
+        );
+        assert_eq!(mock.count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 授予：无票 → 放行，webhook 不被咨询（次序 ② 先于 ③）
+        p1a.visitors
+            .grant(
+                &visitor,
+                Some("guest".into()),
+                None,
+                Some(now_ms() + 3_600_000),
+            )
+            .unwrap();
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(visitor, 2)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(
+            mock.count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "访客命中不咨询 webhook"
+        );
+
+        // 吊销：回落 webhook（再次计数）
+        p1a.visitors.revoke(&visitor).unwrap();
+        assert_eq!(
+            deny_reason(gate.decide(&p1a.no_ticket(visitor, 3)).await),
+            "dweb/cb-no"
+        );
+        assert_eq!(mock.count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // 过期（文件入口 + reload）：static 策略下回落无票路径拒 no-capability
+        let (f2, _gate2) = Fixture::new();
+        let p1a2 = Phase1aFixture::new();
+        let gate2 = p1a2.gate(&f2, PolicyConfig::Static);
+        std::fs::write(
+            p1a2.visitors.path(),
+            format!(
+                "{{\"op\":\"grant\",\"endpoint_id\":\"{}\",\"alias\":\"was\",\"ts\":1,\"expires_at\":100}}\n",
+                "e2".repeat(32)
+            ),
+        )
+        .unwrap();
+        p1a2.visitors.reload().unwrap();
+        assert_eq!(
+            deny_reason(gate2.decide(&p1a2.no_ticket([0xE2; 32], 1)).await),
+            "dweb/no-capability",
+            "过期访客按无票路径拒绝（static）"
+        );
+    }
+
+    /// 访客准入仅 relay 面：rendezvous op 的无票请求恒拒（design §1.6 可达
+    /// 面 v1 冻结为空）
+    #[tokio::test]
+    async fn visitor_admission_is_relay_face_only() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        let gate = p1a.gate(&f, PolicyConfig::Static);
+        let visitor = [0xE3; 32];
+        p1a.visitors.grant(&visitor, None, None, None).unwrap();
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(visitor, 1)).await,
+            GateDecision::Allow
+        );
+        let rdz_input = GateInput {
+            endpoint_id: visitor,
+            auth_header: None,
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzAnnounce,
+        };
+        assert_eq!(
+            deny_reason(gate.decide(&rdz_input).await),
+            "dweb/no-capability"
+        );
+    }
+
+    /// 访客两级配额：per-endpoint 超限拒；全局上限跨端点独立生效；访客不进
+    /// 租户投影；释放恢复（spec Scenario「访客连接配额独立于租户配额」）
+    #[tokio::test]
+    async fn visitor_quotas_two_levels_and_isolated_projection() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        let gate = p1a
+            .gate(&f, PolicyConfig::Static)
+            .with_visitor_quotas(2, 64);
+        let a = [0xE4; 32];
+        let b = [0xE5; 32];
+        p1a.visitors.grant(&a, None, None, None).unwrap();
+        p1a.visitors.grant(&b, None, None, None).unwrap();
+        // per-endpoint 2：a 的第 3 条拒；b 独立不串扰
+        assert_eq!(gate.decide(&p1a.no_ticket(a, 1)).await, GateDecision::Allow);
+        assert_eq!(gate.decide(&p1a.no_ticket(a, 2)).await, GateDecision::Allow);
+        assert_eq!(
+            deny_reason(gate.decide(&p1a.no_ticket(a, 3)).await),
+            VISITOR_QUOTA_EXCEEDED
+        );
+        assert_eq!(gate.decide(&p1a.no_ticket(b, 4)).await, GateDecision::Allow);
+        // 投影：per_visitor 字典序，不进 per_endpoint/per_owner
+        let view = gate.online_view();
+        assert!(
+            view.per_endpoint.is_empty(),
+            "访客无 fabric 归属不进租户投影"
+        );
+        assert!(view.per_owner.is_empty());
+        assert_eq!(view.per_visitor, vec![(a, 2), (b, 1)]);
+        // 释放恢复（on_disconnect 按归属分流到访客表）
+        gate.on_disconnect(a, 1);
+        assert_eq!(gate.decide(&p1a.no_ticket(a, 5)).await, GateDecision::Allow);
+
+        // 全局上限 3：第四条跨端点拒（防多 key 女巫聚合）
+        let g2 = p1a
+            .gate(&f, PolicyConfig::Static)
+            .with_visitor_quotas(10, 3);
+        let c = [0xE6; 32];
+        p1a.visitors.grant(&c, None, None, None).unwrap();
+        assert_eq!(g2.decide(&p1a.no_ticket(a, 11)).await, GateDecision::Allow);
+        assert_eq!(g2.decide(&p1a.no_ticket(b, 12)).await, GateDecision::Allow);
+        assert_eq!(g2.decide(&p1a.no_ticket(c, 13)).await, GateDecision::Allow);
+        assert_eq!(
+            deny_reason(g2.decide(&p1a.no_ticket(a, 14)).await),
+            VISITOR_QUOTA_EXCEEDED,
+            "全局访客上限独立于 per-endpoint"
+        );
+    }
+
+    /// 反向独立：访客连接不受（也不占）per-owner 配额
+    #[tokio::test]
+    async fn visitor_connections_do_not_consume_owner_quota() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        let gate = p1a
+            .gate(&f, PolicyConfig::Static)
+            .with_max_connections_per_owner(Some(1));
+        let visitor = [0xE7; 32];
+        p1a.visitors.grant(&visitor, None, None, None).unwrap();
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(visitor, 1)).await,
+            GateDecision::Allow
+        );
+        // owner 唯一名额不被访客占用
+        assert_eq!(
+            gate.decide(&quota_input(&f, f.recipient, 2)).await,
+            GateDecision::Allow,
+            "访客接入不占 per-owner 配额"
+        );
+        // owner 配额满后访客连接仍可用（反向独立）
+        assert_eq!(
+            deny_reason(gate.decide(&quota_input(&f, f.recipient, 3)).await),
+            OWNER_QUOTA_EXCEEDED
+        );
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(visitor, 4)).await,
+            GateDecision::Allow
+        );
+    }
+
+    /// 黑名单矩阵（spec Scenario 全组）：endpoint 维度先于 C0（有效票不豁免、
+    /// 坏凭证同吃 blocked）；fabric 维度 L1 后 L1b 前（L1 失败仍回密码学
+    /// reason——验证链不回退）；解除后恢复
+    #[tokio::test]
+    async fn blocklist_endpoint_and_fabric_dimensions() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        let gate = p1a.gate(&f, PolicyConfig::Static);
+        let victim = f.recipient;
+
+        // endpoint 维度：有效票 + 被拉黑 → dweb/blocked（不豁免）
+        p1a.blocklist
+            .add(BlockKind::Endpoint, &victim, Some("abuse".into()))
+            .unwrap();
+        let valid = f.valid_token();
+        assert_eq!(
+            deny_reason(
+                gate.decide(&f.input(Some(&format!("Bearer {valid}")), None))
+                    .await
+            ),
+            BLOCKED_REASON
+        );
+        // 坏凭证同样先吃 blocked（先于 C0——次序冻结）
+        assert_eq!(
+            deny_reason(gate.decide(&f.input(Some("garbage"), None)).await),
+            BLOCKED_REASON
+        );
+        // 无票 + 被拉黑 → blocked（先于访客/callback 路径）
+        assert_eq!(
+            deny_reason(gate.decide(&p1a.no_ticket(victim, 1)).await),
+            BLOCKED_REASON
+        );
+        // 解除 → 恢复放行
+        p1a.blocklist.remove(BlockKind::Endpoint, &victim).unwrap();
+        assert_eq!(
+            gate.decide(&f.input(Some(&format!("Bearer {valid}")), None))
+                .await,
+            GateDecision::Allow
+        );
+
+        // fabric 维度：issuer fabric 拉黑 → 持有效票拒
+        p1a.blocklist
+            .add(BlockKind::Fabric, &f.fabric_id, None)
+            .unwrap();
+        assert_eq!(
+            deny_reason(
+                gate.decide(&f.input(Some(&format!("Bearer {valid}")), None))
+                    .await
+            ),
+            BLOCKED_REASON
+        );
+        // L1 失败（坏签名）先于 fabric 维度：密码学 reason 不被掩盖
+        let mut tampered = f.valid_token().into_bytes();
+        tampered[100] = if tampered[100] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        assert_eq!(
+            deny_reason(
+                gate.decide(&f.input(Some(&format!("Bearer {tampered}")), None))
+                    .await
+            ),
+            "dweb/bad-signature"
+        );
+        // 未拉黑 fabric 的票不受影响
+        let issuer2 = SigningKey::from_bytes(&[0x71; 32]);
+        let fabric2 = [0x72; 32];
+        f.registry
+            .register(&fabric2, &issuer2.verifying_key().to_bytes())
+            .unwrap();
+        let now = now_ms();
+        let token2 = sign_and_encode(
+            &issuer2,
+            &fabric2,
+            &f.server_id,
+            &f.recipient,
+            CAP_RELAY,
+            now,
+            now + TTL,
+        );
+        assert_eq!(
+            gate.decide(&f.input(Some(&format!("Bearer {token2}")), None))
+                .await,
+            GateDecision::Allow
+        );
+        // 解除 → 恢复
+        p1a.blocklist
+            .remove(BlockKind::Fabric, &f.fabric_id)
+            .unwrap();
+        assert_eq!(
+            gate.decide(&f.input(Some(&format!("Bearer {valid}")), None))
+                .await,
+            GateDecision::Allow
+        );
+    }
+
+    /// owner-expired 边界（spec Scenario「租户条目过期拒绝且 reason 与未注册
+    /// 区分」「续期恢复准入」）：过期 → dweb/owner-expired；未注册 →
+    /// dweb/unknown-owner；文件入口续期（新 register + reload）→ 恢复
+    #[tokio::test]
+    async fn owner_expired_reason_distinct_and_renewal_restores() {
+        // Fixture 的 registry 临时目录不保活——本测试要直接写 owners.jsonl
+        // （文件入口），用独立存活的 TempDir 自建 registry（签名材料与
+        // Fixture 同构：fabric=[3;32] issuer=[1;32] server=[2;32]）
+        let dir = TempDir::new().unwrap();
+        let registry = Arc::new(OwnerRegistry::load(&dir.path().join("owners.jsonl")).unwrap());
+        let issuer = SigningKey::from_bytes(&[1u8; 32]);
+        let issuer_root = issuer.verifying_key().to_bytes();
+        registry.register(&[3u8; 32], &issuer_root).unwrap();
+        let gate = AccessGate::new([2u8; 32], registry.clone(), PolicyConfig::Static).unwrap();
+        let now = now_ms();
+        let valid = sign_and_encode(
+            &issuer,
+            &[3u8; 32],
+            &[2u8; 32],
+            &[4u8; 32],
+            CAP_RELAY,
+            now,
+            now + TTL,
+        );
+        let input = GateInput {
+            endpoint_id: [4u8; 32],
+            auth_header: Some(format!("Bearer {valid}")),
+            query_token: None,
+            connection_id: 1,
+            op: Op::RelayConnect,
+        };
+        // 基线：有效票放行
+        assert_eq!(gate.decide(&input).await, GateDecision::Allow);
+
+        // 文件入口写入带过期时间的 register（expires_at = 过去）+ reload
+        let fabric_hex = hex::encode([3u8; 32]);
+        let root_hex = hex::encode(issuer_root);
+        let path = registry.path().to_path_buf();
+        let expired_line = format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{fabric_hex}\",\"root\":\"{root_hex}\",\"ts\":100,\"expires_at\":200}}\n"
+        );
+        std::fs::write(&path, &expired_line).unwrap();
+        registry.reload().unwrap();
+        // now >= expires_at（等值=过期）→ owner-expired（区别于 unknown）
+        assert_eq!(deny_reason(gate.decide(&input).await), OWNER_EXPIRED);
+
+        // 未注册 fabric → unknown-owner（区分面）
+        let impostor = sign_and_encode(
+            &SigningKey::from_bytes(&[1u8; 32]),
+            &[0x77; 32],
+            &[2u8; 32],
+            &[4u8; 32],
+            CAP_RELAY,
+            now_ms(),
+            now_ms() + TTL,
+        );
+        let impostor_input = GateInput {
+            endpoint_id: [4u8; 32],
+            auth_header: Some(format!("Bearer {impostor}")),
+            query_token: None,
+            connection_id: 2,
+            op: Op::RelayConnect,
+        };
+        assert_eq!(
+            deny_reason(gate.decide(&impostor_input).await),
+            "dweb/unknown-owner"
+        );
+
+        // 续期：新 register（远期 expires_at + alias）+ reload → 放行
+        let renewed_expiry = now_ms() + 3_600_000;
+        let renewed = format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{fabric_hex}\",\"root\":\"{root_hex}\",\"ts\":300,\"expires_at\":{renewed_expiry},\"alias\":\"renewed\"}}\n"
+        );
+        std::fs::write(&path, format!("{expired_line}{renewed}")).unwrap();
+        registry.reload().unwrap();
+        assert_eq!(gate.decide(&input).await, GateDecision::Allow);
+        // 快照携带元数据（续期事件的 alias/expires_at）
+        let entries = registry.snapshot().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].expires_at, Some(renewed_expiry));
+        assert_eq!(entries[0].alias.as_deref(), Some("renewed"));
+    }
+
+    /// 复合 generation 缓存联动（r1-P1-6 回归）：无票 webhook 放行被缓存后，
+    /// 访客 grant（世代+1）→ 名册放行；revoke（世代+1）→ 旧 allow 缓存失效，
+    /// webhook 在 TTL 内也被重新咨询
+    #[tokio::test]
+    async fn visitor_generation_invalidates_cached_webhook_allow() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        // 可缓存形态：TTL 60s（> 测试时长）
+        let mock = callback_mock_json(r#"{"allow":true}"#).await;
+        let mut cfg = cb_cfg(mock.url.clone());
+        cfg.cache_ttl_ms = 60_000;
+        let gate = p1a.gate(&f, PolicyConfig::Callback(cfg));
+
+        let endpoint = [0xE8; 32];
+        let count = || mock.count.load(std::sync::atomic::Ordering::SeqCst);
+        // ① 无票非访客：webhook allow → 放行并缓存；第二次缓存命中
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(endpoint, 1)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(count(), 1);
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(endpoint, 2)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(count(), 1, "缓存命中不回调");
+
+        // ② grant：名册放行（webhook 仍不咨询）
+        p1a.visitors.grant(&endpoint, None, None, None).unwrap();
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(endpoint, 3)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(count(), 1);
+
+        // ③ revoke：复合世代变化 → 旧 allow 缓存不命中 → webhook 重新咨询
+        p1a.visitors.revoke(&endpoint).unwrap();
+        assert_eq!(
+            gate.decide(&p1a.no_ticket(endpoint, 4)).await,
+            GateDecision::Allow
+        );
+        assert_eq!(count(), 2, "revoke 后不得命中 revoke 前的 allow 缓存");
+    }
+
+    /// RdzResolve 的 endpoint_id 是解析目标：黑名单 endpoint 维度不适用
+    /// （bearer-only 无请求方身份——按目标拉黑会错杀合法解析）
+    #[tokio::test]
+    async fn blocklist_endpoint_dim_skips_rdz_resolve() {
+        let (f, _gate) = Fixture::new();
+        let p1a = Phase1aFixture::new();
+        let gate = p1a.gate(&f, PolicyConfig::Static);
+        let target = [0xE9; 32];
+        p1a.blocklist
+            .add(BlockKind::Endpoint, &target, None)
+            .unwrap();
+        // 被拉黑 id 作为解析目标 + 无票 → 走 C0（no-capability），非 blocked
+        let input = GateInput {
+            endpoint_id: target,
+            auth_header: None,
+            query_token: None,
+            connection_id: 0,
+            op: Op::RdzResolve,
+        };
+        assert_eq!(deny_reason(gate.decide(&input).await), "dweb/no-capability");
+        // 对照：同 id 在 relay 面（已认证身份）→ blocked
+        assert_eq!(
+            deny_reason(gate.decide(&p1a.no_ticket(target, 1)).await),
+            BLOCKED_REASON
+        );
     }
 }

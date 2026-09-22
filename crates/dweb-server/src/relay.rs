@@ -76,6 +76,10 @@ pub async fn start(
 
 /// iroh-relay AccessControl 适配层：从 [`ClientRequest`] 抽取原始凭证要素
 /// 交 [`AccessGate`]，deny reason 原样透传（Option<String>）。
+/// 装配前提 = gate 存在（restricted）；open 模式 relay::start 不构造本类型
+/// （AllowAll 快路径，O-9 冻结：门禁台账/黑名单/访客名册在 open 不生效）。
+/// server-access-roles Phase 1a：Deny 臂是 KnockLog 的唯一生产写入口
+/// （E1 握手认证身份；rendezvous 面身份不可信不入账，r1-P0-1 红线）。
 pub struct RelayAccessControl {
     gate: Arc<AccessGate>,
 }
@@ -132,9 +136,23 @@ impl AccessControl for RelayAccessControl {
         let input = Self::gate_input(request);
         match self.gate.decide(&input).await {
             GateDecision::Allow => Access::Allow,
-            GateDecision::Deny(reason) => Access::Deny {
-                reason: Some(reason.into_owned()),
-            },
+            GateDecision::Deny(reason) => {
+                // 敲门台账（server-access-roles Phase 1a，KnockLog 唯一生产
+                // 入口）：只记 relay 握手认证身份（E1 链——request.endpoint_id
+                // 已通过 iroh-relay 挑战握手验证；rendezvous HTTP 面身份不可信
+                // 不入账，r1-P0-1 红线由「本臂是唯一写入口」结构性保证）。
+                // `dweb/blocked` 的排除在 KnockLog 内部处理（已被处置非待办）。
+                self.gate
+                    .record_knock(*request.endpoint_id().as_bytes(), &reason);
+                tracing::debug!(
+                    endpoint = %request.endpoint_id(),
+                    reason = %reason,
+                    "relay connect denied"
+                );
+                Access::Deny {
+                    reason: Some(reason.into_owned()),
+                }
+            }
         }
     }
 
@@ -330,5 +348,73 @@ mod tests {
         // ConnectionId 无公开构造器（进程内自增）：借 ClientRequest::new 派发
         let cr = client_request(&f.recipient, "/relay", None);
         ctl.on_disconnect(f.recipient, cr.connection_id());
+    }
+
+    // ---- server-access-roles Phase 1a：Deny 臂 → KnockLog 挂点 ----
+
+    /// relay Deny 臂入账（E1 身份）；Allow 不入账；dweb/blocked 排除在
+    /// KnockLog 内部。此臂是台账唯一生产写入口（rendezvous 面结构性隔离）。
+    #[tokio::test]
+    async fn deny_arm_records_knock_and_allow_does_not() {
+        let f = Fixture::new();
+        let gate = f.gate(registered_registry(&f));
+        let ctl = RelayAccessControl { gate: gate.clone() };
+        // 无票 deny → 台账一条（no-capability）
+        let req = client_request(&f.recipient, "/relay", None);
+        let access = ctl.on_connect(&req).await;
+        assert_eq!(
+            access_reason(&access).as_deref(),
+            Some("dweb/no-capability")
+        );
+        let list = gate.knock_log().list(true);
+        assert_eq!(list.knocks.len(), 1);
+        assert_eq!(list.knocks[0].endpoint_id, *f.recipient.as_bytes());
+        assert_eq!(list.knocks[0].last_reason, "dweb/no-capability");
+        assert_eq!(list.knocks[0].count, 1);
+        // 再次 deny → 聚合（count=2，同端点单条目）
+        ctl.on_connect(&req).await;
+        let list = gate.knock_log().list(true);
+        assert_eq!(list.knocks.len(), 1);
+        assert_eq!(list.knocks[0].count, 2);
+        // 有效票 Allow → 不入账
+        let req = client_request(
+            &f.recipient,
+            "/relay",
+            Some(&format!("Bearer {}", f.token())),
+        );
+        assert_eq!(ctl.on_connect(&req).await, Access::Allow);
+        assert_eq!(gate.knock_log().list(true).knocks.len(), 1);
+    }
+
+    /// dweb/blocked（黑名单命中）不入台账——排除项在 KnockLog.record 内部
+    #[tokio::test]
+    async fn blocked_deny_not_recorded_in_knock_log() {
+        use crate::access::blocklist::{BlockKind, Blocklist};
+        let f = Fixture::new();
+        let dir = TempDir::new().unwrap();
+        let registry = registered_registry(&f);
+        let blocklist = Arc::new(Blocklist::load(&dir.path().join("blocklist.jsonl")).unwrap());
+        blocklist
+            .add(BlockKind::Endpoint, f.recipient.as_bytes(), None)
+            .unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, registry, PolicyConfig::Static)
+                .unwrap()
+                .with_blocklist(blocklist),
+        );
+        let ctl = RelayAccessControl { gate: gate.clone() };
+        // 被拉黑端点持有效票仍拒（endpoint 维度先于 C0）且不入台账
+        let req = client_request(
+            &f.recipient,
+            "/relay",
+            Some(&format!("Bearer {}", f.token())),
+        );
+        let access = ctl.on_connect(&req).await;
+        assert_eq!(access_reason(&access).as_deref(), Some("dweb/blocked"));
+        assert_eq!(
+            gate.knock_log().list(true).knocks.len(),
+            0,
+            "blocked 不记敲门"
+        );
     }
 }

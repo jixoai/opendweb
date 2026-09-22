@@ -502,6 +502,9 @@ struct Status {
     per_owner_connections: Vec<OwnerOnlineInfo>,
     /// callback 决策缓存条目数（static 恒 0）
     cache_entries: usize,
+    /// 访客在线连接总数（server-access-roles Phase 1a 增量字段——纯增量，
+    /// 既有 wire 冻结不变，旧消费者忽略未知字段）
+    visitors_online: usize,
 }
 
 #[derive(Serialize)]
@@ -519,7 +522,7 @@ struct OwnerOnlineInfo {
 
 async fn status(State(state): State<AdminState>) -> Json<Status> {
     let snapshot = state.registry.snapshot();
-    let (quota, active, per_owner, cache_entries) = match &state.gate {
+    let (quota, active, per_owner, cache_entries, visitors_online) = match &state.gate {
         Some(gate) => {
             let view = gate.online_view();
             (
@@ -537,9 +540,11 @@ async fn status(State(state): State<AdminState>) -> Json<Status> {
                     })
                     .collect(),
                 gate.cache_entries(),
+                // 访客在线总数（Phase 1a 增量：per_visitor 的 connections 求和）
+                view.per_visitor.iter().map(|(_, n)| n).sum(),
             )
         }
-        None => (None, Vec::new(), Vec::new(), 0),
+        None => (None, Vec::new(), Vec::new(), 0, 0),
     };
     Json(Status {
         mode: match state.mode {
@@ -552,6 +557,7 @@ async fn status(State(state): State<AdminState>) -> Json<Status> {
         active_connections: active,
         per_owner_connections: per_owner,
         cache_entries,
+        visitors_online,
     })
 }
 
@@ -566,9 +572,18 @@ struct Connections {
     /// relay 服务装配事实（独立字段，与 mode 无推导关系）
     relay_enabled: bool,
     quota: Quota,
-    /// endpoint_id 字典序（online_view 冻结排序）
+    /// endpoint_id 字典序（online_view 冻结排序；仅租户票接入对）
     per_endpoint: Vec<EndpointOnlineInfo>,
     per_owner: Vec<OwnerOnlineInfo>,
+    /// 访客在线连接（server-access-roles Phase 1a 增量数组：endpoint_id
+    /// 字典序，[{endpoint_id, connections}]——旧消费者忽略）
+    per_visitor: Vec<VisitorOnlineInfo>,
+}
+
+#[derive(Serialize)]
+struct VisitorOnlineInfo {
+    endpoint_id: String,
+    connections: usize,
 }
 
 #[derive(Serialize)]
@@ -585,7 +600,7 @@ struct Quota {
 /// （gate=None）→ 空投影；restricted+relay 未启用 → 在线表天然为空（无
 /// relay 即无票接入），mode/relay_enabled 如实各自取值。
 async fn connections(State(state): State<AdminState>) -> Json<Connections> {
-    let (quota, per_endpoint, per_owner) = match &state.gate {
+    let (quota, per_endpoint, per_owner, per_visitor) = match &state.gate {
         Some(gate) => {
             let view = gate.online_view();
             (
@@ -608,6 +623,13 @@ async fn connections(State(state): State<AdminState>) -> Json<Connections> {
                         connections,
                     })
                     .collect(),
+                view.per_visitor
+                    .into_iter()
+                    .map(|(endpoint_id, connections)| VisitorOnlineInfo {
+                        endpoint_id: hex::encode(endpoint_id),
+                        connections,
+                    })
+                    .collect(),
             )
         }
         None => (
@@ -615,6 +637,7 @@ async fn connections(State(state): State<AdminState>) -> Json<Connections> {
                 configured: false,
                 max_connections_per_owner: None,
             },
+            Vec::new(),
             Vec::new(),
             Vec::new(),
         ),
@@ -629,6 +652,7 @@ async fn connections(State(state): State<AdminState>) -> Json<Connections> {
         quota,
         per_endpoint,
         per_owner,
+        per_visitor,
     })
 }
 
@@ -1718,6 +1742,7 @@ mod tests {
                 },
             ],
             per_owner: vec![],
+            per_visitor: vec![],
         };
         let proj = endpoint_level_projection(&view);
         assert_eq!(proj.len(), 2, "同 endpoint 聚合一条");
@@ -1730,6 +1755,96 @@ mod tests {
         assert_eq!(proj[0].connections, 3, "connections 求和");
         assert_eq!(proj[1].endpoint_id, hex::encode([0x44; 32]));
         assert_eq!(proj[1].connections, 5);
+    }
+
+    /// server-access-roles Phase 1a：status `visitors_online` 与 connections
+    /// `per_visitor` 增量投影——纯增量字段，既有 wire 断言（本文件其余测试）
+    /// 不动；访客连接不进 active_connections/per_owner
+    #[tokio::test]
+    async fn status_and_connections_project_visitors_incrementally() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let visitors = Arc::new(
+            crate::access::visitor::VisitorRegistry::load(&dir.path().join("visitors.jsonl"))
+                .unwrap(),
+        );
+        let visitor_a = [0xD1; 32];
+        let visitor_b = [0xD2; 32];
+        visitors.grant(&visitor_a, None, None, None).unwrap();
+        visitors.grant(&visitor_b, None, None, None).unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static)
+                .unwrap()
+                .with_visitor_ledger(visitors),
+        );
+        // 访客无票接入全链（名册命中 → 配额预约）：a×2 + b×1
+        for (endpoint, conn) in [(visitor_a, 1u64), (visitor_a, 2u64), (visitor_b, 9u64)] {
+            assert_eq!(
+                gate.decide(&GateInput {
+                    endpoint_id: endpoint,
+                    auth_header: None,
+                    query_token: None,
+                    connection_id: conn,
+                    op: Op::RelayConnect,
+                })
+                .await,
+                GateDecision::Allow
+            );
+        }
+
+        let app = router(f.state(Some(Arc::clone(&gate))));
+        // status：visitors_online=3；既有字段不受访客影响
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/status")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["visitors_online"], 3, "访客在线总数（增量字段）");
+        assert_eq!(body["active_connections"].as_array().unwrap().len(), 0);
+        assert_eq!(body["per_owner_connections"].as_array().unwrap().len(), 0);
+
+        // connections：per_visitor 字典序两条，既有 per_endpoint/per_owner 空
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/connections")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        let per_visitor = body["per_visitor"].as_array().unwrap();
+        assert_eq!(per_visitor.len(), 2);
+        assert_eq!(per_visitor[0]["endpoint_id"], hex::encode(visitor_a));
+        assert_eq!(per_visitor[0]["connections"], 2);
+        assert_eq!(per_visitor[1]["endpoint_id"], hex::encode(visitor_b));
+        assert_eq!(per_visitor[1]["connections"], 1);
+        assert_eq!(body["per_endpoint"].as_array().unwrap().len(), 0);
+        assert_eq!(body["per_owner"].as_array().unwrap().len(), 0);
+
+        // 断连释放 → visitors_online 实时下降
+        gate.on_disconnect(visitor_a, 1);
+        let res = app
+            .oneshot(
+                Request::get("/admin/status")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(res).await;
+        assert_eq!(body["visitors_online"], 2);
     }
 
     #[test]
