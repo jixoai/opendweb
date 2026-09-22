@@ -21,11 +21,12 @@
 	import { toast } from "svelte-sonner";
 	import { validateHex64, shortHex } from "$lib/hex";
 	import { formatTime } from "$lib/format";
-	import { blockKindLabel, knockReasonLabel } from "$lib/terms";
+	import { aliasTargetKey, blockKindLabel, knockReasonLabel } from "$lib/terms";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
+	import AliasInlineEdit from "./AliasInlineEdit.svelte";
 
 	const open = $derived(cs.overviewData?.mode === "open");
 	const knocks = $derived(Array.isArray(cs.knocksData?.knocks) ? cs.knocksData!.knocks : []);
@@ -35,6 +36,14 @@
 	const blocklist = $derived(Array.isArray(cs.blocklistData?.blocklist) ? cs.blocklistData!.blocklist : []);
 	const blocklistLoading = $derived(cs.blocklistData === null && cs.blocklistError === null);
 	const action = $derived(cs.knockAction);
+	/** 正在编辑别名的行（编辑期间该行 HexValue 不再重复显示别名）。 */
+	const editingKey = $derived(cs.aliasEdit !== null ? aliasTargetKey(cs.aliasEdit) : null);
+	/** 清除别名确认的目标行（弹窗内双展示：别名 + 缩写）。 */
+	const clearVisitor = $derived(
+		cs.aliasClearConfirm?.kind === "visitor"
+			? visitors.find((v) => v.endpoint_id === cs.aliasClearConfirm?.endpointId) ?? null
+			: null,
+	);
 	const visitorEndpointOk = $derived(
 		validateHex64(cs.visitorForm.endpointId) !== null || cs.visitorForm.endpointId === "",
 	);
@@ -53,6 +62,12 @@
 				duration: 8_000,
 			});
 		});
+	}
+
+	/** 确认清除别名：PATCH {"alias":""}；成功 toast（失败走名册既有错误态）。 */
+	async function onConfirmClearAlias(): Promise<void> {
+		const res = await cs.confirmClearAlias();
+		if (res !== null && res.ok) toast.success("别名已清除");
 	}
 </script>
 
@@ -201,8 +216,18 @@
 						</Table.Header>
 						<Table.Body>
 							{#each visitors as v (v.endpoint_id)}
-								<Table.Row>
-									<Table.Cell><HexValue value={v.endpoint_id} alias={v.alias ?? null} kind="端点" /></Table.Cell>
+								<Table.Row class="group/row">
+									<Table.Cell>
+										<!-- 编辑期间 HexValue 只显示缩写（别名由行内输入承载，避免双呈现打架） -->
+										<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+											<HexValue
+												value={v.endpoint_id}
+												alias={editingKey === v.endpoint_id ? null : (v.alias ?? null)}
+												kind="端点"
+											/>
+											<AliasInlineEdit kind="visitor" endpointId={v.endpoint_id} current={v.alias ?? null} />
+										</div>
+									</Table.Cell>
 									<Table.Cell class="whitespace-nowrap text-muted-foreground">{formatTime(v.granted_at)}</Table.Cell>
 									<Table.Cell class="text-muted-foreground">
 										{typeof v.expires_at === "number" ? formatTime(v.expires_at) : "长期有效"}
@@ -462,6 +487,23 @@
 			移出后，这个{cs.blockConfirm?.kind === "fabric" ? "Fabric" : "端点"}
 			<span class="font-mono text-[13px]">({cs.blockConfirm ? shortHex(cs.blockConfirm.id) : ""})</span>
 			回到「敲门可见」状态，可重新走放行流程。
+		</p>
+	</ConfirmDialog>
+	<!-- 清除别名确认（空串保存=清除；PM §4.5 行内编辑——双展示铁则：别名 + 缩写） -->
+	<ConfirmDialog
+		open={cs.aliasClearConfirm !== null && cs.aliasClearConfirm.kind === "visitor"}
+		title="清除这个别名？"
+		confirmLabel="确认清除"
+		oncancel={() => cs.cancelClearAlias()}
+		onconfirm={() => void onConfirmClearAlias()}
+	>
+		<p class="text-foreground">
+			将清除访客 {clearVisitor != null && typeof clearVisitor.alias === "string" && clearVisitor.alias !== ""
+				? `「${clearVisitor.alias}」`
+				: ""}
+			的别名——此后该行只显示缩写
+			<span class="font-mono text-[13px]">({clearVisitor != null ? shortHex(clearVisitor.endpoint_id) : ""})</span>。
+			别名可以随时再设，身份以缩写为准。
 		</p>
 	</ConfirmDialog>
 </section>

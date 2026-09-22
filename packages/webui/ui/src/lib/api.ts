@@ -351,6 +351,8 @@ export interface CodeEntry {
   alias_hint?: string | null;
   revoked?: boolean;
   default_ttl_days?: number | null;
+  /** deny-set 命中（Phase 1c 运维投影：补写失败 fail-closed 的码暂时停兑；恢复后自动解除）。 */
+  denied?: boolean;
 }
 
 /** GET /api/codes → {codes:[…]}——列表只含哈希与计数，绝无码全文。 */
@@ -379,6 +381,31 @@ export function renewOwner(fabricId: string, root: string, body: { expires_in_da
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   }) as Promise<Receipt & { expires_at?: number }>;
+}
+
+/**
+ * PATCH /api/owners/{fabric_id}/{root}（元数据编辑：body alias/note 至少其一，
+ * **空串=清除**；上限 alias ≤ 32 / note ≤ 256 UTF-8 字节，越界 400）。
+ * 回执 op=owner-meta（0x0D，alias/note 为编辑后终值）——PM §4.5 别名行内编辑的承载面。
+ */
+export function patchOwnerMeta(fabricId: string, root: string, body: { alias?: string; note?: string }): Promise<Receipt> {
+  return jsonFetch(`/api/owners/${encodeURIComponent(fabricId)}/${encodeURIComponent(root)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }) as Promise<Receipt>;
+}
+
+/**
+ * PATCH /api/visitors/{endpoint_id}（访客元数据编辑，与 owner 同构；空串=清除）。
+ * 回执 op=visitor-meta（0x0E；fabric_id 维度置零，endpoint_id 承载身份）。
+ */
+export function patchVisitorMeta(endpointId: string, body: { alias?: string; note?: string }): Promise<Receipt> {
+  return jsonFetch(`/api/visitors/${encodeURIComponent(endpointId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }) as Promise<Receipt>;
 }
 
 export interface BlockEntry {

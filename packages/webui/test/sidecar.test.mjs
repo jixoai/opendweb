@@ -118,7 +118,7 @@ test("valid /api path proxies to /admin/* with Bearer injection", async (t) => {
   assert.equal(upstream.hits[0].headers.host, `127.0.0.1:${upstream.port}`);
 });
 
-test("method whitelist: PUT/HEAD on /api rejected 405, DELETE passes", async (t) => {
+test("method whitelist: PUT/HEAD on /api rejected 405, DELETE/PATCH pass", async (t) => {
   const upstream = await fakeUpstream({ handler: (req, res) => { res.writeHead(204); res.end(); } });
   t.after(() => upstream.close());
   const sc = await readySidecar(upstream);
@@ -129,6 +129,11 @@ test("method whitelist: PUT/HEAD on /api rejected 405, DELETE passes", async (t)
   assert.equal(del.status, 204);
   assert.equal(upstream.hits[0].url, "/admin/owners/aa/bb");
   assert.equal(upstream.hits[0].method, "DELETE");
+  // PATCH 透传（server-access-roles 1c：别名/备注元数据编辑路由 /admin/owners|visitors/*）
+  const patch = await request(sc.port, { method: "PATCH", path: "/api/visitors/cc" });
+  assert.equal(patch.status, 204);
+  assert.equal(upstream.hits[1].url, "/admin/visitors/cc");
+  assert.equal(upstream.hits[1].method, "PATCH");
 });
 
 test("POST body forwarded verbatim with content-type; query passthrough", async (t) => {

@@ -41,7 +41,7 @@ export const LIMITS = {
 };
 
 /** 代理方法白名单（非通用代理） */
-const API_METHODS = new Set(["GET", "POST", "DELETE"]);
+const API_METHODS = new Set(["GET", "POST", "DELETE", "PATCH"]);
 
 /** scheme 默认端口（maskTarget 端口省略规则；与 target.mjs 序列化一致） */
 const DEFAULT_PORTS = { http: 80, https: 443 };

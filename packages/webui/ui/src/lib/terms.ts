@@ -18,6 +18,8 @@ export const OP_LABEL: Record<string, string> = {
   "block-remove": "移出黑名单",
   "knock-dismiss": "忽略敲门",
   "knock-undismiss": "恢复待办",
+  "owner-meta": "编辑别名",
+  "visitor-meta": "编辑别名",
 };
 
 export interface ModeBadge {
@@ -89,6 +91,75 @@ export function codeStatus(
   const max = Number(entry.max_uses ?? 1);
   if (used >= max) return { status: "exhausted", label: "已用尽" };
   return { status: "available", label: "待使用" };
+}
+
+/** deny-set 运维投影徽章（Phase 1c；「暂不可兑」四态词风格——非第五态，与四态并列呈现）。 */
+export interface CodeDeniedBadge {
+  label: string;
+  title: string;
+}
+
+/**
+ * denied=true 的码加「暂不可兑（服务端故障保护）」徽章：补写失败 fail-closed
+ * 暂时停兑，恢复后自动解除（与吊销不同——无需重发）。不改变四态机
+ * （codeStatus 与本函数正交，denied+待使用是合法并存）。
+ */
+export function codeDeniedBadge(entry: { denied?: boolean | null }): CodeDeniedBadge | null {
+  if (entry.denied !== true) return null;
+  return {
+    label: "暂不可兑",
+    title: "暂不可兑（服务端故障保护）：这台服务器的台账补写出了故障，为防重复兑换暂时停用这张码；故障恢复后自动解除，无需吊销重发。",
+  };
+}
+
+// ---- 别名行内编辑（PM §4.5 流 E；server-access-roles Phase 1c PATCH 承载面） -----------
+
+/** 别名字节上限（与服务端 roles.rs ALIAS_MAX_BYTES 同源冻结：alias ≤ 32 UTF-8 字节）。 */
+export const ALIAS_MAX_BYTES = 32;
+
+/** UTF-8 字节长度（别名校验的唯一实现；一个汉字约占 3 字节）。 */
+export function aliasByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/** 输入实时校验：trim 后超 32 字节 → 报错文案；否则 null（null=可提交）。 */
+export function aliasEditError(value: string): string | null {
+  const n = aliasByteLength(value.trim());
+  if (n <= ALIAS_MAX_BYTES) return null;
+  return `别名最长 ${ALIAS_MAX_BYTES} 字节（当前 ${n} 字节）——一个汉字约占 3 字节，请缩短。`;
+}
+
+/** 别名编辑提交裁决（纯函数；store 消费，node --test 直测）。 */
+export type AliasEditDecision =
+  | { action: "error"; message: string }
+  | { action: "cancel" }
+  | { action: "confirm-clear" }
+  | { action: "save"; value: string };
+
+/**
+ * 提交语义（PM §4.5 + 1c 契约）：
+ * - error：trim 后超 32 字节（不发请求）；
+ * - cancel：与编辑前等值（含双方皆空白）——无网络请求，直接收起；
+ * - confirm-clear：清空已有别名——先二次确认，确认后 PATCH body `{"alias":""}`（空串=清除）；
+ * - save：常规保存（trim 后的新值）。
+ */
+export function aliasEditSubmit(raw: string, prev: string): AliasEditDecision {
+  const value = raw.trim();
+  const err = aliasEditError(value);
+  if (err !== null) return { action: "error", message: err };
+  if (value === prev.trim()) return { action: "cancel" };
+  if (value === "") return { action: "confirm-clear" };
+  return { action: "save", value };
+}
+
+/** 编辑目标的行标识（组件行匹配用：owner = `fabric/root` 二元组，visitor = endpoint_id）。 */
+export function aliasTargetKey(target: {
+  kind: "owner" | "visitor";
+  fabricId?: string;
+  root?: string;
+  endpointId?: string;
+}): string {
+  return target.kind === "owner" ? `${target.fabricId ?? ""}/${target.root ?? ""}` : (target.endpointId ?? "");
 }
 
 /**

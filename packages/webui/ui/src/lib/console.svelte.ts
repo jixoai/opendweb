@@ -32,6 +32,8 @@ import {
 	loadOwners,
 	loadStatus,
 	loadVisitors,
+	patchOwnerMeta,
+	patchVisitorMeta,
 	postConnect,
 	registerOwner,
 	renewOwner,
@@ -53,7 +55,7 @@ import {
 } from "./api";
 import { routeFor, canonicalHashFor, type Route } from "./route";
 import { validateHex64 } from "./hex";
-import type { DisconnectPhase } from "./terms";
+import { aliasEditError, aliasEditSubmit, type DisconnectPhase } from "./terms";
 
 export const POLL_MS = 5_000;
 export const CONVERGE_POLL_MS = 1_000;
@@ -117,6 +119,15 @@ export interface NodeConfirm {
 	kind: "switch" | "delete";
 	node: SidecarNode;
 }
+/** 别名行内编辑目标（一次至多一个；owner 以二元组定位，visitor 以端点定位）。 */
+export type AliasEditTarget =
+	| { kind: "owner"; fabricId: string; root: string }
+	| { kind: "visitor"; endpointId: string };
+/** 编辑会话：prev=编辑前别名（trim 后），value=当前输入。 */
+export interface AliasEdit extends AliasEditTarget {
+	prev: string;
+	value: string;
+}
 export interface AddNodeForm {
 	server: string;
 	token: string;
@@ -159,6 +170,14 @@ class ConsoleStore {
 	ownerConfirm = $state<OwnerConfirm | null>(null);
 	renewConfirm = $state<RenewConfirm | null>(null);
 	renewBusy = $state(false);
+
+	// ---- 别名行内编辑（PM §4.5 流 E；PATCH owner-meta/visitor-meta 承载） --------------
+
+	aliasEdit = $state<AliasEdit | null>(null);
+	aliasEditError = $state<string | null>(null);
+	aliasBusy = $state(false);
+	/** 空串清除的二次确认（挂起的清除提交；确认后 PATCH body {"alias":""}）。 */
+	aliasClearConfirm = $state<AliasEdit | null>(null);
 
 	// ---- 敲门台 / 访客 / 黑名单 ---------------------------------------------------
 
@@ -497,6 +516,84 @@ class ConsoleStore {
 			this.ownersError = e as AdminError;
 		} finally {
 			this.renewBusy = false;
+		}
+	}
+
+	// ---- 别名行内编辑（PM §4.5 流 E：hover 入口 → 行内输入 → 保存即 PATCH） ---------
+
+	beginAliasEdit(target: AliasEditTarget, current: string | null | undefined): void {
+		const prev = typeof current === "string" ? current.trim() : "";
+		this.aliasEdit = { ...target, prev, value: prev };
+		this.aliasEditError = null;
+	}
+
+	onAliasEditInput(value: string): void {
+		if (this.aliasEdit === null) return;
+		this.aliasEdit = { ...this.aliasEdit, value };
+		this.aliasEditError = aliasEditError(value); // 实时校验（trim 后计字节）
+	}
+
+	cancelAliasEdit(): void {
+		this.aliasEdit = null;
+		this.aliasEditError = null;
+	}
+
+	/**
+	 * 提交：裁决在纯函数 aliasEditSubmit（node --test 直测）——save→PATCH；
+	 * confirm-clear→挂 aliasClearConfirm 二次确认；cancel/error 不发请求。
+	 * 返回 {ok} 供组件 toast；null=无需反馈（确认框接管/无变化收起）。
+	 */
+	async submitAliasEdit(): Promise<{ ok: boolean } | null> {
+		const edit = this.aliasEdit;
+		if (edit === null) return null;
+		const decision = aliasEditSubmit(edit.value, edit.prev);
+		if (decision.action === "error") {
+			this.aliasEditError = decision.message;
+			return { ok: false };
+		}
+		if (decision.action === "cancel") {
+			this.cancelAliasEdit();
+			return null;
+		}
+		if (decision.action === "confirm-clear") {
+			this.aliasClearConfirm = edit;
+			return null;
+		}
+		return await this.#patchAlias(edit, decision.value);
+	}
+
+	cancelClearAlias(): void {
+		this.aliasClearConfirm = null;
+	}
+
+	/** 确认清除别名：PATCH body `{"alias":""}`（空串=清除）。 */
+	async confirmClearAlias(): Promise<{ ok: boolean } | null> {
+		const edit = this.aliasClearConfirm;
+		this.aliasClearConfirm = null;
+		if (edit === null) return null;
+		return await this.#patchAlias(edit, "");
+	}
+
+	async #patchAlias(edit: AliasEdit, alias: string): Promise<{ ok: boolean }> {
+		this.aliasBusy = true;
+		try {
+			this.receipt =
+				edit.kind === "owner"
+					? await patchOwnerMeta(edit.fabricId, edit.root, { alias })
+					: await patchVisitorMeta(edit.endpointId, { alias });
+			// 别名是名册呈现元数据——刷新对应名册即可（总览计数不受别名影响）
+			if (edit.kind === "owner") await this.refreshOwners();
+			else await this.refreshVisitors();
+			this.aliasEdit = null;
+			this.aliasEditError = null;
+			return { ok: true };
+		} catch (e) {
+			// 失败走既有错误态（名册 ErrorBanner）；编辑态保留以便修正后重试
+			if (edit.kind === "owner") this.ownersError = e as AdminError;
+			else this.visitorsError = e as AdminError;
+			return { ok: false };
+		} finally {
+			this.aliasBusy = false;
 		}
 	}
 
@@ -868,6 +965,9 @@ class ConsoleStore {
 		this.receipt = null;
 		this.disconnect = null;
 		this.knockAction = null;
+		this.aliasEdit = null;
+		this.aliasEditError = null;
+		this.aliasClearConfirm = null;
 		this.onlineFilter = null;
 		this.ownerForm = { fabricId: "", root: "" };
 		this.visitorForm = { endpointId: "", alias: "" };

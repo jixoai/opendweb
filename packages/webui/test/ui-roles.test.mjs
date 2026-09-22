@@ -26,6 +26,8 @@ import {
 	loadCodes,
 	loadKnocks,
 	loadVisitors,
+	patchOwnerMeta,
+	patchVisitorMeta,
 	registerOwner,
 	renewOwner,
 	revokeCode,
@@ -40,7 +42,17 @@ import {
 	setApiFetch,
 } from "../ui/src/lib/api.ts";
 import { fmtDate, groupInviteCode, leaseState } from "../ui/src/lib/format.ts";
-import { codeStatus, knockReasonLabel, multiRootFabrics, maskNodeUrl } from "../ui/src/lib/terms.ts";
+import {
+	aliasByteLength,
+	aliasEditError,
+	aliasEditSubmit,
+	aliasTargetKey,
+	codeDeniedBadge,
+	codeStatus,
+	knockReasonLabel,
+	maskNodeUrl,
+	multiRootFabrics,
+} from "../ui/src/lib/terms.ts";
 
 test.afterEach(() => resetApiFetch());
 
@@ -217,15 +229,18 @@ test("path contract: every business call goes through /api/* only", async () => 
 		registerOwner(fabric, root),
 		renewOwner(fabric, root, { expires_in_days: 30 }),
 		renewOwner(fabric, root, { permanent: true }),
+		patchOwnerMeta(fabric, root, { alias: "李四团队" }),
+		patchOwnerMeta(fabric, root, { alias: "" }), // 空串=清除别名
+		patchVisitorMeta(endpoint, { alias: "张三的设备" }),
 		loadBlocklist(),
 		addBlocklist({ kind: "endpoint", id: endpoint }),
 		removeBlocklist("endpoint", endpoint),
 	]);
-	// 业务面：全部 /api/* 且方法属白名单 GET/POST/DELETE
-	assert.ok(paths.length >= 16);
+	// 业务面：全部 /api/* 且方法属白名单 GET/POST/DELETE/PATCH（PATCH 为 1c 元数据编辑增量）
+	assert.ok(paths.length >= 19);
 	for (const p of paths) {
 		assert.ok(p.path.startsWith("/api/"), `business path must be /api/*: ${p.path}`);
-		assert.ok(["GET", "POST", "DELETE"].includes(p.method), `method whitelist: ${p.method}`);
+		assert.ok(["GET", "POST", "DELETE", "PATCH"].includes(p.method), `method whitelist: ${p.method}`);
 	}
 	const expected = [
 		"/api/knocks",
@@ -235,12 +250,14 @@ test("path contract: every business call goes through /api/* only", async () => 
 		"/api/visitors",
 		"/api/visitors/from-knock",
 		`/api/visitors/${endpoint}`,
+		`/api/visitors/${endpoint}`, // PATCH 元数据（与 DELETE 同路径、方法不同）
 		"/api/codes",
 		"/api/codes",
 		`/api/codes/${hash}`,
 		"/api/owners",
 		`/api/owners/${fabric}/${root}/renew`,
 		`/api/owners/${fabric}/${root}/renew`,
+		`/api/owners/${fabric}/${root}`, // PATCH 元数据
 		"/api/blocklist",
 		"/api/blocklist",
 		`/api/blocklist/endpoint/${endpoint}`,
@@ -303,4 +320,106 @@ test("apiFetch matrix: knock/code errors flow through the injectable layer uncha
 	});
 	const network = await rejected(loadVisitors());
 	assert.equal(network.code, "network");
+});
+
+// ---- 别名行内编辑（Phase 1c 接线：PM §4.5 流 E → PATCH owner-meta/visitor-meta） -------
+
+test("aliasByteLength/aliasEditError: UTF-8 byte counting with the frozen 32-byte cap", () => {
+	assert.equal(aliasByteLength(""), 0);
+	assert.equal(aliasByteLength("abcd"), 4);
+	assert.equal(aliasByteLength("李四团队"), 12); // 汉字 3 字节 × 4
+	assert.equal(aliasEditError("a".repeat(32)), null); // 32 字节恰好合法
+	assert.equal(aliasEditError("李".repeat(10)), null); // 30 字节合法
+	assert.equal(aliasEditError("a".repeat(33)) !== null, true); // 33 字节超限
+	assert.equal(aliasEditError("李".repeat(11)) !== null, true); // 33 字节（混合文字同理）
+	assert.match(aliasEditError("李".repeat(11)), /32 字节（当前 33 字节）/);
+	assert.equal(aliasEditError("  "), null); // 首尾空白剥除后计字节（内部 trim）
+});
+
+test("aliasEditSubmit: trim-then-save; unchanged=no-op; clearing an existing alias asks first", () => {
+	// 常规保存：首尾空白剥除后提交
+	assert.deepEqual(aliasEditSubmit("  李四团队  ", ""), { action: "save", value: "李四团队" });
+	assert.deepEqual(aliasEditSubmit("张三团队", "李四"), { action: "save", value: "张三团队" });
+	assert.deepEqual(aliasEditSubmit("a".repeat(32), ""), { action: "save", value: "a".repeat(32) });
+	// 与编辑前等值（含双方皆空白）＝无操作，不发请求
+	assert.deepEqual(aliasEditSubmit(" 李四 ", "李四"), { action: "cancel" });
+	assert.deepEqual(aliasEditSubmit("", ""), { action: "cancel" });
+	assert.deepEqual(aliasEditSubmit("   ", "  "), { action: "cancel" });
+	// 清空已有别名＝先二次确认，确认后 PATCH body {"alias":""}（空串=清除）
+	assert.deepEqual(aliasEditSubmit("", "李四"), { action: "confirm-clear" });
+	assert.deepEqual(aliasEditSubmit("   ", "李四"), { action: "confirm-clear" });
+	// 超限＝错误裁决（消息透传给行内错误提示），不发请求
+	assert.equal(aliasEditSubmit("a".repeat(33), "").action, "error");
+});
+
+test("aliasTargetKey: row matching key (owner=fabric/root pair, visitor=endpoint)", () => {
+	assert.equal(aliasTargetKey({ kind: "owner", fabricId: "aa", root: "bb" }), "aa/bb");
+	assert.equal(aliasTargetKey({ kind: "visitor", endpointId: "cc" }), "cc");
+});
+
+test("alias PATCH wiring: owner/visitor meta via /api/* with JSON body; empty alias string clears", async () => {
+	const calls = [];
+	setApiFetch(async (path, init) => {
+		calls.push({ path, method: init?.method ?? "GET", body: init?.body ?? null });
+		return new Response(JSON.stringify({ op: "owner-meta", ts: 1, generation: 2, receipt_sig: "x" }), { status: 200 });
+	});
+	const fabric = "11".repeat(32);
+	const root = "22".repeat(32);
+	const endpoint = "33".repeat(32);
+	await patchOwnerMeta(fabric, root, { alias: "李四团队" });
+	await patchOwnerMeta(fabric, root, { alias: "" }); // 清除
+	await patchVisitorMeta(endpoint, { alias: "张三的设备" });
+	assert.deepEqual(
+		calls.map((c) => `${c.method} ${c.path}`),
+		[
+			`PATCH /api/owners/${fabric}/${root}`,
+			`PATCH /api/owners/${fabric}/${root}`,
+			`PATCH /api/visitors/${endpoint}`,
+		],
+	);
+	assert.deepEqual(
+		calls.map((c) => JSON.parse(c.body)),
+		[{ alias: "李四团队" }, { alias: "" }, { alias: "张三的设备" }],
+	);
+});
+
+test("alias PATCH failure: envelope error normalizes to AdminError (existing error-state path)", async () => {
+	const rejected = (p) =>
+		p.then(
+			() => {
+				throw new Error("expected rejection");
+			},
+			(e) => e,
+		);
+	// 超限 400 invalid-request（服务端 roles.rs ALIAS_MAX_BYTES 同源校验）
+	setApiFetch(async () => new Response(JSON.stringify({ error: { code: "invalid-request", message: "alias too long" } }), { status: 400 }));
+	const tooLong = await rejected(patchVisitorMeta("33".repeat(32), { alias: "x".repeat(33) }));
+	assert.ok(tooLong instanceof AdminError);
+	assert.equal(tooLong.code, "invalid-request");
+	assert.equal(tooLong.status, 400);
+	// 目标不在名册 404 no-match（与 disconnect/knock 判定一致的既有语义）
+	setApiFetch(async () => new Response(JSON.stringify({ error: { code: "no-match", message: "x" } }), { status: 404 }));
+	const noMatch = await rejected(patchOwnerMeta("11".repeat(32), "22".repeat(32), { alias: "" }));
+	assert.equal(noMatch.code, "no-match");
+	assert.equal(noMatch.status, 404);
+});
+
+// ---- 邀请码 denied 投影（Phase 1c：deny-set 运维徽章，与四态并列不占位） ------------------
+
+test("codeDeniedBadge: deny-set ops projection renders 「暂不可兑」 without touching the four states", () => {
+	assert.equal(codeDeniedBadge({ denied: false }), null);
+	assert.equal(codeDeniedBadge({}), null); // 旧服务端无此字段＝无徽章（未知字段忽略）
+	assert.equal(codeDeniedBadge({ denied: null }), null);
+	const badge = codeDeniedBadge({ denied: true });
+	assert.equal(badge.label, "暂不可兑");
+	assert.ok(badge.title.includes("服务端故障保护"));
+	// 四态机与 denied 正交：denied+可用仍是「待使用」（徽章并列呈现由组件承担）
+	assert.deepEqual(codeStatus({ used_count: 0, max_uses: 1, expires_at: Date.now() + 1_000, denied: true }), {
+		status: "available",
+		label: "待使用",
+	});
+	assert.deepEqual(codeStatus({ used_count: 1, max_uses: 1, expires_at: Date.now() + 1_000, revoked: true, denied: true }), {
+		status: "revoked",
+		label: "已吊销",
+	});
 });

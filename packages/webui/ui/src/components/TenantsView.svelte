@@ -16,12 +16,13 @@
 	import { toast } from "svelte-sonner";
 	import { validateHex64, shortHex } from "$lib/hex";
 	import { fmtDate, formatTime, groupInviteCode, leaseState } from "$lib/format";
-	import { codeStatus, multiRootFabrics } from "$lib/terms";
+	import { codeDeniedBadge, codeStatus, multiRootFabrics } from "$lib/terms";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
 	import ReceiptCard from "./ReceiptCard.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
+	import AliasInlineEdit from "./AliasInlineEdit.svelte";
 
 	const owners = $derived(Array.isArray(cs.ownersData?.owners) ? cs.ownersData!.owners : []);
 	const loading = $derived(cs.ownersData === null && cs.ownersError === null);
@@ -51,6 +52,16 @@
 		return `次数 ${ic.maxUses} 次 · ${ic.expiresInDays} 天内有效（今天 ${zhDay(today)}签发，${zhDay(expiry)}过期）`;
 	});
 
+	/** 清除别名确认的目标行（空串提交=清除；弹窗内双展示：别名 + 缩写）。 */
+	const clearOwner = $derived(
+		cs.aliasClearConfirm?.kind === "owner"
+			? owners.find(
+					(o) =>
+						o.fabric_id === cs.aliasClearConfirm?.fabricId && o.root === cs.aliasClearConfirm?.root,
+				) ?? null
+			: null,
+	);
+
 	async function register(e: SubmitEvent): Promise<void> {
 		e.preventDefault();
 		await cs.submitRegister();
@@ -65,6 +76,12 @@
 	async function copyCode(code: string): Promise<void> {
 		const ok = await cs.copyText(code);
 		if (ok) toast.success("已复制邀请码全文");
+	}
+
+	/** 确认清除别名：PATCH {"alias":""}；成功 toast（失败走名册既有错误态）。 */
+	async function onConfirmClearAlias(): Promise<void> {
+		const res = await cs.confirmClearAlias();
+		if (res !== null && res.ok) toast.success("别名已清除");
 	}
 
 	function leaseBadgeClass(state: string): string {
@@ -135,14 +152,10 @@
 						<Table.Body>
 							{#each owners as o (o.fabric_id + o.root)}
 								{@const lease = leaseState(typeof o.expires_at === "number" ? o.expires_at : null)}
-								<Table.Row>
+								<Table.Row class="group/row">
 									<Table.Cell>
 										<div class="flex flex-col gap-1">
-											<span class="text-sm">
-												{#if typeof o.alias === "string" && o.alias !== ""}
-													<span class="font-medium">{o.alias}</span>
-												{/if}
-											</span>
+											<AliasInlineEdit kind="owner" fabricId={o.fabric_id} root={o.root} current={o.alias ?? null} />
 											<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
 												<span class="text-xs text-muted-foreground">
 													Fabric <span class="font-mono text-[13px] text-foreground" title={o.fabric_id}>{shortHex(o.fabric_id)}</span>
@@ -377,21 +390,34 @@
 					<Table.Body>
 						{#each codes as c (c.code_hash)}
 							{@const status = codeStatus(c)}
-							<Table.Row>
+							{@const denied = codeDeniedBadge(c)}
+							<Table.Row data-code={c.code_hash}>
 								<Table.Cell><HexValue value={c.code_hash} kind="码指纹" /></Table.Cell>
 								<Table.Cell class="text-muted-foreground">{c.alias_hint ?? "-"}</Table.Cell>
 								<Table.Cell class="text-right font-mono tabular-nums">{c.used_count} / {c.max_uses}</Table.Cell>
 								<Table.Cell>
-									<Badge
-										variant="outline"
-										class={status.status === "available"
-											? "border-success/30 bg-success/10 text-success"
-											: status.status === "revoked"
-												? "border-destructive/30 bg-destructive/10 text-destructive"
-												: "border-border bg-muted/50 text-muted-foreground"}
-									>
-										{status.label}
-									</Badge>
+									<!-- denied=deny-set 运维投影（与四态并列的非状态徽章；恢复自动解除，非吊销） -->
+									<div class="flex flex-wrap items-center gap-1.5">
+										<Badge
+											variant="outline"
+											class={status.status === "available"
+												? "border-success/30 bg-success/10 text-success"
+												: status.status === "revoked"
+													? "border-destructive/30 bg-destructive/10 text-destructive"
+													: "border-border bg-muted/50 text-muted-foreground"}
+										>
+											{status.label}
+										</Badge>
+										{#if denied !== null}
+											<Badge
+												variant="outline"
+												class="border-warning/40 bg-warning/10 text-warning"
+												title={denied.title}
+											>
+												{denied.label}
+											</Badge>
+										{/if}
+									</div>
 								</Table.Cell>
 								<Table.Cell class="whitespace-nowrap text-muted-foreground">{fmtDate(c.expires_at)}</Table.Cell>
 								<Table.Cell>
@@ -532,4 +558,21 @@
 			</Dialog.Footer>
 		</Dialog.Content>
 	</Dialog.Root>
+	<!-- 清除别名确认（空串保存=清除；PM §4.5 行内编辑——双展示铁则：别名 + 缩写） -->
+	<ConfirmDialog
+		open={cs.aliasClearConfirm !== null && cs.aliasClearConfirm.kind === "owner"}
+		title="清除这个别名？"
+		confirmLabel="确认清除"
+		oncancel={() => cs.cancelClearAlias()}
+		onconfirm={() => void onConfirmClearAlias()}
+	>
+		<p class="text-foreground">
+			将清除租户 {clearOwner != null && typeof clearOwner.alias === "string" && clearOwner.alias !== ""
+				? `「${clearOwner.alias}」`
+				: ""}
+			的别名——此后该行只显示缩写
+			<span class="font-mono text-[13px]">({clearOwner != null ? shortHex(clearOwner.root) : ""})</span>。
+			别名可以随时再设，身份以缩写为准。
+		</p>
+	</ConfirmDialog>
 </section>
