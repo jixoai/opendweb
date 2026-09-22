@@ -62,6 +62,8 @@
 
 ## 契约影响
 
-- server admin API：**新增两个路由**（纯增量；既有路由零变化）。
-- client-sdk exports map：新增 `./admin`、`./token` 两个 subpath（semver
-  minor；`./` 与 `./net*` 不变）。
+- server admin API：**新增两个路由**；既有路由的路径/方法/成功 wire 不变，
+  错误 body 由单字符串迁移为 envelope（**有意的 minor wire change**，旧消费
+  者只看 status code）。
+- client-sdk exports map：新增 `./admin`、`./token` 两个**纯 ESM** subpath
+  （`.mjs`+`.d.mts`；semver minor；`./` 与 `./net*` 等既有 CJS 入口不变）。

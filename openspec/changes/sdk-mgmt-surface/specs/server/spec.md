@@ -26,7 +26,7 @@
 
 **错误面契约**：管理面业务错误响应 MUST 携带稳定 JSON envelope `{"error":{"code":"<machine-readable>","message":"<human>"}}`（Content-Type application/json）。「未挂载」（未配置 token 的 axum 默认 404，空 body）与「业务未命中」（404 + envelope `no-match`）的判别 MUST NOT 依赖空 body 嗅探作为唯一信号——客户端以专用 `GET /admin/status` 探测判定未挂载（404 = 未启用；200 = 已挂载）。
 
-**回执契约**（版本化冻结，与既有 register/unregister 同构）：变更类操作（register/unregister/disconnect）SHALL 返回服务端 `server.key`（Ed25519）签名的回执。canonical 载荷统一为 `b"dweb/admin-receipt/v1\0" || op u8 || fabric_id 32B || target 32B || ts_ms u64BE || generation u64BE`（op：register=0x01 / unregister=0x02 / disconnect=0x03；register/unregister 的 target = root EndpointId；disconnect 的 target = 被断开的 endpoint EndpointId——**每个被断端点一张回执**，实现 per-target 审计）。HTTP JSON 形态（snake_case，与既有 Receipt 一致）：`{ "op": "disconnect", "fabric_id": "<64hex>", "endpoint_id": "<64hex>", "ts": 1789…, "generation": 4, "receipt_sig": "<base64url-nopad 64B>" }`（register/unregister 沿用既有字段 `root` 与顶层形态，不变）。回执是审计辅助而非授权凭证。
+**回执契约**（版本化冻结，与既有 register/unregister 同构）：变更类操作（register/unregister/disconnect）SHALL 返回服务端 `server.key`（Ed25519）签名的回执。canonical 载荷统一为 `b"dweb/admin-receipt/v1\0" || op u8 || fabric_id 32B || target 32B || ts_ms u64BE || generation u64BE`（op：register=0x01 / unregister=0x02 / disconnect=0x03；register/unregister 的 target = root EndpointId；disconnect 的 target = 被断开的 endpoint EndpointId——**每个被断端点一张回执**，实现 per-target 审计）。disconnect 的快照规则 MUST 冻结为：判定取**单次在线表快照**；按 endpoint_id 请求命中该快照中唯一条目（无条目 = 404 no-match）；按 fabric_id 请求按 endpoint_id 字典序展开该 owner 全部在线条目；每张回执的 fabric_id 取自快照条目，ts 与 generation 为全请求共享（单一动作时刻与 registry 世代）；open 模式或 relay 未启用的空报告响应中 receipts MUST 为空数组。HTTP JSON 形态（snake_case，与既有 Receipt 一致）：`{ "op": "disconnect", "fabric_id": "<64hex>", "endpoint_id": "<64hex>", "ts": 1789…, "generation": 4, "receipt_sig": "<base64url-nopad 64B>" }`（register/unregister 沿用既有字段 `root` 与顶层形态，不变）。回执是审计辅助而非授权凭证。**错误 body 版本化变更**：既有 401/400 单字符串错误 body 统一迁移为 envelope `{"error":{"code","message"}}`（有意的 minor wire change；旧消费者只看 status code）。
 
 #### Scenario: 未配置 token 时管理面零暴露
 
@@ -57,6 +57,16 @@
 
 - **WHEN** `POST /admin/connections/disconnect` 指定一个有在线连接的 endpoint_id
 - **THEN** 响应报告该端点的连接数并附 per-target 回执（op/endpoint_id/ts/generation/receipt_sig）；随后以有界轮询（如 ≤5s）观测 `GET /admin/connections`，该端点的连接计数收敛消失
+
+#### Scenario: 按 fabric 断连多端点的确定性展开
+
+- **WHEN** 某 fabric 有两个在线 endpoint，`POST /admin/connections/disconnect` 指定该 fabric_id
+- **THEN** disconnected 与 receipts 均按 endpoint_id 字典序展开；两张回执的 fabric_id 各取自快照条目、ts 与 generation 相同
+
+#### Scenario: 空报告的 receipts 语义
+
+- **WHEN** relay 未启用或 open 模式下调用 disconnect
+- **THEN** 返回 200，disconnected 与 receipts 均为空数组
 
 #### Scenario: 断连目标未命中
 

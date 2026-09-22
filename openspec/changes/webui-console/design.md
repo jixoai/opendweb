@@ -72,20 +72,35 @@ index.html（hash 路由）；`Cache-Control: no-store`。
 - 仅绝对 `http://`/`https://`（`new URL` 解析失败即拒）。
 - 路径段拒绝 `..`/编码斜杠（`%2f`）/反斜杠；端口显式任意（admin 常驻非标
   端口），无端口默认 80/443。
-- `http` scheme：hostname 为 `localhost` 或字面 loopback IP 直接放行；否则
-  DNS 解析**所有** A/AAAA 记录须全部为 loopback 才放行——非 loopback 结果
-  即拒（未设 `--allow-insecure` 时）。**连接按解析后的 IP 建立并显式设置
-  Host header / SNI**（解析一次缓存，防 TOCTOU rebinding）。
+- `http` scheme：hostname 为 `localhost` 或字面 loopback IP（`127.0.0.0/8`、
+  `::1`、IPv4-mapped `::ffff:127.0.0.0/104`）直接放行；否则 DNS 解析**所有**
+  A/AAAA 记录须全部为 loopback 才放行（`localhost` 字面量也走一次全记录
+  校验，解析异常按非 loopback 拒）——非 loopback 结果即拒（未设
+  `--allow-insecure` 时）。hostname 尾点剥除后判定；IPv6 zone-id 拒绝；
+  无显式端口默认 80/443 并按此序列化进 Host header。**连接按解析后的 IP
+  建立并显式设置 Host header / SNI**（解析一次缓存，防 TOCTOU rebinding）。
 - `https` scheme：不做 IP 限制（公网正常形态）；连接同样按解析 IP + SNI。
 - `--allow-insecure` 仅放宽「http 非 loopback」的传输加密判断；目标/路径
   校验恒全量执行。
-- 不跟随重定向（3xx 按原状态透传给 UI 呈现）；不读 env 代理（node fetch
-  默认不读——文档化此依赖）。
+- 不跟随重定向（3xx 按原状态透传给 UI 呈现）；不读 env 代理。
+- **连接实现冻结（r2-P1-4）**：代理路径不用全局 fetch，用标准库
+  `node:http`/`node:https` 的 `request()`——`options.host = 解析缓存 IP`、
+  `options.servername = 原 hostname`（TLS SNI）、`headers.host = 原序列化
+  host[:port]`（IPv6 字面量 bracket 序列化）；**逐请求新建连接**（无连接
+  池生命周期问题），响应结束/abort 即 destroy socket。DNS 变更重解析仅随
+  目标重设（冻结语义），请求内不复解析。
+- **代理资源界（r2-P2-3）**：上游响应 body 上限 1 MiB（超限 abort + 502
+  `upstream-too-large`）；上游响应头白名单透传（content-type/ etag 类 +
+  状态码），其余剥除；请求 body 上限 64 KiB。
 
 ### 2.4 /api/* 代理面（r0 语义 + 修正）
 
-- 路径重写 `/api/x` → `/admin/x`；方法白名单 GET/POST/DELETE；`/admin/`
-  前缀外一律 404。
+- 路径重写 `/api/x` → `/admin/x`；方法白名单 GET/POST/DELETE。**入站
+  raw path 先过独立解析函数（r2-P1-7）**：拒绝任何路径段含 `.`/`..`、
+  percent-encoded 的 `.`/`/`/`\`、反斜杠、空段与重复斜杠；解析出单层
+  admin 相对路径后拼接，并**再次断言最终远端 pathname 以 `/admin/` 开头**
+  ——双保险防规范化差异把带 Bearer 的请求送出白名单。任一校验失败 = 404，
+  且 MUST NOT 发出上游请求（单测以假上游断言零出站）。
 - Bearer 注入（ready 态）；setup 态一律 503 `no-target`。
 - 超时 10s；透传 JSON body 与 status；剥 hop-by-hop 头。**body 原样透传
   不重写**（错误 envelope 语义由远端负责，sidecar 不解释）。
@@ -113,7 +128,10 @@ export default {
   （plugin-contract.mjs:113 实测形态——r0 草案的 `run(args)` 写法有误，已修）。
 - URL 格式/端口范围/互斥等校验在 cli.mjs 自担（契约不扩展 secret/format
   等 schema 能力）；`--token` 的可见性提示放命令 description 尾注（ASCII），
-  help 渲染器原样呈现。
+  help 渲染器原样呈现——**告警文案为冻结 fixture（r2-P1-5）**，help golden
+  测试钉住；CLI parser 矩阵测试覆盖 `--token value` / `--token=value` /
+  boolean `--allow-insecure=false` 形态；token 值 MUST NOT 进入 log 输出与
+  任何错误字符串（测试断言）。
 - `npx opendweb-webui` 同入口（bin → cli.mjs）。
 
 ## 4. SPA 信息架构
@@ -127,6 +145,10 @@ export default {
   重启换 token——目标冻结使然，UI 明示重启路径）；回执展示（op/ts/
   generation/签名前 16 hex + 复制全文）；断连二次确认（收敛语义：提交后
   有界轮询观测收敛，UI 呈现「已下发/收敛中」两态）。
+- **失败态可测（r2-P2-4）**：SPA 的 API 访问收敛为单一可注入 `apiFetch`
+  抽象层——单测注入 error fixture（not-enabled/unauthorized/http-502/
+  network/timeout/断连未命中）断言各视图呈现（无错误风暴、重启提示可见），
+  不依赖真实 server。
 
 ## 5. 安全模型汇总（r1 修订版）
 
@@ -152,7 +174,7 @@ export default {
 | sidecar 单测 | 配对面三重防线（无码/错码/坏 Origin/坏 Host/连败销毁/成功冻结/再提交 target-frozen）、/api 白名单越界 404、setup 态 503、日志无 token、hop-by-hop 剥除 |
 | plugin 契约 | manifest 过 PluginManifestSchema、--help 零执行 + token 提示文案 |
 | e2e | 真 restricted server → --server 启动 → /api/status 透传 → 注册/断连全流程（fetch 驱动）；setup 流程（起 sidecar → 模拟浏览器带码 connect → 冻结 → 业务通） |
-| UI | 构建产物冒烟 + Owner 视觉走查（验收证据） |
+| UI | 构建产物冒烟 + **apiFetch 注入失败态矩阵**（r2-P2-4）+ Owner 视觉走查（验收证据） |
 
 ## 7. 分期（r1 修订）
 
@@ -173,3 +195,14 @@ export default {
 | P1-7 契约承载 | 不扩展契约；run envelope 修正为既定形态；校验自担（§3） |
 | P1-8 Phase B 拆出 | webui-owner-console 独立 change（§7） |
 | P2-2 缺省 --server | setup 模式 + 503 no-target（§2.2；spec 场景钉住） |
+
+### r2 增补处置
+
+| 项 | 处置 |
+|---|---|
+| r2-P1-4 连接接口 | stdlib http/https.request 冻结（IP+SNI+Host 序列化、逐请求连接）（§2.3） |
+| r2-P1-5 help/parser | 告警文案 fixture + help golden + parser 矩阵 + token 不入 log（§3） |
+| r2-P1-7 入站路径 | 独立解析函数 + 拼接后二次 /admin/ 断言 + 零出站测试（§2.4） |
+| r2-P2-1 解析边界 | localhost 全记录校验/IPv4-mapped/zone-id/尾点/默认端口序列化（§2.3） |
+| r2-P2-3 代理资源界 | body 1MiB/64KiB 上限 + 响应头白名单 + abort 回收（§2.3） |
+| r2-P2-4 UI 失败态 | apiFetch 注入层 + 失败态矩阵单测（§4） |
