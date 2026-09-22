@@ -68,8 +68,9 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   签名验证前的 ACL 拒绝同样无已验身份）**不入 endpoint 台账**，仅
   结构化 debug 日志（防伪造污染/诱导授权攻击）。
 - KnockAgg：`{endpoint_id, seq, first_at, last_at, count, last_reason,
-  dismissed: bool}`——seq 进程内单调序号（last_at 相同的排序
-  tie-break）；count u64 饱和递增（r1-P2-2）。
+  dismissed: bool}`——**seq 为唯一排序键**（endpoint_id 仅作同 seq
+  的最终 tie-break；last_at 仅展示，不参与排序/逐出）；count u64
+  饱和递增（r1-P2-2）。
 - 挂点：仅 `relay.rs:135-138` Deny 臂（顺带补一条 deny debug log）。
 - 排除项：`dweb/blocked` 不记敲门（已被处置，不是待办）；
   `dweb/owner-expired` 记为租户到期提醒类别。
@@ -102,9 +103,10 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   `sig = root_key.sign(b"dweb/register/v1\0" || code || fabric_id ||
   root || ts u64BE)`（**与 spec 冻结一致：被签载荷含 root**——验签键
   即 body.root，载荷与验签键同源才构成完整 PoP；**PoP 防 O-4 冒名**：
-  fabric_id 无持有证明的攻击面被 root 签名关死；ts 窗口 ±120s 防重放）。校验链：限流 → 码有效（哈希命中/未吊销/
-  used<max/expires 未过）→ PoP 验签（root 由 fabric 的 genesis 推导？
-  否——root 即公钥本身，验 sig 用 body.root）→ **fabric_id 一致性**：
+  fabric_id 无持有证明的攻击面被 root 签名关死；ts 窗口 ±120s 防重放）。
+  校验链（与 spec 一致）：限流 → 形状 → ts±120s → **PoP 验签**（回
+  放路径同样先验签）→ 幂等命中（durable 回放/pending 补写，均不刷
+  新租期）→ 码状态 → 新兑换（root 即公钥本身，验 sig 用 body.root）→ **fabric_id 一致性**：
   body.fabric_id 与 root 的关系不校验（root 自由声明是新 fabric 的
   genesis root——首次注册无第三方可证；PoP 保证的是"root 密钥持有者
   本人请求"，冒名注册他人已存在的 (fabric_id, root) 需要他人 root 私钥
@@ -132,16 +134,17 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   via_code_hash 且无匹配 consume 的 register 事件，自动补齐缺失的
   consume 事件（完成提交；generation 相应递增）——崩溃窗口的结果
   恒为「完整兑换」或「码完好」，**不存在烧码无租户**。② 失败（进程
-  存活）=500 且内存挂起补写：同码重试幂等完成（register 续期 +
-  consume 补写）。回执 generation=**owners 世代**（r2-P1-5，客户端
+  存活）=500 且内存挂起补写：同键重试=幂等完成（按首次已持久化
+  register 结果补写 consume，不刷新租期；durable 后重试=回放）。回执 generation=**owners 世代**（r2-P1-5，客户端
   不透明）。故障注入 e2e：① 后崩溃→重启→码已消费且租户在册。
 - **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：幂等键=(code_hash,
   fabric_id, root) 三元组；pending 期间他键 409 `code-pending`（零
   used_count 误放行）、同键重试幂等完成（durable 后重试 200 不重复
   consume）；孤儿匹配/去重按完整三元组，旧行永不触发补写。
 - **reconciliation 覆盖热重载（r3-P0-2）**：孤儿补齐=每次加载（启动
-  +mtime reload）的同锁步骤；补写失败=保旧快照+该码 fail-closed
-  禁兑+告警，不影响其他台账。
+  +mtime reload）的同锁步骤；**台账加载失败（含首启）=整服务
+  fail-fast 拒绝启动**（v1 无台账级降级）；补写 append 失败=保旧
+  快照+该码进 deny-set（503 code-unavailable）+告警，不影响其他台账。
 - **重放/代理日志（r3-P2-2）**：同键重放幂等 200；跨键重放被 PoP
   结构性阻止（签名绑定 fabric/root）——无需 nonce；部署红线：反代
   /access-log/tracing 禁记 /register 请求体。

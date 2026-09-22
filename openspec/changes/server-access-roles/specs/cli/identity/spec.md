@@ -30,5 +30,5 @@
 
 #### Scenario: 码失效的明确失败
 
-- **WHEN** 持已耗尽/过期/吊销的码 join
+- **WHEN** 持**他人已耗尽**/过期/吊销的码 join（本机曾成功兑换的同码重试=幂等回放成功，不续期）
 - **THEN** 非零退出与对应错误码（code-exhausted/code-expired/code-invalid），本地无残留状态
