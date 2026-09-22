@@ -36,6 +36,9 @@ export const LIMITS = {
 /** 代理方法白名单（非通用代理） */
 const API_METHODS = new Set(["GET", "POST", "DELETE"]);
 
+/** scheme 默认端口（maskTarget 端口省略规则；与 target.mjs 序列化一致） */
+const DEFAULT_PORTS = { http: 80, https: 443 };
+
 /** 上游响应头白名单（其余剥除；hop-by-hop 永不透传） */
 const RESPONSE_HEADER_WHITELIST = ["content-type", "etag", "last-modified"];
 
@@ -94,6 +97,26 @@ export function parseApiPath(rawUrl) {
   if (segs.includes(".") || segs.includes("..")) return { ok: false, error: "dot segment" };
   if (segs.includes("")) return { ok: false, error: "empty segment (duplicate or trailing slash)" };
   return { ok: true, value: { rel, query } };
+}
+
+/**
+ * 目标掩码（/sidecar/state 的 server_host_masked）：仅保留 scheme + 域名
+ * 右侧标签 + 端口——IPv4 掩末段、域名掩首标签、IPv6 全掩、单标签全掩。
+ * token 与完整 URL 永不进入该面（design §4：state 暴露面最小化）。
+ * @param {{ scheme: "http" | "https", hostname: string, port: number }} t
+ * @returns {string}
+ */
+export function maskTarget(t) {
+  const host = t.hostname;
+  let masked;
+  if (host.includes(":")) masked = "[***]";
+  else if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) masked = `${host.split(".").slice(0, 3).join(".")}.***`;
+  else {
+    const labels = host.split(".");
+    masked = labels.length >= 2 ? `***.${labels.slice(1).join(".")}` : "***";
+  }
+  const portSuffix = t.port === DEFAULT_PORTS[t.scheme] ? "" : `:${t.port}`;
+  return `${t.scheme}://${masked}${portSuffix}`;
 }
 
 /** 8 随机字节 → base32（RFC 4648，无填充；13 字符定长） */
@@ -314,6 +337,24 @@ export async function startSidecar(opts = {}) {
 
   async function handleSidecar(req, res) {
     const startedAt = now();
+    // GET /sidecar/state：SPA 启动期状态暴露面（design §4）——phase + 掩码
+    // host + insecure 明文标志。MUST NOT 含 token/完整 URL/配对码。
+    if (req.method === "GET" && req.url === "/sidecar/state") {
+      const body = {
+        phase: state.mode,
+        server_host_masked: state.target === null ? null : maskTarget(state.target),
+        insecure: state.target?.insecure === true,
+      };
+      const buf = Buffer.from(JSON.stringify(body), "utf8");
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+        "content-length": String(buf.length),
+      });
+      res.end(buf);
+      logAccess(req, 200, startedAt);
+      return;
+    }
     if (req.method !== "POST") {
       sendJson(res, 404, { error: { code: "not-found" } });
       logAccess(req, 404, startedAt);

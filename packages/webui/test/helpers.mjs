@@ -111,4 +111,25 @@ export function fakeDns(map, { fail = new Set() } = {}) {
   };
 }
 
+/**
+ * preact vnode → HTML 字符串（UI 单测断言面）：展开函数组件、拼接属性与
+ * 文本。仅用于断言（非转义、非完整性）——关注「含预期提示」与横幅计数。
+ * @param {import("preact").VNode | string | number | Array | null | undefined | boolean} v
+ * @returns {string}
+ */
+export function vnodeHtml(v) {
+  if (v === null || v === undefined || v === false || v === true) return "";
+  if (Array.isArray(v)) return v.map(vnodeHtml).join("");
+  if (typeof v === "number") return String(v);
+  if (typeof v === "string") return v;
+  if (typeof v.type === "function") return vnodeHtml(v.type(v.props ?? {}));
+  const props = v.props ?? {};
+  const attrs = Object.entries(props)
+    .filter(([k, val]) => k !== "children" && k !== "key" && k !== "ref" && val !== null && val !== undefined && val !== false)
+    .map(([k, val]) => (val === true ? ` ${k}` : ` ${k}="${String(val)}"`))
+    .join("");
+  const tag = String(v.type);
+  return `<${tag}${attrs}>${vnodeHtml(props.children)}</${tag}>`;
+}
+
 export { delay };

@@ -15,3 +15,6 @@ packages/server-binary/bin/dweb-server-aarch64-apple-darwin
 !packages/client-sdk/dweb.win32-x64.node
 !packages/server-binary/bin/dweb-server-aarch64-apple-darwin
 !packages/server-binary/bin/dweb-server-x86_64-pc-windows.exe
+
+# webui SPA 预构建产物入库（webui-console design §1 冻结：dist 随包分发）
+!packages/webui/dist/

@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import http from "node:http";
 import net from "node:net";
-import { startSidecar, parseApiPath, LIMITS } from "../src/sidecar.mjs";
+import { startSidecar, parseApiPath, LIMITS, maskTarget } from "../src/sidecar.mjs";
 import { fakeUpstream, fakeDns, request, postJson } from "./helpers.mjs";
 
 /** ready 态 sidecar（指向假上游）+ 捕获日志 */
@@ -416,6 +416,63 @@ test("pairing: non-POST and unknown /sidecar paths -> 404; malformed JSON -> inv
   const r = await request(sc.port, { method: "POST", path: "/sidecar/connect", body: "not json" });
   assert.equal(r.status, 400);
   assert.equal(JSON.parse(r.text).error.code, "invalid-request");
+});
+
+// ---- /sidecar/state（SPA 启动期状态暴露面） ----
+
+test("sidecar state: setup phase exposes phase/null host/insecure=false, never the pairing code or token", async (t) => {
+  const sc = await startSidecar({ token: "" });
+  t.after(() => sc.close());
+  const res = await request(sc.port, { path: "/sidecar/state" });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers["content-type"], "application/json");
+  assert.equal(res.headers["cache-control"], "no-store");
+  const body = JSON.parse(res.text);
+  assert.deepEqual(body, { phase: "setup", server_host_masked: null, insecure: false });
+  assert.ok(!res.text.includes(sc.pairingCode ?? ""), "pairing code must not leak to HTTP");
+});
+
+test("sidecar state: ready phase exposes masked host and insecure flag, never the token", async (t) => {
+  const upstream = await fakeUpstream();
+  t.after(() => upstream.close());
+  const sc = await readySidecar(upstream);
+  t.after(() => sc.close());
+  const res = await request(sc.port, { path: "/sidecar/state" });
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.text);
+  assert.equal(body.phase, "ready");
+  assert.equal(body.server_host_masked, `http://127.0.0.***:${upstream.port}`);
+  assert.equal(body.insecure, false);
+  assert.ok(!res.text.includes("sekret-token-xyz"), "token must not leak");
+});
+
+test("sidecar state: insecure http target flips the insecure flag (plaintext banner source)", async (t) => {
+  const sc = await startSidecar({
+    target: {
+      scheme: "http",
+      hostname: "srv.example",
+      port: 18787,
+      hostHeader: "srv.example:18787",
+      connectHost: "192.0.2.10",
+      servername: "srv.example",
+      insecure: true,
+    },
+    token: "t-ok",
+  });
+  t.after(() => sc.close());
+  const res = await request(sc.port, { path: "/sidecar/state" });
+  const body = JSON.parse(res.text);
+  assert.equal(body.phase, "ready");
+  assert.equal(body.server_host_masked, "http://***.example:18787");
+  assert.equal(body.insecure, true);
+});
+
+test("maskTarget unit matrix", () => {
+  assert.equal(maskTarget({ scheme: "http", hostname: "localhost", port: 80 }), "http://***");
+  assert.equal(maskTarget({ scheme: "http", hostname: "127.0.0.1", port: 8080 }), "http://127.0.0.***:8080");
+  assert.equal(maskTarget({ scheme: "https", hostname: "srv.example", port: 443 }), "https://***.example");
+  assert.equal(maskTarget({ scheme: "https", hostname: "a.b.c.example", port: 8443 }), "https://***.b.c.example:8443");
+  assert.equal(maskTarget({ scheme: "http", hostname: "::1", port: 9000 }), "http://[***]:9000");
 });
 
 // ---- 静态面 ----
