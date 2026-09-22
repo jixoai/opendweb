@@ -315,6 +315,42 @@ test("pairing: correct Host + no Origin + correct code -> frozen; business flows
   assert.equal(JSON.parse(again.text).error.code, "target-frozen");
 });
 
+test("pairing: concurrent connects with delayed DNS -> exactly one 200 (single-flight, r5-P0-1)", async (t) => {
+  const upstream = await fakeUpstream({ handler: (req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end('{"mode":"restricted"}'); } });
+  t.after(() => upstream.close());
+  // 延迟 DNS：validateTarget 让出事件循环足够久，两个并发请求都能到达校验段
+  const slowDns = {
+    lookup: async (hostname) => {
+      await new Promise((r) => setTimeout(r, 150));
+      return [{ address: "127.0.0.1", family: 4 }];
+    },
+  };
+  const sc = await setupSidecar({ dns: slowDns });
+  t.after(() => sc.close());
+  // localhost 主机名触发 DNS 全记录校验路径（字面 IP 会跳过 DNS，无竞态窗口）
+  const upstreamPort = new URL(upstream.url).port;
+  const body = connectBody(sc, `http://localhost:${upstreamPort}`);
+  // 独立连接（默认 Agent keepAlive=false）强制真并发——全局 agent 的
+  // keep-alive 会把两请求串行化到一条 socket 上，测不出竞态
+  const mk = () => new http.Agent();
+  const buf = JSON.stringify(body);
+  const post = (agent) => request(sc.port, {
+    method: "POST",
+    path: "/sidecar/connect",
+    headers: { "content-type": "application/json" },
+    body: buf,
+    agent,
+  });
+  const [a, b] = await Promise.all([post(mk()), post(mk())]);
+  const codes = [a.status, b.status].sort();
+  assert.equal(codes[0], 200, `one must succeed: ${a.status}/${b.status}`);
+  assert.equal(codes[1], 409, `the other must be pairing-in-progress, got ${codes}`);
+  assert.equal(sc.mode(), "ready");
+  // 目标冻结后第三个请求（同码）→ target-frozen（码已消费或状态已离开 setup）
+  const third = await postJson(sc.port, "/sidecar/connect", body);
+  assert.equal(JSON.parse(third.text).error.code, "target-frozen");
+});
+
 test("pairing: wrong code 5 times burns the code (correct code then rejected)", async (t) => {
   const upstream = await fakeUpstream();
   t.after(() => upstream.close());

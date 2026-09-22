@@ -227,7 +227,7 @@ Rust 面（含 wire 冻结向量导出）先行；TS 两 subpath 并行；pack �
 |---|---|
 | P0-1 回执矛盾 | canonical 统一为既有冻结布局；disconnect 复用 root 槽位承载 endpoint_id、per-target 回执；JSON snake_case + endpoint_id 字段；跨语言向量钉住（§1.2） |
 | P0-2 mode 投影 | mode 取配置 + relay_enabled 独立字段；restricted+无 relay 保持 restricted（§1.2；spec 场景钉住） |
-| P0-4 发布物 | files 增目录；手写 ESM+.d.ts 零构建；npm pack 双门禁（§2.1） |
+| P0-4 发布物 | files 增目录；纯 ESM `.mjs`+`.d.mts` 零构建；npm pack 双门禁（§2.1） |
 | P1-1 404 判别 | error envelope 冻结 + status 探测为唯一规范判别（§1.2） |
 | P1-2 收敛语义 | best-effort + 有界轮询，spec/测试同步（§1.2） |
 | P1-3 共享面 | 共享文件 owner 协议 + rebase 落盘 + 最终 exports 全集断言（§3） |

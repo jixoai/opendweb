@@ -1780,7 +1780,10 @@ async fn e19_admin_disconnect_mixed_fabric_same_endpoint() {
     assert_eq!(pairs.len(), 2, "per-pair 两条");
     let endpoint_hex = e.public().to_string();
     assert!(pairs.iter().all(|p| p["endpoint_id"] == endpoint_hex));
-    let fabrics: Vec<&str> = pairs.iter().map(|p| p["fabric_id"].as_str().unwrap()).collect();
+    let fabrics: Vec<&str> = pairs
+        .iter()
+        .map(|p| p["fabric_id"].as_str().unwrap())
+        .collect();
     let mut sorted = fabrics.clone();
     sorted.sort();
     assert_eq!(fabrics, sorted, "同 endpoint 内按 fabric 字典序");
@@ -1796,8 +1799,7 @@ async fn e19_admin_disconnect_mixed_fabric_same_endpoint() {
     assert_eq!(mine.len(), 1, "status 聚合为一条（r4-P1-1）");
     assert_eq!(mine[0]["connections"], 2_u64, "connections 求和");
     assert_eq!(
-        mine[0]["fabric_id"],
-        sorted[0],
+        mine[0]["fabric_id"], sorted[0],
         "聚合条目 fabric 取字典序最小"
     );
 
@@ -1815,22 +1817,43 @@ async fn e19_admin_disconnect_mixed_fabric_same_endpoint() {
     let receipts = resp["receipts"].as_array().unwrap();
     assert_eq!(disconnected.len(), 2, "两张 pair 全保留（r4-P0-1）");
     assert_eq!(receipts.len(), 2, "每 pair 一张回执");
+    // r5-P2-1：disconnected 的 wire 字段与顺序逐项钉住（同 endpoint 按
+    // fabric 字典序，connections 各 1）
+    let mut expected: Vec<serde_json::Value> = [fabric1, fabric2]
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "endpoint_id": endpoint_hex,
+                "fabric_id": hex::encode(f),
+                "connections": 1,
+            })
+        })
+        .collect();
+    expected.sort_by_key(|j| j["fabric_id"].as_str().unwrap().to_owned());
+    assert_eq!(*disconnected, expected, "disconnected wire 与顺序逐项一致");
     let ts_set: Vec<u64> = receipts.iter().map(|r| r["ts"].as_u64().unwrap()).collect();
     let gen_set: Vec<u64> = receipts
         .iter()
         .map(|r| r["generation"].as_u64().unwrap())
         .collect();
     assert!(ts_set.windows(2).all(|w| w[0] == w[1]), "ts 全回执共享");
-    assert!(gen_set.windows(2).all(|w| w[0] == w[1]), "generation 全回执共享");
+    assert!(
+        gen_set.windows(2).all(|w| w[0] == w[1]),
+        "generation 全回执共享"
+    );
     for (r, fabric) in receipts.iter().zip([fabric1, fabric2]) {
         verify_disconnect_receipt(r, &server_id, &fabric, e.public().as_bytes());
     }
 
-    // 收敛：两 fabric 的 per_owner 计数归零
+    // 收敛：per_endpoint 与 per_owner 双双清零（r5-P2-1：两 fabric 计数
+    // 均归零，不只看 endpoint 维度）
     poll_connections_until(
         server.gateway,
-        |c| c["per_endpoint"].as_array().map(|a| a.len()) == Some(0),
-        "混合 fabric 断连后视图清空",
+        |c| {
+            c["per_endpoint"].as_array().map(|a| a.len()) == Some(0)
+                && c["per_owner"].as_array().map(|a| a.len()) == Some(0)
+        },
+        "混合 fabric 断连后 per_endpoint 与 per_owner 双清零",
     )
     .await;
 }

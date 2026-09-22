@@ -180,3 +180,21 @@ test("adminPublicKeyFromServices: extracts server_id from services.json (string 
   assert.throws(() => adminPublicKeyFromServices({ server_id: "zz".repeat(32) }), TypeError);
   assert.throws(() => adminPublicKeyFromServices(42), TypeError);
 });
+
+// r5-P1-2 回归：原型键不得穿透 op 查表（曾把 "constructor" 静默编码为 0）
+test("receiptCanonical rejects prototype-key ops", () => {
+  const base = {
+    op: "register",
+    fabric_id: "f1".repeat(32),
+    root: "aa".repeat(32),
+    ts: 1,
+    generation: 2,
+  };
+  for (const bad of ["constructor", "toString", "__proto__"]) {
+    assert.throws(
+      () => receiptCanonical({ ...base, op: bad }),
+      TypeError,
+      `op=${JSON.stringify(bad)} must be rejected`,
+    );
+  }
+});

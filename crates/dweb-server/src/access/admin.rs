@@ -391,28 +391,31 @@ fn disconnect_endpoints(clients: &Clients, entries: &[OnlineEndpoint]) -> Vec<On
 }
 
 /// 断连原语的纯决策核（dispatch 注入便于单测伪造「一次成功覆盖全 endpoint」
-/// 的 None 语义）：dispatch 每 endpoint 至多被调用一次；成功过的 endpoint 的
-/// 全部 pair 计入返回。
+/// 的 None 语义）：dispatch 每 endpoint 至多被调用一次（**无论成败**——
+/// r5-P1-1：false-first 时也不得对同 endpoint 重试，调用次数不依赖输入
+/// pair 数量）；成功过的 endpoint 的全部 pair 计入返回。
 fn disconnect_endpoints_with(
     entries: &[OnlineEndpoint],
     dispatch: impl Fn(EndpointId) -> bool,
 ) -> Vec<OnlineEndpoint> {
-    let mut dispatched: Vec<[u8; 32]> = Vec::new();
+    let mut attempted: Vec<[u8; 32]> = Vec::new();
+    let mut succeeded: Vec<[u8; 32]> = Vec::new();
     for e in entries {
-        if dispatched.contains(&e.endpoint_id) {
-            continue; // 同 endpoint 物理动作只做一次
+        if attempted.contains(&e.endpoint_id) {
+            continue; // 同 endpoint 物理动作只做一次（false 也不重试）
         }
         // 在线表条目源自握手认证身份（合法曲线点）；构造失败 = 该 endpoint
         // 整体诚实跳过
-        if let Ok(endpoint_id) = EndpointId::from_bytes(&e.endpoint_id)
-            && dispatch(endpoint_id)
-        {
-            dispatched.push(e.endpoint_id);
+        if let Ok(endpoint_id) = EndpointId::from_bytes(&e.endpoint_id) {
+            attempted.push(e.endpoint_id);
+            if dispatch(endpoint_id) {
+                succeeded.push(e.endpoint_id);
+            }
         }
     }
     entries
         .iter()
-        .filter(|e| dispatched.contains(&e.endpoint_id))
+        .filter(|e| succeeded.contains(&e.endpoint_id))
         .cloned()
         .collect()
 }
@@ -1659,6 +1662,34 @@ mod tests {
         assert_eq!(hits[1].fabric_id, [0x22; 32]);
         // dispatch false（连接表已无该 endpoint）→ 整 endpoint 诚实不计入
         let hits = disconnect_endpoints_with(&entries, |_| false);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn disconnect_endpoints_false_first_does_not_redispatch() {
+        // r5-P1-1 回归：同 endpoint 第一张 pair dispatch false 时，第二张
+        // pair 不得再次调用（调用次数与输入 pair 数解耦）。
+        let endpoint = *iroh_base::SecretKey::from_bytes(&[0x63; 32])
+            .public()
+            .as_bytes();
+        let entries = vec![
+            OnlineEndpoint {
+                endpoint_id: endpoint,
+                fabric_id: [0x11; 32],
+                connections: 1,
+            },
+            OnlineEndpoint {
+                endpoint_id: endpoint,
+                fabric_id: [0x22; 32],
+                connections: 1,
+            },
+        ];
+        let calls = std::cell::Cell::new(0);
+        let hits = disconnect_endpoints_with(&entries, |_| {
+            calls.set(calls.get() + 1);
+            false
+        });
+        assert_eq!(calls.get(), 1, "false 不重试：每 endpoint 至多一次");
         assert!(hits.is_empty());
     }
 

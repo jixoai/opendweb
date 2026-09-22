@@ -64,9 +64,9 @@ export async function fakeUpstream(opts = {}) {
  * @param {{ method?: string, path?: string, headers?: Record<string, string>, body?: Buffer | string }} [opts]
  */
 export function request(port, opts = {}) {
-  const { method = "GET", path = "/", headers = {}, body } = opts;
+  const { method = "GET", path = "/", headers = {}, body, agent } = opts;
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, method, path, headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, method, path, headers, ...(agent ? { agent } : {}) }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () =>

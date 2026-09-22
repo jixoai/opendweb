@@ -419,14 +419,35 @@ export async function startSidecar(opts = {}) {
       logAccess(req, 400, startedAt);
       return;
     }
-    const v = await validateTarget(server, { allowInsecure, dns });
+    // 单飞消费锁（r5-P0-1）：配对码校验通过后、任何 await 让出事件循环前，
+    // 同步置 in-flight——并发第二个请求在此被拒；validateTarget 失败时恢复
+    // （bad-target 不烧码语义不变），成功则走提交段。
+    if (pairing.inFlight) {
+      sendJson(res, 409, { error: { code: "pairing-in-progress", message: "another pairing request is in flight" } });
+      logAccess(req, 409, startedAt);
+      return;
+    }
+    pairing.inFlight = true;
+    let v;
+    try {
+      v = await validateTarget(server, { allowInsecure, dns });
+    } finally {
+      pairing.inFlight = false;
+    }
     if (!v.ok) {
       // 目标守卫失败：配对码匹配成功不烧次数（URL 笔误可重试）
       sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
       logAccess(req, 400, startedAt);
       return;
     }
-    // 三防线全过：存内存目标 + token → 冻结 → 配对码销毁（单次有效）
+    // 三防线全过：存内存目标 + token → 冻结 → 配对码销毁（单次有效）。
+    // target 判定成功后二次检查配对码未被并发消费（in-flight 锁已排除窗口，
+    // 此处防御深度）。
+    if (state.mode !== "setup" || state.pairing === null) {
+      sendJson(res, 400, { error: { code: "target-frozen", message: "target already configured; restart to change" } });
+      logAccess(req, 400, startedAt);
+      return;
+    }
     state.target = v.value;
     state.token = token;
     state.mode = "ready";

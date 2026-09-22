@@ -315,9 +315,15 @@ export class AdminClient {
  * @returns {Uint8Array} 103B 待签载荷
  */
 export function receiptCanonical(receipt) {
+  // Object.hasOwn 防原型键穿透（r5-P1-2）："constructor"/"toString"/
+  // "__proto__" 沿原型链解析为非 undefined 值，会被静默编码为 op byte 0
+  const op =
+    receipt && typeof receipt === "object" && typeof receipt.op === "string"
+      ? receipt.op
+      : undefined;
   const opByte =
-    receipt && typeof receipt === "object"
-      ? RECEIPT_OP_BYTES[receipt.op]
+    op !== undefined && Object.hasOwn(RECEIPT_OP_BYTES, op)
+      ? RECEIPT_OP_BYTES[op]
       : undefined;
   if (opByte === undefined) {
     throw new TypeError(
