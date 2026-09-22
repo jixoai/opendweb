@@ -1,10 +1,21 @@
 {
   "domain_hex": "647765622f61646d696e2d726563656970742f763100",
-  "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
+  "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5; server-access-roles Phase 1c extends ops 0x04-0x0E); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
   "ops": {
+    "block-add": 9,
+    "block-remove": 10,
+    "code-issue": 7,
+    "code-revoke": 8,
     "disconnect": 3,
+    "knock-dismiss": 11,
+    "knock-undismiss": 12,
+    "owner-meta": 13,
     "register": 1,
-    "unregister": 2
+    "renew": 4,
+    "unregister": 2,
+    "visitor-grant": 5,
+    "visitor-meta": 14,
+    "visitor-revoke": 6
   },
   "samples": [
     {
@@ -112,6 +123,309 @@
         "5e212c0980e4b39fc09721134aa02109374edfd260c0d3d03cb501c8d65457a9"
       ],
       "ts": 1789012600000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000451515151515151515151515151515151515151515151515151515151515151515252525252525252525252525252525252525252525252525252525252525252000001a089776b600000000000000008"
+      ],
+      "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+      "generation": 8,
+      "kind": "renew",
+      "op_code": 4,
+      "receipts": [
+        {
+          "expires_at": 1790000000000,
+          "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+          "generation": 8,
+          "op": "renew",
+          "receipt_sig": "KpPYQdQFZnqA-AeW2Ut1SSZv248_mLJgvH8OqYadP6-R_6t4WENgF6vi7IjsY0BIerHHx0oLqMJRkLOLODwsAA",
+          "root": "5252525252525252525252525252525252525252525252525252525252525252",
+          "ts": 1789012700000
+        }
+      ],
+      "target_field": "root",
+      "targets": [
+        "5252525252525252525252525252525252525252525252525252525252525252"
+      ],
+      "ts": 1789012700000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f763100050000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a08978f2000000000000000009"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 9,
+      "kind": "visitor-grant",
+      "op_code": 5,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "expires_at": 1790000000000,
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 9,
+          "op": "visitor-grant",
+          "receipt_sig": "oN9O39WlGIVyo5FqU47fK86pb_Ei5IrPJbNEyb4CERwzwb9n7UugfqYZi2WNNH6FX81lkCY1Ey0jBOmlRjsZBQ",
+          "ts": 1789012800000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789012800000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f763100060000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a08979b550000000000000000a"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 10,
+      "kind": "visitor-revoke",
+      "op_code": 6,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 10,
+          "op": "visitor-revoke",
+          "receipt_sig": "hWXP3rSilXPxyBwKgdTcHYO_6gSXQb6_F8nYTY26qdjJ2VaDrCoQPuUg2soM7wBDybwrTyBkzo3wsPEcOs3mBg",
+          "ts": 1789012850000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789012850000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000700000000000000000000000000000000000000000000000000000000000000005454545454545454545454545454545454545454545454545454545454545454000001a0897a78a0000000000000000b"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 11,
+      "kind": "code-issue",
+      "op_code": 7,
+      "receipts": [
+        {
+          "alias_hint": "fixture-hint",
+          "code": "dwebc1.0123-4567-89cd-fghj",
+          "code_hash": "5454545454545454545454545454545454545454545454545454545454545454",
+          "default_ttl_days": 30,
+          "expires_at": 1790060800000,
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 11,
+          "max_uses": 1,
+          "op": "code-issue",
+          "receipt_sig": "H1q4vpHKcLzn7F8qNdCZeUoOG4Fv5QrttZX64x1MIpcOXTsGZhIoZxXY8EJNYq_Q05hoTFJw3EjRfGbbtM88Dw",
+          "ts": 1789012900000
+        }
+      ],
+      "target_field": "code_hash",
+      "targets": [
+        "5454545454545454545454545454545454545454545454545454545454545454"
+      ],
+      "ts": 1789012900000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000800000000000000000000000000000000000000000000000000000000000000005454545454545454545454545454545454545454545454545454545454545454000001a0897b3bf0000000000000000c"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 12,
+      "kind": "code-revoke",
+      "op_code": 8,
+      "receipts": [
+        {
+          "code_hash": "5454545454545454545454545454545454545454545454545454545454545454",
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 12,
+          "op": "code-revoke",
+          "receipt_sig": "xCADl8bJDVMRU9lUXXRIfbkMWR2XNkTgObYhwA4DP5Z1LsbEdN-H19F3hZ9wXxpqKYSTuaYv7VOFNrZwAf8EDg",
+          "ts": 1789012950000
+        }
+      ],
+      "target_field": "code_hash",
+      "targets": [
+        "5454545454545454545454545454545454545454545454545454545454545454"
+      ],
+      "ts": 1789012950000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f763100090000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a0897bff40000000000000000d"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 13,
+      "kind": "block-add-endpoint",
+      "op_code": 9,
+      "receipts": [
+        {
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 13,
+          "id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "kind": "endpoint",
+          "op": "block-add",
+          "reason": "fixture",
+          "receipt_sig": "56H_HXv4qqSKiVrnkvVx_lVjxqiFr32ZE8Ou57-M9U-Ker8wNY1EnIDjCsVNuFMs-cAIt2S7thAkD5iJ4PuODA",
+          "ts": 1789013000000
+        }
+      ],
+      "target_field": "id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789013000000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000956565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656000001a0897cc290000000000000000e"
+      ],
+      "fabric_id": "5656565656565656565656565656565656565656565656565656565656565656",
+      "generation": 14,
+      "kind": "block-add-fabric",
+      "op_code": 9,
+      "receipts": [
+        {
+          "fabric_id": "5656565656565656565656565656565656565656565656565656565656565656",
+          "generation": 14,
+          "id": "5656565656565656565656565656565656565656565656565656565656565656",
+          "kind": "fabric",
+          "op": "block-add",
+          "reason": "fixture",
+          "receipt_sig": "YkWEurc-WGElYBS2RIOfo59fZk4X-EgPQVdUj5zTaSPcmDciDMHEmU-kYvcuqhGfQOiyPTI1Dq34YtxAQ0dwAw",
+          "ts": 1789013050000
+        }
+      ],
+      "target_field": "id",
+      "targets": [
+        "5656565656565656565656565656565656565656565656565656565656565656"
+      ],
+      "ts": 1789013050000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000a56565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656000001a0897d85e0000000000000000f"
+      ],
+      "fabric_id": "5656565656565656565656565656565656565656565656565656565656565656",
+      "generation": 15,
+      "kind": "block-remove",
+      "op_code": 10,
+      "receipts": [
+        {
+          "fabric_id": "5656565656565656565656565656565656565656565656565656565656565656",
+          "generation": 15,
+          "id": "5656565656565656565656565656565656565656565656565656565656565656",
+          "kind": "fabric",
+          "op": "block-remove",
+          "reason": "fixture",
+          "receipt_sig": "cku-EJWZRLiqBH5bETIOXPPTXDeIUpwafYLJKCgNRupgZz9DJDi86UzvkhcfzNYQK0qAQ9h9D2Ujz9exD020AQ",
+          "ts": 1789013100000
+        }
+      ],
+      "target_field": "id",
+      "targets": [
+        "5656565656565656565656565656565656565656565656565656565656565656"
+      ],
+      "ts": 1789013100000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000b0000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a0897f0c800000000000000010"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 16,
+      "kind": "knock-dismiss",
+      "op_code": 11,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 16,
+          "op": "knock-dismiss",
+          "receipt_sig": "wko2wGLFBEgk7GeWIUcjUWrOel8bcR0-Tl6lMK_sW6R1CaN382V2OTWoWQSBBO7tMikPPFNGH-nnpCYfpfrUCg",
+          "ts": 1789013200000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789013200000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000c0000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a0897fcfd00000000000000010"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 16,
+      "kind": "knock-undismiss",
+      "op_code": 12,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 16,
+          "op": "knock-undismiss",
+          "receipt_sig": "v-iPwwXrDswE90R1vKYe15UOUUcojFvWkz-1VjUOWwOxEhcCAyHIuO9ZYwUYG3ak___2nLF8txqbdgYjcDUfCA",
+          "ts": 1789013250000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789013250000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000d51515151515151515151515151515151515151515151515151515151515151515252525252525252525252525252525252525252525252525252525252525252000001a0898093200000000000000011"
+      ],
+      "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+      "generation": 17,
+      "kind": "owner-meta",
+      "op_code": 13,
+      "receipts": [
+        {
+          "alias": "fixture-alias",
+          "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+          "generation": 17,
+          "op": "owner-meta",
+          "receipt_sig": "TjGZib0snLKCYdPYu_kZaC8QUhoNP6Mnc0pN7r9c60-xXaMSQ1M_Jajpy7RIx7z93a0elW8RHu3DfdZnZVgaBg",
+          "root": "5252525252525252525252525252525252525252525252525252525252525252",
+          "ts": 1789013300000
+        }
+      ],
+      "target_field": "root",
+      "targets": [
+        "5252525252525252525252525252525252525252525252525252525252525252"
+      ],
+      "ts": 1789013300000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000e0000000000000000000000000000000000000000000000000000000000000000f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a0898156700000000000000012"
+      ],
+      "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+      "generation": 18,
+      "kind": "visitor-meta",
+      "op_code": 14,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "fabric_id": "0000000000000000000000000000000000000000000000000000000000000000",
+          "generation": 18,
+          "note": "fixture-note",
+          "op": "visitor-meta",
+          "receipt_sig": "8pK5WEd2I9WUPPnCL-2wnacBhSI2RoZtmaG7-Iz-qfrL3-NwlH4HYPMHoYquNVFQaQ0kNMMeOE2nN2g4X_B9CA",
+          "ts": 1789013350000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789013350000
     }
   ],
   "server_id": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db"

@@ -119,15 +119,21 @@ impl KnockLog {
 
     /// dismiss（幂等管理动作，不删除记录）。false = 台账无此 endpoint
     /// （Phase 1c 映射 404 no-match，与 disconnect 判定一致）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dismiss(&self, endpoint_id: &[u8; 32]) -> bool {
         self.set_dismissed(endpoint_id, true)
     }
 
     /// undismiss（对等管理动作：手动恢复待办，幂等）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn undismiss(&self, endpoint_id: &[u8; 32]) -> bool {
         self.set_dismissed(endpoint_id, false)
+    }
+
+    /// 回执 generation 语义（Phase 1c，spec 冻结）：KnockLog 为内存台账，
+    /// knock-dismiss/undismiss 回执的 generation 使用其**内部单调计数器**
+    /// （与 seq 同源——每次 deny 前进，dismiss/undismiss 不前进；客户端
+    /// 视为不透明 u64）
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap().next_seq
     }
 
     fn set_dismissed(&self, endpoint_id: &[u8; 32], dismissed: bool) -> bool {
@@ -143,7 +149,6 @@ impl KnockLog {
 
     /// 列表（排序冻结：未处置在前、组内 seq 降序、endpoint_id 升序
     /// tie-break；last_at 仅展示）。pending_count 恒为未 dismissed 条目数。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn list(&self, include_dismissed: bool) -> KnockList {
         let inner = self.inner.lock().unwrap();
         let mut knocks: Vec<KnockAgg> = inner

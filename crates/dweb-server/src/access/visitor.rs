@@ -49,18 +49,15 @@ enum Op {
     Revoke,
 }
 
-/// 活跃访客条目（admin 列表 Phase 1c 消费元数据；1a 内核先行携带）
+/// 活跃访客条目（admin 列表/元数据编辑消费元数据——Phase 1c）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisitorEntry {
     pub endpoint_id: [u8; 32],
     /// 最后一次 grant 事件的 ts
     pub granted_at: u64,
     /// None = 永久
-    #[cfg_attr(not(test), allow(dead_code))]
     pub expires_at: Option<u64>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub alias: Option<String>,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub note: Option<String>,
 }
 
@@ -90,6 +87,12 @@ impl VisitorSnapshot {
             .is_some_and(|e| e.expires_at.is_none_or(|expires| now_ms < expires))
     }
 
+    /// 在册判定（无时间维度）：grant 未 revoke 即在册（过期条目仍在——
+    /// Phase 1c PATCH 定位与列表展示用；活跃判定走 is_active）
+    pub fn contains(&self, endpoint_id: &[u8; 32]) -> bool {
+        self.inner.active.contains_key(endpoint_id)
+    }
+
     /// 活跃访客数（启动日志/告警用）
     pub fn len(&self) -> usize {
         self.inner.active.len()
@@ -97,7 +100,6 @@ impl VisitorSnapshot {
 
     /// 活跃集合确定性列表（endpoint_id 字节序；Phase 1c `GET /admin/visitors`
     /// 消费，1a 由测试驱动）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn entries(&self) -> Vec<VisitorEntry> {
         let mut list: Vec<VisitorEntry> = self.inner.active.values().cloned().collect();
         list.sort_by_key(|e| e.endpoint_id);
@@ -187,9 +189,8 @@ impl VisitorRegistry {
         Ok(active)
     }
 
-    /// 授予访客（Phase 1c `POST /admin/visitors` 入口；1a 由测试驱动）。
+    /// 授予访客（Phase 1c `POST /admin/visitors` 入口）。
     /// 同端点重复 grant 覆盖元数据（活跃集合集合语义），事件仍落日志。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn grant(
         &self,
         endpoint_id: &[u8; 32],
@@ -211,7 +212,6 @@ impl VisitorRegistry {
     }
 
     /// 吊销访客（按 endpoint_id 定位；不存在的 revoke 同样落日志、无内存效果）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn revoke(&self, endpoint_id: &[u8; 32]) -> Result<()> {
         self.apply(
             Record {
@@ -224,6 +224,51 @@ impl VisitorRegistry {
             },
             *endpoint_id,
         )
+    }
+
+    /// 元数据编辑（Phase 1c `PATCH /admin/visitors/{endpoint_id}`）：
+    /// 以 grant 事件落盘（台账只有 grant/revoke 两事件——元数据随最新 grant
+    /// 归并），**保留既有 expires_at**（元数据编辑不改租期），granted_at
+    /// 刷新为本次事件 ts（字段语义 = 最新 grant 时间）。false = 端点不在
+    /// 名册（grant 未撤销即算在册——过期条目可编辑，与 revoke 语义对称），
+    /// 映射 404 no-match。
+    pub fn update_metadata(
+        &self,
+        endpoint_id: &[u8; 32],
+        alias: Option<String>,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        let Some(existing) = state.current.active.get(endpoint_id) else {
+            return Ok(false);
+        };
+        let expires_at = existing.expires_at;
+        let record = Record {
+            op: Op::Grant,
+            endpoint_id: encode_id(endpoint_id),
+            alias,
+            note,
+            expires_at,
+            ts: now_ms(),
+        };
+        let line = ledger::record_line(&record)?;
+        ledger::append_line(&self.path, "visitors", &line)?;
+        let mut active = state.current.active.clone();
+        active.insert(
+            *endpoint_id,
+            VisitorEntry {
+                endpoint_id: *endpoint_id,
+                granted_at: record.ts,
+                expires_at: record.expires_at,
+                alias: record.alias,
+                note: record.note,
+            },
+        );
+        state.current = Arc::new(SnapshotInner {
+            generation: ledger::next_generation(),
+            active,
+        });
+        Ok(true)
     }
 
     /// 事件落地公共核：先落盘（append + fsync），成功后才更新内存快照

@@ -14,9 +14,12 @@
 //! 且免除握手状态机。server.key 仍只签注册回执、不签 capability（§6.2
 //! 收窄原则不变）。
 //!
-//! 路由（全部要求 Bearer）：
+//! 路由（全部要求 Bearer；server-access-roles Phase 1c 三角色增量路由见
+//! [`roles`]——敲门/访客/邀请码/黑名单/续期/元数据，同 envelope/auth_guard/
+//! 回执基座）：
 //! - `GET /admin/owners` → `{generation, owners:[{fabric_id,root,
-//!   registered_at}]}`（活跃集合确定性排序）
+//!   registered_at}]}`（活跃集合确定性排序；Phase 1c 增量携带
+//!   alias/note/expires_at/expires_in/status）
 //! - `POST /admin/owners`（`{fabric_id_hex, root_hex}`）→ 注册：jsonl
 //!   append+fsync + 快照替换 + generation+1 + callback 缓存失效——复用
 //!   `OwnerRegistry::register`，与 CLI / 文件重载三入口收敛到同一实例；
@@ -32,7 +35,8 @@
 //! - `GET /admin/status` → `{mode, policy, generation,
 //!   max_connections_per_owner, active_connections（per endpoint 票接入
 //!   在线表，task 3.2）, per_owner_connections, cache_entries}`（既有冻结
-//!   wire，sdk-mgmt-surface 不动——详细视图走 connections）
+//!   wire，sdk-mgmt-surface 不动——详细视图走 connections；Phase 1a/1c
+//!   纯增量：visitors_online / knocks_pending / visitors_active / codes_active）
 //! - `GET /admin/connections` → 详细在线视图 `{mode, policy, relay_enabled,
 //!   quota{configured,max_connections_per_owner}, per_endpoint, per_owner}`
 //!   （sdk-mgmt-surface task 1.4；mode 取 access 配置字段、relay_enabled
@@ -56,10 +60,15 @@
 //! 写入，mtime 看护随后的一次 reload 只会再 +1 generation（缓存键随
 //! generation 变化，正确性无损；admin 信任域内的冗余事件被日志吸收）。
 
+pub(crate) mod roles;
+
+use crate::access::blocklist::Blocklist;
+use crate::access::codes::CodeLedger;
 use crate::access::config::AccessMode;
 use crate::access::gate::{AccessGate, OnlineEndpoint, OnlineView};
 use crate::access::identity::ServerIdentity;
 use crate::access::registry::{OwnerRegistry, parse_owner_hex};
+use crate::access::visitor::VisitorRegistry;
 use axum::{
     Json, Router,
     extract::{Path, Request, State},
@@ -77,12 +86,47 @@ use std::sync::Arc;
 
 /// 回执签名域分隔前缀（18B + 1B op，不进任何 wire 帧；与 relay-cap 域
 /// b"dweb/relay-cap/v1\0" 不同源，跨域重放无意义）
-const RECEIPT_DOMAIN: &[u8] = b"dweb/admin-receipt/v1\0";
-const OP_REGISTER: u8 = 0x01;
-const OP_UNREGISTER: u8 = 0x02;
+pub(crate) const RECEIPT_DOMAIN: &[u8] = b"dweb/admin-receipt/v1\0";
+pub(crate) const OP_REGISTER: u8 = 0x01;
+pub(crate) const OP_UNREGISTER: u8 = 0x02;
 /// disconnect 回执 op（target 槽位承载被断 endpoint_id——布局复用冻结
 /// canonical，JSON 层用显式 endpoint_id 字段不复用 root 键名）
-const OP_DISCONNECT: u8 = 0x03;
+pub(crate) const OP_DISCONNECT: u8 = 0x03;
+// ---- server-access-roles Phase 1c：op 枚举 0x04-0x0E（spec「三角色管理面
+// API」槽位映射表冻结；generation = 所属台账 generation，KnockLog 用其内部
+// 单调计数器——spec 明示） ----
+pub(crate) const OP_RENEW: u8 = 0x04;
+pub(crate) const OP_VISITOR_GRANT: u8 = 0x05;
+pub(crate) const OP_VISITOR_REVOKE: u8 = 0x06;
+pub(crate) const OP_CODE_ISSUE: u8 = 0x07;
+pub(crate) const OP_CODE_REVOKE: u8 = 0x08;
+pub(crate) const OP_BLOCK_ADD: u8 = 0x09;
+pub(crate) const OP_BLOCK_REMOVE: u8 = 0x0A;
+pub(crate) const OP_KNOCK_DISMISS: u8 = 0x0B;
+pub(crate) const OP_KNOCK_UNDISMISS: u8 = 0x0C;
+pub(crate) const OP_OWNER_META: u8 = 0x0D;
+pub(crate) const OP_VISITOR_META: u8 = 0x0E;
+
+/// op 字节 ↔ wire label（roles 路由与 fixture 向量共用，防两处标签漂移）
+pub(crate) fn op_label(op_code: u8) -> &'static str {
+    match op_code {
+        OP_REGISTER => "register",
+        OP_UNREGISTER => "unregister",
+        OP_DISCONNECT => "disconnect",
+        OP_RENEW => "renew",
+        OP_VISITOR_GRANT => "visitor-grant",
+        OP_VISITOR_REVOKE => "visitor-revoke",
+        OP_CODE_ISSUE => "code-issue",
+        OP_CODE_REVOKE => "code-revoke",
+        OP_BLOCK_ADD => "block-add",
+        OP_BLOCK_REMOVE => "block-remove",
+        OP_KNOCK_DISMISS => "knock-dismiss",
+        OP_KNOCK_UNDISMISS => "knock-undismiss",
+        OP_OWNER_META => "owner-meta",
+        OP_VISITOR_META => "visitor-meta",
+        _ => "unknown",
+    }
+}
 
 /// admin API 共享状态（main 在 DWEB_ADMIN_TOKEN 存在时构造并挂载）。
 /// `gate` = relay gate（restricted 模式；open 模式 None——无验证链即无
@@ -93,28 +137,37 @@ const OP_DISCONNECT: u8 = 0x03;
 /// relay 服务装配事实（构造期注入，与 gate 句柄无推导关系——restricted
 /// 恒建 gate，gate=None 不代表 open，connections 投影的 mode/relay_enabled
 /// 必须各自独立取值，P0-2）。
+/// `visitors`/`blocklist`/`codes`（Phase 1c 三角色台账——两种 access mode
+/// 均装配：admin 管理面与门禁执行面正交；open 模式下台账可管理但 gate
+/// 不消费，O-9 冻结不变——open 不装配 gate）。
 #[derive(Clone)]
 pub struct AdminState {
-    token: String,
-    identity: Arc<ServerIdentity>,
-    registry: Arc<OwnerRegistry>,
-    gate: Option<Arc<AccessGate>>,
-    relay_clients: Option<Clients>,
-    mode: AccessMode,
-    policy: &'static str,
-    relay_enabled: bool,
+    pub(crate) token: String,
+    pub(crate) identity: Arc<ServerIdentity>,
+    pub(crate) registry: Arc<OwnerRegistry>,
+    pub(crate) visitors: Arc<VisitorRegistry>,
+    pub(crate) blocklist: Arc<Blocklist>,
+    pub(crate) codes: Arc<CodeLedger>,
+    pub(crate) gate: Option<Arc<AccessGate>>,
+    pub(crate) relay_clients: Option<Clients>,
+    pub(crate) mode: AccessMode,
+    pub(crate) policy: &'static str,
+    pub(crate) relay_enabled: bool,
 }
 
 impl AdminState {
     /// 构造（`policy` 取 "static"|"callback"，与启动日志同源标签；
     /// `relay_clients`/`relay_enabled` 见结构体注释）。参数与字段一一对应
-    /// （main 装配的部署事实清单），8 参不聚合——引入 config struct 反而
+    /// （main 装配的部署事实清单），11 参不聚合——引入 config struct 反而
     /// 掩盖「每字段一个装配来源」的对应关系
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: String,
         identity: Arc<ServerIdentity>,
         registry: Arc<OwnerRegistry>,
+        visitors: Arc<VisitorRegistry>,
+        blocklist: Arc<Blocklist>,
+        codes: Arc<CodeLedger>,
         gate: Option<Arc<AccessGate>>,
         relay_clients: Option<Clients>,
         mode: AccessMode,
@@ -125,6 +178,9 @@ impl AdminState {
             token,
             identity,
             registry,
+            visitors,
+            blocklist,
+            codes,
             gate,
             relay_clients,
             mode,
@@ -135,13 +191,18 @@ impl AdminState {
 }
 
 /// 挂载 admin 路由（仅当 DWEB_ADMIN_TOKEN 已配置时由 main 调用；
-/// 未配置 = 不挂载 = 404 零暴露）
+/// 未配置 = 不挂载 = 404 零暴露）。Phase 1c 三角色增量路由（roles）同
+/// state/同 auth_guard，先 merge 再统一上 Bearer 层。
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/owners", get(list_owners).post(register_owner))
         .route(
             "/admin/owners/{fabric_id}/{root}",
-            axum::routing::delete(unregister_owner),
+            axum::routing::delete(unregister_owner).patch(roles::patch_owner_metadata),
+        )
+        .route(
+            "/admin/owners/{fabric_id}/{root}/renew",
+            axum::routing::post(roles::renew_owner),
         )
         .route("/admin/status", get(status))
         .route("/admin/connections", get(connections))
@@ -149,6 +210,7 @@ pub fn router(state: AdminState) -> Router {
             "/admin/connections/disconnect",
             axum::routing::post(disconnect),
         )
+        .merge(roles::router())
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_guard,
@@ -233,19 +295,40 @@ struct OwnerInfo {
     fabric_id: String,
     root: String,
     registered_at: u64,
+    /// ---- Phase 1c 增量字段（spec「三角色管理面 API」：纯增量，旧消费者
+    /// 忽略；到期边界 now >= expires_at 即过期，等值=过期） ----
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// None（序列化 null）= 永久租户
+    expires_at: Option<u64>,
+    /// 剩余毫秒；永久 = null、已过期 = 0
+    expires_in: Option<u64>,
+    /// active | expired（过期条目仍在册——L1b 拒绝但名册可见，续期入口）
+    status: &'static str,
 }
 
 async fn list_owners(State(state): State<AdminState>) -> Json<OwnersList> {
+    let now = now_ms();
     let snapshot = state.registry.snapshot();
     Json(OwnersList {
         generation: snapshot.generation(),
         owners: snapshot
             .entries()
             .into_iter()
-            .map(|e| OwnerInfo {
-                fabric_id: hex::encode(e.fabric_id),
-                root: hex::encode(e.root),
-                registered_at: e.registered_at,
+            .map(|e| {
+                let active = e.expires_at.is_none_or(|expires| now < expires);
+                OwnerInfo {
+                    fabric_id: hex::encode(e.fabric_id),
+                    root: hex::encode(e.root),
+                    registered_at: e.registered_at,
+                    alias: e.alias,
+                    note: e.note,
+                    expires_at: e.expires_at,
+                    expires_in: e.expires_at.map(|expires| expires.saturating_sub(now)),
+                    status: if active { "active" } else { "expired" },
+                }
             })
             .collect(),
     })
@@ -505,6 +588,14 @@ struct Status {
     /// 访客在线连接总数（server-access-roles Phase 1a 增量字段——纯增量，
     /// 既有 wire 冻结不变，旧消费者忽略未知字段）
     visitors_online: usize,
+    /// ---- Phase 1c status 增量（spec「状态增量」：纯增量字段，既有 wire
+    /// 冻结逐字节不变） ----
+    /// 敲门待办数（未 dismissed；open 模式无 gate = 0）
+    knocks_pending: usize,
+    /// 在册且未过期的访客数
+    visitors_active: usize,
+    /// 未吊销且未过期的邀请码数
+    codes_active: usize,
 }
 
 #[derive(Serialize)]
@@ -521,31 +612,50 @@ struct OwnerOnlineInfo {
 }
 
 async fn status(State(state): State<AdminState>) -> Json<Status> {
+    let now = now_ms();
     let snapshot = state.registry.snapshot();
-    let (quota, active, per_owner, cache_entries, visitors_online) = match &state.gate {
-        Some(gate) => {
-            let view = gate.online_view();
-            (
-                gate.max_connections_per_owner(),
-                // status wire 冻结为 endpoint 级聚合（r4-P1-1）：per-pair 是
-                // /admin/connections 的详细视图；同 endpoint 多 fabric 在此
-                // 聚合为一条——connections 求和、fabric_id 取字典序最小
-                // （确定性规则，不依赖视图对内的次序之外的任何东西）。
-                endpoint_level_projection(&view),
-                view.per_owner
-                    .into_iter()
-                    .map(|(fabric_id, connections)| OwnerOnlineInfo {
-                        fabric_id: hex::encode(fabric_id),
-                        connections,
-                    })
-                    .collect(),
-                gate.cache_entries(),
-                // 访客在线总数（Phase 1a 增量：per_visitor 的 connections 求和）
-                view.per_visitor.iter().map(|(_, n)| n).sum(),
-            )
-        }
-        None => (None, Vec::new(), Vec::new(), 0, 0),
-    };
+    let (quota, active, per_owner, cache_entries, visitors_online, knocks_pending) =
+        match &state.gate {
+            Some(gate) => {
+                let view = gate.online_view();
+                (
+                    gate.max_connections_per_owner(),
+                    // status wire 冻结为 endpoint 级聚合（r4-P1-1）：per-pair 是
+                    // /admin/connections 的详细视图；同 endpoint 多 fabric 在此
+                    // 聚合为一条——connections 求和、fabric_id 取字典序最小
+                    // （确定性规则，不依赖视图对内的次序之外的任何东西）。
+                    endpoint_level_projection(&view),
+                    view.per_owner
+                        .into_iter()
+                        .map(|(fabric_id, connections)| OwnerOnlineInfo {
+                            fabric_id: hex::encode(fabric_id),
+                            connections,
+                        })
+                        .collect(),
+                    gate.cache_entries(),
+                    // 访客在线总数（Phase 1a 增量：per_visitor 的 connections 求和）
+                    view.per_visitor.iter().map(|(_, n)| n).sum(),
+                    // 敲门待办（Phase 1c 增量：未 dismissed 条目数）
+                    gate.knock_log().list(false).pending_count,
+                )
+            }
+            None => (None, Vec::new(), Vec::new(), 0, 0, 0),
+        };
+    // Phase 1c 增量：活跃访客（在册未过期）/ 活跃邀请码（未吊销未过期）
+    let visitors_active = state
+        .visitors
+        .snapshot()
+        .entries()
+        .into_iter()
+        .filter(|e| e.expires_at.is_none_or(|expires| now < expires))
+        .count();
+    let codes_active = state
+        .codes
+        .snapshot()
+        .entries()
+        .into_iter()
+        .filter(|c| !c.revoked && c.expires_at.is_none_or(|expires| now < expires))
+        .count();
     Json(Status {
         mode: match state.mode {
             AccessMode::Open => "open",
@@ -558,6 +668,9 @@ async fn status(State(state): State<AdminState>) -> Json<Status> {
         per_owner_connections: per_owner,
         cache_entries,
         visitors_online,
+        knocks_pending,
+        visitors_active,
+        codes_active,
     })
 }
 
@@ -825,6 +938,9 @@ mod tests {
         dir: TempDir,
         identity: Arc<ServerIdentity>,
         registry: Arc<OwnerRegistry>,
+        visitors: Arc<crate::access::visitor::VisitorRegistry>,
+        blocklist: Arc<Blocklist>,
+        codes: Arc<CodeLedger>,
         issuer: SigningKey,
         server_id: [u8; 32],
         fabric_id: [u8; 32],
@@ -835,10 +951,19 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let identity = Arc::new(ServerIdentity::load_or_create(dir.path()).unwrap());
             let registry = Arc::new(OwnerRegistry::load(&dir.path().join("owners.jsonl")).unwrap());
+            let visitors = Arc::new(
+                crate::access::visitor::VisitorRegistry::load(&dir.path().join("visitors.jsonl"))
+                    .unwrap(),
+            );
+            let blocklist = Arc::new(Blocklist::load(&dir.path().join("blocklist.jsonl")).unwrap());
+            let codes = Arc::new(CodeLedger::load(&dir.path().join("codes.jsonl"), &[]).unwrap());
             Self {
                 dir,
                 identity,
                 registry,
+                visitors,
+                blocklist,
+                codes,
                 issuer: SigningKey::from_bytes(&[0xA1; 32]),
                 server_id: [0xA2; 32],
                 fabric_id: [0xA3; 32],
@@ -872,6 +997,9 @@ mod tests {
                 token: TOKEN.to_string(),
                 identity: Arc::clone(&self.identity),
                 registry: Arc::clone(&self.registry),
+                visitors: Arc::clone(&self.visitors),
+                blocklist: Arc::clone(&self.blocklist),
+                codes: Arc::clone(&self.codes),
                 gate,
                 relay_clients,
                 mode,
@@ -1857,6 +1985,9 @@ mod tests {
         let endpoint = *iroh_base::SecretKey::from_bytes(&[0x53; 32])
             .public()
             .as_bytes();
+        // Phase 1c 增补的固定输入：code_hash 槽位 / block fabric 维度 id
+        let code_hash = [0x54; 32];
+        let block_fabric_id = [0x56; 32];
         // 按 fabric 断连的两 endpoint：真实曲线点，按 endpoint_id 字典序冻结
         let mut endpoints_b = vec![
             *iroh_base::SecretKey::from_bytes(&[0x31; 32])
@@ -1867,24 +1998,37 @@ mod tests {
                 .as_bytes(),
         ];
         endpoints_b.sort();
+        let zeros = [0u8; 32];
+
+        /// op → wire target 字段名（TS 侧 receiptCanonical 的 TARGET_FIELD_
+        /// BY_OP 同表——两侧漂移即对拍红）
+        fn target_field(op_code: u8) -> &'static str {
+            match op_code {
+                OP_DISCONNECT | OP_VISITOR_GRANT | OP_VISITOR_REVOKE | OP_VISITOR_META
+                | OP_KNOCK_DISMISS | OP_KNOCK_UNDISMISS => "endpoint_id",
+                OP_CODE_ISSUE | OP_CODE_REVOKE => "code_hash",
+                OP_BLOCK_ADD | OP_BLOCK_REMOVE => "id",
+                _ => "root",
+            }
+        }
 
         /// 单样例：per-target canonical + JSON wire（receipts 与实现结构体
         /// 同源序列化——wire 形态随实现演化时对拍立即红；op label 由 op_code
-        /// 派生，防调用处两处标签漂移）
+        /// 派生，防调用处两处标签漂移；Phase 1c 增补 0x04-0x0E 全族。
+        /// `block_kind` 仅 block 族样例消费（endpoint|fabric——fabric 槽位
+        /// 是否承载 id 的判定即 kind，spec 槽位映射表）
+        #[allow(clippy::too_many_arguments)]
         fn sample(
             kind: &str,
             op_code: u8,
             fabric: &[u8; 32],
+            block_kind: &'static str,
             targets: &[[u8; 32]],
             ts: u64,
             generation: u64,
             key: &SigningKey,
         ) -> serde_json::Value {
-            let op_label = match op_code {
-                OP_REGISTER => "register",
-                OP_UNREGISTER => "unregister",
-                _ => "disconnect",
-            };
+            let op_label = op_label(op_code);
             let mut canonical_hex = Vec::new();
             let mut receipts = Vec::new();
             for target in targets {
@@ -1897,6 +2041,95 @@ mod tests {
                             op: op_label,
                             fabric_id: hex::encode(fabric),
                             endpoint_id: hex::encode(target),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_RENEW => serde_json::to_value(roles::RenewReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            root: hex::encode(target),
+                            expires_at: 1_790_000_000_000,
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_VISITOR_GRANT => serde_json::to_value(roles::VisitorGrantReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            endpoint_id: hex::encode(target),
+                            expires_at: Some(1_790_000_000_000),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_VISITOR_REVOKE => serde_json::to_value(roles::VisitorRevokeReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            endpoint_id: hex::encode(target),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_CODE_ISSUE => serde_json::to_value(roles::CodeIssueReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            code: "dwebc1.0123-4567-89cd-fghj".into(),
+                            code_hash: hex::encode(target),
+                            alias_hint: Some("fixture-hint".into()),
+                            max_uses: 1,
+                            expires_at: 1_790_060_800_000,
+                            default_ttl_days: 30,
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_CODE_REVOKE => serde_json::to_value(roles::CodeRevokeReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            code_hash: hex::encode(target),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_BLOCK_ADD | OP_BLOCK_REMOVE => {
+                            serde_json::to_value(roles::BlockReceipt {
+                                op: op_label,
+                                fabric_id: hex::encode(fabric),
+                                kind: block_kind,
+                                id: hex::encode(target),
+                                reason: Some("fixture".into()),
+                                ts,
+                                generation,
+                                receipt_sig: sig,
+                            })
+                        }
+                        OP_KNOCK_DISMISS | OP_KNOCK_UNDISMISS => {
+                            serde_json::to_value(roles::KnockReceipt {
+                                op: op_label,
+                                fabric_id: hex::encode(fabric),
+                                endpoint_id: hex::encode(target),
+                                ts,
+                                generation,
+                                receipt_sig: sig,
+                            })
+                        }
+                        OP_OWNER_META => serde_json::to_value(roles::OwnerMetaReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            root: hex::encode(target),
+                            alias: Some("fixture-alias".into()),
+                            note: None,
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        OP_VISITOR_META => serde_json::to_value(roles::VisitorMetaReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            endpoint_id: hex::encode(target),
+                            alias: None,
+                            note: Some("fixture-note".into()),
                             ts,
                             generation,
                             receipt_sig: sig,
@@ -1919,8 +2152,7 @@ mod tests {
                 "kind": kind,
                 "op_code": op_code,
                 "fabric_id": hex::encode(fabric),
-                // register/unregister 的 target 序列化为 root；disconnect 为 endpoint_id
-                "target_field": if op_code == OP_DISCONNECT { "endpoint_id" } else { "root" },
+                "target_field": target_field(op_code),
                 "targets": targets.iter().map(hex::encode).collect::<Vec<_>>(),
                 "ts": ts,
                 "generation": generation,
@@ -1930,15 +2162,34 @@ mod tests {
         }
 
         let vector = serde_json::json!({
-            "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
+            "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5; server-access-roles Phase 1c extends ops 0x04-0x0E); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
             "domain_hex": hex::encode(RECEIPT_DOMAIN),
-            "ops": { "register": OP_REGISTER, "unregister": OP_UNREGISTER, "disconnect": OP_DISCONNECT },
+            "ops": {
+                "register": OP_REGISTER, "unregister": OP_UNREGISTER, "disconnect": OP_DISCONNECT,
+                "renew": OP_RENEW, "visitor-grant": OP_VISITOR_GRANT, "visitor-revoke": OP_VISITOR_REVOKE,
+                "code-issue": OP_CODE_ISSUE, "code-revoke": OP_CODE_REVOKE,
+                "block-add": OP_BLOCK_ADD, "block-remove": OP_BLOCK_REMOVE,
+                "knock-dismiss": OP_KNOCK_DISMISS, "knock-undismiss": OP_KNOCK_UNDISMISS,
+                "owner-meta": OP_OWNER_META, "visitor-meta": OP_VISITOR_META,
+            },
             "server_id": hex::encode(key.verifying_key().to_bytes()),
             "samples": [
-                sample("register", OP_REGISTER, &fabric, &[root], 1_789_012_345_678, 4, &key),
-                sample("unregister", OP_UNREGISTER, &fabric, &[root], 1_789_012_400_000, 5, &key),
-                sample("disconnect-endpoint", OP_DISCONNECT, &fabric, &[endpoint], 1_789_012_500_000, 6, &key),
-                sample("disconnect-fabric", OP_DISCONNECT, &fabric_b, &endpoints_b, 1_789_012_600_000, 7, &key),
+                sample("register", OP_REGISTER, &fabric, "endpoint", &[root], 1_789_012_345_678, 4, &key),
+                sample("unregister", OP_UNREGISTER, &fabric, "endpoint", &[root], 1_789_012_400_000, 5, &key),
+                sample("disconnect-endpoint", OP_DISCONNECT, &fabric, "endpoint", &[endpoint], 1_789_012_500_000, 6, &key),
+                sample("disconnect-fabric", OP_DISCONNECT, &fabric_b, "endpoint", &endpoints_b, 1_789_012_600_000, 7, &key),
+                sample("renew", OP_RENEW, &fabric, "endpoint", &[root], 1_789_012_700_000, 8, &key),
+                sample("visitor-grant", OP_VISITOR_GRANT, &zeros, "endpoint", &[endpoint], 1_789_012_800_000, 9, &key),
+                sample("visitor-revoke", OP_VISITOR_REVOKE, &zeros, "endpoint", &[endpoint], 1_789_012_850_000, 10, &key),
+                sample("code-issue", OP_CODE_ISSUE, &zeros, "endpoint", &[code_hash], 1_789_012_900_000, 11, &key),
+                sample("code-revoke", OP_CODE_REVOKE, &zeros, "endpoint", &[code_hash], 1_789_012_950_000, 12, &key),
+                sample("block-add-endpoint", OP_BLOCK_ADD, &zeros, "endpoint", &[endpoint], 1_789_013_000_000, 13, &key),
+                sample("block-add-fabric", OP_BLOCK_ADD, &block_fabric_id, "fabric", &[block_fabric_id], 1_789_013_050_000, 14, &key),
+                sample("block-remove", OP_BLOCK_REMOVE, &block_fabric_id, "fabric", &[block_fabric_id], 1_789_013_100_000, 15, &key),
+                sample("knock-dismiss", OP_KNOCK_DISMISS, &zeros, "endpoint", &[endpoint], 1_789_013_200_000, 16, &key),
+                sample("knock-undismiss", OP_KNOCK_UNDISMISS, &zeros, "endpoint", &[endpoint], 1_789_013_250_000, 16, &key),
+                sample("owner-meta", OP_OWNER_META, &fabric, "endpoint", &[root], 1_789_013_300_000, 17, &key),
+                sample("visitor-meta", OP_VISITOR_META, &zeros, "endpoint", &[endpoint], 1_789_013_350_000, 18, &key),
             ],
         });
 
@@ -1958,6 +2209,17 @@ mod tests {
         expected.extend_from_slice(&1_789_012_600_000u64.to_be_bytes());
         expected.extend_from_slice(&7u64.to_be_bytes());
         assert_eq!(op3, expected);
+        // Phase 1c 布局断言（op 0x07 code-issue：fabric 槽位置零、target 槽位
+        // 承载 code_hash——spec 槽位映射表）
+        let op7 = receipt_canonical(OP_CODE_ISSUE, &zeros, &code_hash, 1_789_012_900_000, 11);
+        let mut expected7 = RECEIPT_DOMAIN.to_vec();
+        expected7.push(OP_CODE_ISSUE);
+        expected7.extend_from_slice(&zeros);
+        expected7.extend_from_slice(&code_hash);
+        expected7.extend_from_slice(&1_789_012_900_000u64.to_be_bytes());
+        expected7.extend_from_slice(&11u64.to_be_bytes());
+        assert_eq!(op7, expected7);
+        assert_eq!(op7.len(), 103, "103B canonical 布局恒定");
         // 验签（固定 key 的公钥侧——server_id 同源语义）
         let verifying =
             ed25519_dalek::VerifyingKey::from_bytes(&key.verifying_key().to_bytes()).unwrap();
@@ -1977,6 +2239,22 @@ mod tests {
                 ),
             )
             .expect("冻结向量的 receipt_sig 必须可验签");
+        verifying
+            .verify(
+                &op7,
+                &ed25519_dalek::Signature::from_bytes(
+                    &URL_SAFE_NO_PAD
+                        .decode(
+                            vector["samples"][7]["receipts"][0]["receipt_sig"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+            )
+            .expect("Phase 1c 冻结向量（code-issue）必须可验签");
 
         // fixture 随仓库入库（r3-P1-4）：缺失即失败——测试不得在 CI 中写回
         // 源码树；显式重生成 = DWEB_REGEN_FIXTURES=1 跑本测试写出后复核入库。

@@ -85,14 +85,11 @@ pub struct OwnerEntry {
     pub root: [u8; 32],
     pub registered_at: u64,
     /// 到期时间戳（None = 永久）。Phase 1c 起经 `GET /admin/owners` 增量
-    /// 暴露（`expires_at`/`expires_in`/状态），1a 内核快照先行携带
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 暴露（`expires_at`/`expires_in`/状态）
     pub expires_at: Option<u64>,
-    /// 别名（R6）。消费面同上（Phase 1c）
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 别名（R6）。元数据经 `PATCH /admin/owners/{f}/{r}` 编辑（Phase 1c）
     pub alias: Option<String>,
     /// 备注。消费面同上（Phase 1c）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub note: Option<String>,
 }
 
@@ -305,36 +302,149 @@ impl OwnerRegistry {
         expires_at: Option<u64>,
         via_code_hash: &[u8; 32],
     ) -> Result<()> {
+        // expires_at 覆盖、alias/note 保留
+        self.upsert_preserving(
+            fabric_id,
+            root,
+            Some(expires_at),
+            None,
+            None,
+            *via_code_hash,
+        )
+    }
+
+    /// 续期（Phase 1c `POST /admin/owners/{f}/{r}/renew`）：register 事件
+    /// 刷新 expires_at（None = permanent），**保留既有 alias/note**（与
+    /// register_via_code 同语义——renew 不应清空运营元数据）。false = 键
+    /// 不在册（含从未注册；过期条目仍在册可续期——spec「续期恢复准入」），
+    /// 映射 404 no-match。
+    pub fn renew(
+        &self,
+        fabric_id: &[u8; 32],
+        root: &[u8; 32],
+        expires_at: Option<u64>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if !state.current.active.contains_key(&(*fabric_id, *root)) {
+            return Ok(false);
+        }
+        Self::upsert_locked(
+            &mut state,
+            fabric_id,
+            root,
+            Some(expires_at),
+            None,
+            None,
+            None,
+            self.path.as_path(),
+        )?;
+        Ok(true)
+    }
+
+    /// 元数据编辑（Phase 1c `PATCH /admin/owners/{f}/{r}`）：alias/note 覆盖
+    /// 为入参终值（调用方完成「缺省保留/空串清除」合并），**保留既有
+    /// expires_at**（元数据编辑不改租期）。false = 键不在册。
+    pub fn update_metadata(
+        &self,
+        fabric_id: &[u8; 32],
+        root: &[u8; 32],
+        alias: Option<String>,
+        note: Option<String>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap();
+        if !state.current.active.contains_key(&(*fabric_id, *root)) {
+            return Ok(false);
+        }
+        Self::upsert_locked(
+            &mut state,
+            fabric_id,
+            root,
+            None,
+            Some(alias),
+            Some(note),
+            None,
+            self.path.as_path(),
+        )?;
+        Ok(true)
+    }
+
+    /// upsert 公共核（register_via_code 直连；renew/update_metadata 在
+    /// 预检后同锁进入）：None = 保留既有值，Some = 覆盖为终值。锁外不可
+    /// 调用（renew/update 的存在性预检与写入必须同临界区）。
+    fn upsert_preserving(
+        &self,
+        fabric_id: &[u8; 32],
+        root: &[u8; 32],
+        expires_at: Option<Option<u64>>,
+        alias: Option<Option<String>>,
+        note: Option<Option<String>>,
+        via_code_hash: [u8; 32],
+    ) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        Self::upsert_locked(
+            &mut state,
+            fabric_id,
+            root,
+            expires_at,
+            alias,
+            note,
+            Some(via_code_hash),
+            self.path.as_path(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_locked(
+        state: &mut State,
+        fabric_id: &[u8; 32],
+        root: &[u8; 32],
+        expires_at: Option<Option<u64>>,
+        alias: Option<Option<String>>,
+        note: Option<Option<String>>,
+        via_code_hash: Option<[u8; 32]>,
+        path: &Path,
+    ) -> Result<()> {
+        // 先合并出**终值**再落事件行：归并语义 = 最新 register 行原值生效，
+        // 事件行必须携带完整终态（否则「保留既有 alias/note」只存在于内存、
+        // 重启归并即丢失——1b 的潜在漂移在此修正：磁盘与内存同值）。
+        // 合并规则：外层 Some=覆盖终值（内层 None=清除/永久）、外层 None=
+        // 保留既有——**不得**用 flatten().or() 回落（会把「清除」误判为
+        // 「未提供」而复活旧值）
+        let existing = state
+            .current
+            .active
+            .get(&(*fabric_id, *root))
+            .cloned()
+            .unwrap_or_default();
+        let final_expires = expires_at.unwrap_or(existing.expires_at);
+        let final_alias = alias.unwrap_or(existing.alias);
+        let final_note = note.unwrap_or(existing.note);
         let record = Record {
             op: Op::Register,
             fabric_id: encode_key(&hex::encode(fabric_id)),
             root: encode_key(&hex::encode(root)),
             ts: now_ms(),
-            expires_at,
-            alias: None,
-            note: None,
-            via_code_hash: Some(hex::encode(via_code_hash)),
+            expires_at: final_expires,
+            alias: final_alias,
+            note: final_note,
+            via_code_hash: via_code_hash.map(hex::encode),
         };
-        let mut state = self.state.lock().unwrap();
         let line = ledger::record_line(&record).context("serialize owners record")?;
-        ledger::append_line(&self.path, "owners", &line)?;
-        // 续期合并：alias/note 取既有条目（无则空），租期/时间戳刷新
+        ledger::append_line(path, "owners", &line)?;
         let mut active = state.current.active.clone();
-        let existing = active
-            .get(&(*fabric_id, *root))
-            .cloned()
-            .unwrap_or_default();
         active.insert(
             (*fabric_id, *root),
             EntryMeta {
                 registered_at: record.ts,
                 expires_at: record.expires_at,
-                alias: existing.alias,
-                note: existing.note,
+                alias: record.alias,
+                note: record.note,
             },
         );
         let mut via_code = state.current.via_code.clone();
-        via_code.insert((*via_code_hash, *fabric_id, *root));
+        if let Some(hash) = via_code_hash {
+            via_code.insert((hash, *fabric_id, *root));
+        }
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             active,

@@ -429,3 +429,85 @@ test("constructor: rejects malformed baseUrl/token/timeoutMs", () => {
   assert.throws(() => new AdminClient({ baseUrl: BASE, token: "t", timeoutMs: 0 }), TypeError);
   assert.throws(() => new AdminClient({ baseUrl: BASE, token: "t", timeoutMs: 50.5 }), TypeError);
 });
+
+// ---- server-access-roles Phase 1c：三角色管理调用的 wire 形态 ------------------
+
+const EP = "d1".repeat(32);
+const FABRIC = "f1".repeat(32);
+const ROOT = "7c".repeat(32);
+const CODE_HASH = "ab".repeat(32);
+
+test("roles 1c: knocks/visitors/codes/blocklist/renew/PATCH methods hit frozen routes with snake_case bodies", async () => {
+  const { calls, restore } = stubFetch(() => fakeResponse(200, { ok: true }));
+  try {
+    const client = new AdminClient({ baseUrl: BASE, token: "t" });
+
+    await client.listKnocks();
+    await client.listKnocks({ includeDismissed: true });
+    await client.dismissKnock(EP);
+    await client.undismissKnock(EP);
+    await client.listVisitors();
+    await client.grantVisitor({ endpointId: EP, alias: "a", expiresInDays: 7 });
+    await client.grantVisitorFromKnock({ endpointId: EP, note: "from knock" });
+    await client.revokeVisitor(EP);
+    await client.updateVisitorMetadata(EP, { alias: "", note: "n" });
+    await client.listCodes();
+    await client.issueCode({ aliasHint: "h", maxUses: 2, defaultTtlDays: 7 });
+    await client.issueCode();
+    await client.revokeCode(CODE_HASH);
+    await client.renewOwner(FABRIC, ROOT, { expiresInDays: 30 });
+    await client.renewOwner(FABRIC, ROOT, { permanent: true });
+    await client.updateOwnerMetadata(FABRIC, ROOT, { alias: "x" });
+    await client.listBlocklist();
+    await client.block({ kind: "endpoint", id: EP, reason: "abuse" });
+    await client.unblock("fabric", EP);
+
+    const wires = calls.map((c) => ({
+      method: c.init.method ?? "GET",
+      url: c.url.replace(BASE, ""),
+      body: c.init.body === undefined ? null : JSON.parse(c.init.body),
+    }));
+    assert.deepEqual(wires, [
+      { method: "GET", url: "/admin/knocks", body: null },
+      { method: "GET", url: "/admin/knocks?include_dismissed=true", body: null },
+      { method: "POST", url: `/admin/knocks/${EP}/dismiss`, body: null },
+      { method: "POST", url: `/admin/knocks/${EP}/undismiss`, body: null },
+      { method: "GET", url: "/admin/visitors", body: null },
+      { method: "POST", url: "/admin/visitors", body: { endpoint_id: EP, alias: "a", expires_in_days: 7 } },
+      { method: "POST", url: "/admin/visitors/from-knock", body: { endpoint_id: EP, note: "from knock" } },
+      { method: "DELETE", url: `/admin/visitors/${EP}`, body: null },
+      { method: "PATCH", url: `/admin/visitors/${EP}`, body: { alias: "", note: "n" } },
+      { method: "GET", url: "/admin/codes", body: null },
+      { method: "POST", url: "/admin/codes", body: { alias_hint: "h", max_uses: 2, default_ttl_days: 7 } },
+      { method: "POST", url: "/admin/codes", body: {} },
+      { method: "DELETE", url: `/admin/codes/${CODE_HASH}`, body: null },
+      { method: "POST", url: `/admin/owners/${FABRIC}/${ROOT}/renew`, body: { expires_in_days: 30 } },
+      { method: "POST", url: `/admin/owners/${FABRIC}/${ROOT}/renew`, body: { permanent: true } },
+      { method: "PATCH", url: `/admin/owners/${FABRIC}/${ROOT}`, body: { alias: "x" } },
+      { method: "GET", url: "/admin/blocklist", body: null },
+      { method: "POST", url: "/admin/blocklist", body: { kind: "endpoint", id: EP, reason: "abuse" } },
+      { method: "DELETE", url: `/admin/blocklist/fabric/${EP}`, body: null },
+    ]);
+  } finally {
+    restore();
+  }
+});
+
+test("roles 1c: client-side fail-fast matrix (hex/kind/exactly-one/at-least-one)", () => {
+  const client = new AdminClient({ baseUrl: BASE, token: "t" });
+  const expectInvalid = (fn, label) =>
+    assert.throws(fn, (err) => {
+      assert.ok(err instanceof AdminError, label);
+      assert.equal(err.code, "invalid-request");
+      assert.equal(err.status, null);
+      return true;
+    }, label);
+  expectInvalid(() => client.dismissKnock("zz"), "bad hex");
+  expectInvalid(() => client.revokeCode("zz"), "bad hex");
+  expectInvalid(() => client.renewOwner(FABRIC, ROOT, {}), "renew 空");
+  expectInvalid(() => client.renewOwner(FABRIC, ROOT, { expiresInDays: 1, permanent: true }), "renew 双键");
+  expectInvalid(() => client.updateOwnerMetadata(FABRIC, ROOT, {}), "owner meta 空");
+  expectInvalid(() => client.updateVisitorMetadata(EP, {}), "visitor meta 空");
+  expectInvalid(() => client.block({ kind: "node", id: EP }), "坏 kind");
+  expectInvalid(() => client.unblock("endpoint", "zz"), "unblock 坏 hex");
+});

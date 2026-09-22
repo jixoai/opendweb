@@ -362,18 +362,23 @@ async fn main() -> Result<()> {
         owners_snapshot.generation()
     );
 
+    // 访客名册/黑名单台账（server-access-roles Phase 1a 内核 + Phase 1c
+    // 管理面消费）：两种 access mode 均加载——admin 管理面与门禁执行面正交
+    // （Phase 1c 起 open 模式下台账可管理，gate 仍不装配、不消费，O-9 冻结
+    // 不变：open 模式门禁不生效）。坏行与 owners 同纪律：load 失败
+    // fail-fast（? 上抛，退出码非零）。
+    let visitors = std::sync::Arc::new(access::visitor::VisitorRegistry::load(
+        &access_cfg.visitors_file,
+    )?);
+    let blocklist = std::sync::Arc::new(access::blocklist::Blocklist::load(
+        &access_cfg.blocklist_file,
+    )?);
+
     // restricted：构造验证链聚合器并挂台账热重载看护（mtime 轮询 5s；
     // open 模式 relay 走 AllowAll 快路径，无需 gate/看护；visitors/blocklist
-    // 仅 restricted 语义——open 模式不加载，O-9 冻结）。访客名册/黑名单
-    // 坏行与 owners 同纪律：load 失败 fail-fast（? 上抛，退出码非零）。
+    // 仅 restricted 门禁语义——open 模式不装 gate，O-9 冻结）。
     let (relay_gate, rdz_gate) = match access_cfg.mode {
         access::config::AccessMode::Restricted => {
-            let visitors = std::sync::Arc::new(access::visitor::VisitorRegistry::load(
-                &access_cfg.visitors_file,
-            )?);
-            let blocklist = std::sync::Arc::new(access::blocklist::Blocklist::load(
-                &access_cfg.blocklist_file,
-            )?);
             tracing::info!(
                 "visitor registry: {} active (generation {}), blocklist: {} entries",
                 visitors.snapshot().len(),
@@ -499,6 +504,9 @@ async fn main() -> Result<()> {
                 token,
                 std::sync::Arc::clone(&identity),
                 std::sync::Arc::clone(&owners),
+                std::sync::Arc::clone(&visitors),
+                std::sync::Arc::clone(&blocklist),
+                std::sync::Arc::clone(&codes),
                 relay_gate.clone(),
                 relay_clients,
                 access_cfg.mode,

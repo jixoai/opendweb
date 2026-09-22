@@ -595,8 +595,7 @@ impl AccessGate {
         self.knocks.record(endpoint_id, reason, now_ms());
     }
 
-    /// 敲门台账只读句柄（Phase 1c `GET /admin/knocks` 消费；1a 由测试驱动）
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// 敲门台账只读句柄（Phase 1c `GET /admin/knocks` 消费）
     pub fn knock_log(&self) -> &KnockLog {
         &self.knocks
     }

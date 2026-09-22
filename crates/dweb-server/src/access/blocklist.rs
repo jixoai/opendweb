@@ -29,12 +29,22 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// 名单维度（serde wire 值冻结：endpoint|fabric）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// 名单维度（serde wire 值冻结：endpoint|fabric；判别序 endpoint < fabric
+/// ——列表确定性排序的 tie-break 维度）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BlockKind {
     Endpoint,
     Fabric,
+}
+
+/// 当前名单条目（add 事件携带的元数据；Phase 1c 列表回显 ts/reason）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockEntry {
+    /// add 理由（None = 未填写）
+    pub reason: Option<String>,
+    /// add 事件 ts
+    pub ts: u64,
 }
 
 /// (kind, id) 命名空间键——两个维度的同值 id 互不干扰
@@ -66,8 +76,7 @@ pub struct BlocklistSnapshot {
 
 struct SnapshotInner {
     generation: u64,
-    /// 值 = add 事件携带的 reason（None = 未填写）
-    entries: HashMap<BlockKey, Option<String>>,
+    entries: HashMap<BlockKey, BlockEntry>,
 }
 
 impl BlocklistSnapshot {
@@ -86,12 +95,25 @@ impl BlocklistSnapshot {
         self.inner
             .entries
             .get(&(kind, *id))
-            .and_then(|r| r.as_deref())
+            .and_then(|e| e.reason.as_deref())
     }
 
     /// 当前名单条目数（启动日志用）
     pub fn len(&self) -> usize {
         self.inner.entries.len()
+    }
+
+    /// 确定性列表（(kind, id) 字节序——kind 判别序 endpoint < fabric；
+    /// Phase 1c `GET /admin/blocklist` 消费）
+    pub fn entries(&self) -> Vec<(BlockKind, [u8; 32], BlockEntry)> {
+        let mut list: Vec<(BlockKind, [u8; 32], BlockEntry)> = self
+            .inner
+            .entries
+            .iter()
+            .map(|((kind, id), entry)| (*kind, *id, entry.clone()))
+            .collect();
+        list.sort_by_key(|(kind, id, _)| (*kind, *id));
+        list
     }
 }
 
@@ -146,14 +168,20 @@ impl Blocklist {
         }
     }
 
-    fn load_entries(path: &Path) -> Result<HashMap<BlockKey, Option<String>>> {
-        let mut entries: HashMap<BlockKey, Option<String>> = HashMap::new();
+    fn load_entries(path: &Path) -> Result<HashMap<BlockKey, BlockEntry>> {
+        let mut entries: HashMap<BlockKey, BlockEntry> = HashMap::new();
         for (line_no, record) in ledger::read_records::<Record>(path, "blocklist")? {
             let id = super::registry::parse_owner_hex(&record.id)
                 .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
             match record.op {
                 Op::Add => {
-                    entries.insert((record.kind, id), record.reason);
+                    entries.insert(
+                        (record.kind, id),
+                        BlockEntry {
+                            reason: record.reason,
+                            ts: record.ts,
+                        },
+                    );
                 }
                 Op::Remove => {
                     entries.remove(&(record.kind, id));
@@ -163,9 +191,8 @@ impl Blocklist {
         Ok(entries)
     }
 
-    /// 加入名单（Phase 1c `POST /admin/blocklist` 入口；1a 由测试驱动）。
+    /// 加入名单（Phase 1c `POST /admin/blocklist` 入口）。
     /// 同键重复 add 幂等（集合语义），事件仍落日志。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn add(&self, kind: BlockKind, id: &[u8; 32], reason: Option<String>) -> Result<()> {
         self.apply(
             Record {
@@ -180,7 +207,6 @@ impl Blocklist {
     }
 
     /// 移出名单（按 (kind, id) 定位；不存在的 remove 同样落日志、无内存效果）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove(&self, kind: BlockKind, id: &[u8; 32]) -> Result<()> {
         self.apply(
             Record {
@@ -201,7 +227,13 @@ impl Blocklist {
         let mut entries = state.current.entries.clone();
         match record.op {
             Op::Add => {
-                entries.insert((record.kind, id), record.reason);
+                entries.insert(
+                    (record.kind, id),
+                    BlockEntry {
+                        reason: record.reason,
+                        ts: record.ts,
+                    },
+                );
             }
             Op::Remove => {
                 entries.remove(&(record.kind, id));

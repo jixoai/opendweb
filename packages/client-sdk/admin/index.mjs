@@ -22,33 +22,108 @@
 //
 // wire（server spec 全 JSON 示例冻结，snake_case 直映；未知字段忽略）：
 // GET  /admin/status      {mode, policy, generation, max_connections_per_owner,
-//                          active_connections[], per_owner_connections[], cache_entries}
-// GET  /admin/owners      {generation, owners:[{fabric_id, root, registered_at}]}
+//                          active_connections[], per_owner_connections[], cache_entries,
+//                          visitors_online, knocks_pending, visitors_active, codes_active}
+//                          ——后四项为 server-access-roles Phase 1a/1c 纯增量字段
+// GET  /admin/owners      {generation, owners:[{fabric_id, root, registered_at,
+//                          alias?, note?, expires_at, expires_in, status}]}
+//                          ——alias/note/expires_* /status 为 Phase 1c 增量
 // POST /admin/owners      {fabric_id_hex, root_hex} → Receipt
 // DEL  /admin/owners/{fabric_id}/{root}              → Receipt（kicked_* 仅注销）
+// PATCH /admin/owners/{fabric_id}/{root} {alias?, note?} → owner-meta 回执（1c）
+// POST /admin/owners/{fabric_id}/{root}/renew
+//                        {expires_in_days} | {permanent: true}（恰好其一）→ renew 回执（1c）
 // GET  /admin/connections {mode, policy, relay_enabled, quota{...}, per_endpoint[],
-//                          per_owner[]}
+//                          per_owner[], per_visitor[]}
 // POST /admin/connections/disconnect {endpoint_id}|{fabric_id}
 //                          → {disconnected[], receipts[]}（回执 op=disconnect 用
 //                            显式 endpoint_id 字段，不复用 root 键名）
+// GET  /admin/knocks[?include_dismissed=true] {knocks[], pending_count}（1c）
+// POST /admin/knocks/{endpoint_id}/dismiss|undismiss → knock 回执（1c）
+// GET  /admin/visitors    {generation, visitors:[{endpoint_id, alias?, note?,
+//                          granted_at, expires_at?}]}（1c）
+// POST /admin/visitors[/from-knock] {endpoint_id, alias?, note?, expires_in_days?}
+//                          → visitor-grant 回执（from-knock 为语义糖路由）（1c）
+// DEL/PATCH /admin/visitors/{endpoint_id} → visitor-revoke / visitor-meta 回执（1c）
+// GET  /admin/codes       {generation, codes:[{code_hash, max_uses, used_count,
+//                          expires_at?, alias_hint?, revoked, default_ttl_days,
+//                          denied}]}——绝不含码全文（1c）
+// POST /admin/codes       {alias_hint?, max_uses?, expires_in_days?,
+//                          default_ttl_days?} → code-issue 回执（含 code 全文仅一次）
+// DEL  /admin/codes/{code_hash} → code-revoke 回执（1c）
+// GET  /admin/blocklist   {generation, entries:[{kind, id, reason?, ts}]}（1c）
+// POST /admin/blocklist   {kind: endpoint|fabric, id, reason?} → block-add 回执
+// DEL  /admin/blocklist/{kind}/{id} → block-remove 回执（1c）
 //
 // 回执 canonical（admin.rs receipt_canonical 冻结布局，全大端）：
 // b"dweb/admin-receipt/v1\0"(22B) || op u8 || fabric_id 32B || target 32B ||
-// ts u64BE || generation u64BE——register/unregister 的 target=root EndpointId，
-// disconnect 的 target=被断 endpoint EndpointId。跨语言冻结对拍向量：
+// ts u64BE || generation u64BE。Phase 1c 起 op 扩到 0x04-0x0E（server-access-
+// roles spec「三角色管理面 API」槽位映射表）：未用维度的 fabric_id 在 wire
+// 上为 64 个 "0"（与 canonical 置零字节同步），target 字段按 op 族取
+// root/endpoint_id/code_hash/id（TARGET_FIELD_BY_OP）。跨语言冻结对拍向量：
 // crates/dweb-server/tests/fixtures/receipt-vector.json。
+//
+// register-receipt（POST /register 公开兑换面，server-access-roles 1b/1c）：
+// canonical `b"dweb/register-receipt/v1\0" || code_hash 32B || fabric 32B ||
+// root 32B || ts u64BE || generation u64BE`（137B 定长）——registerReceiptCanonical/
+// verifyRegisterReceipt 与 packages/opendweb/src/register.mjs 逐字节互认。
 
 /** 回执签名域分隔前缀（22B；admin.rs RECEIPT_DOMAIN 同值冻结）。 */
 const RECEIPT_DOMAIN = Uint8Array.from("dweb/admin-receipt/v1\0".split(""), (c) =>
   c.charCodeAt(0),
 );
 
-/** op 串 ↔ 字节（admin.rs OP_REGISTER/OP_UNREGISTER/OP_DISCONNECT）。 */
-const RECEIPT_OP_BYTES = { register: 1, unregister: 2, disconnect: 3 };
+/** op 串 ↔ 字节（admin.rs OP_* 冻结；server-access-roles Phase 1c 扩
+ * 0x04-0x0E——spec「三角色管理面 API」op 枚举表逐字对齐）。 */
+const RECEIPT_OP_BYTES = {
+  register: 1,
+  unregister: 2,
+  disconnect: 3,
+  renew: 4,
+  "visitor-grant": 5,
+  "visitor-revoke": 6,
+  "code-issue": 7,
+  "code-revoke": 8,
+  "block-add": 9,
+  "block-remove": 10,
+  "knock-dismiss": 11,
+  "knock-undismiss": 12,
+  "owner-meta": 13,
+  "visitor-meta": 14,
+};
+
+/** op → wire target 字段名（canonical 32B target 槽位的 JSON 承载键；
+ * admin/mod.rs fixture target_field() 同表冻结）。 */
+const TARGET_FIELD_BY_OP = {
+  register: "root",
+  unregister: "root",
+  renew: "root",
+  "owner-meta": "root",
+  disconnect: "endpoint_id",
+  "visitor-grant": "endpoint_id",
+  "visitor-revoke": "endpoint_id",
+  "visitor-meta": "endpoint_id",
+  "knock-dismiss": "endpoint_id",
+  "knock-undismiss": "endpoint_id",
+  "code-issue": "code_hash",
+  "code-revoke": "code_hash",
+  "block-add": "id",
+  "block-remove": "id",
+};
 
 /** canonical 总长 = 22 + 1 + 32 + 32 + 8 + 8 = 103B。 */
 const RECEIPT_CANONICAL_LEN =
   RECEIPT_DOMAIN.length + 1 + 32 + 32 + 8 + 8;
+
+/** register-receipt 域分隔前缀（25B；register.rs RECEIPT_DOMAIN 同值冻结）。 */
+const REGISTER_RECEIPT_DOMAIN = Uint8Array.from(
+  "dweb/register-receipt/v1\0".split(""),
+  (c) => c.charCodeAt(0),
+);
+
+/** register-receipt canonical 定长 = 25 + 32×3 + 8×2 = 137B（spec 冻结）。 */
+const REGISTER_RECEIPT_CANONICAL_LEN =
+  REGISTER_RECEIPT_DOMAIN.length + 32 * 3 + 8 * 2;
 
 const HEX64_RE = /^[0-9a-fA-F]{64}$/;
 
@@ -247,6 +322,236 @@ export class AdminClient {
     throw new AdminError(code, message, res.status);
   }
 
+  // ---- server-access-roles Phase 1c：三角色管理调用 ---------------------------
+
+  /**
+   * GET /admin/knocks（排序冻结：未处置在前、组内 seq 降序、endpoint_id
+   * 升序 tie-break；pending_count 恒为未 dismissed 数）。
+   * @param {{ includeDismissed?: boolean }} [options]
+   */
+  listKnocks({ includeDismissed = false } = {}) {
+    const path = includeDismissed
+      ? "/admin/knocks?include_dismissed=true"
+      : "/admin/knocks";
+    return this.#json(path);
+  }
+
+  /**
+   * POST /admin/knocks/{endpoint_id}/dismiss（幂等；unknown → no-match）。
+   * @param {string} endpointId 64-hex
+   */
+  dismissKnock(endpointId) {
+    requireHex64(endpointId, "endpointId");
+    return this.#json(`/admin/knocks/${endpointId}/dismiss`, { method: "POST" });
+  }
+
+  /** POST /admin/knocks/{endpoint_id}/undismiss（幂等；unknown → no-match）。 */
+  undismissKnock(endpointId) {
+    requireHex64(endpointId, "endpointId");
+    return this.#json(`/admin/knocks/${endpointId}/undismiss`, { method: "POST" });
+  }
+
+  /** GET /admin/visitors → {generation, visitors[]}。 */
+  listVisitors() {
+    return this.#json("/admin/visitors");
+  }
+
+  /**
+   * POST /admin/visitors（授予访客；expiresInDays 缺省 = 永久）。
+   * @param {{ endpointId: string, alias?: string, note?: string, expiresInDays?: number }} grant
+   */
+  grantVisitor({ endpointId, alias, note, expiresInDays } = {}) {
+    requireHex64(endpointId, "endpointId");
+    const body = { endpoint_id: endpointId };
+    if (alias !== undefined) body.alias = alias;
+    if (note !== undefined) body.note = note;
+    if (expiresInDays !== undefined) body.expires_in_days = expiresInDays;
+    return this.#json("/admin/visitors", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * POST /admin/visitors/from-knock（语义糖路由，等同 grantVisitor——敲门台
+   * 一键定位的专用入口）。
+   * @param {{ endpointId: string, alias?: string, note?: string, expiresInDays?: number }} grant
+   */
+  grantVisitorFromKnock(grant = {}) {
+    requireHex64(grant.endpointId, "endpointId");
+    const body = { endpoint_id: grant.endpointId };
+    if (grant.alias !== undefined) body.alias = grant.alias;
+    if (grant.note !== undefined) body.note = grant.note;
+    if (grant.expiresInDays !== undefined) body.expires_in_days = grant.expiresInDays;
+    return this.#json("/admin/visitors/from-knock", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * DELETE /admin/visitors/{endpoint_id}（revoke；unknown → no-match）。
+   * @param {string} endpointId 64-hex
+   */
+  revokeVisitor(endpointId) {
+    requireHex64(endpointId, "endpointId");
+    return this.#json(`/admin/visitors/${endpointId}`, { method: "DELETE" });
+  }
+
+  /**
+   * PATCH /admin/visitors/{endpoint_id}（元数据：alias/note 至少其一、
+   * 空串 = 清除、缺省 = 保留）。
+   * @param {string} endpointId 64-hex
+   * @param {{ alias?: string, note?: string }} meta
+   */
+  updateVisitorMetadata(endpointId, meta = {}) {
+    requireHex64(endpointId, "endpointId");
+    const { alias, note } = meta ?? {};
+    if (alias === undefined && note === undefined) {
+      throw new AdminError(
+        "invalid-request",
+        "updateVisitorMetadata: at least one of alias or note is required",
+        null,
+      );
+    }
+    const body = {};
+    if (alias !== undefined) body.alias = alias;
+    if (note !== undefined) body.note = note;
+    return this.#json(`/admin/visitors/${endpointId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** GET /admin/codes → {generation, codes[]}（只含哈希与计数，绝无码全文）。 */
+  listCodes() {
+    return this.#json("/admin/codes");
+  }
+
+  /**
+   * POST /admin/codes（签发；**响应含 code 全文仅此一次**——调用方负责
+   * 即时呈现/丢弃，不得持久化）。缺省 max_uses=1 / 7 天 / 30 天租期。
+   * @param {{ aliasHint?: string, maxUses?: number, expiresInDays?: number, defaultTtlDays?: number }} [params]
+   */
+  issueCode(params = {}) {
+    const { aliasHint, maxUses, expiresInDays, defaultTtlDays } = params ?? {};
+    const body = {};
+    if (aliasHint !== undefined) body.alias_hint = aliasHint;
+    if (maxUses !== undefined) body.max_uses = maxUses;
+    if (expiresInDays !== undefined) body.expires_in_days = expiresInDays;
+    if (defaultTtlDays !== undefined) body.default_ttl_days = defaultTtlDays;
+    return this.#json("/admin/codes", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * DELETE /admin/codes/{code_hash}（吊销；unknown → no-match）。
+   * @param {string} codeHash 64-hex（blake3）
+   */
+  revokeCode(codeHash) {
+    requireHex64(codeHash, "codeHash");
+    return this.#json(`/admin/codes/${codeHash}`, { method: "DELETE" });
+  }
+
+  /**
+   * POST /admin/owners/{fabric_id}/{root}/renew（续期：expiresInDays 或
+   * permanent 恰好其一——与服务端同规则，双键/空键本地 fail-fast）。
+   * @param {string} fabricId 64-hex
+   * @param {string} rootId 64-hex
+   * @param {{ expiresInDays?: number, permanent?: boolean }} renewal 恰好其一
+   */
+  renewOwner(fabricId, rootId, renewal = {}) {
+    requireHex64(fabricId, "fabricId");
+    requireHex64(rootId, "rootId");
+    const { expiresInDays, permanent } = renewal ?? {};
+    const hasDays = expiresInDays !== undefined;
+    const hasPermanent = permanent !== undefined;
+    if (hasDays === hasPermanent) {
+      throw new AdminError(
+        "invalid-request",
+        "renewOwner: exactly one of expiresInDays or permanent is required",
+        null,
+      );
+    }
+    const body = hasDays ? { expires_in_days: expiresInDays } : { permanent: true };
+    return this.#json(`/admin/owners/${fabricId}/${rootId}/renew`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * PATCH /admin/owners/{fabric_id}/{root}（元数据：alias/note 至少其一、
+   * 空串 = 清除、缺省 = 保留）。
+   * @param {string} fabricId 64-hex
+   * @param {string} rootId 64-hex
+   * @param {{ alias?: string, note?: string }} meta
+   */
+  updateOwnerMetadata(fabricId, rootId, meta = {}) {
+    requireHex64(fabricId, "fabricId");
+    requireHex64(rootId, "rootId");
+    const { alias, note } = meta ?? {};
+    if (alias === undefined && note === undefined) {
+      throw new AdminError(
+        "invalid-request",
+        "updateOwnerMetadata: at least one of alias or note is required",
+        null,
+      );
+    }
+    const body = {};
+    if (alias !== undefined) body.alias = alias;
+    if (note !== undefined) body.note = note;
+    return this.#json(`/admin/owners/${fabricId}/${rootId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /** GET /admin/blocklist → {generation, entries[]}。 */
+  listBlocklist() {
+    return this.#json("/admin/blocklist");
+  }
+
+  /**
+   * POST /admin/blocklist（拉黑）。
+   * @param {{ kind: "endpoint" | "fabric", id: string, reason?: string }} entry
+   */
+  block({ kind, id, reason } = {}) {
+    if (kind !== "endpoint" && kind !== "fabric") {
+      throw new AdminError(
+        "invalid-request",
+        'block: kind must be "endpoint" | "fabric"',
+        null,
+      );
+    }
+    requireHex64(id, "id");
+    const body = { kind, id };
+    if (reason !== undefined) body.reason = reason;
+    return this.#json("/admin/blocklist", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /**
+   * DELETE /admin/blocklist/{kind}/{id}（移出名单；不在名单 → no-match）。
+   * @param {"endpoint" | "fabric"} kind
+   * @param {string} id 64-hex
+   */
+  unblock(kind, id) {
+    if (kind !== "endpoint" && kind !== "fabric") {
+      throw new AdminError(
+        "invalid-request",
+        'unblock: kind must be "endpoint" | "fabric"',
+        null,
+      );
+    }
+    requireHex64(id, "id");
+    return this.#json(`/admin/blocklist/${kind}/${id}`, { method: "DELETE" });
+  }
+
   // ---- 内部：请求/归一 -------------------------------------------------------
 
   /** 单一 fetch 出口：Bearer 注入 + 超时信号；传输层异常 → network/timeout。 */
@@ -308,9 +613,11 @@ export class AdminClient {
 /**
  * 回执待签载荷（admin.rs receipt_canonical 逐字节一致的 canonical，
  * 跨语言冻结对拍钉住）：`b"dweb/admin-receipt/v1\0" || op u8 || fabric_id 32B
- * || target 32B || ts u64BE || generation u64BE`（全大端）。register/
- * unregister 的 target=root；disconnect 的 target=endpoint_id（布局复用冻结
- * 形，op=0x03 区分）。
+ * || target 32B || ts u64BE || generation u64BE`（全大端）。target 字段按
+ * op 族取 root / endpoint_id / code_hash / id（TARGET_FIELD_BY_OP——
+ * register/unregister/renew/owner-meta 用 root，visitor- 与 knock- 族用
+ * endpoint_id，code-* 用 code_hash，block-* 用 id）；零 fabric 维度的回执
+ * wire 携带 64 个 "0"（服务端同步呈现——未用维度置零字节）。
  * @param {import("./index.d.mts").AdminReceipt} receipt 服务端回执（JSON wire 字段）
  * @returns {Uint8Array} 103B 待签载荷
  */
@@ -327,10 +634,10 @@ export function receiptCanonical(receipt) {
       : undefined;
   if (opByte === undefined) {
     throw new TypeError(
-      `receiptCanonical: op must be "register" | "unregister" | "disconnect"`,
+      `receiptCanonical: op must be one of ${Object.keys(RECEIPT_OP_BYTES).map((k) => `"${k}"`).join(" | ")}`,
     );
   }
-  const targetField = opByte === RECEIPT_OP_BYTES.disconnect ? "endpoint_id" : "root";
+  const targetField = TARGET_FIELD_BY_OP[op];
   const targetHex = receipt[targetField];
   const out = new Uint8Array(RECEIPT_CANONICAL_LEN);
   out.set(RECEIPT_DOMAIN, 0);
@@ -391,6 +698,64 @@ export function adminPublicKeyFromServices(servicesJson) {
     );
   }
   return id.toLowerCase();
+}
+
+// ---- register-receipt（POST /register 公开兑换面；server-access-roles） ----
+
+/**
+ * register 兑换回执的待签载荷（register.rs register_receipt_canonical 逐字节
+ * 一致，137B 定长）：`b"dweb/register-receipt/v1\0"(25B) || code_hash 32B ||
+ * fabric_id 32B || root 32B || ts u64BE || generation u64BE`。与
+ * packages/opendweb/src/register.mjs 的 buildRegisterReceiptCanonical 互认
+ * （跨实现冻结向量对拍见 test/admin-receipt.test.mjs）。
+ * @param {import("./index.d.mts").RegisterReceipt} receipt /register 成功响应
+ * @returns {Uint8Array} 137B 待签载荷
+ */
+export function registerReceiptCanonical(receipt) {
+  if (
+    receipt === null ||
+    typeof receipt !== "object" ||
+    receipt.op !== "register"
+  ) {
+    throw new TypeError('registerReceiptCanonical: receipt.op must be "register"');
+  }
+  const out = new Uint8Array(REGISTER_RECEIPT_CANONICAL_LEN);
+  out.set(REGISTER_RECEIPT_DOMAIN, 0);
+  out.set(hexToBytes32(receipt.code_hash, "code_hash"), REGISTER_RECEIPT_DOMAIN.length);
+  out.set(
+    hexToBytes32(receipt.fabric_id, "fabric_id"),
+    REGISTER_RECEIPT_DOMAIN.length + 32,
+  );
+  out.set(hexToBytes32(receipt.root, "root"), REGISTER_RECEIPT_DOMAIN.length + 64);
+  u64BE(out, REGISTER_RECEIPT_DOMAIN.length + 96, receipt.ts, "ts");
+  u64BE(out, REGISTER_RECEIPT_DOMAIN.length + 104, receipt.generation, "generation");
+  return out;
+}
+
+/**
+ * register 兑换回执注入式验签（隔离规则：本目录零运行时依赖——调用方自带
+ * @noble/ed25519 或 node:crypto 的 verify；公钥 = services.json 的
+ * server_id，经 adminPublicKeyFromServices 提取）。语义与 opendweb 包的
+ * verifyRegisterReceipt（serverPublicKeyHex 直注）互认——canonical 同源。
+ * @param {import("./index.d.mts").RegisterReceipt} receipt
+ * @param {import("./index.d.mts").ReceiptVerifier} verifier
+ * @returns {Promise<boolean>}
+ */
+export async function verifyRegisterReceipt(receipt, verifier) {
+  if (typeof verifier !== "function") {
+    throw new TypeError(
+      "verifyRegisterReceipt: verifier must be a function (message, signature) => boolean | Promise<boolean>",
+    );
+  }
+  const message = registerReceiptCanonical(receipt);
+  const sig = fromBase64UrlNoPad(receipt.receipt_sig, "receipt_sig");
+  if (sig.length !== 64) {
+    throw new TypeError(
+      `verifyRegisterReceipt: receipt_sig must decode to exactly 64 bytes (got ${sig.length})`,
+    );
+  }
+  const ok = await verifier(message, sig);
+  return ok === true;
 }
 
 // ---- 内部：编解码助手（零依赖、浏览器同构；token/ 目录各持一份同款，保持

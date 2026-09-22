@@ -13,8 +13,8 @@
 //! 码本体（r1-P1-3）：`dwebc1.` + base32(crockford) 16 字符（80bit 熵），
 //! 4-4-4-4 分组展示；生成 MUST 用 OS CSPRNG；**哈希输入规范化冻结**：码
 //! 本体 16 字符小写形态（剥 `dwebc1.` 前缀与连字符）blake3。码全文仅
-//! 签发响应携带一次（Phase 1c 的签发路由；本 phase 提供 [`generate_code`]
-//! + [`CodeLedger::issue`] 供 1c/测试），**日志/指标/错误零码全文**。
+//! 签发响应携带一次（Phase 1c 的 `POST /admin/codes` 签发路由经
+//! [`CodeLedger::issue`] 消费 [`generate_code`]），**日志/指标/错误零码全文**。
 //!
 //! 跨台账提交协议（r2-P0-1，consume 与 owners register 分属两个 jsonl）：
 //! ① owners register（带 `via_code_hash`）先 fsync → ② codes consume 后
@@ -54,17 +54,12 @@ const CODE_BODY_LEN: usize = 16;
 /// crockford base32 小写字符集（排除 i/l/o/u；哈希输入与生成共用同一集合）
 const CROCKFORD_LOWER: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 /// 签发默认值（spec 冻结）：单次使用 / 7 天有效 / 兑换租期 30 天
-#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_MAX_USES: u32 = 1;
-#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_EXPIRES_IN_DAYS: u64 = 7;
-#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_TTL_DAYS: u32 = 30;
 /// 输入上限（spec 冻结，越界 400 invalid-request——由 Phase 1c 签发路由
 /// 消费；issue() 在本层先行校验）
-#[cfg_attr(not(test), allow(dead_code))]
 pub const MAX_USES_LIMIT: u32 = 1000;
-#[cfg_attr(not(test), allow(dead_code))]
 pub const ALIAS_HINT_MAX_BYTES: usize = 32;
 
 /// jsonl 事件记录（行序冻结：op/code_hash/alias_hint/max_uses/expires_at/
@@ -137,18 +132,17 @@ impl CodeSnapshot {
     }
 
     /// 在册码数（含已吊销——吊销是状态而非删除；Phase 1c 列表过滤）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.inner.codes.len()
     }
 
+    /// len 的空集判别（与 is_consumed 同为测试面消费——保留 1b 的标注纪律）
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.inner.codes.is_empty()
     }
 
     /// 去重后的兑换计数（used_count 恒由事件归并推导，spec 冻结）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn used_count(&self, code_hash: &[u8; 32]) -> usize {
         self.inner
             .consumed
@@ -164,7 +158,6 @@ impl CodeSnapshot {
     }
 
     /// 确定性列表（code_hash 字节序；Phase 1c `GET /admin/codes` 消费）
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn entries(&self) -> Vec<CodeEntry> {
         let mut list: Vec<CodeEntry> = self.inner.codes.values().cloned().collect();
         list.sort_by_key(|e| e.code_hash);
@@ -233,7 +226,6 @@ fn now_ms() -> u64 {
 
 // ---- 码生成与规范化（r1-P1-3 冻结语义） --------------------------------
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// OS CSPRNG 10 字节（iroh `SecretKey::generate` = OS 熵；blake3 作提取器
 /// 取前 10 字节——与 dweb-fabric `random_bytes` 同构，零新增依赖）
 fn random_10_bytes() -> [u8; 10] {
@@ -245,7 +237,6 @@ fn random_10_bytes() -> [u8; 10] {
 }
 
 /// 10 字节 → 16 字符 crockford base32（小写；80bit 恰好无余位）
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_crockford_16(bytes: &[u8; 10]) -> String {
     let mut out = String::with_capacity(CODE_BODY_LEN);
     let mut bitbuf: u32 = 0;
@@ -265,7 +256,6 @@ fn encode_crockford_16(bytes: &[u8; 10]) -> String {
 /// 生成一个新码：返回（全文展示形态 `dwebc1.xxxx-xxxx-xxxx-xxxx`（小写），
 /// code_hash）。全文仅签发响应可携带——本函数的调用方（Phase 1c 签发路由
 /// /测试）之外不得持久化或记录全文。
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn generate_code() -> (String, [u8; 32]) {
     let body = encode_crockford_16(&random_10_bytes());
     let display = format!(
@@ -313,7 +303,6 @@ pub fn code_hash(normalized_body: &str) -> [u8; 32] {
 /// 签发参数（Phase 1c `POST /admin/codes` 入口；1b 由测试驱动）。全部可选，
 /// 缺省 1 / 7 天 / 30 天（spec 冻结）
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct IssueParams {
     pub alias_hint: Option<String>,
     pub max_uses: Option<u32>,
@@ -449,7 +438,6 @@ impl CodeLedger {
     /// 签发（Phase 1c 签发路由入口；1b 由测试驱动）。码全文仅本响应携带。
     /// 输入校验（spec 冻结上限）：max_uses ∈ 1..=1000、expires_in_days ≥ 1、
     /// default_ttl_days ≥ 1、alias_hint ≤ 32 UTF-8 字节。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn issue(&self, params: IssueParams) -> Result<(String, [u8; 32])> {
         let max_uses = params.max_uses.unwrap_or(DEFAULT_MAX_USES);
         let expires_in_days = params.expires_in_days.unwrap_or(DEFAULT_EXPIRES_IN_DAYS);
@@ -505,7 +493,6 @@ impl CodeLedger {
 
     /// 吊销（Phase 1c `DELETE /admin/codes/{code_hash}` 入口）。未知码同样
     /// 落日志（幂等管理员动作），内存无效果。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn revoke(&self, code_hash: &[u8; 32]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
         let record = Record {
@@ -627,10 +614,16 @@ impl CodeLedger {
         &self.path
     }
 
-    /// deny-set 快照（Phase 1c 运维投影/测试断言）
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// deny-set 条目数（进程内；测试断言用）
     pub fn deny_count(&self) -> usize {
         self.state.lock().unwrap().deny.len()
+    }
+
+    /// 单码 deny-set 命中判定（Phase 1c `GET /admin/codes` 的 `denied`
+    /// 运维投影——1b 遗留：补写 append 失败的码在列表显式呈现 fail-closed
+    /// 状态）
+    pub fn is_denied(&self, code_hash: &[u8; 32]) -> bool {
+        self.state.lock().unwrap().deny.contains_key(code_hash)
     }
 }
 
