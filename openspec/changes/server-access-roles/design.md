@@ -75,7 +75,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   `dweb/owner-expired` 记为租户到期提醒类别。
 - dismiss/undismiss 均幂等管理动作；**同端点新 deny 自动复位
   dismissed=false**（再次敲门重新冒出，O-7）；列表排序冻结：
-  未处置在前、组内 last_at 降序、seq 降序、endpoint_id 升序。
+  未处置在前、组内 seq 降序（last_at 仅展示）、endpoint_id 升序。
 
 ### 1.3 租户有效期
 
@@ -94,7 +94,8 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 - 存储：`<data_dir>/codes.jsonl`：`{"op":"issue"|"revoke"|"consume","code_hash":`
   `"<blake3 hex>","alias_hint":"<str?>","max_uses":<u32,"expires_at":<u64ms>,`
-  `"default_ttl_days":<u32?>,"ts":<u64ms>}`。码本体 `dwebc1.` + base32
+  `"default_ttl_days":<u32?>,"fabric_id":"<hex64，consume 携带>","root":`
+  `"<hex64，consume 携带>","ts":<u64ms>}`。码本体 `dwebc1.` + base32
   16 字符（80 bit 熵，仅签发响应显示一次；库存只留哈希）。
 - **兑换端点（公开）**：`POST /register`，body：
   `{code, fabric_id: hex64, root: hex64, ts, sig}`，其中
@@ -113,11 +114,11 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   generation——**回执不含 code 本体**）。
 - 限流：/register per-IP 令牌桶（默认 10/min，突发 5；`DWEB_REGISTER_
   RATE_PER_MIN` 可调；无新依赖的 ~40 行实现）。
-- 兑换幂等：同 (code, fabric_id, root) 重复请求在码 used 耗尽后返回
-  `{"error":{"code":"code-exhausted"}}`；同租户已注册=续期语义（刷新
-  expires_at）——避免攻击者用他人已注册二元组+自己签名？不成立（需
-  他人 root 签名）。**已注册二元组 + 自己的新签名**：fabric_id+root
-  是别人的、自己签不出有效 sig（sig 用 body.root 验）→ 关死。
+- **兑换幂等与续期边界（r4-P1-2）**：幂等键=(code, fabric_id, root)。
+  同键 consume 已 durable → **200 幂等回放**（expires_at 不刷新、
+  零新副作用——旧码耗尽后同键重试走此路径，**不可续期**）；**续期
+  唯一入口=持新有效码**（未耗尽/未过期/未吊销）。幂等命中在码状态
+  检查**之前**。冒名二元组被 PoP 关死（需他人 root 私钥签名）。
 - **消费原子性（r1-P0-2）**：codes.jsonl 事件面增 `consume`（携带
   fabric/root）；used_count=consume 计数由归并推导，不只存内存。兑换
   判定与 consume 追加在同一临界区按 code_hash 串行；**fsync 成功前

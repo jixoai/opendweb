@@ -28,9 +28,10 @@
 - [ ] 码生成：OS CSPRNG `dwebc1.`+base32×16；哈希输入=码本体小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（r1-P1-3）
 - [ ] `POST /register` 公开端点：直连 TCP peer 限流（10/min 突发 5，**XFF 不采信**——r1-P1-2）→ 形状 → ts±120s → 码校验 → PoP 验签（域含 root）；**兑换判定+consume 追加同临界区按 code_hash 串行、fsync 成功前零响应**（r1-P0-2）→ 回执域 `dweb/register-receipt/v1\0`（generation=owners 世代）
 - [ ] **跨台账提交协议（r2-P0-1）**：① owners register 事件带 `via_code_hash`（serde(default)）先 fsync → ② codes consume 后 fsync → ③ 双成功才响应；恢复=每次加载（启动+热重载）补齐孤儿 consume（同锁，r3-P0-2）
-- [ ] **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：幂等键=(code_hash,fabric_id,root)；pending 期间他键 409 `code-pending`；同键重试幂等（durable 后重试 200 不重复 consume）；孤儿匹配/去重按完整三元组；旧行永不补写
+- [ ] **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：幂等键=(code_hash,fabric_id,root)；pending 期间他键 409 `code-pending`；同键重试幂等（durable 后 200 回放，**expires_at 不刷新——幂等回放≠续期，续期唯一入口=持新有效码**，r4-P1-2）；孤儿匹配/去重按完整三元组；旧行永不补写
+- [ ] **reconciliation 失败分级（r4-P1-3）**：台账加载失败（含首启无旧快照）=fail-fast；补写 append 失败=进程内 deny-set（503 `code-unavailable`）+告警（code_hash/原因/重试数），补写成功移除，重启由归并重演
 - [ ] rendezvous per-IP 限流（resolve 60/min、announce 20/min，429 envelope；直连 peer；令牌桶组件与 /register 共用）
-- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/续期/回执验签/**并发双兑恰一成功**/**崩溃恢复补 consume 故障注入**/**pending 第二键 409**/**durable 后重试幂等**/**热重载孤儿补齐+fail-closed**）+ 旧格式兼容（含 via_code 缺省）+ 部署红线（反代禁记 /register 请求体）
+- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/**持新码续期**/**同键旧码重试=幂等回放不刷新**/回执验签/**并发双兑恰一成功**/**max_uses=2 串行序列（K1→同键回放→K2）**/**崩溃恢复补 consume 故障注入**/**pending 第二键 409**/**deny-set 503 与恢复**/**台账加载失败 fail-fast**）+ 旧格式兼容（含 via_code 缺省）+ 部署红线（反代禁记 /register 请求体）
 
 ## 4. Phase 1c —— 三角色管理面 API
 

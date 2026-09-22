@@ -29,7 +29,7 @@
 
 #### Scenario: 目标冻结
 
-- **WHEN** 目标已设定后，任何 `/sidecar/*` 或浏览器途径再次提交新目标
+- **WHEN** 目标已设定后，除 `/sidecar/nodes/switch`（节点簿例外，仅接受已存储 node_id，见上方例外段）外的任何 `/sidecar/*` 或浏览器途径再次提交新目标
 - **THEN** 返回错误（target-frozen），不改写目标；重新指向需重启 sidecar
 
 #### Scenario: 明文远端默认拒绝与 rebinding 防护

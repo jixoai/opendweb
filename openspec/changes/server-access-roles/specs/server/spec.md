@@ -192,16 +192,31 @@
 
 服务端 SHALL 提供邀请码台账 `<data_dir>/codes.jsonl`（append-only，同一 registry 存储模式：坏行 fail-fast、generation、热重载、`serde(default)` 向后兼容）：事件 `{"op":"issue"|"revoke"|"consume","code_hash":"<blake3 64hex>","alias_hint"?,"max_uses"?,"expires_at","default_ttl_days"?,"fabric_id"?,"root"?,"ts"}`——**`consume` 为消费事件**（携带兑换出的 fabric_id/root），`used_count` 由事件归并推导（= consume 事件计数），MUST NOT 只存在于内存。码本体格式 `dwebc1.` + base32 16 字符（crockford 字符集，4-4-4-4 分组展示）；**生成 MUST 使用 OS CSPRNG**；**哈希输入规范化冻结**：取码本体 16 字符的小写规范化形态（剥离 `dwebc1.` 前缀与分组连字符）后 blake3；**存储与一切列表响应只含哈希，码全文仅出现在签发响应一次；日志/指标/错误消息 MUST NOT 含码全文或其可逆变换**（对齐 callback_token 脱敏纪律）。签发默认 `max_uses=1`、`expires_at=签发+7天`、`default_ttl_days=30`，逐项可自定义（R4）；输入上限：`max_uses ≤ 1000`、`expires_in_days ≥ 1`、`default_ttl_days ≥ 1`、`alias_hint ≤ 32` UTF-8 字节，越界 400 `invalid-request`。**fabric_id 语义（P1 明示）**：fabric_id 是**租户自声明标签**（FabricId 由 Roster 随机生成、无服务端可验的 genesis 绑定），身份键 = (fabric_id, root) 二元组（与 owners registry 既有精确匹配语义一致）；同 fabric_id 多 root 为合法并存条目，管理面 MUST 以二元组呈现租户身份（不可单显 fabric），同 fabric 多 root 时 UI 附钓鱼警示。错误码 `code-invalid`/`code-exhausted`/`code-expired` 的**状态区分为有意的产品取舍**（排障需要），属明示的信息泄露面。
 
-**公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**root PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**；残余面=自声明 fabric_id，见上）。校验序（fail-closed）：per-来源-IP 令牌桶限流（**直连 TCP peer 地址，XFF 不采信**；默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。**消费原子性**：兑换判定与 consume 事件追加 MUST 在同一临界区内按 code_hash 串行（同码并发兑换互斥；`max_uses=1` 时并发双兑 MUST 恰一个成功，另一个 `code-exhausted`）。
+**公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**root PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**；残余面=自声明 fabric_id，见上）。校验序（fail-closed）：per-来源-IP 令牌桶限流（**直连 TCP peer 地址，XFF 不采信**；默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ **幂等命中**（同键 consume 已 durable → **200 幂等回放**：返回该键首次兑换持久化的结果，`expires_at` 不刷新、不新增 consume、不重复建条目；回执以当前时刻重签——旧码耗尽后同键重试同样走此路径，**不可用于续期**）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。**续期语义的唯一入口是持新有效码的兑换**（同键旧码重试=幂等回放，不构成续期）。**消费原子性**：兑换判定与 consume 事件追加 MUST 在同一临界区内按 code_hash 串行（同码并发兑换互斥；`max_uses=1` 时并发双兑 MUST 恰一个成功，另一个 `code-exhausted`）。
 **跨台账提交协议（consume 与 register 分属两个 jsonl，顺序冻结）**：① owners.jsonl 追加 register 事件（携带 `via_code_hash` 字段，`serde(default)` 兼容旧行）并 fsync；② codes.jsonl 追加 consume 事件并 fsync；③ **双 fsync 成功后才允许返回成功响应/签发回执**。**启动恢复**：归并时对每个带 via_code_hash 且无匹配 consume 事件的 register 事件，MUST 自动补齐缺失的 consume 事件（完成提交，相关 generation 递增）——崩溃窗口的结果恒为「完整兑换」或「码完好」，MUST NOT 出现「码已消费但租户不在册」（烧码无租户）。② 落盘失败且进程存活 = 500 且挂起补写（见下「码级 pending 预留」）；回执的 `generation` 字段 = **owners registry 世代**（register 为兑换的主效果；客户端视为不透明 u64）。
 **码级 pending 预留与幂等键（r3-P0-1/P1-2）**：兑换幂等键 = `(code_hash, fabric_id, root)` 三元组。任一兑换通过校验后，该码即在台账锁内进入 pending 状态：pending 期间**其他幂等键的兑换请求一律 409 `code-pending`**（MUST NOT 基于未归并的 used_count 放行第二键——pending 释放以 consume durable 或兑换失败回滚为条件）；**同幂等键重试 = 幂等完成**（register 续期 + consume 补写；consume 已 durable 后响应丢失的重试返回 200、不重复 consume，回执以重试时刻重签）。**恢复/归并不变量**：孤儿匹配键为**完整三元组**（按 code_hash 粗匹配禁止——max_uses>1 同码多租户会漏补）；每个带 `via_code_hash` 的 register 事件至多对应一个同键 consume（重复 consume 事件按键去重）；`used_count` = 去重后的 consume 键数；无 `via_code_hash` 的旧行/管理员直加行**永不触发补写**。
-**reconciliation 覆盖热重载（r3-P0-2）**：孤儿 consume 补齐 MUST 作为**每次加载（启动 + mtime 热重载）的同锁步骤**执行（与 pending 预留同一台账锁协调）；补写失败（IO 错误）= 保留旧快照 + **该码禁止继续兑换**（fail-closed）+ 告警重试，不影响其他台账与码的服务；运行时经文件入口手工追加的带 via_code_hash register 在下次 reload 归并时同样补齐。
+**reconciliation 覆盖热重载（r3-P0-2）**：孤儿 consume 补齐 MUST 作为**每次加载（启动 + mtime 热重载）的同锁步骤**执行（与 pending 预留同一台账锁协调）；运行时经文件入口手工追加的带 via_code_hash register 在下次 reload 归并时同样补齐。**失败分级（r4-P1-3）**：(a) **台账加载/归并失败**（含首次启动——坏行/IO 不可读，此时无旧快照）= **服务 fail-fast 拒绝启动或拒绝该台账功能面**（与 owners 坏行既有纪律一致，不进入降级服务）；(b) **加载成功后的补写 append 失败** = 保留当前快照 + 受影响码加入**进程内 deny-set**（不落盘；deny-set 中的码兑换一律 503 `code-unavailable`）+ 告警；补写成功即从 deny-set 移除；进程重启后 deny-set 不复存在——由归并重演自然恢复（若磁盘仍坏则落入 (a) fail-fast）。可观测：告警含 code_hash、失败原因、重试次数。
 **重放与中间层日志（r3-P2-2）**：同幂等键重放 = 幂等 200（见上）；跨键重放被 PoP 结构性阻止（签名绑定 fabric_id+root，换键即验签失败——无需额外 nonce）；生产部署文档 MUST 明示反向代理/access-log/tracing **禁止记录 `POST /register` 请求体**（与码全文脱敏同级的红线）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，checked 运算防溢出；缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at、保留 alias/note，不重复建条目）；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 由 root 侧自行签发——server 只认票据不签票据，identity.rs 域纪律不变）。**客户端入口**：`opendweb join` CLI（见 cli/identity capability）承担 root 选取/fabric 生成/签名/兑换/回执保存，HTTP 面不要求租户手工构造。
 
 #### Scenario: 正常兑换与回执验签
 
 - **WHEN** 租户以有效码 + 正确 root 签名调用 POST /register
 - **THEN** 返回 200（op=register 回执字段 + expires_at）；registry 活跃集合出现该 (fabric_id, root)；回执可用 server.key 公钥按 canonical 验签；consume 事件已持久化（重启后 used_count 不丢失）
+
+#### Scenario: 幂等回放不构成续期（max_uses=1 同键旧码重试）
+
+- **WHEN** max_uses=1 的码已被键 K1 兑换耗尽后，K1 持有者以新 ts 重新签名同键请求
+- **THEN** 返回 200 幂等回放：expires_at 与首次兑换持久化值相同（不刷新）、无新 consume/条目；任何他键请求返回 `code-exhausted`
+
+#### Scenario: max_uses=2 的串行序列
+
+- **WHEN** max_uses=2 的码：K1 首兑成功 → K1 同键重试（durable 后）→ K2 请求到达
+- **THEN** K1 成功；同键重试 200 幂等回放且 used_count 仍为 1；K2 在 K1 durable 后按剩余次数成功（used_count=2）
+
+#### Scenario: deny-set 码的 fail-closed
+
+- **WHEN** 某码因补写 IO 失败进入 deny-set，持有效码请求兑换
+- **THEN** 返回 503 `code-unavailable`（非 exhausted/expired——状态可区分）；补写成功后该码恢复兑换
 
 #### Scenario: 并发双兑恰一个成功（max_uses=1）
 
@@ -297,7 +312,7 @@
 #### Scenario: 敲门列表排序契约
 
 - **WHEN** 存在 2 条未处置与 1 条已处置敲门（未处置的 last_at 较新），`GET /admin/knocks`
-- **THEN** 前两条为未处置且按 last_at 降序，已处置条目不在默认响应中；pending_count=2
+- **THEN** 前两条为未处置且按 seq 降序（last_at 仅展示），已处置条目不在默认响应中；pending_count=2
 
 #### Scenario: 签发响应码全文仅一次
 
