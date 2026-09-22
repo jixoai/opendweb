@@ -8,10 +8,11 @@
 
 ```bash
 cd <worktree>
-npm run build --prefix packages/webui        # 已构建过可跳过（dist 已入库）
-npm exec --prefix packages/webui -- opendweb-webui \
+# 形态一（零安装直跑，推荐走查用）：
+npm start --prefix packages/webui -- \
   --server http://39.107.213.167:18787 \
-  --token demo-admin-token
+  --token demo-admin-token --allow-insecure
+# 等价：node packages/webui/src/cli.mjs --server … --token … --allow-insecure
 ```
 
 > 注意：走查目标是公网 **http**（非 https 非 loopback）→ 必须加
@@ -19,10 +20,10 @@ npm exec --prefix packages/webui -- opendweb-webui \
 > 顶栏常驻——这是设计行为，demo 可接受；生产用 https 或隧道）。
 
 ```bash
-npm exec --prefix packages/webui -- opendweb-webui \
+npm start --prefix packages/webui -- \
   --server http://39.107.213.167:18787 \
   --token demo-admin-token --allow-insecure
-# 终端打印 http://127.0.0.1:<port> 并自动打开浏览器
+# 终端打印 http://127.0.0.1:<port> 并自动打开浏览器（--no-open 关闭）
 ```
 
 浏览器走查点（`#/status → #/owners → #/connections`）：
@@ -39,7 +40,7 @@ npm exec --prefix packages/webui -- opendweb-webui \
 ## 二、setup 配对面（无 --server 启动）
 
 ```bash
-npm exec --prefix packages/webui -- opendweb-webui --allow-insecure
+npm start --prefix packages/webui -- --allow-insecure
 # 终端打印 URL + 一次性配对码（13 字符）
 ```
 
@@ -50,9 +51,12 @@ target-frozen（重指向需重启）。
 ## 三、CLI 插件面（需发布或本地链接后）
 
 ```bash
-npm link --prefix packages/webui          # 本地链接模拟安装
-opendweb webui --server http://127.0.0.1:18787   # 单命令折叠直达
+npm link --prefix packages/webui          # 本地链接（全局 bin opendweb-webui）
+opendweb-webui --server http://127.0.0.1:18787   # bin 直跑（npx 同名，须先发布或 link）
+opendweb webui --server http://127.0.0.1:18787   # CLI 单命令折叠直达（需 opendweb CLI）
 opendweb webui --help                     # 零执行 help + token 可见性提示
+# 注意：包未发布前 `npm exec -- opendweb-webui` 会静默退出（解析落空）——
+# 本地走查一律用 npm start / node src/cli.mjs / npm link 后的 bin。
 ```
 
 ## 四、SDK 面（管理 SDK 消费者视角）

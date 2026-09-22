@@ -20,7 +20,8 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs",
-    "build": "vite build"
+    "build": "vite build",
+    "start": "node src/cli.mjs"
   },
   "devDependencies": {
     "htm": "^3.1.1",
