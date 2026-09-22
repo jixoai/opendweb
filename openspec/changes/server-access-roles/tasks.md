@@ -35,10 +35,11 @@
 
 ## 4. Phase 1c —— 三角色管理面 API
 
-- [ ] knocks（GET 排序契约：未处置前/**seq desc**/endpoint_id asc——每次 deny 分配新 seq，时钟回拨免疫 + dismiss/**undismiss**（unknown endpoint=404 no-match）；**pending_count 恒为未处置数**（include_dismissed 不改变）；dismiss/deny/逐出同锁原子、后写胜）、visitors CRUD + from-knock、codes 三路（签发响应含全文仅一次）、renew、blocklist CRUD、status 增量四字段
+- [ ] knocks（GET 排序契约：未处置前/**seq desc**/endpoint_id asc——每次 deny 分配新 seq，时钟回拨免疫 + dismiss/**undismiss**（unknown endpoint=404 no-match）；**pending_count 恒为未处置数**（include_dismissed 不改变）；dismiss/deny/逐出同锁原子、后写胜）
+- [ ] **元数据 PATCH（实现期增补，2a 集成发现）**：`PATCH /admin/owners/{f}/{r}` 与 `PATCH /admin/visitors/{id}`（alias/note 至少其一、空串清除、长度上限同签发）；回执 op=0x0D/0x0E、visitors CRUD + from-knock、codes 三路（签发响应含全文仅一次）、renew、blocklist CRUD、status 增量四字段
 - [ ] 回执 op 枚举 0x04-0x0C（103B canonical 未用维度置零；code 类 target=code_hash；**generation=所属台账 generation**——r1-P1-12 按 spec 槽位映射表逐项实现）
 - [ ] 输入上限与边界（r1-P2-3）：alias≤32/note≤256/alias_hint≤32/max_uses≤1000/expires_in_days≥1/checked 运算/now>=expires_at 等值=过期
-- [ ] client-sdk 同步（r1-P1-8）：`./admin` op 映射 0x04-0x0C + Receipt 类型 union + canonical builder；receipt-vector.json 增补新 op 向量（Rust 生成断言 + TS 只读对拍，`DWEB_REGEN_FIXTURES=1` 门）
+- [ ] client-sdk 同步（r1-P1-8）：`./admin` op 映射 0x04-0x0E（含元数据 0x0D/0x0E）+ Receipt 类型 union + canonical builder；receipt-vector.json 增补新 op 向量（Rust 生成断言 + TS 只读对拍，`DWEB_REGEN_FIXTURES=1` 门）
 - [ ] 绿门：admin e2e 全链路（敲门→定位访客→重连放行；签发→兑换→名册出现带别名/到期；到期 deny reason；黑名单同票拒；undismiss/复位）+ 既有 sdk-mgmt-surface e2e 零回归
 
 ## 5. Phase 2a —— webui 三角色重设计（packages/webui/ui）

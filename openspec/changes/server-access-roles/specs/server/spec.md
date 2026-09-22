@@ -290,7 +290,7 @@
 
 ### Requirement: 三角色管理面 API（敲门/访客/邀请码/黑名单/续期）
 
-在 sdk-mgmt-surface 冻结的管理面基座（`/admin/*` Bearer token 认证、错误 envelope `{"error":{code,message}}`、未配置 token=零暴露 404、变更类操作 server.key 回执）之上，服务端 SHALL 提供三角色管理增量路由。全部响应 snake_case、未知字段忽略；全部变更类操作返回同构回执（canonical 复用 103B `b"dweb/admin-receipt/v1\0"` 布局，**generation = 该操作所属台账的 generation**（客户端视为不透明 u64；owners=register/renew、visitors=visitor-\*/knock-\*、codes=code-\*、blocklist=block-\*；KnockLog 为内存台账，knock-dismiss/undismiss 使用其内部单调计数器），op 枚举：renew=0x04 / visitor-grant=0x05 / visitor-revoke=0x06 / code-issue=0x07 / code-revoke=0x08 / block-add=0x09 / block-remove=0x0A / knock-dismiss=0x0B / knock-undismiss=0x0C。canonical/wire 槽位映射（未用维度置零字节）：
+在 sdk-mgmt-surface 冻结的管理面基座（`/admin/*` Bearer token 认证、错误 envelope `{"error":{code,message}}`、未配置 token=零暴露 404、变更类操作 server.key 回执）之上，服务端 SHALL 提供三角色管理增量路由。全部响应 snake_case、未知字段忽略；全部变更类操作返回同构回执（canonical 复用 103B `b"dweb/admin-receipt/v1\0"` 布局，**generation = 该操作所属台账的 generation**（客户端视为不透明 u64；owners=register/renew、visitors=visitor-\*/knock-\*、codes=code-\*、blocklist=block-\*；KnockLog 为内存台账，knock-dismiss/undismiss 使用其内部单调计数器），op 枚举：renew=0x04 / visitor-grant=0x05 / visitor-revoke=0x06 / code-issue=0x07 / code-revoke=0x08 / block-add=0x09 / block-remove=0x0A / knock-dismiss=0x0B / knock-undismiss=0x0C / owner-meta=0x0D / visitor-meta=0x0E（**实现期增补（2a 集成发现）**：PM 别名/备注行内编辑的承载路由）。canonical/wire 槽位映射（未用维度置零字节）：
 
 | op | fabric 32B | target 32B | 响应形态（除共享 op/ts/generation/receipt_sig 外） |
 |---|---|---|---|
@@ -299,13 +299,15 @@
 | code-issue 0x07 / revoke 0x08 | 零 | code_hash | 签发响应另含 `code` 全文（仅一次）；列表/吊销只回 `code_hash` |
 | block-add 0x09 / remove 0x0A | fabric 命中时为 id、endpoint 维度为零 | id（非 32B 的 kind 用哈希填充并同步 wire 明示） | `kind`/`id`/`reason?` |
 | knock-dismiss 0x0B / undismiss 0x0C | 零 | endpoint_id | `endpoint_id` |
+| owner-meta 0x0D | fabric_id | root | `fabric_id`/`root`/`alias?`/`note?` |
+| visitor-meta 0x0E | 零 | endpoint_id | `endpoint_id`/`alias?`/`note?` |
 
 **client-sdk 同步义务**：`packages/client-sdk` 的 `./admin` subpath MUST 同步扩展 op 映射（0x04-0x0C）、Receipt 类型 union 与 canonical builder；`receipt-vector.json` fixture MUST 增补新 op 向量（Rust 生成断言 + TS 只读对拍，重生走既有 `DWEB_REGEN_FIXTURES=1` 门）；`register-receipt/v1` 的客户端验签 helper 随 `opendweb join` 提供。输入校验上限（越界 400 `invalid-request`）：`alias ≤ 32` UTF-8 字节、`note ≤ 256`、`alias_hint ≤ 32`、`max_uses ≤ 1000`、`expires_in_days ≥ 1`（0 非法）、`permanent:true` 与 `expires_in_days` 恰好其一；**到期边界冻结**：`now >= expires_at` 即过期（等值=过期）。
 
 - **敲门**：`GET /admin/knocks`（排序冻结：dismissed 在前与否分组——未处置在前、组内 seq 降序（last_at 仅展示）、endpoint_id 升序 tie-break；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss` 与 `POST /admin/knocks/{endpoint_id}/undismiss`（均幂等，回执 op=knock-dismiss/knock-undismiss）。
 - **访客名册**：`GET /admin/visitors`（活跃列表：endpoint_id/alias/note/granted_at/expires_at）；`POST /admin/visitors`（body：endpoint_id 必填、alias/note/expires_in_days 可选，缺省=永久；回执 op=visitor-grant）；`DELETE /admin/visitors/{endpoint_id}`（revoke；回执 op=visitor-revoke）。语义糖路由 `POST /admin/visitors/from-knock`（body 含 endpoint_id，等同 POST，供敲门台一键定位）。
 - **邀请码**：`GET /admin/codes`（列表只含 code_hash/max_uses/used_count/expires_at/alias_hint/revoked/default_ttl_days，**绝不含码全文**）；`POST /admin/codes`（body：alias_hint/max_uses/expires_in_days/default_ttl_days 可选，缺省 1/7/30；**响应含 `code` 全文——仅此一次**；回执 op=code-issue）；`DELETE /admin/codes/{code_hash}`（吊销；回执 op=code-revoke）。
-- **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略。
+- **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。**元数据编辑（实现期增补，2a 集成发现）**：`PATCH /admin/owners/{fabric_id}/{root}`（body：`alias`/`note` 至少其一，空串=清除；长度上限同签发；回执 op=owner-meta）与 `PATCH /admin/visitors/{endpoint_id}`（同构；回执 op=visitor-meta）——PM 别名行内编辑的承载面。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略。
 - **黑名单**：`GET /admin/blocklist`（当前集合：kind/id/reason/ts）；`POST /admin/blocklist`（body：kind(endpoint|fabric)/id/reason?；回执 op=block-add）；`DELETE /admin/blocklist/{kind}/{id}`（回执 op=block-remove）。
 - **状态增量**：`GET /admin/status` 响应增量字段 `knocks_pending`/`visitors_active`/`codes_active`/`visitors_online`（既有 wire 冻结不变，新字段为纯增量）。
 
