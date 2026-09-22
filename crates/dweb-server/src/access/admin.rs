@@ -31,7 +31,20 @@
 //!   自动释放），响应附 `kicked_endpoints`/`kicked_connections` 计数）
 //! - `GET /admin/status` → `{mode, policy, generation,
 //!   max_connections_per_owner, active_connections（per endpoint 票接入
-//!   在线表，task 3.2）, per_owner_connections, cache_entries}`
+//!   在线表，task 3.2）, per_owner_connections, cache_entries}`（既有冻结
+//!   wire，sdk-mgmt-surface 不动——详细视图走 connections）
+//! - `GET /admin/connections` → 详细在线视图 `{mode, policy, relay_enabled,
+//!   quota{configured,max_connections_per_owner}, per_endpoint, per_owner}`
+//!   （sdk-mgmt-surface task 1.4；mode 取 access 配置字段、relay_enabled
+//!   取装配事实，两字段独立——restricted+无 relay 不得误报 open）
+//! - `POST /admin/connections/disconnect` → 主动断连（task 1.3；请求体
+//!   `{endpoint_id}` 或 `{fabric_id}` 恰好其一，per-target 回执 op=0x03）
+//!
+//! **错误 envelope（sdk-mgmt-surface 冻结）**：管理面业务错误统一
+//! `{"error":{"code","message"}}`——401 `unauthorized` / 400 请求不可解析
+//! `invalid-request` / 404 业务未命中 `no-match` / 500 registry 故障
+//! `registry`。既有 401/400 单字符串 body 是**有意的 minor wire change**
+//! （旧消费者只看 status code，影响面零）。
 //!
 //! **断连语义边界（design §13 勘定）**：admin API 的 DELETE 是 admin 动作
 //! 的即时全灭（存量连接一并断开）；文件热重载路径（CLI owners unregister
@@ -44,7 +57,7 @@
 //! generation 变化，正确性无损；admin 信任域内的冗余事件被日志吸收）。
 
 use crate::access::config::AccessMode;
-use crate::access::gate::{AccessGate, OnlineView};
+use crate::access::gate::{AccessGate, OnlineEndpoint, OnlineView};
 use crate::access::identity::ServerIdentity;
 use crate::access::registry::{OwnerRegistry, parse_owner_hex};
 use axum::{
@@ -67,13 +80,19 @@ use std::sync::Arc;
 const RECEIPT_DOMAIN: &[u8] = b"dweb/admin-receipt/v1\0";
 const OP_REGISTER: u8 = 0x01;
 const OP_UNREGISTER: u8 = 0x02;
+/// disconnect 回执 op（target 槽位承载被断 endpoint_id——布局复用冻结
+/// canonical，JSON 层用显式 endpoint_id 字段不复用 root 键名）
+const OP_DISCONNECT: u8 = 0x03;
 
 /// admin API 共享状态（main 在 DWEB_ADMIN_TOKEN 存在时构造并挂载）。
 /// `gate` = relay gate（restricted 模式；open 模式 None——无验证链即无
 /// 在线统计，status 如实投影为空集合）。`relay_clients` = iroh-relay
 /// 在线连接表句柄（task 3.2b 踢存量用；`Server::relay_service()` →
 /// `RelayService::clients()` 的 clone——relay 未启用时 None，此时
-/// unregister 仍即时阻断新连接，仅无法主动断存量）。
+/// unregister 仍即时阻断新连接，仅无法主动断存量）。`relay_enabled` =
+/// relay 服务装配事实（构造期注入，与 gate 句柄无推导关系——restricted
+/// 恒建 gate，gate=None 不代表 open，connections 投影的 mode/relay_enabled
+/// 必须各自独立取值，P0-2）。
 #[derive(Clone)]
 pub struct AdminState {
     token: String,
@@ -83,11 +102,15 @@ pub struct AdminState {
     relay_clients: Option<Clients>,
     mode: AccessMode,
     policy: &'static str,
+    relay_enabled: bool,
 }
 
 impl AdminState {
     /// 构造（`policy` 取 "static"|"callback"，与启动日志同源标签；
-    /// `relay_clients` 见结构体注释）
+    /// `relay_clients`/`relay_enabled` 见结构体注释）。参数与字段一一对应
+    /// （main 装配的部署事实清单），8 参不聚合——引入 config struct 反而
+    /// 掩盖「每字段一个装配来源」的对应关系
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         token: String,
         identity: Arc<ServerIdentity>,
@@ -96,6 +119,7 @@ impl AdminState {
         relay_clients: Option<Clients>,
         mode: AccessMode,
         policy: &'static str,
+        relay_enabled: bool,
     ) -> Self {
         Self {
             token,
@@ -105,6 +129,7 @@ impl AdminState {
             relay_clients,
             mode,
             policy,
+            relay_enabled,
         }
     }
 }
@@ -119,6 +144,11 @@ pub fn router(state: AdminState) -> Router {
             axum::routing::delete(unregister_owner),
         )
         .route("/admin/status", get(status))
+        .route("/admin/connections", get(connections))
+        .route(
+            "/admin/connections/disconnect",
+            axum::routing::post(disconnect),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_guard,
@@ -128,7 +158,7 @@ pub fn router(state: AdminState) -> Router {
 
 /// Bearer 鉴权中间件：scheme 大小写不敏感（HTTP 语义，与 relay 面
 /// strip_bearer 同构）；token 比较为常量时间（长度先行情报可接受——
-/// 剩余字节不泄露）。任何缺失/不符 → 401 JSON。
+/// 剩余字节不泄露）。任何缺失/不符 → 401 envelope。
 async fn auth_guard(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     let authorized = req
         .headers()
@@ -142,7 +172,11 @@ async fn auth_guard(State(state): State<AdminState>, req: Request, next: Next) -
         })
         .unwrap_or(false);
     if !authorized {
-        return error_response(StatusCode::UNAUTHORIZED, "unauthorized");
+        return error_envelope(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "missing or invalid admin bearer token",
+        );
     }
     next.run(req).await
 }
@@ -153,25 +187,34 @@ fn ct_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn error_response(status: StatusCode, message: &str) -> Response {
-    let body = serde_json::json!({ "error": message });
+/// 管理面错误 envelope（sdk-mgmt-surface 冻结）：所有业务错误响应统一
+/// `{"error":{"code","message"}}`（Content-Type application/json）。
+/// code 表：unauthorized / invalid-request / no-match / registry。
+fn error_envelope(status: StatusCode, code: &str, message: &str) -> Response {
+    let body = serde_json::json!({ "error": { "code": code, "message": message } });
     (status, Json(body)).into_response()
 }
 
-/// handler 层错误 → HTTP 映射（错误体 JSON {"error": ...}，同 rendezvous
-/// ACL 形态）
+/// handler 层错误 → HTTP 映射（错误体统一 envelope，见 error_envelope）
 enum AdminError {
-    /// hex 形态非法（400）
-    InvalidHex(String),
-    /// registry 写入/IO 失败（500）
+    /// 请求不可解析：JSON 形态/hex 非法/键约束违反（400 invalid-request）
+    InvalidRequest(String),
+    /// registry 写入/IO 失败（500 registry）
     Registry(String),
+    /// 业务未命中：disconnect 目标不在在线表快照（404 no-match）
+    NoMatch(String),
 }
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
         match self {
-            Self::InvalidHex(msg) => error_response(StatusCode::BAD_REQUEST, &msg),
-            Self::Registry(msg) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+            Self::InvalidRequest(msg) => {
+                error_envelope(StatusCode::BAD_REQUEST, "invalid-request", &msg)
+            }
+            Self::Registry(msg) => {
+                error_envelope(StatusCode::INTERNAL_SERVER_ERROR, "registry", &msg)
+            }
+            Self::NoMatch(msg) => error_envelope(StatusCode::NOT_FOUND, "no-match", &msg),
         }
     }
 }
@@ -240,12 +283,12 @@ struct Receipt {
 
 async fn register_owner(
     State(state): State<AdminState>,
-    Json(body): Json<RegisterOwnerBody>,
+    body: Result<Json<RegisterOwnerBody>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Receipt>, AdminError> {
-    let fabric_id =
-        parse_owner_hex(&body.fabric_id_hex).map_err(|e| AdminError::InvalidHex(e.to_string()))?;
-    let root =
-        parse_owner_hex(&body.root_hex).map_err(|e| AdminError::InvalidHex(e.to_string()))?;
+    // JSON 解析失败同入 invalid-request envelope（400 面统一迁移）
+    let Json(body) = body.map_err(|e| AdminError::InvalidRequest(e.body_text()))?;
+    let fabric_id = parse_owner_hex(&body.fabric_id_hex).map_err(AdminError::InvalidRequest)?;
+    let root = parse_owner_hex(&body.root_hex).map_err(AdminError::InvalidRequest)?;
     apply_mutation(&state, OP_REGISTER, "register", fabric_id, root).map(Json)
 }
 
@@ -253,9 +296,8 @@ async fn unregister_owner(
     State(state): State<AdminState>,
     Path((fabric_id_hex, root_hex)): Path<(String, String)>,
 ) -> Result<Json<Receipt>, AdminError> {
-    let fabric_id =
-        parse_owner_hex(&fabric_id_hex).map_err(|e| AdminError::InvalidHex(e.to_string()))?;
-    let root = parse_owner_hex(&root_hex).map_err(|e| AdminError::InvalidHex(e.to_string()))?;
+    let fabric_id = parse_owner_hex(&fabric_id_hex).map_err(AdminError::InvalidRequest)?;
+    let root = parse_owner_hex(&root_hex).map_err(AdminError::InvalidRequest)?;
     apply_mutation(&state, OP_UNREGISTER, "unregister", fabric_id, root).map(Json)
 }
 
@@ -316,10 +358,8 @@ fn apply_mutation(
     })
 }
 
-/// 踢存量连接（task 3.2b，design §13 Phase3-A 评估结论的落地）：在线表
-/// 反查 fabric 名下全部 endpoint → 逐个 `Clients::disconnect(ep, None)`
-/// （iroh-relay 异步 start_shutdown；OnDisconnectGuard drop 触发 gate
-/// on_disconnect → per-owner 配额自动释放）。返回
+/// 踢存量连接（task 3.2b，design §13 Phase3-A 评估结论的落地）：单次在线表
+/// 快照反查 fabric 名下全部 endpoint → 共享断连原语下发。返回
 /// (disconnect 命中的 endpoint 数, 在线表视角被踢连接数)。
 ///
 /// 粒度勘定：在线表按 fabric_id 归属（与 per-owner 配额同一维度）——同一
@@ -331,29 +371,39 @@ fn kick_existing_connections(state: &AdminState, fabric_id: &[u8; 32]) -> (usize
     let (Some(gate), Some(clients)) = (&state.gate, &state.relay_clients) else {
         return (0, 0);
     };
-    let mut kicked_endpoints = 0usize;
-    let mut kicked_connections = 0usize;
-    for endpoint in endpoints_of_fabric(&gate.online_view(), fabric_id) {
-        // 在线表条目源自握手认证身份（合法曲线点）；防御性跳过构造失败
-        let Ok(endpoint_id) = EndpointId::from_bytes(&endpoint.0) else {
-            continue;
-        };
-        // disconnect(ep, None)：该 endpoint 的全部连接（active+inactive）
-        if clients.disconnect(endpoint_id, None) {
-            kicked_endpoints += 1;
-            kicked_connections += endpoint.1;
-        }
-    }
-    (kicked_endpoints, kicked_connections)
+    let snapshot = gate.online_view();
+    let hits = disconnect_endpoints(clients, &endpoints_of_fabric(&snapshot, fabric_id));
+    let kicked_connections: usize = hits.iter().map(|e| e.connections).sum();
+    (hits.len(), kicked_connections)
 }
 
-/// 在线表反查（task 3.2b）：fabric 名下 (endpoint_id, connections) 清单
-/// （踢存量与 kicked 计数的公共映射层；单测在此层冻结）
-fn endpoints_of_fabric(view: &OnlineView, fabric_id: &[u8; 32]) -> Vec<([u8; 32], usize)> {
+/// 共享断连原语（task 1.3 抽取）：unregister 踢存量与 disconnect 路由的
+/// 唯一下发路径——对单次快照筛出的在线条目逐个
+/// `Clients::disconnect(ep, None)`（iroh-relay 异步 start_shutdown，该
+/// endpoint 的全部连接 active+inactive；OnDisconnectGuard drop 触发 gate
+/// on_disconnect → 配额自动释放）。返回 disconnect 返回 true 的条目
+/// （「已下发」清单——返回 false = 连接表已无此 endpoint，诚实不计入）。
+fn disconnect_endpoints(clients: &Clients, entries: &[OnlineEndpoint]) -> Vec<OnlineEndpoint> {
+    entries
+        .iter()
+        .filter(|e| {
+            // 在线表条目源自握手认证身份（合法曲线点）；防御性跳过构造失败
+            let Ok(endpoint_id) = EndpointId::from_bytes(&e.endpoint_id) else {
+                return false;
+            };
+            clients.disconnect(endpoint_id, None)
+        })
+        .cloned()
+        .collect()
+}
+
+/// 在线表反查（task 3.2b）：fabric 名下在线条目清单（踢存量、kicked
+/// 计数与 disconnect 路由的公共映射层；单测在此层冻结）
+fn endpoints_of_fabric(view: &OnlineView, fabric_id: &[u8; 32]) -> Vec<OnlineEndpoint> {
     view.per_endpoint
         .iter()
         .filter(|e| e.fabric_id == *fabric_id)
-        .map(|e| (e.endpoint_id, e.connections))
+        .cloned()
         .collect()
 }
 
@@ -455,6 +505,227 @@ async fn status(State(state): State<AdminState>) -> Json<Status> {
     })
 }
 
+// ---- GET /admin/connections（task 1.4：详细在线视图） ----
+
+#[derive(Serialize)]
+struct Connections {
+    /// 取 AdminState.mode 配置字段（禁止 gate 句柄推导——restricted+无
+    /// relay 仍为 restricted，P0-2）
+    mode: &'static str,
+    policy: &'static str,
+    /// relay 服务装配事实（独立字段，与 mode 无推导关系）
+    relay_enabled: bool,
+    quota: Quota,
+    /// endpoint_id 字典序（online_view 冻结排序）
+    per_endpoint: Vec<EndpointOnlineInfo>,
+    per_owner: Vec<OwnerOnlineInfo>,
+}
+
+#[derive(Serialize)]
+struct Quota {
+    configured: bool,
+    /// configured=false 时 null（quota 结构恒在——与 status 的扁平字段
+    /// 分工：connections 是新详细视图，status wire 冻结不动）
+    max_connections_per_owner: Option<usize>,
+}
+
+/// 与 /admin/status 的分工（P2-3 冻结）：status 的 active_connections/
+/// per_owner_connections 是既有冻结 wire；connections 是 SDK 面向的详细
+/// 视图（fabric 绑定 + mode/relay_enabled 拆分 + quota 结构）。open 模式
+/// （gate=None）→ 空投影；restricted+relay 未启用 → 在线表天然为空（无
+/// relay 即无票接入），mode/relay_enabled 如实各自取值。
+async fn connections(State(state): State<AdminState>) -> Json<Connections> {
+    let (quota, per_endpoint, per_owner) = match &state.gate {
+        Some(gate) => {
+            let view = gate.online_view();
+            (
+                Quota {
+                    configured: gate.max_connections_per_owner().is_some(),
+                    max_connections_per_owner: gate.max_connections_per_owner(),
+                },
+                view.per_endpoint
+                    .into_iter()
+                    .map(|e| EndpointOnlineInfo {
+                        endpoint_id: hex::encode(e.endpoint_id),
+                        fabric_id: hex::encode(e.fabric_id),
+                        connections: e.connections,
+                    })
+                    .collect(),
+                view.per_owner
+                    .into_iter()
+                    .map(|(fabric_id, connections)| OwnerOnlineInfo {
+                        fabric_id: hex::encode(fabric_id),
+                        connections,
+                    })
+                    .collect(),
+            )
+        }
+        None => (
+            Quota {
+                configured: false,
+                max_connections_per_owner: None,
+            },
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    Json(Connections {
+        mode: match state.mode {
+            AccessMode::Open => "open",
+            AccessMode::Restricted => "restricted",
+        },
+        policy: state.policy,
+        relay_enabled: state.relay_enabled,
+        quota,
+        per_endpoint,
+        per_owner,
+    })
+}
+
+// ---- POST /admin/connections/disconnect（task 1.3：主动断连） ----
+
+/// 请求体：endpoint_id / fabric_id 恰好其一（deny_unknown_fields + 显式
+/// 互斥检查——serde 拒未知字段，缺键/双键在此统一 400 invalid-request）
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DisconnectBody {
+    endpoint_id: Option<String>,
+    fabric_id: Option<String>,
+}
+
+/// disconnect 回执（JSON 形态与 register/unregister Receipt 同构，但
+/// target 用显式 endpoint_id 字段——不复用 root 键名，design §1.2 P0-1）
+#[derive(Serialize)]
+struct DisconnectReceipt {
+    op: &'static str,
+    fabric_id: String,
+    endpoint_id: String,
+    ts: u64,
+    generation: u64,
+    /// base64url-nopad(64B)（Ed25519 over RECEIPT_DOMAIN || canonical；
+    /// canonical 的 root 槽位承载被断 endpoint_id）
+    receipt_sig: String,
+}
+
+#[derive(Serialize)]
+struct DisconnectResponse {
+    /// 已下发 start_shutdown 的条目（「已下发」非「已完成」——收敛由调用方
+    /// 有界轮询确认，P1-2）
+    disconnected: Vec<EndpointOnlineInfo>,
+    /// per-target 回执（与 disconnected 对齐；空报告必为空数组）
+    receipts: Vec<DisconnectReceipt>,
+}
+
+/// 主动断连。快照规则（r2-P1-1 冻结）：判定取**单次** online_view 快照；
+/// 按 endpoint_id 请求命中快照中该 endpoint 的唯一条目（无条目 = 404
+/// no-match）；按 fabric_id 请求展开该 owner 全部条目（快照本身已按
+/// endpoint_id 字典序）。ts 在 handler 进入时取一次、generation 取当时
+/// registry snapshot——全部回执共享（与 register/unregister 回执的
+/// generation 同源：`registry.snapshot().generation()`）。open 模式 /
+/// relay 未启用 → 200 空 disconnected + 空 receipts（明确语义而非报错）。
+async fn disconnect(
+    State(state): State<AdminState>,
+    body: Result<Json<DisconnectBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<DisconnectResponse>, AdminError> {
+    let Json(body) = body.map_err(|e| AdminError::InvalidRequest(e.body_text()))?;
+    // 恰好其一约束（含缺键/双键/未知字段三类，spec 场景钉住）
+    let selector = match (body.endpoint_id, body.fabric_id) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(AdminError::InvalidRequest(
+                "request body must specify exactly one of endpoint_id or fabric_id".into(),
+            ));
+        }
+        (Some(endpoint_hex), None) => DisconnectSelector::Endpoint(
+            parse_owner_hex(&endpoint_hex).map_err(AdminError::InvalidRequest)?,
+        ),
+        (None, Some(fabric_hex)) => DisconnectSelector::Fabric(
+            parse_owner_hex(&fabric_hex).map_err(AdminError::InvalidRequest)?,
+        ),
+    };
+    // 共享 ts/generation：单一动作时刻与 registry 世代（进入分发前取定）
+    let ts = now_ms();
+    let generation = state.registry.snapshot().generation();
+    // 单次快照判定 + 共享断连原语下发（与 unregister 踢存量同一路径）
+    let (Some(gate), Some(clients)) = (&state.gate, &state.relay_clients) else {
+        return Ok(Json(DisconnectResponse {
+            disconnected: Vec::new(),
+            receipts: Vec::new(),
+        }));
+    };
+    let snapshot = gate.online_view();
+    let targets: Vec<OnlineEndpoint> = match selector {
+        DisconnectSelector::Endpoint(endpoint_id) => snapshot
+            .per_endpoint
+            .iter()
+            .filter(|e| e.endpoint_id == endpoint_id)
+            .cloned()
+            .collect(),
+        // 快照 per_endpoint 已按 endpoint_id 字典序冻结排序，过滤保序
+        DisconnectSelector::Fabric(fabric_id) => snapshot
+            .per_endpoint
+            .iter()
+            .filter(|e| e.fabric_id == fabric_id)
+            .cloned()
+            .collect(),
+    };
+    if targets.is_empty() {
+        return Err(AdminError::NoMatch(format!(
+            "no online connection matches {}",
+            match selector {
+                DisconnectSelector::Endpoint(id) => format!("endpoint_id {}", hex::encode(id)),
+                DisconnectSelector::Fabric(id) => format!("fabric_id {}", hex::encode(id)),
+            }
+        )));
+    }
+    let hits = disconnect_endpoints(clients, &targets);
+    tracing::info!(
+        requested = match selector {
+            DisconnectSelector::Endpoint(id) => hex::encode(id),
+            DisconnectSelector::Fabric(id) => hex::encode(id),
+        },
+        issued = hits.len(),
+        generation,
+        "admin API: disconnect issued (async start_shutdown)"
+    );
+    let receipts = hits
+        .iter()
+        .map(|e| DisconnectReceipt {
+            op: "disconnect",
+            fabric_id: hex::encode(e.fabric_id),
+            endpoint_id: hex::encode(e.endpoint_id),
+            ts,
+            generation,
+            // canonical 的 root 32B 槽位承载被断 endpoint_id（P0-1：
+            // 布局复用冻结形，op=0x03 区分）
+            receipt_sig: URL_SAFE_NO_PAD.encode(state.identity.sign(&receipt_canonical(
+                OP_DISCONNECT,
+                &e.fabric_id,
+                &e.endpoint_id,
+                ts,
+                generation,
+            ))),
+        })
+        .collect();
+    let disconnected = hits
+        .into_iter()
+        .map(|e| EndpointOnlineInfo {
+            endpoint_id: hex::encode(e.endpoint_id),
+            fabric_id: hex::encode(e.fabric_id),
+            connections: e.connections,
+        })
+        .collect();
+    Ok(Json(DisconnectResponse {
+        disconnected,
+        receipts,
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum DisconnectSelector {
+    Endpoint([u8; 32]),
+    Fabric([u8; 32]),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,7 +734,7 @@ mod tests {
     use crate::access::gate::{GateDecision, GateInput, Op};
     use axum::body::Body;
     use axum::http::Request;
-    use ed25519_dalek::{SigningKey, Verifier};
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
@@ -511,14 +782,27 @@ mod tests {
             gate: Option<Arc<AccessGate>>,
             relay_clients: Option<Clients>,
         ) -> AdminState {
+            self.state_as(gate, relay_clients, true, AccessMode::Restricted)
+        }
+
+        /// task 1.4 投影矩阵：mode/relay_enabled 独立注入（P0-2——
+        /// restricted+无 relay 的组合只能在字段层构造）
+        fn state_as(
+            &self,
+            gate: Option<Arc<AccessGate>>,
+            relay_clients: Option<Clients>,
+            relay_enabled: bool,
+            mode: AccessMode,
+        ) -> AdminState {
             AdminState {
                 token: TOKEN.to_string(),
                 identity: Arc::clone(&self.identity),
                 registry: Arc::clone(&self.registry),
                 gate,
                 relay_clients,
-                mode: AccessMode::Restricted,
+                mode,
                 policy: "static",
+                relay_enabled,
             }
         }
 
@@ -568,7 +852,10 @@ mod tests {
                 "headers {headers:?}"
             );
             let body = body_json(res).await;
-            assert_eq!(body["error"], "unauthorized");
+            // envelope 迁移回归（sdk-mgmt-surface task 1.1）：401 统一
+            // {"error":{"code","message"}} 形态
+            assert_eq!(body["error"]["code"], "unauthorized");
+            assert!(body["error"]["message"].is_string());
         }
         // 正确 token + 大小写不敏感 scheme → 200
         let res = app
@@ -886,10 +1173,21 @@ mod tests {
         assert_eq!(gate.decide(&input2).await, GateDecision::Allow);
 
         let mut hits = endpoints_of_fabric(&gate.online_view(), &f.fabric_id);
-        hits.sort();
+        hits.sort_by_key(|e| e.endpoint_id);
         assert_eq!(
             hits,
-            vec![(ep1, 2), (ep2, 1)],
+            vec![
+                OnlineEndpoint {
+                    endpoint_id: ep1,
+                    fabric_id: f.fabric_id,
+                    connections: 2,
+                },
+                OnlineEndpoint {
+                    endpoint_id: ep2,
+                    fabric_id: f.fabric_id,
+                    connections: 1,
+                },
+            ],
             "fabric 反查：两个 endpoint（连接数聚合），fabric2 不混入"
         );
         // 未知 fabric → 空集
@@ -978,5 +1276,465 @@ mod tests {
         let receipt = body_json(res).await;
         assert_eq!(receipt["kicked_endpoints"], 0);
         assert_eq!(receipt["kicked_connections"], 0);
+    }
+
+    // ---- sdk-mgmt-surface task 1.6：connections 投影 + disconnect 面单测 ----
+
+    /// spec 场景「在线视图投影与配额」：restricted + relay 启用，两个
+    /// owner 各一条在线连接——per_endpoint 字典序 / per_owner / quota 结构 /
+    /// mode 与 relay_enabled 独立如实
+    #[tokio::test]
+    async fn connections_projects_online_view_quota_and_mode_split() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let issuer2 = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let fabric2 = [0x72; 32];
+        f.registry
+            .register(&fabric2, &issuer2.verifying_key().to_bytes())
+            .unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static)
+                .unwrap()
+                .with_max_connections_per_owner(Some(2)),
+        );
+        let ep1 = occupy(&gate, &f, 0xB1, 1).await;
+        // fabric2 的一条连接（独立 owner 投影对照）
+        let recipient2 = *iroh_base::SecretKey::from_bytes(&[0xB2; 32])
+            .public()
+            .as_bytes();
+        let now = test_now_ms();
+        let token2 = sign_and_encode(
+            &issuer2,
+            &fabric2,
+            &f.server_id,
+            &recipient2,
+            CAP_RELAY,
+            now,
+            now + 3_600_000,
+        );
+        assert_eq!(
+            gate.decide(&GateInput {
+                endpoint_id: recipient2,
+                auth_header: Some(format!("Bearer {token2}")),
+                query_token: None,
+                connection_id: 2,
+                op: Op::RelayConnect,
+            })
+            .await,
+            GateDecision::Allow
+        );
+
+        let app = router(f.state_as(Some(gate), None, true, AccessMode::Restricted));
+        let res = app
+            .oneshot(
+                Request::get("/admin/connections")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["mode"], "restricted");
+        assert_eq!(body["policy"], "static");
+        assert_eq!(body["relay_enabled"], true);
+        assert_eq!(body["quota"]["configured"], true);
+        assert_eq!(body["quota"]["max_connections_per_owner"], 2);
+        // 字典序冻结：返回数组与排序后的 hex 清单逐一相等
+        let mut expected = [ep1, recipient2];
+        expected.sort();
+        let got: Vec<&str> = body["per_endpoint"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["endpoint_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            got,
+            expected.iter().map(hex::encode).collect::<Vec<_>>(),
+            "per_endpoint 必须按 endpoint_id 字典序"
+        );
+        assert_eq!(body["per_endpoint"][0]["connections"], 1);
+        assert_eq!(
+            body["per_endpoint"][0]["fabric_id"],
+            hex::encode(f.fabric_id)
+        );
+        assert_eq!(body["per_endpoint"][1]["fabric_id"], hex::encode(fabric2));
+        let owners: Vec<&str> = body["per_owner"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["fabric_id"].as_str().unwrap())
+            .collect();
+        let mut fabrics = [f.fabric_id, fabric2];
+        fabrics.sort();
+        assert_eq!(owners, fabrics.iter().map(hex::encode).collect::<Vec<_>>());
+        assert_eq!(body["per_owner"][0]["connections"], 1);
+    }
+
+    /// spec 场景「restricted + relay 未启用的正确投影」（P0-2）：不得把
+    /// restricted+无 relay 误报为 open——mode/relay_enabled 各自如实，投影
+    /// 为空（relay 未装配即无票接入，在线表天然为空）。
+    /// 同场覆盖 open 模式：如实标注 mode、空投影、quota 无上限。
+    #[tokio::test]
+    async fn connections_projection_restricted_without_relay_and_open_mode() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+
+        // restricted + relay 未启用（gate 恒建——restricted 装配事实）
+        let gate = AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static)
+            .unwrap()
+            .with_max_connections_per_owner(Some(2));
+        let app = router(f.state_as(Some(Arc::new(gate)), None, false, AccessMode::Restricted));
+        let res = app
+            .oneshot(
+                Request::get("/admin/connections")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["mode"], "restricted", "不得投影为 open");
+        assert_eq!(body["relay_enabled"], false);
+        assert_eq!(body["per_endpoint"].as_array().unwrap().len(), 0);
+        assert_eq!(body["per_owner"].as_array().unwrap().len(), 0);
+        // quota 是 gate 装配事实（配置了上限即如实透出，与 relay 无关）
+        assert_eq!(body["quota"]["configured"], true);
+        assert_eq!(body["quota"]["max_connections_per_owner"], 2);
+
+        // open 模式（无 gate）：mode 如实 + 空投影 + 无配额概念
+        let app = router(f.state_as(None, None, true, AccessMode::Open));
+        let res = app
+            .oneshot(
+                Request::get("/admin/connections")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body["mode"], "open");
+        assert_eq!(body["relay_enabled"], true);
+        assert_eq!(body["per_endpoint"].as_array().unwrap().len(), 0);
+        assert_eq!(body["per_owner"].as_array().unwrap().len(), 0);
+        assert_eq!(body["quota"]["configured"], false);
+        assert!(body["quota"]["max_connections_per_owner"].is_null());
+    }
+
+    /// spec 场景「请求体同时缺失或同时给出两个键」：缺键/双键/未知字段/
+    /// 坏 hex/坏 JSON → 400 + invalid-request envelope（信息指明恰好其一）
+    #[tokio::test]
+    async fn disconnect_request_body_matrix_rejected_with_envelope() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static).unwrap(),
+        );
+        let app = router(f.state_with_relay(Some(gate), Some(Clients::default())));
+        let good_hex = hex::encode([0xB1; 32]);
+        let cases: Vec<(&str, String, bool)> = vec![
+            // (标签, body, 恰好其一约束违例？——错误信息须指明)
+            ("缺两键", serde_json::json!({}).to_string(), true),
+            (
+                "双键",
+                serde_json::json!({"endpoint_id": good_hex, "fabric_id": good_hex}).to_string(),
+                true,
+            ),
+            (
+                "未知字段",
+                serde_json::json!({"endpoint_id": good_hex, "extra": 1}).to_string(),
+                false,
+            ),
+            (
+                "坏 hex",
+                serde_json::json!({"endpoint_id": "zz"}).to_string(),
+                false,
+            ),
+            ("坏 JSON", "{\"nope".to_string(), false),
+        ];
+        for (label, body, exactly_one) in cases {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post("/admin/connections/disconnect")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "用例 {label}");
+            let json = body_json(res).await;
+            assert_eq!(json["error"]["code"], "invalid-request", "用例 {label}");
+            assert!(json["error"]["message"].is_string(), "用例 {label}");
+            if exactly_one {
+                assert!(
+                    json["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("exactly one"),
+                    "用例 {label} 错误信息须指明必须恰好其一: {json}"
+                );
+            }
+        }
+    }
+
+    /// spec 场景「断连目标未命中」：快照无条目 → 404 no-match envelope，
+    /// 不产生断开动作与回执（endpoint 与 fabric 两查询键）
+    #[tokio::test]
+    async fn disconnect_no_match_returns_404_envelope() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static).unwrap(),
+        );
+        occupy(&gate, &f, 0xB1, 1).await; // 在线的是别的 endpoint
+        let app = router(f.state_with_relay(Some(Arc::clone(&gate)), Some(Clients::default())));
+
+        for key in ["endpoint_id", "fabric_id"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::post("/admin/connections/disconnect")
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .body(Body::from(
+                            serde_json::json!({ key: hex::encode([0x99; 32]) }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "查询键 {key}");
+            let json = body_json(res).await;
+            assert_eq!(json["error"]["code"], "no-match", "查询键 {key}");
+            assert!(json["error"]["message"].is_string());
+        }
+        // 未命中不产生断开动作：在线表不受影响
+        assert_eq!(gate.online_view().per_endpoint.len(), 1);
+    }
+
+    /// spec 场景「空报告的 receipts 语义」两路：relay 未启用 → 200 空
+    /// disconnected+空 receipts；快照命中但连接表 miss（单测空句柄模拟
+    /// 「已定位未下发」竞态）→ 同样空报告——诚实计数，不虚构回执
+    #[tokio::test]
+    async fn disconnect_empty_reports_stay_empty() {
+        let f = Fixture::new();
+        f.registry.register(&f.fabric_id, &f.issuer_key()).unwrap();
+        let gate = Arc::new(
+            AccessGate::new(f.server_id, f.registry.clone(), PolicyConfig::Static).unwrap(),
+        );
+        let ep = occupy(&gate, &f, 0xB1, 1).await;
+
+        // relay 未启用（clients None）→ 200 空报告（明确语义而非报错）
+        let app = router(f.state_with_relay(Some(Arc::clone(&gate)), None));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/connections/disconnect")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        serde_json::json!({"endpoint_id": hex::encode(ep)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["disconnected"].as_array().unwrap().len(), 0);
+        assert_eq!(json["receipts"].as_array().unwrap().len(), 0);
+
+        // 连接表 miss（Clients::default() 空 registry）：快照命中但 disconnect
+        // 返回 false → 已下发清单为空 → 无回执（真实命中路径由 e2e 钉死）
+        let app = router(f.state_with_relay(Some(Arc::clone(&gate)), Some(Clients::default())));
+        let res = app
+            .oneshot(
+                Request::post("/admin/connections/disconnect")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .body(Body::from(
+                        serde_json::json!({"fabric_id": hex::encode(f.fabric_id)}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["disconnected"].as_array().unwrap().len(), 0);
+        assert_eq!(json["receipts"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- sdk-mgmt-surface task 1.5：回执 canonical 冻结向量 ----
+
+    /// CROSS_CRATE_RECEIPT_VECTOR（r2-P2-2 可复现规则）：固定 key/ts/
+    /// generation/输入在测试内生成 fixtures/receipt-vector.json——存在即
+    /// 对拍（实现漂移即红）、不存在则写出入库（首次+CI 缺档自愈）；TS 侧
+    /// （client-sdk ./admin）只读该文件对拍 receiptCanonical。绝不使用本地
+    /// 时钟——任何环境重跑同结果。
+    #[test]
+    fn receipt_vector_fixture_is_frozen() {
+        // 固定输入（Ed25519 seed 与真实 server.key 同为 32B 裸 seed）
+        let key = SigningKey::from_bytes(&[0x5D; 32]);
+        let fabric = [0x51; 32];
+        let root = [0x52; 32];
+        let fabric_b = [0x55; 32];
+        let endpoint = *iroh_base::SecretKey::from_bytes(&[0x53; 32])
+            .public()
+            .as_bytes();
+        // 按 fabric 断连的两 endpoint：真实曲线点，按 endpoint_id 字典序冻结
+        let mut endpoints_b = vec![
+            *iroh_base::SecretKey::from_bytes(&[0x31; 32])
+                .public()
+                .as_bytes(),
+            *iroh_base::SecretKey::from_bytes(&[0x32; 32])
+                .public()
+                .as_bytes(),
+        ];
+        endpoints_b.sort();
+
+        /// 单样例：per-target canonical + JSON wire（receipts 与实现结构体
+        /// 同源序列化——wire 形态随实现演化时对拍立即红；op label 由 op_code
+        /// 派生，防调用处两处标签漂移）
+        fn sample(
+            kind: &str,
+            op_code: u8,
+            fabric: &[u8; 32],
+            targets: &[[u8; 32]],
+            ts: u64,
+            generation: u64,
+            key: &SigningKey,
+        ) -> serde_json::Value {
+            let op_label = match op_code {
+                OP_REGISTER => "register",
+                OP_UNREGISTER => "unregister",
+                _ => "disconnect",
+            };
+            let mut canonical_hex = Vec::new();
+            let mut receipts = Vec::new();
+            for target in targets {
+                let canonical = receipt_canonical(op_code, fabric, target, ts, generation);
+                let sig = URL_SAFE_NO_PAD.encode(key.sign(&canonical).to_bytes());
+                canonical_hex.push(hex::encode(&canonical));
+                receipts.push(
+                    match op_code {
+                        OP_DISCONNECT => serde_json::to_value(DisconnectReceipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            endpoint_id: hex::encode(target),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                        }),
+                        _ => serde_json::to_value(Receipt {
+                            op: op_label,
+                            fabric_id: hex::encode(fabric),
+                            root: hex::encode(target),
+                            ts,
+                            generation,
+                            receipt_sig: sig,
+                            kicked_endpoints: None,
+                            kicked_connections: None,
+                        }),
+                    }
+                    .unwrap(),
+                );
+            }
+            serde_json::json!({
+                "kind": kind,
+                "op_code": op_code,
+                "fabric_id": hex::encode(fabric),
+                // register/unregister 的 target 序列化为 root；disconnect 为 endpoint_id
+                "target_field": if op_code == OP_DISCONNECT { "endpoint_id" } else { "root" },
+                "targets": targets.iter().map(hex::encode).collect::<Vec<_>>(),
+                "ts": ts,
+                "generation": generation,
+                "canonical_hex": canonical_hex,
+                "receipts": receipts,
+            })
+        }
+
+        let vector = serde_json::json!({
+            "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
+            "domain_hex": hex::encode(RECEIPT_DOMAIN),
+            "ops": { "register": OP_REGISTER, "unregister": OP_UNREGISTER, "disconnect": OP_DISCONNECT },
+            "server_id": hex::encode(key.verifying_key().to_bytes()),
+            "samples": [
+                sample("register", OP_REGISTER, &fabric, &[root], 1_789_012_345_678, 4, &key),
+                sample("unregister", OP_UNREGISTER, &fabric, &[root], 1_789_012_400_000, 5, &key),
+                sample("disconnect-endpoint", OP_DISCONNECT, &fabric, &[endpoint], 1_789_012_500_000, 6, &key),
+                sample("disconnect-fabric", OP_DISCONNECT, &fabric_b, &endpoints_b, 1_789_012_600_000, 7, &key),
+            ],
+        });
+
+        // 独立于文件的布局断言（op3 canonical：domain || 0x03 || fabric ||
+        // endpoint(root 槽位) || ts u64BE || generation u64BE）
+        let op3 = receipt_canonical(
+            OP_DISCONNECT,
+            &fabric_b,
+            &endpoints_b[0],
+            1_789_012_600_000,
+            7,
+        );
+        let mut expected = RECEIPT_DOMAIN.to_vec();
+        expected.push(OP_DISCONNECT);
+        expected.extend_from_slice(&fabric_b);
+        expected.extend_from_slice(&endpoints_b[0]);
+        expected.extend_from_slice(&1_789_012_600_000u64.to_be_bytes());
+        expected.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(op3, expected);
+        // 验签（固定 key 的公钥侧——server_id 同源语义）
+        let verifying =
+            ed25519_dalek::VerifyingKey::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        verifying
+            .verify(
+                &op3,
+                &ed25519_dalek::Signature::from_bytes(
+                    &URL_SAFE_NO_PAD
+                        .decode(
+                            vector["samples"][3]["receipts"][0]["receipt_sig"]
+                                .as_str()
+                                .unwrap(),
+                        )
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                ),
+            )
+            .expect("冻结向量的 receipt_sig 必须可验签");
+
+        // fixture 随仓库入库（r3-P1-4）：缺失即失败——测试不得在 CI 中写回
+        // 源码树；显式重生成 = DWEB_REGEN_FIXTURES=1 跑本测试写出后复核入库。
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/receipt-vector.json");
+        let read = std::fs::read_to_string(&path);
+        let on_disk: serde_json::Value = match read {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(_) if std::env::var("DWEB_REGEN_FIXTURES").is_ok() => {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, serde_json::to_vec_pretty(&vector).unwrap()).unwrap();
+                eprintln!("regenerated {}", path.display());
+                return;
+            }
+            Err(e) => panic!(
+                "receipt-vector.json 缺失或不可读（{e}）——冻结向量必须随仓库入库；\
+                 显式重生成：DWEB_REGEN_FIXTURES=1 cargo test -p dweb-server \
+                 receipt_vector，复核后 git add"
+            ),
+        };
+        assert_eq!(
+            on_disk, vector,
+            "receipt-vector.json 与当前实现漂移——回执 canonical/wire 是冻结契约，\
+             需以实现复核后重新入库（并同步 TS 对拍）"
+        );
     }
 }

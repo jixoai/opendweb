@@ -35,6 +35,31 @@
 - **WHEN** sidecar 启动
 - **THEN** 监听地址为 127.0.0.1，非本机不可访问
 
+#### Scenario: 入站路径越界零出站
+
+- **WHEN** 浏览器请求 `/api/../status`、`/api/%2e%2e/status`、`/api/a%2fb`、`/api//x`、`/api/x/` 等含 dot-segment/编码分隔符/空段/重复斜杠的路径
+- **THEN** 全部返回 404 且 sidecar **不向上游发出任何请求**（以假上游零收包断言）；拼接后最终远端 pathname 必须再次断言以 `/admin/` 开头
+
+#### Scenario: 上游资源超限的失败 wire
+
+- **WHEN** 上游响应 body 超过 1 MiB（或请求 body 超 64 KiB）
+- **THEN** sidecar abort 上游连接（socket 回收）并返回 502 + `{"error":{"code":"upstream-too-large"}}` envelope
+
+#### Scenario: 逐请求连接不跨目标复用
+
+- **WHEN** 代理连续向同一目标发出多个请求（含一请求 abort）
+- **THEN** 每请求独立新建连接（禁用连接池复用），响应结束或 abort 即销毁 socket——以 keep-alive 不跨请求存活断言
+
+#### Scenario: token 不入 help 与错误输出
+
+- **WHEN** `opendweb webui --help` 或任一 CLI 错误路径（坏 URL/坏端口/代理失败）执行且 token 已传入
+- **THEN** 输出（help golden/错误信息）不含 token 值；`--token value` 与 `--token=value` 两形态解析均正确
+
+#### Scenario: UI 失败态矩阵呈现
+
+- **WHEN** SPA 的 apiFetch 注入层分别返回 not-enabled / unauthorized / http-502 / network / timeout / no-match 六类错误
+- **THEN** 各对应视图呈现语义化提示（not-enabled→配置指引、unauthorized→重启换 token 指引等），无未捕获异常与错误风暴；setup 态业务请求呈现「未连接」引导
+
 ### Requirement: CLI 面接线（plugin 契约与一键启动）
 
 `opendweb-webui` SHALL 通过 `./opendweb-plugin` 子路径导出符合 CLI 插件契约的清单（`webui` 命令，args JSON Schema 声明 `--server/--token/--port/--allow-insecure/--no-open`，均为既有契约的 string/number/boolean 子集——不扩展插件契约；URL/端口/互斥等语义校验由命令实现自担，进入 run 前后均可校验）。`run` 收到契约既定的 dispatch envelope `{command, args, log, cwd, stdout, stderr}`。`opendweb webui …` 经 marketplace 自适应解析直达（候选 `opendweb-webui` 命中默认 glob `npm:opendweb-*`；自愈安装语义沿用 marketplace spec）。命令启动 sidecar 后 SHALL 打印本地访问 URL（setup 模式同时打印一次性配对码）；默认在可打开浏览器的环境下自动打开（`--no-open` 关闭；headless/失败仅打印 URL 不报错）。`--token` 的 help 文本 MUST 标注 OS 可见性与推荐替代途径。缺省 `--server` = setup 模式（非错误）。

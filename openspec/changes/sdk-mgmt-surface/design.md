@@ -56,7 +56,9 @@ active_connections/per_owner_connections，admin.rs:389-399）：
   restricted 恒建 gate）。
 - 数据源：`gate.online_view()`（gate.rs:400）快照 + `gate.
   max_connections_per_owner()`（gate.rs:395）；gate=None（open 模式）→ 空
-  投影。per_endpoint 按 endpoint_id 字典序稳定排序。
+  投影。**per_endpoint 条目粒度 = (endpoint_id, fabric_id) 对（r3-P1-3），
+  按 (endpoint_id, fabric_id) 双键字典序**——同 endpoint 持多 fabric 连接
+  时逐对成条，无 first() 类不确定聚合。
 - **与 /admin/status 的分工**（P2-3）：status 的 active_connections/
   per_owner_connections 是既有冻结 wire（旧消费者依赖），保持不动；
   connections 是新详细视图（含 fabric 绑定、mode/relay 拆分、quota 结构）。
@@ -84,9 +86,10 @@ active_connections/per_owner_connections，admin.rs:389-399）：
   用显式 `endpoint_id` 字段（不复用 `root` 键名），register/unregister 的
   Receipt 形态零变化。
 - **回执快照规则（r2-P1-1 冻结）**：断连判定取**单次** `OnlineView` 快照；
-  按 `endpoint_id` 请求 → 快照中该 endpoint 的唯一 `{endpoint_id, fabric_id,
-  connections}` 条目（快照无此条目 = no-match 404）；按 `fabric_id` 请求 →
-  该 owner 全部条目按 endpoint_id 字典序展开。每张回执的 fabric_id 取自该
+  按 `endpoint_id` 请求 → 快照中该 endpoint 的全部 (endpoint, fabric) 对
+  条目（per-pair 语义下可多条，按 fabric_id 字典序；无任何条目 = no-match
+  404）；按 `fabric_id` 请求 → 该 owner 全部条目按 (endpoint_id, fabric_id)
+  字典序展开（endpoint 在单一 fabric 名下至多一条）。每张回执的 fabric_id 取自该
   快照条目；**ts 与 generation 全部回执共享**（同一动作同一时刻同一 registry
   世代——ts 在进入 handler 时取一次，generation 取当时 registry snapshot）。
   open 模式 / restricted+relay 未启用 → 200 空 disconnected 且 **receipts
@@ -124,8 +127,10 @@ body 形态）。既有 401/400 路由响应改造为 envelope 形态（微调�
   （./token 同形）。**冻结契约决策：两 subpath 为 ESM-only**（`import` 载入；
   不承诺 `require()`——Node 22 前 require(ESM) 不可用，写进 README）。
   目录 `packages/client-sdk/admin/`、`packages/client-sdk/token/`。
-- `package.json` 增量：`exports["./admin"]`、`exports["./token"]`（types/
-  default 指向 .d.ts/.js）；**`files` 数组增 `admin`、`token` 目录**。
+- `package.json` 增量（r3-P1-1：后缀统一 .mjs/.d.mts，全文不出现旧后缀）：
+  `"./admin": { "types": "./admin/index.d.mts", "default": "./admin/index.mjs" }`
+  （./token 同形）；**`files` 数组增 `admin`、`token` 目录**；tasks 2.2 的
+  最终 exports 断言逐字冻结这两条路径。
 - **隔离规则**：两目录源码 MUST NOT import 包内 root/`net`/`http`（无传递
   native 加载）；`.d.ts` 自包含。
 - **pack 门禁（tasks 2.4）**：干净临时目录 `npm pack` → 解包安装 → 无
@@ -143,11 +148,14 @@ new AdminClient({ baseUrl, token, timeoutMs?: 10_000 })
 ```
 
 - fetch + `AbortSignal.timeout`；Bearer 注入；baseUrl 尾斜杠归一。
-- **probeEnabled 判别矩阵（r2-P1-3 冻结）**：`200 → true`；`404 →
-  admin-not-enabled（false 语义错误对象）`；`401 → unauthorized（已挂载但
-  凭证错——不是 not-enabled）`；其余 HTTP 状态/网络失败/超时 → 原样
-  AdminError（network/timeout/`http-<status>`）。**禁止把任意非 200 折叠为
-  not-enabled**。mock-fetch + e2e 双矩阵测试。
+- **probeEnabled 签名与矩阵（r2-P1-3 + r3-P1-2 冻结）**：
+  `probeEnabled(): Promise<true>`——仅在探测得到 200 时 resolve `true`；
+  **其余一律 reject `AdminError`**：404 → `code="admin-not-enabled"`（已判定
+  未启用）；401 → `unauthorized`（已挂载但凭证错——不是 not-enabled）；
+  502/503/任意非 200 → `http-<status>`；fetch reject → `network`；超时 →
+  `timeout`。**不存在「false 返回值」，禁止把任意非 200 折叠为 not-enabled**。
+  code 枚举含 `http-<status>` 形态（AdminError.code: string）。
+  mock-fetch + e2e 双矩阵测试（502/503/未知 5xx 显式用例）。
 - 错误归一 `AdminError{status, code, message}`；code 表：`admin-not-enabled`、
   `unauthorized`、`invalid-request`、`no-match`、`network`、`timeout`。
 - 回执：`receiptCanonical(receipt)` 输出 §1.1 冻结 canonical（disconnect 的
@@ -235,3 +243,12 @@ Rust 面（含 wire 冻结向量导出）先行；TS 两 subpath 并行；pack �
 | r2-P1-2 envelope 迁移措辞 | §1.1 改「错误 body 版本化变更」；proposal 契约影响同步 |
 | r2-P1-3 probe 矩阵 | 200/404/401/其余/网络/超时 全矩阵冻结，禁止折叠（§2.2） |
 | r2-P2-2 向量可复现 | fixture 文件路径 + 固定 key/ts/generation 生成规则（§2.2） |
+
+## 9. r3 评审处置表
+
+| 项 | 处置 |
+|---|---|
+| r3-P1-1 exports 残句 | 删除旧后缀句；全文统一 .mjs/.d.mts；tasks 2.2 逐字断言（§2.1） |
+| r3-P1-2 probe 签名 | `Promise<true>` + 全 reject 矩阵 + `http-<status>` 入枚举（§2.2） |
+| r3-P1-3 OnlineView 唯一性 | view() 改 per-(endpoint,fabric) 对 + 双键字典序 + 混 fabric 回归测试（gate.rs；§1.2/spec 同步） |
+| r3-P1-4 fixture 入库 | 随仓库提交；测试缺失即败（重生成走 DWEB_REGEN_FIXTURES=1 显式门） |

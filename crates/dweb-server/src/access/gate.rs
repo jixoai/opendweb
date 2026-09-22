@@ -182,23 +182,23 @@ impl OnlineTable {
     /// 只读投影（admin status 低频调用；双表分别确定性排序）
     fn view(&self) -> OnlineView {
         let inner = self.0.lock().unwrap();
-        let mut by_endpoint: HashMap<[u8; 32], (Vec<[u8; 32]>, usize)> = HashMap::new();
+        // 条目粒度 = (endpoint_id, fabric_id) 对（r3-P1-3）：同 endpoint 持
+        // 多 fabric 连接时逐对成条，杜绝 first() 类不确定聚合；排序双键
+        // （endpoint_id, fabric_id）字典序，消费侧（disconnect 展开/receipts）
+        // 依赖该确定性。
+        let mut by_pair: HashMap<([u8; 32], [u8; 32]), usize> = HashMap::new();
         for ((endpoint, _conn), fabric) in &inner.conns {
-            let entry = by_endpoint.entry(*endpoint).or_default();
-            entry.0.push(*fabric);
-            entry.1 += 1;
+            *by_pair.entry((*endpoint, *fabric)).or_insert(0) += 1;
         }
-        let mut per_endpoint: Vec<OnlineEndpoint> = by_endpoint
+        let mut per_endpoint: Vec<OnlineEndpoint> = by_pair
             .into_iter()
-            .map(|(endpoint_id, (fabrics, connections))| OnlineEndpoint {
+            .map(|((endpoint_id, fabric_id), connections)| OnlineEndpoint {
                 endpoint_id,
-                // 同一 endpoint 的多条连接理论上同 fabric（recipient 绑定）；
-                // 防御性取首条
-                fabric_id: fabrics.first().copied().unwrap_or([0u8; 32]),
+                fabric_id,
                 connections,
             })
             .collect();
-        per_endpoint.sort_by_key(|e| e.endpoint_id);
+        per_endpoint.sort_by_key(|e| (e.endpoint_id, e.fabric_id));
         let mut per_owner: Vec<([u8; 32], usize)> =
             inner.owners.iter().map(|(k, v)| (*k, *v)).collect();
         per_owner.sort();
@@ -1294,5 +1294,27 @@ mod tests {
             vec![],
             "endpoint 维度同样无残留"
         );
+    }
+
+    #[test]
+    fn online_view_mixed_fabric_endpoint_is_per_pair_deterministic() {
+        // r3-P1-3 回归：同 endpoint 持两个 fabric 的连接——view 必须逐对成条
+        // 且 (endpoint_id, fabric_id) 双键字典序，杜绝 first() 类 HashMap 序
+        // 聚合；per_owner 两 fabric 计数独立。
+        let (f, gate) = Fixture::new();
+        let other_fabric = [0x77; 32];
+        let e = f.recipient;
+        // 同 endpoint 两条连接分属两 fabric（recipient 复用两个 owner 的票）
+        assert!(gate.online.reserve(&f.fabric_id, e, 1, None));
+        assert!(gate.online.reserve(&other_fabric, e, 2, None));
+        let view = gate.online_view();
+        assert_eq!(view.per_endpoint.len(), 2, "per-(endpoint,fabric) 对成条");
+        let fabrics: Vec<[u8; 32]> = view.per_endpoint.iter().map(|x| x.fabric_id).collect();
+        let mut sorted = fabrics.clone();
+        sorted.sort();
+        assert_eq!(fabrics, sorted, "同 endpoint 内按 fabric_id 字典序");
+        assert!(view.per_endpoint.iter().all(|x| x.connections == 1));
+        assert!(view.per_owner.contains(&(f.fabric_id, 1)));
+        assert!(view.per_owner.contains(&(other_fabric, 1)));
     }
 }

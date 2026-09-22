@@ -1,0 +1,118 @@
+{
+  "domain_hex": "647765622f61646d696e2d726563656970742f763100",
+  "note": "CROSS_CRATE_RECEIPT_VECTOR: dweb admin receipt frozen vector — fixed key/ts/generation, generated and asserted by crates/dweb-server unit test (sdk-mgmt-surface task 1.5); TS (client-sdk ./admin) recomputes canonical from fields and verifies receipt_sig against server_id",
+  "ops": {
+    "disconnect": 3,
+    "register": 1,
+    "unregister": 2
+  },
+  "samples": [
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000151515151515151515151515151515151515151515151515151515151515151515252525252525252525252525252525252525252525252525252525252525252000001a08972034e0000000000000004"
+      ],
+      "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+      "generation": 4,
+      "kind": "register",
+      "op_code": 1,
+      "receipts": [
+        {
+          "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+          "generation": 4,
+          "op": "register",
+          "receipt_sig": "Xzb_3ryNUMIuxQZ9fNgSL774JQQL8g3mW6KINKGzgBsmQKTcNG_jm0PQ0I3F96uzgcQTnVkf_zf8z7o532YWBQ",
+          "root": "5252525252525252525252525252525252525252525252525252525252525252",
+          "ts": 1789012345678
+        }
+      ],
+      "target_field": "root",
+      "targets": [
+        "5252525252525252525252525252525252525252525252525252525252525252"
+      ],
+      "ts": 1789012345678
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f7631000251515151515151515151515151515151515151515151515151515151515151515252525252525252525252525252525252525252525252525252525252525252000001a08972d7800000000000000005"
+      ],
+      "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+      "generation": 5,
+      "kind": "unregister",
+      "op_code": 2,
+      "receipts": [
+        {
+          "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+          "generation": 5,
+          "op": "unregister",
+          "receipt_sig": "lfC1g6VDfAB9lwI3N4QYKPM4R9ZzVA_dIRrXWgM1mToMpKBvduuEhePzaAsI6BorMr1-mbj869g433W3HkdODw",
+          "root": "5252525252525252525252525252525252525252525252525252525252525252",
+          "ts": 1789012400000
+        }
+      ],
+      "target_field": "root",
+      "targets": [
+        "5252525252525252525252525252525252525252525252525252525252525252"
+      ],
+      "ts": 1789012400000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f763100035151515151515151515151515151515151515151515151515151515151515151f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0000001a089745e200000000000000006"
+      ],
+      "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+      "generation": 6,
+      "kind": "disconnect-endpoint",
+      "op_code": 3,
+      "receipts": [
+        {
+          "endpoint_id": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "fabric_id": "5151515151515151515151515151515151515151515151515151515151515151",
+          "generation": 6,
+          "op": "disconnect",
+          "receipt_sig": "aww7cTJ1r5OOLeG37jw2hjFlm9-qYytyTdDp8RQ6CyTS3kaLKTaOS4GNHu4CaYgAiEG57ESa8kB-Rgbl7aceDw",
+          "ts": 1789012500000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0"
+      ],
+      "ts": 1789012500000
+    },
+    {
+      "canonical_hex": [
+        "647765622f61646d696e2d726563656970742f76310003555555555555555555555555555555555555555555555555555555555555555548075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd000001a08975e4c00000000000000007",
+        "647765622f61646d696e2d726563656970742f7631000355555555555555555555555555555555555555555555555555555555555555555e212c0980e4b39fc09721134aa02109374edfd260c0d3d03cb501c8d65457a9000001a08975e4c00000000000000007"
+      ],
+      "fabric_id": "5555555555555555555555555555555555555555555555555555555555555555",
+      "generation": 7,
+      "kind": "disconnect-fabric",
+      "op_code": 3,
+      "receipts": [
+        {
+          "endpoint_id": "48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd",
+          "fabric_id": "5555555555555555555555555555555555555555555555555555555555555555",
+          "generation": 7,
+          "op": "disconnect",
+          "receipt_sig": "B_9qKE9udQBILOwUU5pRClqfhV5DCd1xwLX4ufrsZ0HE9s6f_JvDw-MwPR9482iYge4kmAfl1yIzbWBZCv0HBA",
+          "ts": 1789012600000
+        },
+        {
+          "endpoint_id": "5e212c0980e4b39fc09721134aa02109374edfd260c0d3d03cb501c8d65457a9",
+          "fabric_id": "5555555555555555555555555555555555555555555555555555555555555555",
+          "generation": 7,
+          "op": "disconnect",
+          "receipt_sig": "6bt_Lt9VqLnqDmV1ImN0j0fDWPp4YbSTQY96prkPx2sU8sGDpn2NsFnAKKEZzlKTnMCk6U5WBUV8Twn5hLqjBg",
+          "ts": 1789012600000
+        }
+      ],
+      "target_field": "endpoint_id",
+      "targets": [
+        "48075a597e721a156e2e0799de5cc0c5324dc6e7eaf1cdd46250868ec53215dd",
+        "5e212c0980e4b39fc09721134aa02109374edfd260c0d3d03cb501c8d65457a9"
+      ],
+      "ts": 1789012600000
+    }
+  ],
+  "server_id": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db"
+}

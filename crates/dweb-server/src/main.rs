@@ -449,6 +449,9 @@ async fn main() -> Result<()> {
                     access::config::PolicyConfig::Static => "static",
                     access::config::PolicyConfig::Callback(_) => "callback",
                 },
+                // relay 装配事实（sdk-mgmt-surface task 1.2）：connections
+                // 投影独立字段，取服务是否构造而非 gate 句柄推导
+                relay.is_some(),
             ))
         });
 

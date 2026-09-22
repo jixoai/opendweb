@@ -33,6 +33,13 @@
 //!   DELETE /admin/owners → kicked 计数 + relay 在线表清零（OnDisconnectGuard
 //!   随真断连触发，配额自动释放）+ 同票新连接 unknown-owner（对照：文件
 //!   热重载路径不踢存量——e8）
+//! - e17 admin connections 视图 + 按 endpoint 断连（sdk-mgmt-surface
+//!   task 1.7）：两 owner 各一连接 → GET /admin/connections 投影（字典序/
+//!   quota/mode/relay_enabled）→ POST disconnect{endpoint_id} → per-target
+//!   回执（ServerId 验签）→ 有界轮询（≤5s/50ms）观测收敛
+//! - e18 admin 按 fabric 断连多端点：同 fabric 两 endpoint → disconnect
+//!   {fabric_id} → disconnected/receipts 按 endpoint_id 字典序展开 + 两回执
+//!   共享 ts/generation → 收敛后同票可重连（disconnect ≠ unregister）
 //!
 //! 进程纪律：Server guard Drop 恒 kill+wait（防孤儿 dweb-server——全局
 //! 规则：测试泄漏常驻进程是重大事故）；网络测试以 --gateway/--relay
@@ -1322,6 +1329,330 @@ async fn e16_admin_unregister_kicks_existing_connections() {
 fn base64url(bytes: [u8; 64]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+// ---------- e17/e18：admin connections 视图 + 主动断连 ----------
+// （sdk-mgmt-surface task 1.7；raw Client 形态而非全量 iroh Endpoint——
+// 全量 Endpoint 对 relay 断开会自动重连，会与「在线计数收敛消失」的
+// 有界轮询观测互相竞态；raw Client 持有即常驻、断开即消亡，收敛确定性）
+
+/// raw relay 客户端持久连接（持有 = 在线；drop = 关闭，无重试逻辑）
+async fn raw_relay_client(
+    relay: SocketAddr,
+    secret: &SecretKey,
+    token: Option<String>,
+) -> iroh_relay::client::Client {
+    let tls = iroh_relay::tls::CaTlsConfig::default()
+        .client_config(iroh_relay::tls::default_provider())
+        .expect("tls client config");
+    let mut builder = iroh_relay::client::ClientBuilder::new(
+        relay_url(relay),
+        secret.clone(),
+        iroh::dns::DnsResolver::builder().build(),
+    )
+    .tls_client_config(tls);
+    if let Some(token) = token {
+        builder = builder.auth_token(token);
+    }
+    tokio::time::timeout(Duration::from_secs(10), builder.connect())
+        .await
+        .expect("connect 超时（10s）")
+        .expect("raw relay client 连接失败（预期放行）")
+}
+
+/// GET /admin/connections（admin token 恒注入）
+async fn admin_connections(gateway: SocketAddr) -> serde_json::Value {
+    let (status, body) =
+        http_get_with_auth(gateway, "/admin/connections", "Bearer e2e-admin-token").await;
+    assert_eq!(status, 200, "GET /admin/connections: {body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// 有界轮询（≤5s、50ms 间隔；spec 场景「主动断连的最终收敛」冻结口径）：
+/// 直到 `pred` 对 connections 投影为真；超时 panic 带最后一次投影
+async fn poll_connections_until(
+    gateway: SocketAddr,
+    pred: impl Fn(&serde_json::Value) -> bool,
+    what: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = serde_json::Value::Null;
+    while Instant::now() < deadline {
+        last = admin_connections(gateway).await;
+        if pred(&last) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("5s 内未见收敛（{what}）：{last}");
+}
+
+/// disconnect 回执验签（canonical 测试侧独立重实现：op3 的 target 槽位 =
+/// 被断 endpoint_id；与 admin.rs 互为交叉验证）
+fn verify_disconnect_receipt(
+    receipt: &serde_json::Value,
+    server_id: &[u8; 32],
+    fabric: &[u8; 32],
+    endpoint: &[u8; 32],
+) {
+    use base64::Engine;
+    use ed25519_dalek::Verifier;
+    assert_eq!(receipt["op"], "disconnect");
+    assert_eq!(receipt["fabric_id"], hex::encode(fabric));
+    assert_eq!(receipt["endpoint_id"], hex::encode(endpoint));
+    let ts = receipt["ts"].as_u64().unwrap();
+    let generation = receipt["generation"].as_u64().unwrap();
+    let sig: [u8; 64] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(receipt["receipt_sig"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let verifying = ed25519_dalek::VerifyingKey::from_bytes(server_id).unwrap();
+    verifying
+        .verify(
+            &admin_receipt_canonical(0x03, fabric, endpoint, ts, generation),
+            &ed25519_dalek::Signature::from_bytes(&sig),
+        )
+        .expect("disconnect 回执必须可 ServerId 验签");
+}
+
+/// e2e 断言要点（spec 场景「在线视图投影与配额」+「主动断连的最终收敛」）：
+/// 1. 两 owner 各一条在线连接 → per_endpoint 字典序 / per_owner / quota
+///    结构 / mode 与 relay_enabled 独立如实
+/// 2. disconnect{endpoint_id} → disconnected 恰一条 + per-target 回执验签
+/// 3. 有界轮询（≤5s/50ms）观测该 endpoint 计数消失，另一 owner 不受影响
+#[tokio::test]
+async fn e17_admin_connections_view_and_disconnect_by_endpoint() {
+    let dir = TempDir::new().unwrap();
+    // 两个 owner（独立 fabric——Owner::new 的 fabric 恒 0xF1，这里直接用
+    // owners_cli 注册自定义二元组）
+    let fabric1 = [0xF1; 32];
+    let fabric2 = [0xF2; 32];
+    let issuer1 = SigningKey::from_bytes(&[0x71; 32]);
+    let issuer2 = SigningKey::from_bytes(&[0x72; 32]);
+    owners_cli(
+        dir.path(),
+        "register",
+        &fabric1,
+        &issuer1.verifying_key().to_bytes(),
+    );
+    owners_cli(
+        dir.path(),
+        "register",
+        &fabric2,
+        &issuer2.verifying_key().to_bytes(),
+    );
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "8"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 两 owner 各一条持久在线连接
+    let a = SecretKey::generate();
+    let token_a = relay_cap_token(
+        &issuer1,
+        &fabric1,
+        &server_id,
+        a.public().as_bytes(),
+        CAP_RELAY,
+        now_ms(),
+        now_ms() + TOKEN_TTL_MS,
+    );
+    let client_a = raw_relay_client(relay, &a, Some(token_a)).await;
+    let b = SecretKey::generate();
+    let token_b = relay_cap_token(
+        &issuer2,
+        &fabric2,
+        &server_id,
+        b.public().as_bytes(),
+        CAP_RELAY,
+        now_ms(),
+        now_ms() + TOKEN_TTL_MS,
+    );
+    // 票可复用（bearer 多次使用）；重连断言（disconnect ≠ unregister）留待后用
+    let client_b = raw_relay_client(relay, &b, Some(token_b.clone())).await;
+
+    // 视图前置：两 endpoint 都上线（有界等待——握手完成到在线表可见）
+    poll_connections_until(
+        server.gateway,
+        |c| c["per_endpoint"].as_array().map(|a| a.len()) == Some(2),
+        "两 owner 上线",
+    )
+    .await;
+    let view = admin_connections(server.gateway).await;
+    assert_eq!(view["mode"], "restricted");
+    assert_eq!(view["policy"], "static");
+    assert_eq!(view["relay_enabled"], true);
+    assert_eq!(view["quota"]["configured"], true);
+    assert_eq!(view["quota"]["max_connections_per_owner"], 8);
+    let endpoints: Vec<String> = view["per_endpoint"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["endpoint_id"].as_str().unwrap().to_string())
+        .collect();
+    let mut expected = vec![a.public().to_string(), b.public().to_string()];
+    expected.sort();
+    assert_eq!(endpoints, expected, "per_endpoint 按 endpoint_id 字典序");
+    let owners: Vec<String> = view["per_owner"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["fabric_id"].as_str().unwrap().to_string())
+        .collect();
+    let mut fabrics = vec![hex::encode(fabric1), hex::encode(fabric2)];
+    fabrics.sort();
+    assert_eq!(owners, fabrics);
+    assert_eq!(view["per_owner"][0]["connections"], 1);
+
+    // disconnect 按 endpoint（b 的 endpoint）：恰一条 + 回执验签
+    let b_hex = b.public().to_string();
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/admin/connections/disconnect",
+        &serde_json::json!({ "endpoint_id": b_hex }),
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200, "disconnect by endpoint: {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let disconnected = resp["disconnected"].as_array().unwrap();
+    assert_eq!(disconnected.len(), 1);
+    assert_eq!(disconnected[0]["endpoint_id"], b_hex);
+    assert_eq!(disconnected[0]["fabric_id"], hex::encode(fabric2));
+    assert_eq!(disconnected[0]["connections"], 1);
+    let receipts = resp["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1, "per-target 恰一张回执");
+    verify_disconnect_receipt(&receipts[0], &server_id, &fabric2, b.public().as_bytes());
+
+    // 有界轮询（≤5s/50ms）：b 消失、a 存活（disconnect 不伤及其它 owner）
+    poll_connections_until(
+        server.gateway,
+        |c| {
+            c["per_endpoint"].as_array().map(|a| a.len()) == Some(1)
+                && c["per_endpoint"][0]["endpoint_id"] == a.public().to_string()
+        },
+        "断连 b 后仅剩 a",
+    )
+    .await;
+    // b 的连接确实被服务端终结：同票重连放行（disconnect ≠ unregister，
+    // registry 未动）；探测连接随 map(|_| ()) 即弃，由 guard 统一收尾
+    expect_connected(relay, &b, Some(token_b)).await;
+    drop(client_a);
+    drop(client_b);
+}
+
+/// e2e 断言要点（spec 场景「按 fabric 断连多端点的确定性展开」）：
+/// 1. 同 fabric 两 endpoint → disconnect{fabric_id} → disconnected 与
+///    receipts 均按 endpoint_id 字典序展开
+/// 2. 两张回执共享 ts 与 generation（单一动作时刻与 registry 世代）、
+///    fabric_id 取自快照条目
+/// 3. 有界轮询观测在线表清零；同票重连放行（disconnect ≠ unregister）
+#[tokio::test]
+async fn e18_admin_disconnect_by_fabric_expands_two_endpoints() {
+    let dir = TempDir::new().unwrap();
+    let fabric = [0xF3; 32];
+    let issuer = SigningKey::from_bytes(&[0x73; 32]);
+    owners_cli(
+        dir.path(),
+        "register",
+        &fabric,
+        &issuer.verifying_key().to_bytes(),
+    );
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_OWNER", "8"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    let a = SecretKey::generate();
+    let b = SecretKey::generate();
+    let token_for = |secret: &SecretKey| {
+        let now = now_ms();
+        relay_cap_token(
+            &issuer,
+            &fabric,
+            &server_id,
+            secret.public().as_bytes(),
+            CAP_RELAY,
+            now,
+            now + TOKEN_TTL_MS,
+        )
+    };
+    let client_a = raw_relay_client(relay, &a, Some(token_for(&a))).await;
+    let client_b = raw_relay_client(relay, &b, Some(token_for(&b))).await;
+    poll_connections_until(
+        server.gateway,
+        |c| {
+            c["per_endpoint"].as_array().map(|x| x.len()) == Some(2)
+                && c["per_owner"][0]["connections"] == 2_u64
+        },
+        "同 fabric 两 endpoint 上线",
+    )
+    .await;
+
+    // disconnect 按 fabric：字典序展开 + 共享 ts/generation + 逐张验签
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/admin/connections/disconnect",
+        &serde_json::json!({ "fabric_id": hex::encode(fabric) }),
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200, "disconnect by fabric: {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let disconnected = resp["disconnected"].as_array().unwrap();
+    let receipts = resp["receipts"].as_array().unwrap();
+    assert_eq!(disconnected.len(), 2);
+    assert_eq!(receipts.len(), 2, "per-target 回执：每端点一张");
+    let mut expected = vec![a.public().to_string(), b.public().to_string()];
+    expected.sort();
+    let got: Vec<&str> = disconnected
+        .iter()
+        .map(|e| e["endpoint_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, expected, "disconnected 按 endpoint_id 字典序展开");
+    let receipt_eps: Vec<&str> = receipts
+        .iter()
+        .map(|r| r["endpoint_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(receipt_eps, got, "receipts 与 disconnected 对齐展开");
+    assert_eq!(
+        receipts[0]["ts"].as_u64().unwrap(),
+        receipts[1]["ts"].as_u64().unwrap(),
+        "两回执共享 ts（单一动作时刻）"
+    );
+    assert_eq!(
+        receipts[0]["generation"].as_u64().unwrap(),
+        receipts[1]["generation"].as_u64().unwrap(),
+        "两回执共享 generation（同一 registry 世代）"
+    );
+    // endpoint_id hex 即公钥字节（32B）——直接取回供逐张验签
+    let pk_of = |hex_id: &str| -> [u8; 32] { hex::decode(hex_id).unwrap().try_into().unwrap() };
+    verify_disconnect_receipt(&receipts[0], &server_id, &fabric, &pk_of(got[0]));
+    verify_disconnect_receipt(&receipts[1], &server_id, &fabric, &pk_of(got[1]));
+
+    // 有界轮询：该 fabric 在线表清零
+    poll_connections_until(
+        server.gateway,
+        |c| {
+            c["per_endpoint"].as_array().unwrap().is_empty()
+                && c["per_owner"].as_array().unwrap().is_empty()
+        },
+        "fabric 全断后在线表清零",
+    )
+    .await;
+    // 同票重连放行（owner 未注销，仅断连）
+    expect_connected(relay, &a, Some(token_for(&a))).await;
+    drop(client_a);
+    drop(client_b);
 }
 
 /// 极简 HTTP/1.1 POST JSON
