@@ -495,20 +495,39 @@ async fn relay_echo_roundtrip(server_ep: &Endpoint, client_ep: &Endpoint, relay:
         .expect("accept 任务 panic");
 }
 
-// ---------- e1：open 回归 ----------
+// ---------- e1：open 回归（含 O-9 门禁台账不生效负向） ----------
 
 #[tokio::test]
 async fn e1_open_mode_no_token_relay_roundtrip() {
     let dir = TempDir::new().unwrap();
+    let a = SecretKey::generate();
+    let b = SecretKey::generate();
+    // server-access-roles Phase 1a（O-9 冻结）：open 不装 gate——门禁台账
+    // 文件在场（endpoint a 已拉黑 / b 非访客）也完全不生效、启动不读不炸
+    std::fs::write(
+        dir.path().join("blocklist.jsonl"),
+        format!(
+            "{{\"op\":\"add\",\"kind\":\"endpoint\",\"id\":\"{}\",\"reason\":\"e2e-open-negative\",\"ts\":1}}\n",
+            a.public()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("visitors.jsonl"),
+        format!(
+            "{{\"op\":\"grant\",\"endpoint_id\":\"{}\",\"alias\":\"unused\",\"ts\":1}}\n",
+            a.public()
+        ),
+    )
+    .unwrap();
     let server = Server::spawn(dir.path(), &[], &[], true);
     let relay = server.relay_addr();
 
-    let a = SecretKey::generate();
-    let b = SecretKey::generate();
     let ep_a = iroh_endpoint(relay, a, None).await;
     let ep_b = iroh_endpoint(relay, b, None).await;
     await_online(&ep_a).await;
     await_online(&ep_b).await;
+    // a 名义上被拉黑、b 无票非访客——open 模式（AllowAll）全部照常通行
     relay_echo_roundtrip(&ep_a, &ep_b, relay).await;
 }
 
@@ -1862,4 +1881,212 @@ async fn e19_admin_disconnect_mixed_fabric_same_endpoint() {
 fn x_all_same_endpoint(arr: &[serde_json::Value]) -> bool {
     let first = arr.first().and_then(|v| v["endpoint_id"].as_str());
     first.is_some_and(|f| arr.iter().all(|v| v["endpoint_id"].as_str() == Some(f)))
+}
+
+// ---------- e20-e22：server-access-roles Phase 1a（访客名册/黑名单/租户到期） ----------
+
+/// e20：访客名册准入 + 两级配额 + 投影（spec「访客裁决次序」「访客连接配额
+/// 独立于租户配额」）。文件入口授予（文件/admin 两入口收敛的文件侧），
+/// per-endpoint 配额 2：同端点第 3 条拒；非访客无票拒 no-capability；
+/// /admin/status 增量字段 visitors_online 与 /admin/connections 的
+/// per_visitor 数组如实投影；断连释放后名额恢复。
+#[tokio::test]
+async fn e20_visitor_registry_admission_quota_and_projection() {
+    let dir = TempDir::new().unwrap();
+    let visitor = SecretKey::generate();
+    // 文件入口授予（永久、带 alias）
+    std::fs::write(
+        dir.path().join("visitors.jsonl"),
+        format!(
+            "{{\"op\":\"grant\",\"endpoint_id\":\"{}\",\"alias\":\"e2e-guest\",\"ts\":1}}\n",
+            visitor.public()
+        ),
+    )
+    .unwrap();
+    let envs = [
+        ("DWEB_ACCESS_MODE", "restricted"),
+        ("DWEB_ADMIN_TOKEN", "e2e-admin-token"),
+        ("DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR", "2"),
+    ];
+    let server = Server::spawn(dir.path(), &envs, &[], true);
+    let relay = server.relay_addr();
+
+    // 无票访客准入（R1 敲门即连）：同端点两条常驻连接（两个 Endpoint 实例
+    // 共享同一身份 key）
+    let ep1 = iroh_endpoint(relay, visitor.clone(), None).await;
+    await_online(&ep1).await;
+    let ep2 = iroh_endpoint(relay, visitor.clone(), None).await;
+    await_online(&ep2).await;
+
+    // 第 3 条（同端点）→ per-endpoint 配额拒
+    let reason = expect_denied(relay, &visitor, None).await;
+    assert_eq!(reason, "dweb/visitor-quota-exceeded");
+
+    // 非访客无票 → no-capability（回落原路径）
+    let outsider = SecretKey::generate();
+    let reason = expect_denied(relay, &outsider, None).await;
+    assert_eq!(reason, "dweb/no-capability");
+
+    // 投影：status visitors_online=2；connections per_visitor=[{visitor,2}]；
+    // 既有字段（per_endpoint/per_owner）不含访客
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/status",
+        "GET",
+        None,
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let st: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(st["visitors_online"], 2, "status 增量字段：访客在线数");
+    assert_eq!(st["active_connections"].as_array().unwrap().len(), 0);
+    let (status, body) = http_request(
+        server.gateway,
+        "/admin/connections",
+        "GET",
+        None,
+        &[("authorization", "Bearer e2e-admin-token")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let conns: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let per_visitor = conns["per_visitor"].as_array().unwrap();
+    assert_eq!(per_visitor.len(), 1);
+    assert_eq!(per_visitor[0]["endpoint_id"], visitor.public().to_string());
+    assert_eq!(per_visitor[0]["connections"], 2);
+    assert_eq!(conns["per_endpoint"].as_array().unwrap().len(), 0);
+    assert_eq!(conns["per_owner"].as_array().unwrap().len(), 0);
+
+    // 断开两条常驻 → 名额恢复（poll 探测式重试，上限 15s）
+    drop(ep1);
+    drop(ep2);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            raw_relay_connect(relay, &visitor, None),
+        )
+        .await
+        .expect("probe connect 超时");
+        match probe {
+            Ok(()) => break,
+            Err(iroh_relay::client::ConnectError::Handshake { source, .. }) => match source {
+                iroh_relay::protos::handshake::Error::ServerDeniedAuth { reason, .. }
+                    if reason == "dweb/visitor-quota-exceeded" => {}
+                other => panic!("非预期握手失败: {other:#}"),
+            },
+            Err(other) => panic!("传输层失败: {other:#}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "断开后 15s 内访客名额未恢复（配额泄漏）"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// e21：黑名单双维（spec「黑名单 endpoint 维度先于凭证分类」「黑名单 fabric
+/// 维度拒整个租户」）。endpoint 维度：被拉黑端点持**有效票**仍拒；fabric
+/// 维度经文件追加 + mtime 热重载生效：同 fabric 任何端点的有效票拒。
+#[tokio::test]
+async fn e21_blocklist_endpoint_and_fabric_dimensions() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xC3);
+    owner.register(dir.path());
+    let blocked_client = SecretKey::generate();
+    let other_client = SecretKey::generate();
+    // 文件入口：endpoint 维度拉黑 blocked_client（有票无票同样生效）
+    std::fs::write(
+        dir.path().join("blocklist.jsonl"),
+        format!(
+            "{{\"op\":\"add\",\"kind\":\"endpoint\",\"id\":\"{}\",\"reason\":\"e2e-abuse\",\"ts\":1}}\n",
+            blocked_client.public()
+        ),
+    )
+    .unwrap();
+    let server = Server::spawn(dir.path(), &[("DWEB_ACCESS_MODE", "restricted")], &[], true);
+    let relay = server.relay_addr();
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 被拉黑端点持有效票 → dweb/blocked（有效票不豁免，先于 C0）
+    let token_blocked = owner.token_for(&server_id, &blocked_client.public(), CAP_RELAY);
+    let reason = expect_denied(relay, &blocked_client, Some(token_blocked)).await;
+    assert_eq!(reason, "dweb/blocked");
+
+    // 未拉黑端点同票 → 放行
+    let token_other = owner.token_for(&server_id, &other_client.public(), CAP_RELAY);
+    expect_connected(relay, &other_client, Some(token_other.clone())).await;
+
+    // 文件入口追加 fabric 维度（owner.fabric_id）→ mtime 热重载（5s 看护）
+    // 后同 fabric 任何端点的有效票拒
+    std::fs::write(
+        dir.path().join("blocklist.jsonl"),
+        format!(
+            "{{\"op\":\"add\",\"kind\":\"endpoint\",\"id\":\"{}\",\"reason\":\"e2e-abuse\",\"ts\":1}}\n{{\"op\":\"add\",\"kind\":\"fabric\",\"id\":\"{}\",\"reason\":\"bad tenant\",\"ts\":2}}\n",
+            blocked_client.public(),
+            hex::encode(owner.fabric_id)
+        ),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let probe = tokio::time::timeout(
+            Duration::from_secs(10),
+            raw_relay_connect(relay, &other_client, Some(token_other.clone())),
+        )
+        .await
+        .expect("probe connect 超时");
+        match probe {
+            Ok(()) => {} // 尚未重载——继续等
+            Err(iroh_relay::client::ConnectError::Handshake { source, .. }) => match source {
+                iroh_relay::protos::handshake::Error::ServerDeniedAuth { reason, .. }
+                    if reason == "dweb/blocked" =>
+                {
+                    break; // fabric 维度热重载生效
+                }
+                other => panic!("非预期握手失败: {other:#}"),
+            },
+            Err(other) => panic!("传输层失败: {other:#}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fabric 拉黑后 20s 内未见 blocked（热重载未生效）"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// e22：租户到期（spec「租户条目过期拒绝且 reason 与未注册区分」）：文件
+/// 入口的带 expires_at（已过）register → 有效票拒 `dweb/owner-expired`；
+/// 未注册 fabric 的票仍拒 `dweb/unknown-owner`（两 reason 区分面）
+#[tokio::test]
+async fn e22_owner_expired_denied_with_distinct_reason() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xC4);
+    let client = SecretKey::generate();
+    // 文件入口：register 携带已过期的 expires_at（跳过 CLI——CLI 无到期参数）
+    std::fs::write(
+        dir.path().join("owners.jsonl"),
+        format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":{}}}\n",
+            hex::encode(owner.fabric_id),
+            hex::encode(owner.issuer.verifying_key().to_bytes()),
+            now_ms() - 1_000
+        ),
+    )
+    .unwrap();
+    let server = Server::spawn(dir.path(), &[("DWEB_ACCESS_MODE", "restricted")], &[], true);
+    let server_id = fetch_server_id(server.gateway).await;
+
+    // 到期租户的有效票 → owner-expired（在册但过期，非 unknown）
+    let token = owner.token_for(&server_id, &client.public(), CAP_RELAY);
+    let reason = expect_denied(server.relay_addr(), &client, Some(token)).await;
+    assert_eq!(reason, "dweb/owner-expired");
+
+    // 未注册 fabric 的票 → unknown-owner（区分面）
+    let impostor = Owner::new(0xC5);
+    let token2 = impostor.token_for(&server_id, &client.public(), CAP_RELAY);
+    let reason = expect_denied(server.relay_addr(), &client, Some(token2)).await;
+    assert_eq!(reason, "dweb/unknown-owner");
 }
