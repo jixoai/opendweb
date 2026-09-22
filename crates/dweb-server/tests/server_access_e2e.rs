@@ -2090,3 +2090,861 @@ async fn e22_owner_expired_denied_with_distinct_reason() {
     let reason = expect_denied(server.relay_addr(), &client, Some(token2)).await;
     assert_eq!(reason, "dweb/unknown-owner");
 }
+
+// ---------- server-access-roles Phase 1b：邀请码与公开注册面 ----------
+//
+// 黑盒交叉验证：canonical/哈希/回执全部测试侧独立重实现（与服务端实现
+// 互不依赖——wire 冻结的对拍锚）。码签发经 codes.jsonl 文件入口（admin
+// 签发路由是 Phase 1c；文件入口是 spec 冻结的第二入口）。
+// - e20 兑换全场景矩阵（正常/回执验签/错 sig/stale-ts/回放不刷新/耗尽他键/
+//   过期/吊销/持新码续期/响应形态）
+// - e21 register 限流 + XFF 伪造分裂失败
+// - e22 并发双兑恰一成功
+// - e23 max_uses=2 串行序列（K1→同键回放计数仍 1→K2）
+// - e24 崩溃恢复补 consume（register fsync 后崩溃的磁盘等价态 + 重启归并）
+// - e25 pending 第二键 409 + 同键补写完成（codes.jsonl 0444 故障注入）
+// - e26 deny-set 503 与恢复（启动孤儿 + 注入失败 → 补写成功移除）
+// - e27 codes 台账坏行 fail-fast（整服务拒绝启动）
+// - e28 热重载孤儿补齐（运行中文件入口 register → mtime reload 补 consume）
+
+/// 测试侧独立码哈希：blake3(码本体 16 字符小写)——spec 冻结规范化
+fn code_hash_of(body16: &str) -> [u8; 32] {
+    *blake3::hash(body16.as_bytes()).as_bytes()
+}
+
+/// 文件入口签发（codes.jsonl 追加 issue 行；Phase 1c 前的合法签发通道）
+fn issue_code_file_entry(
+    data_dir: &Path,
+    body16: &str,
+    max_uses: u32,
+    expires_at: u64,
+    default_ttl_days: u32,
+) {
+    use std::io::Write;
+    let line = serde_json::json!({
+        "op": "issue",
+        "code_hash": hex::encode(code_hash_of(body16)),
+        "max_uses": max_uses,
+        "expires_at": expires_at,
+        "default_ttl_days": default_ttl_days,
+        "ts": now_ms(),
+    })
+    .to_string();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("codes.jsonl"))
+        .unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+/// 追加任意 codes.jsonl 行（吊销等）
+fn append_codes_line(data_dir: &Path, value: serde_json::Value) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(data_dir.join("codes.jsonl"))
+        .unwrap();
+    writeln!(file, "{value}").unwrap();
+}
+
+/// 码展示形态：`dwebc1.` + 4-4-4-4 分组
+fn code_display(body16: &str) -> String {
+    format!(
+        "dwebc1.{}-{}-{}-{}",
+        &body16[0..4],
+        &body16[4..8],
+        &body16[8..12],
+        &body16[12..16]
+    )
+}
+
+/// register PoP canonical（独立重实现：域 + code 原文 + fabric/root 小写
+/// hex 文本 + ts u64BE——CLI register.mjs 同构）
+fn register_pop_canonical(
+    code: &str,
+    fabric_hex_lower: &str,
+    root_hex_lower: &str,
+    ts: u64,
+) -> Vec<u8> {
+    let mut buf = b"dweb/register/v1\0".to_vec();
+    buf.extend_from_slice(code.as_bytes());
+    buf.extend_from_slice(fabric_hex_lower.as_bytes());
+    buf.extend_from_slice(root_hex_lower.as_bytes());
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf
+}
+
+/// 组装合法签名的 /register 请求体（root PoP）
+fn register_body(
+    code: &str,
+    fabric: &[u8; 32],
+    root_key: &SigningKey,
+    ts: u64,
+) -> serde_json::Value {
+    let root_hex = hex::encode(root_key.verifying_key().to_bytes());
+    let canonical = register_pop_canonical(code, &hex::encode(fabric), &root_hex, ts);
+    serde_json::json!({
+        "code": code,
+        "fabric_id": hex::encode(fabric),
+        "root": root_hex,
+        "ts": ts,
+        "sig": base64url(root_key.sign(&canonical).to_bytes()),
+    })
+}
+
+/// register-receipt canonical（独立重实现，137B）
+fn register_receipt_canonical(
+    code_hash: &[u8; 32],
+    fabric: &[u8; 32],
+    root: &[u8; 32],
+    ts: u64,
+    generation: u64,
+) -> Vec<u8> {
+    let mut buf = b"dweb/register-receipt/v1\0".to_vec();
+    buf.extend_from_slice(code_hash);
+    buf.extend_from_slice(fabric);
+    buf.extend_from_slice(root);
+    buf.extend_from_slice(&ts.to_be_bytes());
+    buf.extend_from_slice(&generation.to_be_bytes());
+    buf
+}
+
+fn error_code_of(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["error"]["code"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn e20_register_full_scenario_matrix() {
+    let dir = TempDir::new().unwrap();
+    // 三码预签发：A（1 用/30 天）、B（1 用/30 天，持新码续期用）、
+    // R（吊销）、E（已过期）
+    issue_code_file_entry(dir.path(), "0123456789abcdea", 1, now_ms() + 86_400_000, 30);
+    issue_code_file_entry(dir.path(), "0123456789abcdeb", 1, now_ms() + 86_400_000, 30);
+    issue_code_file_entry(dir.path(), "0123456789abcded", 1, now_ms() + 86_400_000, 30);
+    append_codes_line(
+        dir.path(),
+        serde_json::json!({
+            "op": "revoke",
+            "code_hash": hex::encode(code_hash_of("0123456789abcded")),
+            "ts": now_ms(),
+        }),
+    );
+    issue_code_file_entry(dir.path(), "0123456789abcdee", 1, now_ms() - 1, 30);
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_REGISTER_RATE_PER_MIN", "1000"),
+        ],
+        &[],
+        false,
+    );
+    let server_id = fetch_server_id(server.gateway).await;
+
+    let fabric = [0xA1; 32];
+    let root_key = SigningKey::from_bytes(&[0xA2; 32]);
+    let code_a = code_display("0123456789abcdea");
+
+    // 正常兑换：200 + 回执可验签 + registry 生效
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code_a, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let receipt: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt["op"], "register");
+    assert_eq!(
+        receipt["code_hash"],
+        hex::encode(code_hash_of("0123456789abcdea"))
+    );
+    assert!(body.len() <= 4096, "响应体 ≤4KiB");
+    assert!(!body.contains("dwebc1."), "回执不含码本体");
+    let canonical = register_receipt_canonical(
+        &code_hash_of("0123456789abcdea"),
+        &fabric,
+        &root_key.verifying_key().to_bytes(),
+        receipt["ts"].as_u64().unwrap(),
+        receipt["generation"].as_u64().unwrap(),
+    );
+    let sig: [u8; 64] = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        receipt["receipt_sig"].as_str().unwrap(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    use ed25519_dalek::Verifier;
+    ed25519_dalek::VerifyingKey::from_bytes(&server_id)
+        .unwrap()
+        .verify(&canonical, &ed25519_dalek::Signature::from_bytes(&sig))
+        .expect("回执可用 services.json ServerId 验签");
+    // registry 生效：到期前租户在册（owners.jsonl 出现带 via_code_hash 的 register）
+    let owners_text = std::fs::read_to_string(dir.path().join("owners.jsonl")).unwrap();
+    assert!(owners_text.contains(&format!(
+        "\"via_code_hash\":\"{}\"",
+        hex::encode(code_hash_of("0123456789abcdea"))
+    )));
+
+    // 错 sig：冒名者私钥签名（canonical 覆盖受害者 root）→ bad-signature
+    let impostor = SigningKey::from_bytes(&[0xA3; 32]);
+    let ts = now_ms();
+    let canonical = register_pop_canonical(
+        &code_display("0123456789abcdeb"),
+        &hex::encode(fabric),
+        &hex::encode(root_key.verifying_key().to_bytes()),
+        ts,
+    );
+    let forged = serde_json::json!({
+        "code": code_display("0123456789abcdeb"),
+        "fabric_id": hex::encode(fabric),
+        "root": hex::encode(root_key.verifying_key().to_bytes()),
+        "ts": ts,
+        "sig": base64url(impostor.sign(&canonical).to_bytes()),
+    });
+    let (status, body) = http_post_json(server.gateway, "/register", &forged, &[]).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(error_code_of(&body), "bad-signature");
+
+    // stale-ts：窗口外重发
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(
+            &code_display("0123456789abcdeb"),
+            &fabric,
+            &root_key,
+            now_ms() - 121_000,
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(error_code_of(&body), "stale-ts");
+
+    // 同键回放：expires_at 不刷新、无新副作用、回执以当前时刻重签
+    std::thread::sleep(Duration::from_millis(10));
+    let (status, replay) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code_a, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{replay}");
+    let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(
+        replay["expires_at"], receipt["expires_at"],
+        "同键回放不刷新租期（回放≠续期）"
+    );
+    assert!(replay["ts"].as_u64().unwrap() > receipt["ts"].as_u64().unwrap());
+
+    // 耗尽他键：码 A 已被 K1 用掉
+    let other_root = SigningKey::from_bytes(&[0xA4; 32]);
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code_a, &fabric, &other_root, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(error_code_of(&body), "code-exhausted");
+
+    // 持新码续期：同 (fabric,root) 持码 B → 200 且 expires_at 刷新
+    let (status, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(
+            &code_display("0123456789abcdeb"),
+            &fabric,
+            &root_key,
+            now_ms(),
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let renewed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        renewed["expires_at"].as_u64().unwrap() > receipt["expires_at"].as_u64().unwrap(),
+        "持新码 = 续期（expires_at 刷新）"
+    );
+
+    // 吊销 → code-invalid；过期 → code-expired
+    for (code, want) in [
+        (&code_display("0123456789abcded"), "code-invalid"),
+        (&code_display("0123456789abcdee"), "code-expired"),
+    ] {
+        let fresh = SigningKey::from_bytes(&[0xA5; 32]);
+        let (status, body) = http_post_json(
+            server.gateway,
+            "/register",
+            &register_body(code, &fabric, &fresh, now_ms()),
+            &[],
+        )
+        .await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(error_code_of(&body), want, "{code}");
+    }
+    drop(server);
+}
+
+#[tokio::test]
+async fn e21_register_rate_limit_and_xff_not_trusted() {
+    let dir = TempDir::new().unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_REGISTER_RATE_PER_MIN", "2"), // burst = 1
+        ],
+        &[],
+        false,
+    );
+    let body = register_body(
+        "dwebc1.0123-4567-89cd-fghj",
+        &[0xB1; 32],
+        &SigningKey::from_bytes(&[0xB2; 32]),
+        now_ms(),
+    );
+    let with_xff = |ip: &str| {
+        let mut v = body.clone();
+        // XFF 不进 body——经 header 伪造
+        v["sig"] = v["sig"].clone();
+        (v, ip.to_string())
+    };
+    let (b1, xff1) = with_xff("1.2.3.4");
+    let (b2, xff2) = with_xff("5.6.7.8");
+    let (s1, body1) = http_post_json(
+        server.gateway,
+        "/register",
+        &b1,
+        &[("x-forwarded-for", &xff1)],
+    )
+    .await;
+    assert_eq!(
+        s1, 400,
+        "首个消费突发（PoP 合法、码未知 → code-invalid）: {body1}"
+    );
+    assert_eq!(error_code_of(&body1), "code-invalid");
+    let (s2, body2) = http_post_json(
+        server.gateway,
+        "/register",
+        &b2,
+        &[("x-forwarded-for", &xff2)],
+    )
+    .await;
+    assert_eq!(s2, 429, "第 2 次超突发；XFF 换值不分裂限流键: {body2}");
+    assert_eq!(error_code_of(&body2), "rate-limited");
+    drop(server);
+}
+
+#[tokio::test]
+async fn e22_concurrent_double_redemption_single_winner() {
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf0", 1, now_ms() + 86_400_000, 30);
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let gateway = server.gateway;
+    let code = code_display("0123456789abcdf0");
+    let k1 = SigningKey::from_bytes(&[0xC1; 32]);
+    let k2 = SigningKey::from_bytes(&[0xC2; 32]);
+    let (f1, f2) = ([0xC3; 32], [0xC4; 32]);
+    let body1 = register_body(&code, &f1, &k1, now_ms());
+    let body2 = register_body(&code, &f2, &k2, now_ms());
+    let (r1, r2) = tokio::join!(
+        http_post_json(gateway, "/register", &body1, &[]),
+        http_post_json(gateway, "/register", &body2, &[]),
+    );
+    let statuses = [r1.0, r2.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 200).count(),
+        1,
+        "恰一个 200：{statuses:?} / {} / {}",
+        r1.1,
+        r2.1
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == 400).count(),
+        1,
+        "另一个 code-exhausted"
+    );
+    if r1.0 == 400 {
+        assert_eq!(error_code_of(&r1.1), "code-exhausted");
+    } else {
+        assert_eq!(error_code_of(&r2.1), "code-exhausted");
+    }
+    // codes.jsonl 恰一条 consume、无半提交
+    let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+    assert_eq!(
+        codes_text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"consume\""))
+            .count(),
+        1,
+        "{codes_text}"
+    );
+    drop(server);
+}
+
+#[tokio::test]
+async fn e23_max_uses_two_serial_sequence() {
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf1", 2, now_ms() + 86_400_000, 30);
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let code = code_display("0123456789abcdf1");
+    let k1 = SigningKey::from_bytes(&[0xD1; 32]);
+    let k2 = SigningKey::from_bytes(&[0xD2; 32]);
+    let fabric = [0xD3; 32];
+    // K1 首兑
+    let (s, _) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k1, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200);
+    // K1 同键回放：used_count 仍 1
+    let (s, _) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k1, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200);
+    let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+    assert_eq!(
+        codes_text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"consume\""))
+            .count(),
+        1,
+        "回放不增 consume（used_count 仍 1）"
+    );
+    // K2 在 K1 durable 后按剩余次数成功
+    let (s, _) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k2, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200);
+    let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+    assert_eq!(
+        codes_text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"consume\""))
+            .count(),
+        2,
+        "K2 后 used_count=2"
+    );
+    // 第三键耗尽
+    let k3 = SigningKey::from_bytes(&[0xD4; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k3, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 400);
+    assert_eq!(error_code_of(&body), "code-exhausted");
+    drop(server);
+}
+
+/// 崩溃窗口磁盘等价态：owners register（含 via_code_hash）已 fsync、
+/// codes consume 未落盘 → 进程崩溃。重启归并必须补齐 consume（完整兑换，
+/// 无烧码无租户）；同键再兑 = 幂等回放；他键 = 耗尽。
+#[tokio::test]
+async fn e24_crash_recovery_completes_orphan_consume() {
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf2", 1, now_ms() + 86_400_000, 30);
+    let fabric = [0xE1; 32];
+    let root = SigningKey::from_bytes(&[0xE2; 32])
+        .verifying_key()
+        .to_bytes();
+    let expires = now_ms() + 30 * 24 * 3_600_000;
+    // 崩溃窗口等价态：register durable、consume 缺失
+    use std::io::Write;
+    let mut owners = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.path().join("owners.jsonl"))
+        .unwrap();
+    writeln!(
+        owners,
+        "{}",
+        serde_json::json!({
+            "op": "register",
+            "fabric_id": hex::encode(fabric),
+            "root": hex::encode(root),
+            "ts": now_ms(),
+            "expires_at": expires,
+            "via_code_hash": hex::encode(code_hash_of("0123456789abcdf2")),
+        })
+    )
+    .unwrap();
+    // 重启：启动归并补齐 consume
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+        if codes_text.contains("\"op\":\"consume\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "启动 reconciliation 未补齐 consume：{codes_text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // 完整兑换：租户在册（restricted gate 侧由 owners.jsonl 保证）
+    // 同键重试 → 200 幂等回放（不产生第二次租户条目）
+    let root_key = SigningKey::from_bytes(&[0xE2; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(
+            &code_display("0123456789abcdf2"),
+            &fabric,
+            &root_key,
+            now_ms(),
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        replay["expires_at"].as_u64().unwrap(),
+        expires,
+        "回放回落 owners 持久值"
+    );
+    let owners_text = std::fs::read_to_string(dir.path().join("owners.jsonl")).unwrap();
+    assert_eq!(owners_text.lines().count(), 1, "无第二次租户条目");
+    let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+    assert_eq!(
+        codes_text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"consume\""))
+            .count(),
+        1
+    );
+    drop(server);
+}
+
+/// pending 矩阵（codes.jsonl 0444 注入，root 环境跳过）：K1 兑换至 consume
+/// 失败 → 500；他键 K2 → 409 code-pending；恢复后同键 K1 补写完成（租期
+/// 不重算）；K2 → code-exhausted
+#[tokio::test]
+#[cfg(unix)]
+async fn e25_pending_second_key_409_and_completion() {
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf3", 1, now_ms() + 86_400_000, 30);
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let codes_path = dir.path().join("codes.jsonl");
+    let code = code_display("0123456789abcdf3");
+    let fabric = [0xF1; 32];
+    let k1 = SigningKey::from_bytes(&[0xF2; 32]);
+    let k2 = SigningKey::from_bytes(&[0xF3; 32]);
+    // ① 锁 consume 追加：K1 → 500（register durable、consume 失败）
+    std::fs::set_permissions(&codes_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k1, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 500, "{body}");
+    let owners_text = std::fs::read_to_string(dir.path().join("owners.jsonl")).unwrap();
+    assert!(
+        owners_text.contains("via_code_hash"),
+        "跨台账提交 ① 已 durable"
+    );
+    // ② 他键 K2 → 409 code-pending（不得按未归并 used_count 放行）
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k2, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 409, "{body}");
+    assert_eq!(error_code_of(&body), "code-pending");
+    // ③ 恢复可写 → K1 同键补写完成（200）
+    std::fs::set_permissions(&codes_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k1, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    // ④ K2 → code-exhausted
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &k2, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(error_code_of(&body), "code-exhausted");
+    drop(server);
+}
+
+/// deny-set fail-closed：启动即有孤儿（register durable + consume 缺失）且
+/// codes.jsonl 不可写 → 该码兑换一律 503 code-unavailable（非 exhausted/
+/// expired）；恢复可写并触发 reload（同键重试）→ 补写完成移除 deny
+#[tokio::test]
+#[cfg(unix)]
+async fn e26_deny_set_503_and_recovery() {
+    if nix::unistd::Uid::effective().is_root() {
+        return;
+    }
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf4", 1, now_ms() + 86_400_000, 30);
+    let fabric = [0xF5; 32];
+    let root = SigningKey::from_bytes(&[0xF6; 32])
+        .verifying_key()
+        .to_bytes();
+    let mut owners = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.path().join("owners.jsonl"))
+        .unwrap();
+    writeln!(
+        owners,
+        "{}",
+        serde_json::json!({
+            "op": "register",
+            "fabric_id": hex::encode(fabric),
+            "root": hex::encode(root),
+            "ts": now_ms(),
+            "expires_at": now_ms() + 30 * 24 * 3_600_000,
+            "via_code_hash": hex::encode(code_hash_of("0123456789abcdf4")),
+        })
+    )
+    .unwrap();
+    drop(owners);
+    // 启动即锁：reconciliation 补写失败 → deny-set（非 fail-fast）
+    std::fs::set_permissions(
+        dir.path().join("codes.jsonl"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let root_key = SigningKey::from_bytes(&[0xF6; 32]);
+    let code = code_display("0123456789abcdf4");
+    let stranger = SigningKey::from_bytes(&[0xF7; 32]);
+    // 他键兑换（无 pending 预留）：503 code-unavailable
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &stranger, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 503, "{body}");
+    assert_eq!(error_code_of(&body), "code-unavailable");
+    // 恢复可写：看护的 deny-set 自愈重试（权限修复不改变 mtime/len——
+    // deny 非空即每轮重试）补齐 consume → deny 移除
+    std::fs::set_permissions(
+        dir.path().join("codes.jsonl"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(9);
+    loop {
+        let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+        if codes_text.contains("\"op\":\"consume\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deny-set 自愈未在 9s 内补齐：{codes_text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 补写完成后按码状态裁决：孤儿键 = 幂等回放 200；他键 = 耗尽
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        s, 200,
+        "孤儿键同键兑换 = 幂等回放（补写已 durable）：{body}"
+    );
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &stranger, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 400, "补写完成后按码状态裁决：{body}");
+    assert_eq!(error_code_of(&body), "code-exhausted");
+    drop(server);
+}
+
+/// 台账加载失败 fail-fast：codes.jsonl 坏行 → 整服务拒绝启动（退出码非零，
+/// 日志含台账路径与失败原因——r4-P1-3 分级 (a)）
+#[tokio::test]
+async fn e27_codes_ledger_bad_line_fails_fast() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("codes.jsonl"), "not json\n").unwrap();
+    let mut server = Server::spawn_raw(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    let status = server.wait_exit(Duration::from_secs(10));
+    assert!(!status.success(), "坏行必须 fail-fast 拒绝启动");
+    let dump = server.log_dump();
+    assert!(dump.contains("codes.jsonl"), "启动日志含台账路径：{dump}");
+    assert!(
+        dump.contains("malformed codes record"),
+        "日志含失败原因：{dump}"
+    );
+}
+
+/// 热重载孤儿补齐：运行中经文件入口追加带 via_code_hash 的 register →
+/// mtime reload（5s 轮询）同锁补齐 consume；同键兑换收敛为幂等回放
+#[tokio::test]
+async fn e28_hot_reload_orphan_reconciliation() {
+    let dir = TempDir::new().unwrap();
+    issue_code_file_entry(dir.path(), "0123456789abcdf5", 1, now_ms() + 86_400_000, 30);
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_ACCESS_MODE", "restricted")],
+        &[],
+        false,
+    );
+    // 运行中文件入口追加孤儿 register（无 consume）
+    use std::io::Write;
+    let fabric = [0xF8; 32];
+    let root_key = SigningKey::from_bytes(&[0xF9; 32]);
+    let root = root_key.verifying_key().to_bytes();
+    let mut owners = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.path().join("owners.jsonl"))
+        .unwrap();
+    writeln!(
+        owners,
+        "{}",
+        serde_json::json!({
+            "op": "register",
+            "fabric_id": hex::encode(fabric),
+            "root": hex::encode(root),
+            "ts": now_ms(),
+            "via_code_hash": hex::encode(code_hash_of("0123456789abcdf5")),
+        })
+    )
+    .unwrap();
+    drop(owners);
+    // 等 mtime 轮询（5s 间隔）补齐 consume
+    let deadline = Instant::now() + Duration::from_secs(9);
+    loop {
+        let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+        if codes_text.contains("\"op\":\"consume\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "热重载未在 9s 内补齐孤儿 consume：{codes_text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // 同键兑换 → 200 幂等回放（consume 已补齐；恰一条 consume）
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(
+            &code_display("0123456789abcdf5"),
+            &fabric,
+            &root_key,
+            now_ms(),
+        ),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    let codes_text = std::fs::read_to_string(dir.path().join("codes.jsonl")).unwrap();
+    assert_eq!(
+        codes_text
+            .lines()
+            .filter(|l| l.contains("\"op\":\"consume\""))
+            .count(),
+        1
+    );
+    drop(server);
+}
+
+/// rendezvous per-IP 限流经真实 gateway（ConnectInfo 接线 + open 模式同
+/// 样生效——与 access mode 正交；resolve 2/min → burst 1：第二个请求 429）
+#[tokio::test]
+async fn e29_rendezvous_rate_limit_on_real_gateway() {
+    let dir = TempDir::new().unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[("DWEB_RDZ_RATE_RESOLVE_PER_MIN", "2")],
+        &[],
+        false,
+    );
+    let target = hex::encode([0xAB; 32]);
+    // open 模式匿名 resolve：首请求 404（无登记，未限流）；第二个 429
+    let (s1, _) = http_get(server.gateway, &format!("/rendezvous/{target}")).await;
+    assert_eq!(s1, 404);
+    let (s2, body) = http_get(server.gateway, &format!("/rendezvous/{target}")).await;
+    assert_eq!(s2, 429, "{body}");
+    assert_eq!(body, r#"{"error":"rate-limited"}"#);
+    drop(server);
+}
