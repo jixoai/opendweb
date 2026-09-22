@@ -2,26 +2,30 @@
 
 ### Requirement: 管理客户端 subpath（./admin）
 
-`@jixo/opendweb-client-sdk` SHALL 提供 `./admin` subpath 导出：零 native 依赖的纯 TS `AdminClient`（Node 18+ 全局 fetch；浏览器同构可用），封装 Server 管理 API 全部路由（status/owners CRUD/connections 视图/主动断连）。客户端 MUST 以构造参数注入 `baseUrl` 与 `token`，请求自动附 Bearer 头；请求超时 MUST 可配置（默认 10s）。错误 MUST 归一为可判别的 `AdminError`（携带 HTTP status、机器可读 code、服务端 reason 文本），404-no-admin（未配置 token 的 server）与 401（凭证错误）MUST 是互斥可判别的 code。变更类操作的返回 SHALL 包含服务端回执的结构化透出（op、fabric、ts、generation、签名 hex），并提供 canonical bytes 助手与**注入式**验签接口（`verify(receipt, verifier)`，包本身不引入签名依赖、不内置验签实现）。subpath 的运行时依赖 MUST 为零（打包产物不携带 native binding）。
+`@jixo/opendweb-client-sdk` SHALL 提供 `./admin` subpath 导出：零 native 依赖的纯 TS `AdminClient`（Node 18+ 全局 fetch；浏览器同构可用），封装 Server 管理 API 全部路由（status/owners CRUD/connections 视图/主动断连）。客户端 MUST 以构造参数注入 `baseUrl` 与 `token`，请求自动附 Bearer 头；请求超时 MUST 可配置（默认 10s）。响应字段为冻结的 snake_case wire（server spec 全 JSON 示例）；客户端类型 MUST 忽略未知字段（不因服务端向前兼容新增字段而失败）。
+
+错误 MUST 归一为可判别的 `AdminError`（携带 HTTP status、机器可读 code、服务端 message）。code 判别：`admin-not-enabled` MUST 经专用 `GET /admin/status` 探测判定（404 = 未启用；200 = 已启用）——MUST NOT 以「404 空 body」作为唯一判别信号；业务未命中（disconnect no-match）以 404 + error envelope 判别；`unauthorized`（401）、`invalid-request`（400）、`network`、`timeout` 互斥可判别。
+
+变更类操作的返回 SHALL 包含服务端回执的结构化透出（op/fabric_id/endpoint_id 或 root/ts/generation/receipt_sig base64url），并提供 `receiptCanonical(receipt)` 助手输出与 server 侧 `receipt_canonical` 逐字节一致的待签载荷（canonical = domain||op u8||fabric 32B||target 32B||ts u64BE||generation u64BE，全大端；register/unregister 的 target=root，disconnect 的 target=endpoint——对拍测试钉住）；验签接口 MUST 为注入式（`verifyReceipt(receipt, verifier)`，包本身不引入签名依赖、不内置验签实现）。subpath 的运行时依赖 MUST 为零，且 MUST NOT 传递性 import 包的 native 主入口（`.`）/`./net`/`./http`；`npm pack` 发布物 MUST 包含 `admin/` 目录（干净目录 pack + 无 `.node` 环境 import 双门禁）。
 
 #### Scenario: 纯 TS 环境导入可用
 
 - **WHEN** 仅安装 `@jixo/opendweb-client-sdk` 并 `import { AdminClient } from "@jixo/opendweb-client-sdk/admin"`，运行环境无 native binding
-- **THEN** 导入成功，AdminClient 可构造并可对可达的 admin API 发起请求
+- **THEN** 导入成功，AdminClient 可构造并可对可达的 admin API 发起请求（pack 物含 admin/ 目录）
 
 #### Scenario: 错误归一与判别
 
-- **WHEN** AdminClient 访问未配置 `DWEB_ADMIN_TOKEN` 的 server（404）与 token 错误的 server（401）
-- **THEN** 分别抛出 code 互异的 AdminError（如 `admin-not-enabled` / `unauthorized`），错误对象携带 status 与服务端 reason（若有）
+- **WHEN** AdminClient 访问未配置 `DWEB_ADMIN_TOKEN` 的 server 与 token 错误的 server
+- **THEN** 分别得到 `admin-not-enabled`（经 status 探测判定）与 `unauthorized` 的 AdminError，code 互异且携带 status 与服务端 message
 
-#### Scenario: 断连往返
+#### Scenario: 断连往返与回执对拍
 
 - **WHEN** 调用 `disconnect({endpointId})` 命中在线端点
-- **THEN** 返回断开明细与回执对象；`receiptCanonical(receipt)` 输出与 server 侧 `receipt_canonical` 逐字节一致的待签载荷（对拍测试钉住）
+- **THEN** 返回断开明细与 per-endpoint 回执数组；`receiptCanonical(receipt)` 对每张回执输出与 server 侧 `receipt_canonical` 逐字节一致的待签载荷（跨语言冻结向量对拍钉住）
 
 ### Requirement: 令牌工具 subpath（./token）
 
-`@jixo/opendweb-client-sdk` SHALL 提供 `./token` subpath 导出：`dweb2.`（InviteV2）与 `dwebr1.`（RelayCapV1）令牌的**只读解码显示**工具，纯 TS 零依赖（base64url/BE 定长字段解析，对齐 server-access-policy design 附录 A 的冻结 wire 格式）。解码结果 SHALL 覆盖：invite 的 fabricId/inviteId/issuer/recipient/expiresAtMs/relays[{url, hasCapability}]/directAddrs；capability 的 fabricId/serverId/issuer/recipient/caps 位图（命名展开）/issuedAt/expiresAt。非法输入（前缀不符/长度不符/字符集非法/保留位）MUST 抛出可判别的解析错误。解码 MUST NOT 做验签（无密钥材料；显示用途——调用方安全决策 MUST 依赖服务端验证结果而非本解码）。
+`@jixo/opendweb-client-sdk` SHALL 提供 `./token` subpath 导出：`dweb2.`（InviteV2）与 `dwebr1.`（RelayCapV1）令牌的**只读解码显示**工具，纯 TS 零依赖（base64url/BE 定长字段解析，对齐 server-access-policy design 附录 A 的冻结 wire 格式）。解码结果 SHALL 覆盖：invite 的 fabricId/inviteId/issuer/recipient/expiresAtMs/relays[{url, hasCapability}]/directAddrs；capability 的 fabricId/serverId/issuer/recipient/caps 位图（命名展开）/issuedAt/expiresAt。非法输入（前缀不符/长度不符/字符集非法/保留位）MUST 抛出可判别的解析错误。解码 MUST NOT 做验签（无密钥材料；显示用途——调用方安全决策 MUST 依赖服务端验证结果而非本解码）。`npm pack` 发布物 MUST 包含 `token/` 目录；与 `./admin` 同受无 native 环境 import 门禁约束。
 
 #### Scenario: 邀请令牌解码显示
 

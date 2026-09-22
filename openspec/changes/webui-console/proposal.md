@@ -34,18 +34,20 @@
     空闲端口），托管预构建 SPA 静态资源；`/api/*` 同源反代到 `--server`
     指定的远端 admin base URL 并注入 Bearer（token 来自 `--token` flag /
     `DWEB_ADMIN_TOKEN` env / 交互式输入，**不落盘、不进浏览器**）；
-  - **CLI 面**（plugin 契约）：`opendweb webui [--server URL] [--token T]
-    [--port N] [--allow-insecure] [--no-open]`；
-  - **明文远端告警**：`--server` 非 https 且非 loopback 时，sidecar 启动
-    横幅 + UI 顶栏双重告警，且 MUST 经 `--allow-insecure` 显式确认才启动
-    （token 走明文公网 = 凭证暴露）；
+  - **CLI 面**（plugin 契约，不扩展契约——校验自担）：`opendweb webui
+    [--server URL] [--token T] [--port N] [--allow-insecure] [--no-open]`；
+  - **目标生命周期**：目标 URL + token 一经设定即冻结（重指向 = 重启）；
+    缺省 `--server` 进入 setup 模式（终端打印一次性配对码，浏览器经
+    `/sidecar/connect` 三重防线——配对码 + Host + Origin——完成配对）；
+  - **明文远端告警**：目标非 https 且非 loopback（按 DNS 解析判定）时，
+    sidecar 默认拒绝启动，`--allow-insecure` 显式放行后横幅 + UI 顶栏双重
+    持续告警（token 走明文公网 = 凭证暴露）；
   - **Server 管理视图**（SPA，Phase A）：连接配置页（server URL + token
     输入，token 仅驻 sidecar）、status 总览、owners 注册/注销（回执展示）、
     在线连接表 + 配额、主动断连（确认对话 + 回执展示）。
-- **Owner 控制台视图**（SPA，Phase B）：sidecar 进程内经
-  `@jixo/opendweb-client-sdk` native binding 打开/附加本地 fabric 数据面
-  （`--data-dir`），提供成员名册、邀请签发（`./token` 解码展示：发给谁/
-    何时过期/带哪条 relay）、成员撤销、relay capability 查看与续发入口。
+- **Owner 控制台拆出**：本地 fabric 数据面管理（成员/邀请/撤销/
+  capability 视图）不在本 change——独立 change `webui-owner-console`
+  登记（未排期；前置 = 本 change + sidecar 本地数据面 JSON 契约冻结）。
 
 ## 非 Goals（明确不做）
 

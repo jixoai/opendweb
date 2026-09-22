@@ -1,5 +1,9 @@
 # Design: sdk-mgmt-surface
 
+> r1 修订（2026-09-22）：按 Codex 评审 docs/codex-review-sdkmgmt-r1.md 处置
+> P0-1（回执 canonical 统一）、P0-2（mode/relay_enabled 拆分）、P0-4（发布物
+> 门禁）、P1-1/2/3/4、P2-3/4。处置表见文末 §7。
+
 ## 0. 定位与边界
 
 本 change 交付「别人基于 opendweb 做管理/授权」的可编程地基，三层：
@@ -19,166 +23,177 @@ dweb-server /admin/*（既有 owners/status + 新 connections/disconnect） ← 
 本 change 不触碰 L1/L1b/L2 验证链与 relay 数据面。
 
 **Owner 裁决（2026-09-22）**：不做 Server 驻留管理台——管理动作从本地发起。
-因此 server 侧**不新增**静态托管/CORS/WebSocket 面；`/admin/*` 保持纯 JSON
-REST（这是「不扩大 server 攻击面」的结构性保证）。
+server 侧**不新增**静态托管/CORS/WebSocket 面；`/admin/*` 保持纯 JSON REST。
 
 ## 1. admin API 扩面（crates/dweb-server/src/access/admin.rs）
 
 ### 1.1 既有面（收编进 spec，实现零变化）
 
-- 挂载语义：`DWEB_ADMIN_TOKEN` 存在才挂 `/admin/*`（main.rs:436-441），未设 = 404。
-- 认证：Bearer 常时比较中间件（admin.rs 既有）。
+- 挂载语义：`DWEB_ADMIN_TOKEN` 存在才挂 `/admin/*`（main.rs:436-441）。
+- 认证：Bearer 常时比较中间件。
 - 路由：`GET/POST /admin/owners`、`DELETE /admin/owners/{fabric_id}/{root}`、
   `GET /admin/status`。
-- 回执：`receipt_canonical`（admin.rs:363）domain `dweb/admin-receipt/v1\0`，
-  OP_REGISTER=0x01 / OP_UNREGISTER=0x02。
+- 回执 canonical（admin.rs:362-377 冻结）：`b"dweb/admin-receipt/v1\0" ||
+  op u8 || fabric 32B || root 32B || ts u64BE || generation u64BE`；JSON
+  Receipt `{op: "register"|"unregister", fabric_id, root, ts, generation,
+  receipt_sig(base64url-nopad), kicked_*?}`（admin.rs:219-239）。
 
 ### 1.2 新增路由
 
-**`GET /admin/connections`**
+**`GET /admin/connections`**（wire 见 spec 全 JSON 示例；snake_case 与既有
+admin 面一致——既有 /admin/status 即 snake_case：max_connections_per_owner/
+active_connections/per_owner_connections，admin.rs:389-399）：
+
+- `mode` 取自 access 配置（AdminState.mode 字段直存，非 gate 句柄推导）；
+  `relay_enabled` 独立字段（AdminState 增存 relay 装配事实）。restricted +
+  relay 未启用 → mode="restricted" + relay_enabled=false + 空投影（P0-2
+  处置：**不得**用 gate=None 推导 open——main.rs:343-447 实际装配是
+  restricted 恒建 gate）。
+- 数据源：`gate.online_view()`（gate.rs:400）快照 + `gate.
+  max_connections_per_owner()`（gate.rs:395）；gate=None（open 模式）→ 空
+  投影。per_endpoint 按 endpoint_id 字典序稳定排序。
+- **与 /admin/status 的分工**（P2-3）：status 的 active_connections/
+  per_owner_connections 是既有冻结 wire（旧消费者依赖），保持不动；
+  connections 是新详细视图（含 fabric 绑定、mode/relay 拆分、quota 结构）。
+  两路并存是有意的，SDK 只面向 connections 详细视图抽象。
+
+**`POST /admin/connections/disconnect`**：
 
 ```jsonc
+// 请求（恰好其一；deny_unknown_fields）
+{ "endpoint_id": "<64hex>" } | { "fabric_id": "<64hex>" }
 // 200
-{
-  "mode": "restricted",          // "open" | "restricted"
-  "policy": "static",
-  "quota": { "maxConnectionsPerOwner": 16, "configured": true },
-  "perOwner":  [ { "fabricId": "80ad…", "connections": 2 } ],
-  "perEndpoint": [ { "endpointId": "9726…", "fabricId": "80ad…", "connections": 2 } ]
-}
+{ "disconnected": [ { "endpoint_id": "<64hex>", "fabric_id": "<64hex>", "connections": 1 } ],
+  "receipts": [ { "op": "disconnect", "fabric_id": "<64hex>", "endpoint_id": "<64hex>",
+                  "ts": 1789…, "generation": 4, "receipt_sig": "<base64url-nopad>" } ] }
+// 404（业务未命中，必带 envelope）
+{ "error": { "code": "no-match", "message": "…" } }
 ```
 
-数据源：`AdminState.gate`（restricted 模式）→ `gate.online_view()`
-（gate.rs:400，`OnlineView{per_endpoint, per_owner}` 已是快照语义）+
-`gate.max_connections_per_owner()`（gate.rs:395）。`gate = None`（open 模式
-或 relay 未启用）→ 如实空集 + `"mode": "open"`（spec 场景钉住：不报错、
-不虚构）。在用值 = perOwner[].connections 直接可读，无需额外字段。
+- 实现：抽取 unregister 既有断连路径为共享函数（当前 admin.rs 注销分支
+  内联「online_view 反查 → Clients::disconnect」）；unregister 与 disconnect
+  共用，仅过滤键不同。
+- **回执（P0-1 处置）**：canonical 布局**不变**（§1.1 冻结形），disconnect
+  复用 `root` 32B 槽位承载**被断 endpoint_id**（op=0x03）；**每个被断端点
+  一张回执**（per-target 审计，P2-1 一并解决——不再有「只签动作不签对象」
+  的空洞）。JSON 层 disconnect Receipt 用显式 `endpoint_id` 字段（不复用
+  `root` 键名），register/unregister 的 Receipt 形态零变化。
+- **收敛语义（P1-2）**：`Clients::disconnect` 是异步 start_shutdown，在线
+  计数等 OnDisconnectGuard 回调释放——响应报告「已下发」而非「已完成」；
+  spec 场景钉有界轮询收敛；Rust/TS e2e 用 poll-with-deadline 断言。
+- `relay_clients = None`（relay 未启用）：200 + 空 disconnected。
+- 未命中：404 + envelope。请求体缺键/双键/未知字段/坏 hex：400 + envelope
+  （`invalid-request`）。
 
-**`POST /admin/connections/disconnect`**
+**错误 envelope（P1-1 冻结）**：所有管理面业务错误响应统一
+`{"error":{"code","message"}}`。「未挂载」判别的唯一规范途径 = `GET
+/admin/status` 探测（404=未启用，200=已启用）——不依赖空 body 嗅探；代理
+剥 body 场景下 status 探测依然成立（status 探测判别的是路由存在性而非
+body 形态）。既有 401/400 路由响应改造为 envelope 形态（微调，属本 change
+收编面）。
 
-```jsonc
-// 请求（恰好其一）
-{ "endpointId": "9726…" } | { "fabricId": "80ad…" }
-// 200
-{ "disconnected": [ { "endpointId": "9726…", "fabricId": "80ad…", "connections": 1 } ],
-  "receipt": { "op": 3, "ts": 1789…, "generation": 4, "signature": "hex…" } }
-```
+### 1.3 不做的（与 r1 评审对齐预答）
 
-实现：**抽取 unregister 既有断连路径为共享函数**（当前 admin.rs 注销分支
-内联「gate.online_view 反查 → relay_clients.disconnect(endpoint, Option<
-ConnectionId>)」；抽 `disconnect_online(state, filter) -> Vec<DisconnectHit>`，
-unregister 与新路由共用——unregister 按 (fabric,root) 过滤，新路由按
-endpointId/fabricId 过滤）。语义边界：
+- 不做 `POST /admin/callback/test`（避免 callback_token 经 admin 面反射）。
+- 不做运行时改配额/改 mode（重启生效的既有部署模型）。
+- 不做 SSE/长轮询（轮询 connections 足够）。
 
-- `relay_clients = None`（relay 未启用）：返回 200 + 空 disconnected（明确
-  语义；spec 场景钉住）。
-- 未命中：404（不断开、无回执）。
-- 请求体校验：`endpointId`/`fabricId` 恰好其一（serde deny_unknown_fields +
-  手工互斥检查），违者 400。
-- hex 解析失败：400（与既有 owners 路由的 400 语义一致）。
+## 2. client-sdk `./admin` 与 `./token` subpath（纯 TS）
 
-**回执 op 扩展**：`OP_DISCONNECT: u8 = 0x03`；canonical 载荷 =
-`RECEIPT_DOMAIN || 0x03 || ts_ms u64BE || generation u64BE`（disconnect 不绑
-fabric/root 单主键——命中可能是多 endpoint 的聚合动作，绑 op+ts+generation
-即可审计；多 endpoint 明细在响应体不在签名内，签名只承诺「该动作发生于该
-时刻的该 registry 世代」）。
+### 2.1 形态、放置与发布物门禁（P0-4 处置）
 
-### 1.3 不做的（与 Codex 对齐预答）
-
-- **不做** `POST /admin/callback/test`（webhook 连通性测试）：callback 配置含
-  token，测试端点会诱导把 callback_token 经 admin 面反射，扩大凭证暴露面；
-  连通性由 operator 在 webhook 侧自测（curl 即可）。若后续需要，独立 change
-  论证。
-- **不做** 运行时改配额/改 mode：配置变更重启生效是既有部署模型（SIGHUP
-  只热加载 registry）；运行时突变与 fail-fast 校验冲突，收益不抵复杂度。
-- **不做** SSE/长轮询在线流：轮询 `GET /admin/connections` 足够管理场景。
-
-## 2. client-sdk `./admin` subpath（纯 TS）
-
-### 2.1 形态与放置
-
-遵循 app-protocol-layer Owner 裁决的 subpath 形态（不新增独立包）：
-
-```jsonc
-// packages/client-sdk/package.json exports 增量
-"./admin": { "types": "./admin/index.d.ts", "default": "./admin/index.js" },
-"./token": { "types": "./token/index.d.ts", "default": "./token/index.js" }
-```
-
-源码放 `packages/client-sdk/admin/` 与 `packages/client-sdk/token/`（纯 TS，
-**不经过** napi build 产物目录——与 Rust 构建解耦，`app-protocol-layer` 的
-`./net`/`./http` 面（native+TS 混合）文件级互不相交）。零运行时依赖：
-手写窄类型守卫（不引 zod——client-sdk 是 native 包，TS 侧依赖面要最小化；
-解析失败路径统一抛 `AdminError`/`TokenError`）。
+- 源码形态：**手写 ESM `.js` + `.d.ts`**（零构建步骤——与 packages/opendweb
+  的 .mjs + JSDoc 纪律一致；不引 tsc 构建链）。目录 `packages/client-sdk/
+  admin/`、`packages/client-sdk/token/`。
+- `package.json` 增量：`exports["./admin"]`、`exports["./token"]`（types/
+  default 指向 .d.ts/.js）；**`files` 数组增 `admin`、`token` 目录**。
+- **隔离规则**：两目录源码 MUST NOT import 包内 root/`net`/`http`（无传递
+  native 加载）；`.d.ts` 自包含。
+- **pack 门禁（tasks 2.4）**：干净临时目录 `npm pack` → 解包安装 → 无
+  `.node` 环境 self-reference import（`import "@jixo/opendweb-client-sdk/admin"`）
+  + 类型检查双过。纳入 CI 面（与 app-protocol-layer 的 pack 验收同款）。
 
 ### 2.2 AdminClient
 
 ```ts
-new AdminClient({ baseUrl: "https://srv.example:18787", token: "…", timeoutMs?: 10_000 })
-.status()                                    // GET /admin/status
-.listOwners() / .registerOwner(fabricId, root) / .unregisterOwner(fabricId, root)
-.connections()                               // GET /admin/connections
-.disconnect({ endpointId? , fabricId? })     // POST /admin/connections/disconnect
+new AdminClient({ baseUrl, token, timeoutMs?: 10_000 })
+.status() / .listOwners() / .registerOwner(fabricId, root) / .unregisterOwner(fabricId, root)
+.connections()                                // GET /admin/connections（详细视图）
+.disconnect({ endpointId? , fabricId? })      // POST /admin/connections/disconnect
+.probeEnabled()                               // GET /admin/status → boolean（404=未启用）
 ```
 
-- 请求：全局 `fetch` + `AbortSignal.timeout`；Bearer 头注入；`baseUrl` 尾斜杠
-  归一。
-- 错误归一：非 2xx → `AdminError`。code 判别表：
-  `admin-not-enabled`（404 且路径存在性不可探测——server 未配 token）、
-  `unauthorized`（401）、`bad-request`（400）、`not-found`（404 且业务语义
-  = 目标不存在，如 disconnect 未命中）、`network`（fetch reject）、
-  `timeout`。实现注意：404 的两种语义靠 body 区分不可靠（axum 默认 404 空
-  body）——**决策**：disconnect 未命中改为带 JSON body `{"error":"no-match"}`
-  的 404，AdminClient 以 body 判别；未挂载的 404 body 为空。此判别规则写进
-  实现注释与测试。
-- 回执：变更类返回 `{ receipt: AdminReceipt }`；`receiptCanonical(receipt)`
-  输出待签字节（与 server `receipt_canonical` 逐字节一致，冻结对拍测试）；
-  `verifyReceipt(receipt, verifier)` —— verifier 为注入的
-  `(payload: Uint8Array, signature: Uint8Array, publicKey?: Uint8Array) =>
-  boolean`，包内不引 ed25519（调用方可自带 @noble/ed25519 或用 server_id
-  公钥自验）。公钥来源：`GET /`（services.json 的 `server_id` hex 即 Ed25519
-  公钥）——helper `adminPublicKeyFromServices(json)` 提取之。
+- fetch + `AbortSignal.timeout`；Bearer 注入；baseUrl 尾斜杠归一。
+- 错误归一 `AdminError{status, code, message}`；code 表：`admin-not-enabled`
+  （probeEnabled 判定）、`unauthorized`、`invalid-request`、`no-match`、
+  `network`、`timeout`。
+- 回执：`receiptCanonical(receipt)` 输出 §1.1 冻结 canonical（disconnect 的
+  target=endpoint_id）；`verifyReceipt(receipt, verifier)` 注入式（包内无
+  ed25519 依赖；调用方可自带 @noble/ed25519，公钥 = services.json 的
+  server_id hex——helper `adminPublicKeyFromServices(json)` 提取）。
+- 跨语言冻结对拍：Rust 单测导出 disconnect receipt 样例（canonical bytes +
+  JSON），TS 测试消费同向量断言 `receiptCanonical` 逐字节一致（沿用
+  CROSS_CRATE_CAP_VECTOR 先例，新增 CROSS_CRATE_RECEIPT_VECTOR）。
 
-### 2.3 ./token subpath（只读解码显示）
+### 2.3 ./token（只读解码显示）
 
-- `decodeInvite(token: string): DecodedInviteV2` —— wire 按归档 design 附录 A
-  冻结解析：`dweb2.` + base64url-nopad；canonical = version(1)||fabric(32)||
-  invite_id(16)||issuer(32)||expires u64BE||recipient(32)||relay_count u8||[
-  url_len u16BE||url||cap_len u16BE||cap]…||addr 段。输出 hex 化 id 字段、
-  `relays: [{url, hasCapability}]`、`directAddrs: string[]`。
-- `decodeCapability(token: string): DecodedRelayCapV1` —— `dwebr1.` 210B wire：
-  canonical 146B（version(1)+4×32+caps(1)+issued u64BE+expires u64BE）+sig 64B。
-  caps 位图命名展开 `{relay, rdzAnnounce, rdzResolve}`。
-- 冻结对拍：测试向量与 Rust 侧同源生成（fabric 协议测试已有
-  `CROSS_CRATE_CAP_VECTOR`（crates/dweb-fabric/src/lib.rs:29）——TS 测试读
-  同一向量文件对拍；invite 侧新增一个跨语言冻结向量（Rust 测试导出 + TS
-  消费，形式沿用 cap 向量先例）。
-- 显式不做：验签、私钥操作、令牌构造（构造留在 Rust——签名域集中在
-  native/服务端，TS 只读显示）。
+同 r0（wire 按归档 design 附录 A 冻结；caps 位图命名展开；非法输入抛
+TokenError；显式不做验签/构造）。对拍向量：cap 复用既有
+CROSS_CRATE_CAP_VECTOR（crates/dweb-fabric/src/lib.rs:29）；invite 新增跨语言
+向量（Rust 导出 + TS 消费）。
 
-## 3. 测试策略
+## 3. 与 app-protocol-layer 的共享面协议（P1-3 处置）
 
-| 层 | 测试 | 门 |
+「文件级互不相交」修正为「源码目录不相交 + 共享文件显式 owner 协议」：
+
+- **共享文件**：`packages/client-sdk/package.json`（exports/files）、pack
+  验收脚本、exports 存在性测试。并行 change app-protocol-layer 已冻结五个
+  subpath 的同文件域（其 tasks 4.2/4.6）。
+- **协议**：本 change 的 tasks 2.2 明确「**rebase 后落盘**」——实现期以
+  app-protocol-layer 已合入的 exports/files 快照为基线增量追加
+  `./admin`/`./token`，冲突以「并集快照」解决；最终 exports 全集 =
+  `.`/`./net`/`./net/internals`/`./http`/`./http/internals`/`./admin`/
+  `./token`（写进本 change tasks 作为完成态断言）。pack 门禁脚本两 change
+  共用同一份，后合并者负责跑通。
+
+## 4. 测试策略
+
+| 层 | 测试 | 性质 |
 |---|---|---|
-| Rust 单测 | disconnect 请求体校验矩阵（缺键/双键/坏 hex/未命中/命中）、open 模式空投影、回执 op3 canonical | `mbx test -p dweb-server --bins`（node:test 无关，cargo 系） |
-| Rust e2e | admin_token e2e 扩展：restricted 起 server + 真实 relay 连接 → connections 视图计数 → disconnect → 视图收敛 + 回执验签（server 侧 ServerIdentity 验） | server_access_e2e 风格（同文件追加） |
-| TS 单测 | AdminClient mock-fetch 全 code 路径（404 空体 vs 带 body 判别）、receiptCanonical 冻结对拍、token 解码向量 + 非法输入矩阵 | `packages/client-sdk` 既有 node --test（test/ 目录） |
-| TS e2e（可选但默认做） | story 侧：node 脚本用 AdminClient 打真实本地 server | npm script，纳入 change 验证记录 |
+| Rust 单测 | disconnect 请求体矩阵（缺键/双键/未知字段/坏 hex→400 envelope）、restricted+无 relay 投影、open 空投影、未命中 404 envelope、回执 op3 canonical 冻结向量 | 实现门 |
+| Rust e2e | restricted + 真实 relay 连接 → connections 计数 → disconnect → **有界轮询**收敛 + 回执 ServerIdentity 验签（per-target） | 实现门 |
+| TS 单测 | AdminClient mock-fetch 全 code 路径（probeEnabled 判定 no-match/enabled 分流）、receiptCanonical 冻结对拍、token 解码向量 + 非法矩阵 | 实现门 |
+| TS e2e | AdminClient 打真实本地 server（与 Rust e2e 同场景） | 实现门 |
+| pack 门禁 | 干净目录 npm pack + 无 .node import | 实现门（CI） |
+| Owner 走查 | 手册演示（curl/AdminClient 对照） | Owner 验收证据（非实现门） |
 
-## 4. 任务切分依据
-
-Rust 面（1.x）先行——TS 客户端的判别规则依赖路由语义冻结；TS 两 subpath
-可并行；e2e 收口在最后。
+（P2-4 处置：上表「性质」列即门禁与验收证据的分界，tasks 不再混写。）
 
 ## 5. 风险与开放问题
 
-- **404 双语义判别**（§2.2）是最脆的契约点：已用 body 约定钉住，spec 场景
-  「未配置 token 零暴露」+「断连未命中」分立，TS 测试双覆盖。若 Codex 认为
-  应改用 409/410 等独立状态码，实现期可换——spec 只钉「互斥可判别」。
-- **AdminState 无 lock 的快照一致性**：online_view 是单锁快照，disconnect
-  反查与断连间存在竞态窗口（查到时在、断时已走）——语义为 best-effort 断开
-  报告（报告实际断开数），不承诺线性一致；与 unregister 既有语义相同。
-- **./admin 在无 native 环境 import 的验证**：client-sdk 的 `.` 主入口加载
-  native binding——subpath 独立文件树必须保证不传递性 import 主入口
-  （package.json `exports` 隔离即可，测试以 `node --input-type=module` 在无
-  binding 环境冒烟）。
+- disconnect 响应与视图收敛间的竞态：已冻结为 best-effort + 有界轮询
+  （§1.2）；响应中的 disconnected 列表 = 已下发 start_shutdown 的快照。
+- AdminState 需增存 `relay_enabled`（构造期注入；main.rs 装配处一行）——
+  mode 字段已存在。
+- envelope 改造涉及既有 400/401 路由响应体微调（旧消费者只看 status 不看
+  body，影响面零；spec 场景钉住新形态）。
+
+## 6. 任务切分依据
+
+Rust 面（含 wire 冻结向量导出）先行；TS 两 subpath 并行；pack 门禁与 e2e
+收口在后。
+
+## 7. r1 评审处置表
+
+| 项 | 处置 |
+|---|---|
+| P0-1 回执矛盾 | canonical 统一为既有冻结布局；disconnect 复用 root 槽位承载 endpoint_id、per-target 回执；JSON snake_case + endpoint_id 字段；跨语言向量钉住（§1.2） |
+| P0-2 mode 投影 | mode 取配置 + relay_enabled 独立字段；restricted+无 relay 保持 restricted（§1.2；spec 场景钉住） |
+| P0-4 发布物 | files 增目录；手写 ESM+.d.ts 零构建；npm pack 双门禁（§2.1） |
+| P1-1 404 判别 | error envelope 冻结 + status 探测为唯一规范判别（§1.2） |
+| P1-2 收敛语义 | best-effort + 有界轮询，spec/测试同步（§1.2） |
+| P1-3 共享面 | 共享文件 owner 协议 + rebase 落盘 + 最终 exports 全集断言（§3） |
+| P1-4 wire 冻结 | spec 全 JSON 示例（snake_case、排序、未知字段忽略）（spec 文件） |
+| P2-1 审计空洞 | per-target 回执（§1.2） |
+| P2-3 status 重叠 | 分工显式化：status 冻结不动，connections 为详细视图（§1.2） |
+| P2-4 证据分界 | 测试表「性质」列（§4） |
