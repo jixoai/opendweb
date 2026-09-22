@@ -1,9 +1,14 @@
 //! Owner registry：`owners.jsonl` append-only 事件日志 + 活跃集合只读快照
-//! （task 1.2，需求来源 2026-09-17；design §8.2 B1 / §8.5 generation / §11.2）。
+//! （task 1.2，需求来源 2026-09-17；design §8.2 B1 / §8.5 generation / §11.2；
+//! server-access-roles Phase 1a：条目元数据 expires_at/alias/note + 时间维度
+//! 活跃判定 `contains_active`——R5 租户有效期 / R6 别名）。
 //!
 //! 活跃集合 = (fabric_id, root EndpointId) 二元组集合，由全量 jsonl 归并得出
 //! （register 加入 / unregister 按 fabric_id+root 定位移除——同一 fabric 换
-//! root 或多 fabric 同 root 都是不同记录）。
+//! root 或多 fabric 同 root 都是不同记录）。条目可携带元数据
+//! `expires_at`（u64 毫秒；`now >= expires_at` 即过期，等值=过期——spec
+//! 冻结边界）/`alias`/`note`，全部 `serde(default)`：**旧格式条目（无这些
+//! 字段）解析为「永久、无别名」，MUST NOT 因缺字段启动失败**。
 //!
 //! generation 语义（design §8.5 缓存键冻结）：每次 load / 每次变更 +1；
 //! 快照携带 generation，下一棒 CallbackProvider 缓存以 (registry_generation,
@@ -11,17 +16,17 @@
 //! 并清空全部缓存（撤销即时生效窗口 = 0）。
 //!
 //! 坏行语义：load 对非空白行的 JSON 解析失败**硬错误**（admin 信任域的本地
-//! 文件被截断/篡改必须暴露而非静默跳过，§9 A9）。
+//! 文件被截断/篡改必须暴露而非静默跳过，§9 A9）。文件 IO/generation 计数
+//! 由 [`super::ledger`] 共享基座承担（r1-P1-5 四台账统一矩阵）。
 //!
 //! CLI 子命令（`dweb-server owners register|unregister <fabric_id_hex>
 //! <root_hex>`）：直接操作 data_dir 的 jsonl 后退出，不启动服务。
 
+use super::ledger;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    fs::OpenOptions,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -30,13 +35,24 @@ use std::{
 /// (fabric_id, root EndpointId) 活跃二元组的键类型（L1b 查表键，design §8.2 B1）
 pub type OwnerKey = ([u8; 32], [u8; 32]);
 
-/// jsonl 事件记录（行格式冻结：op/fabric_id/root/ts；hex 64 字符小写）
+/// jsonl 事件记录（行格式：op/fabric_id/root/ts + 可选元数据；hex 64 字符
+/// 小写）。元数据字段 serde(default) + 缺省不落行——旧格式条目（无这些
+/// 字段）解析为永久无别名，写入侧不带元数据时行形状与本变更前逐字节一致
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
     op: Op,
     fabric_id: String,
     root: String,
     ts: u64,
+    /// 租户有效期（u64 毫秒时间戳；None = 永久）。R5/server-access-roles
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    /// 别名（R6；管理面展示用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<String>,
+    /// 备注（管理面展示用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -44,6 +60,15 @@ struct Record {
 enum Op {
     Register,
     Unregister,
+}
+
+/// 活跃条目的元数据（归并保留该键最后一次 register 事件的值）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EntryMeta {
+    registered_at: u64,
+    expires_at: Option<u64>,
+    alias: Option<String>,
+    note: Option<String>,
 }
 
 /// 活跃 Owner 条目（admin API 列表用，task 3.1；registered_at = 该键最后
@@ -54,6 +79,16 @@ pub struct OwnerEntry {
     pub fabric_id: [u8; 32],
     pub root: [u8; 32],
     pub registered_at: u64,
+    /// 到期时间戳（None = 永久）。Phase 1c 起经 `GET /admin/owners` 增量
+    /// 暴露（`expires_at`/`expires_in`/状态），1a 内核快照先行携带
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub expires_at: Option<u64>,
+    /// 别名（R6）。消费面同上（Phase 1c）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub alias: Option<String>,
+    /// 备注。消费面同上（Phase 1c）
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub note: Option<String>,
 }
 
 /// 活跃集合只读快照。验证链 O(1) 查表（snapshot() 是 Arc 克隆，零拷贝派发）。
@@ -64,9 +99,10 @@ pub struct RegistrySnapshot {
 
 struct SnapshotInner {
     generation: u64,
-    /// Phase 3（task 3.1）：值 = registered_at（GET /admin/owners 暴露）；
-    /// 归并语义与 HashSet 时代一致（register 插入/覆盖、unregister 移除）
-    active: HashMap<OwnerKey, u64>,
+    /// Phase 3（task 3.1）+ Phase 1a（元数据）：值 = 该键最后一次 register
+    /// 事件的完整元数据；归并语义与 HashSet 时代一致（register 插入/覆盖、
+    /// unregister 移除）
+    active: HashMap<OwnerKey, EntryMeta>,
 }
 
 impl RegistrySnapshot {
@@ -75,9 +111,21 @@ impl RegistrySnapshot {
         self.inner.generation
     }
 
-    /// L1b B1：(fabric_id, issuer) 是否 ∈ registry（验证链接线 task 1.5 消费）
+    /// L1b B1（无时间维度）：(fabric_id, issuer) 是否 ∈ registry（已注册，
+    /// 无论是否过期）。gate 据此区分 `dweb/owner-expired` 与
+    /// `dweb/unknown-owner`（spec「relay capability 验证」冻结语义）
     pub fn contains(&self, fabric_id: &[u8; 32], root: &[u8; 32]) -> bool {
         self.inner.active.contains_key(&(*fabric_id, *root))
+    }
+
+    /// L1b B1 时间维度（server-access-roles Phase 1a）：已注册**且未过期**。
+    /// 到期判定冻结：`now >= expires_at` 即过期（等值=过期）；无 expires_at
+    /// = 永久活跃（旧格式条目兼容）
+    pub fn contains_active(&self, fabric_id: &[u8; 32], root: &[u8; 32], now_ms: u64) -> bool {
+        self.inner
+            .active
+            .get(&(*fabric_id, *root))
+            .is_some_and(|meta| meta.expires_at.is_none_or(|expires| now_ms < expires))
     }
 
     /// 活跃 Owner 数（空 registry 启动告警与 CLI 回显用）
@@ -97,10 +145,13 @@ impl RegistrySnapshot {
             .inner
             .active
             .iter()
-            .map(|((fabric_id, root), registered_at)| OwnerEntry {
+            .map(|((fabric_id, root), meta)| OwnerEntry {
                 fabric_id: *fabric_id,
                 root: *root,
-                registered_at: *registered_at,
+                registered_at: meta.registered_at,
+                expires_at: meta.expires_at,
+                alias: meta.alias.clone(),
+                note: meta.note.clone(),
             })
             .collect();
         list.sort_by_key(|e| (e.fabric_id, e.root));
@@ -110,15 +161,6 @@ impl RegistrySnapshot {
 
 struct State {
     current: Arc<SnapshotInner>,
-}
-
-/// 进程级单调 generation 计数器：每次 load / 每次变更 +1（task 1.2；
-/// design §8.5 缓存键冻结）。全局单调而非每实例计数，保证后续文件重载
-/// （SIGHUP/mtime）后 generation 不回退、缓存键不复用旧值。
-static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_generation() -> u64 {
-    GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 /// Owner registry 句柄：load 建立活跃集合；register/unregister 在锁内
@@ -148,7 +190,7 @@ impl OwnerRegistry {
             path: path.to_path_buf(),
             state: Mutex::new(State {
                 current: Arc::new(SnapshotInner {
-                    generation: next_generation(),
+                    generation: ledger::next_generation(),
                     active,
                 }),
             }),
@@ -156,37 +198,29 @@ impl OwnerRegistry {
     }
 
     /// jsonl 全量归并（load 与 reload 共享；坏行硬错误，见模块注释）。
-    /// 值 = 该键最后一次 register 事件的 ts。
-    fn load_active(path: &Path) -> Result<HashMap<OwnerKey, u64>> {
-        let mut active: HashMap<OwnerKey, u64> = HashMap::new();
-        match std::fs::File::open(path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                for (idx, line) in reader.lines().enumerate() {
-                    let line = line.with_context(|| format!("read {}", path.display()))?;
-                    if line.trim().is_empty() {
-                        continue; // 容忍尾随空行；非空白坏行仍硬错误（见模块注释）
-                    }
-                    let record: Record = serde_json::from_str(&line).with_context(|| {
-                        format!("{}:{} malformed owners record", path.display(), idx + 1)
-                    })?;
-                    let fabric_id = parse_owner_hex(&record.fabric_id)
-                        .map_err(|e| anyhow::anyhow!("{}:{} {e}", path.display(), idx + 1))?;
-                    let root = parse_owner_hex(&record.root)
-                        .map_err(|e| anyhow::anyhow!("{}:{} {e}", path.display(), idx + 1))?;
-                    match record.op {
-                        Op::Register => {
-                            active.insert((fabric_id, root), record.ts);
-                        }
-                        Op::Unregister => {
-                            active.remove(&(fabric_id, root));
-                        }
-                    }
+    /// 值 = 该键最后一次 register 事件的完整元数据。
+    fn load_active(path: &Path) -> Result<HashMap<OwnerKey, EntryMeta>> {
+        let mut active: HashMap<OwnerKey, EntryMeta> = HashMap::new();
+        for (line_no, record) in ledger::read_records::<Record>(path, "owners")? {
+            let fabric_id = parse_owner_hex(&record.fabric_id)
+                .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
+            let root = parse_owner_hex(&record.root)
+                .map_err(|e| anyhow::anyhow!("{}:{line_no} {e}", path.display()))?;
+            match record.op {
+                Op::Register => {
+                    active.insert(
+                        (fabric_id, root),
+                        EntryMeta {
+                            registered_at: record.ts,
+                            expires_at: record.expires_at,
+                            alias: record.alias,
+                            note: record.note,
+                        },
+                    );
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("open owners file {}", path.display()));
+                Op::Unregister => {
+                    active.remove(&(fabric_id, root));
+                }
             }
         }
         Ok(active)
@@ -203,43 +237,50 @@ impl OwnerRegistry {
         self.mutate(Op::Unregister, fabric_id, root)
     }
 
+    /// CLI/admin 入口的事件构造（不带元数据——永久租户）。带元数据的写入
+    /// 走文件入口（jsonl 直接追加）或 Phase 1b/1c 的专用端点，不经本方法。
     fn mutate(&self, op: Op, fabric_id: &[u8; 32], root: &[u8; 32]) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        // 先落盘（append + fsync），成功后才更新内存——磁盘失败不留内存超前状态
-        let record = Record {
-            op,
-            fabric_id: encode_key(&hex::encode(fabric_id)),
-            root: encode_key(&hex::encode(root)),
-            ts: now_ms(),
-        };
-        let line = serde_json::to_string(&record).context("serialize owners record")?;
-        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create owners dir {}", parent.display()))?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("open owners file {}", self.path.display()))?;
-        file.write_all(line.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .with_context(|| format!("append owners file {}", self.path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("fsync owners file {}", self.path.display()))?;
-        drop(file);
+        self.apply(
+            Record {
+                op,
+                fabric_id: encode_key(&hex::encode(fabric_id)),
+                root: encode_key(&hex::encode(root)),
+                ts: now_ms(),
+                expires_at: None,
+                alias: None,
+                note: None,
+            },
+            *fabric_id,
+            *root,
+        )
+    }
 
+    /// 事件落地公共核：先落盘（append + fsync），成功后才更新内存——磁盘
+    /// 失败不留内存超前状态；快照按事件字段重建（元数据 = 事件原值）
+    fn apply(&self, record: Record, fabric_id: [u8; 32], root: [u8; 32]) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let line = ledger::record_line(&record).context("serialize owners record")?;
+        ledger::append_line(&self.path, "owners", &line)?;
+        let op = record.op;
         let mut active = state.current.active.clone();
         match op {
             Op::Register => {
-                active.insert((*fabric_id, *root), record.ts);
+                active.insert(
+                    (fabric_id, root),
+                    EntryMeta {
+                        registered_at: record.ts,
+                        expires_at: record.expires_at,
+                        alias: record.alias,
+                        note: record.note,
+                    },
+                );
             }
             Op::Unregister => {
-                active.remove(&(*fabric_id, *root));
+                active.remove(&(fabric_id, root));
             }
         }
         state.current = Arc::new(SnapshotInner {
-            generation: next_generation(),
+            generation: ledger::next_generation(),
             active,
         });
         Ok(())
@@ -267,7 +308,7 @@ impl OwnerRegistry {
         let fresh = Self::load_active(&self.path)?;
         let mut state = self.state.lock().unwrap();
         state.current = Arc::new(SnapshotInner {
-            generation: next_generation(),
+            generation: ledger::next_generation(),
             active: fresh,
         });
         Ok(())
@@ -387,6 +428,7 @@ mod tests {
         reg.register(&key(3), &key(4)).unwrap();
         let snap = reg.snapshot();
         assert!(snap.contains(&key(1), &key(2)));
+        assert!(snap.contains_active(&key(1), &key(2), now_ms()));
         assert!(snap.contains(&key(3), &key(4)));
         assert_eq!(snap.len(), 2);
         reg.unregister(&key(1), &key(2)).unwrap();
@@ -397,6 +439,168 @@ mod tests {
         let snap = reloaded.snapshot();
         assert!(!snap.contains(&key(1), &key(2)));
         assert!(snap.contains(&key(3), &key(4)));
+    }
+
+    // ---- server-access-roles Phase 1a：元数据 + 时间维度活跃判定 ----
+
+    /// spec Scenario「旧格式 owners 条目解析为永久租户」：本变更前格式的行
+    /// （无 expires_at/alias/note 字段）启动成功、按永久无别名参与活跃集合
+    #[test]
+    fn old_format_entry_parses_as_permanent_no_alias() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        // 逐字节复刻本变更前的行形状（无新字段）
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":111}}\n",
+                "31".repeat(32),
+                "32".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        let snap = reg.snapshot();
+        assert!(snap.contains(&[0x31; 32], &[0x32; 32]));
+        // 永久：任意 now（含远未来）都活跃
+        assert!(snap.contains_active(&[0x31; 32], &[0x32; 32], u64::MAX));
+        let entry = &snap.entries()[0];
+        assert_eq!(entry.expires_at, None, "旧条目 = 永久");
+        assert_eq!(entry.alias, None, "旧条目 = 无别名");
+        assert_eq!(entry.note, None);
+        assert_eq!(entry.registered_at, 111);
+    }
+
+    /// 到期边界冻结：now >= expires_at 即过期（等值=过期）；过期后
+    /// contains 仍真（区分 owner-expired 与 unknown-owner 的事实源）
+    #[test]
+    fn expires_at_boundary_equality_means_expired() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":1000}}\n",
+                "41".repeat(32),
+                "42".repeat(32)
+            ),
+        )
+        .unwrap();
+        let snap = OwnerRegistry::load(&path).unwrap().snapshot();
+        assert!(
+            snap.contains_active(&[0x41; 32], &[0x42; 32], 999),
+            "到期前活跃"
+        );
+        assert!(
+            !snap.contains_active(&[0x41; 32], &[0x42; 32], 1000),
+            "等值 = 过期（spec 冻结边界）"
+        );
+        assert!(!snap.contains_active(&[0x41; 32], &[0x42; 32], 1001));
+        assert!(
+            snap.contains(&[0x41; 32], &[0x42; 32]),
+            "过期条目仍在册（owner-expired ≠ unknown-owner）"
+        );
+    }
+
+    /// 续期恢复（spec Scenario「续期恢复准入」的 registry 层）：过期条目经
+    /// 文件入口追加新 register（未来 expires_at）+ reload → 重新活跃
+    #[test]
+    fn renewal_via_file_reload_restores_active() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        let expired_line = format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":200}}\n",
+            "51".repeat(32),
+            "52".repeat(32)
+        );
+        std::fs::write(&path, &expired_line).unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        assert!(
+            !reg.snapshot()
+                .contains_active(&[0x51; 32], &[0x52; 32], 10_000)
+        );
+        // 文件入口续期：新 register 事件携带远期 expires_at（重复注册=刷新语义）
+        let renewed = format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":5000,\"expires_at\":9000}}\n",
+            "51".repeat(32),
+            "52".repeat(32)
+        );
+        std::fs::write(&path, format!("{expired_line}{renewed}")).unwrap();
+        reg.reload().unwrap();
+        assert!(
+            reg.snapshot()
+                .contains_active(&[0x51; 32], &[0x52; 32], 8_999)
+        );
+        assert!(
+            !reg.snapshot()
+                .contains_active(&[0x51; 32], &[0x52; 32], 9_000)
+        );
+        // 重复注册保留单一条目，元数据取最后一次 register 事件
+        let entries = reg.snapshot().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].registered_at, 5000);
+        assert_eq!(entries[0].expires_at, Some(9000));
+    }
+
+    /// register()/unregister()（CLI/admin 入口）不带元数据：落行形状与本
+    /// 变更前逐字节一致（无 expires_at/alias/note 键）——旧行形状冻结
+    #[test]
+    fn mutation_line_shape_unchanged_without_metadata() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        let reg = OwnerRegistry::load(&path).unwrap();
+        reg.register(&key(1), &key(2)).unwrap();
+        reg.unregister(&key(1), &key(2)).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        for keyword in ["expires_at", "alias", "note"] {
+            assert!(
+                !content.contains(keyword),
+                "无元数据写入不得落 {keyword} 键：{content}"
+            );
+        }
+        assert!(content.contains("\"op\":\"register\""));
+        assert!(content.contains("\"op\":\"unregister\""));
+    }
+
+    /// 元数据完整往返：文件入口写入 alias/note/expires_at → 快照携带 →
+    /// 重启 load 保留（append-only 日志是唯一事实源）
+    #[test]
+    fn metadata_roundtrips_through_file_and_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":99999999999999,\"alias\":\"tenant-a\",\"note\":\"paid plan\"}}\n",
+                "61".repeat(32),
+                "62".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        let entry = &reg.snapshot().entries()[0];
+        assert_eq!(entry.expires_at, Some(99_999_999_999_999));
+        assert_eq!(entry.alias.as_deref(), Some("tenant-a"));
+        assert_eq!(entry.note.as_deref(), Some("paid plan"));
+        let reloaded = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(reloaded.snapshot().entries(), reg.snapshot().entries());
+    }
+
+    /// 带元数据行的坏元数据形态：expires_at 非数字 = 坏行硬错误（fail-fast）
+    #[test]
+    fn malformed_metadata_field_fails_load() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":1,\"expires_at\":\"soon\"}}\n",
+                "71".repeat(32),
+                "72".repeat(32)
+            ),
+        )
+        .unwrap();
+        assert!(OwnerRegistry::load(&path).is_err());
     }
 
     #[test]
