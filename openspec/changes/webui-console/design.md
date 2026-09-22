@@ -61,8 +61,13 @@ index.html（hash 路由）；`Cache-Control: no-store`。
   token}`，防线三重：(1) 配对码单次匹配（成功或 10min 超时即失效，常时
   比较）；(2) Host 头 === `127.0.0.1:<port>`；(3) Origin 缺失或 === sidecar
   origin。三者全过 → 校验 server 守卫 → 存内存 → 冻结 → 配对码销毁。
-  任何失败 → 400 + 错误码（`bad-pairing` / `bad-origin-host` /
-  `bad-target`），且**配对码连续失败 5 次即销毁**（防在线猜测）。
+  失败 wire（r6 冻结）：header/配对码/目标错误 → 400 + 错误码
+  （`bad-pairing` / `bad-origin-host` / `invalid-request` / `bad-target`）；
+  **并发单飞冲突 → 409 + `pairing-in-progress`**（r5-P0-1：配对码校验通过
+  后、`await validateTarget` 让出事件循环前同步置 in-flight 锁——并发
+  第二请求立即 409；validateTarget 失败 finally 恢复锁，bad-target 不烧码
+  语义不变；成功提交前二次防御 `target-frozen`）。且**配对码连续失败 5 次
+  即销毁**（防在线猜测）。
 - **token 途径可见性（P1-6）**：`--token`/env 途径在 help 与启动横幅打印
   提醒（OS 级可见：history/ps/env）；推荐 TTY 或配对面。
 - token 内存驻留纪律同 r0：日志只记 method/path/status/耗时。
@@ -195,6 +200,13 @@ export default {
 | P1-7 契约承载 | 不扩展契约；run envelope 修正为既定形态；校验自担（§3） |
 | P1-8 Phase B 拆出 | webui-owner-console 独立 change（§7） |
 | P2-2 缺省 --server | setup 模式 + 503 no-target（§2.2；spec 场景钉住） |
+
+### r5/r6 处置增补
+
+| 项 | 处置 |
+|---|---|
+| r5-P0-1 配对并发竞态 | in-flight 单飞锁（同步置位先于 await）+ 409 pairing-in-progress + 提交前二次防御（§2.2） |
+| r6-P1 409 wire 契约同步 | design/spec/tasks 三处冻结（本修订） |
 
 ### r2 增补处置
 

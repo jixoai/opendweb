@@ -20,7 +20,9 @@
        no-target）
 - [x] A.4 配对面 `/sidecar/connect`：一次性配对码（终端打印；常时比较；单次
        有效 10min；连败 5 次销毁）+ Host===127.0.0.1:port 校验 + Origin
-       同源/缺失校验；成功即目标冻结（再提交 target-frozen）
+       同源/缺失校验；**in-flight 单飞锁（r5-P0-1：同步置位先于 await；并发
+       第二请求 409 pairing-in-progress；成功提交前二次防御 target-frozen）**；
+       成功即目标冻结（再提交 target-frozen）
 - [x] A.5 token 获取链：--token > DWEB_ADMIN_TOKEN > TTY 交互（回显关闭）；
        argv/env 途径横幅可见性提醒
 - [x] A.6 `src/plugin.mjs` 契约清单（run envelope {command,args,log,cwd,

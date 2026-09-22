@@ -20,6 +20,11 @@
 - **WHEN** 攻击者网页（evil.com）向 `http://127.0.0.1:<port>/sidecar/connect` 直接 POST 目标+token 配置
 - **THEN** 被 Origin 校验拒绝；伪造/缺失配对码被拒绝；即便通过 header 校验，无终端打印的一次性配对码无法提交成功
 
+#### Scenario: 并发配对单飞
+
+- **WHEN** 两个请求以同一有效配对码并发提交 `/sidecar/connect`（目标校验含 DNS 解析的让出窗口）
+- **THEN** 恰一个成功（200）；另一个返回 409 + `{"error":{"code":"pairing-in-progress"}}`；配对码不被双消费，目标不重复提交
+
 #### Scenario: 目标冻结
 
 - **WHEN** 目标已设定后，任何 `/sidecar/*` 或浏览器途径再次提交新目标
