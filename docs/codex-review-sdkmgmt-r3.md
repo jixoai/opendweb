@@ -69,7 +69,7 @@
 
 ### P1-4：冻结回执向量未进入 r2 提交，当前只存在脏树文件
 
-证据：r2 commit 的统计与 tree 没有 `crates/dweb-server/tests/fixtures/receipt-vector.json`；当前文件只在脏 worktree/staged diff 中出现，仍不属于 `3d58e4e`。因此 design/tasks 所称“TS 只读冻结文件”在评审 commit 上没有可消费对象。该问题不否定修订规则，但会让跨 Rust/TS 对拍在以该 commit 为基线的干净 checkout 中无法运行。
+证据：r2 commit 的统计与 tree 没有 `crates/dweb-server/tests/fixtures/receipt-vector.json`；当前文件只在脏 worktree/staged diff 中出现，仍不属于 `3d58e4e`。脏树中的生成/对拍测试位于 `crates/dweb-server/src/access/admin.rs:1585-1722`，并且缺文件时会写回源码树（:1711-1722），所以它证明了当前实现草案有生成逻辑，却不能证明评审 commit 有可消费 fixture。该问题不否定修订规则，但会让跨 Rust/TS 对拍在以该 commit 为基线的干净 checkout 中无法运行。
 
 修复：将 JSON fixture 与其 Rust 只读断言、TS 消费测试一并纳入 change 交付；测试应在 fixture 缺失时失败，而不是在 CI 中写回源码树。若 fixture 只在实现阶段生成，须在 tasks 标明“生成后提交”及 pack/CI 的读取路径。
 
