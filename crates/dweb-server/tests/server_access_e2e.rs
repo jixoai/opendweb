@@ -2948,3 +2948,875 @@ async fn e29_rendezvous_rate_limit_on_real_gateway() {
     assert_eq!(body, r#"{"error":"rate-limited"}"#);
     drop(server);
 }
+
+// ---------- server-access-roles Phase 1c：三角色管理面 e2e ----------
+//
+// 黑盒全链路（真 relay/gateway 子进程 + admin Bearer）：
+// - e30 敲门台全链路：deny 入账 → 排序契约（seq desc）→ dismiss 幂等/复位/
+//   undismiss/unknown 404 → from-knock 定位访客 → 无票重连放行 → status 增量
+// - e31 邀请码管理面：签发（码全文仅一次）→ /register 兑换 → 名册 alias/到期
+//   → admin renew → 吊销后兑换拒绝
+// - e32 到期租户 admin renew 恢复准入（owner-expired → 有效票接入成功）
+// - e33 黑名单管理面：拉黑同票拒（endpoint 维度有效票不豁免）+ fabric 维度
+//   + 列表/移除恢复
+// - e34 元数据 PATCH：owners/visitors alias/note 设置·空串清除 + 回执验签
+// - e35 真实 kill-between-fsyncs 崩溃注入：真码经签发路由落地 → register ①
+//   fsync 后 consume 失败挂起（0444 注入）→ **SIGKILL 真进程** → 重启补齐
+//   consume（1b 磁盘等价态构型升级为真实 kill）+ deny-set 运维投影
+
+const ROLES_ADMIN_TOKEN: &str = "e2e-roles-admin-token";
+
+/// admin 面 JSON 请求（Bearer 注入；body None = 无体）
+async fn admin_json(
+    server: &Server,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> (u16, String) {
+    http_request(
+        server.gateway,
+        path,
+        method,
+        body.map(|b| b.to_string()).as_deref(),
+        &[("authorization", &format!("Bearer {ROLES_ADMIN_TOKEN}"))],
+    )
+    .await
+}
+
+/// 200 admin 响应体 → JSON（非 200 即 panic 带原文）
+fn parse_ok(status: u16, body: &str) -> serde_json::Value {
+    assert_eq!(status, 200, "admin 请求失败: {body}");
+    serde_json::from_str(body).unwrap()
+}
+
+/// knocks/visitors 数组按 endpoint_id 定位条目（无则 panic）
+fn find_by_endpoint(list: &serde_json::Value, endpoint_hex: &str) -> serde_json::Value {
+    list.as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["endpoint_id"] == endpoint_hex)
+        .unwrap_or_else(|| panic!("列表缺 {endpoint_hex}: {list}"))
+        .clone()
+}
+
+#[tokio::test]
+async fn e30_knocks_admin_surface_from_knock_and_reconnect() {
+    let dir = TempDir::new().unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+        ],
+        &[],
+        true,
+    );
+    let relay = server.relay_addr();
+
+    // 三端点无票敲门（seq 1/2/3——C 最新；A 的 last_at 与 seq 次序故意不谈，
+    // 排序只看 seq，时钟回拨免疫由 knock 单测钉死）
+    let a = SecretKey::generate();
+    let b = SecretKey::generate();
+    let c = SecretKey::generate();
+    for key in [&a, &b, &c] {
+        let reason = expect_denied(relay, key, None).await;
+        assert_eq!(reason, "dweb/no-capability");
+    }
+    let (a_hex, b_hex, c_hex) = (
+        hex::encode(a.public().as_bytes()),
+        hex::encode(b.public().as_bytes()),
+        hex::encode(c.public().as_bytes()),
+    );
+
+    // 排序契约：未处置在前、组内 seq 降序（C→B→A）；pending_count=3
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks", None).await;
+    let knocks = parse_ok(s, &body);
+    let order: Vec<&str> = knocks["knocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["endpoint_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, vec![c_hex.as_str(), b_hex.as_str(), a_hex.as_str()]);
+    assert_eq!(knocks["pending_count"], 3);
+    assert!(
+        knocks["knocks"][0]["seq"].as_u64().unwrap() > knocks["knocks"][2]["seq"].as_u64().unwrap(),
+        "seq 降序"
+    );
+    assert!(knocks["knocks"][0]["last_reason"] == "dweb/no-capability");
+
+    // dismiss A：幂等（两次 200）+ 已处置不进默认响应 + pending_count 恒未处置数
+    for _ in 0..2 {
+        let (s, body) = admin_json(
+            &server,
+            "POST",
+            &format!("/admin/knocks/{a_hex}/dismiss"),
+            Some(&serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(s, 200, "{body}");
+        assert_eq!(parse_ok(s, &body)["op"], "knock-dismiss");
+    }
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks", None).await;
+    let knocks = parse_ok(s, &body);
+    assert_eq!(knocks["knocks"].as_array().unwrap().len(), 2);
+    assert_eq!(knocks["pending_count"], 2);
+    // include_dismissed=true 含已处置、pending_count 语义不变（spec Scenario）
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks?include_dismissed=true", None).await;
+    let knocks = parse_ok(s, &body);
+    assert_eq!(knocks["knocks"].as_array().unwrap().len(), 3);
+    assert_eq!(knocks["pending_count"], 2);
+    assert_eq!(
+        find_by_endpoint(&knocks["knocks"], &a_hex)["dismissed"],
+        true
+    );
+
+    // 新 deny 复位：A 再次被拒 → 回到列表最前（seq 4）、count=2、pending=3
+    let reason = expect_denied(relay, &a, None).await;
+    assert_eq!(reason, "dweb/no-capability");
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks", None).await;
+    let knocks = parse_ok(s, &body);
+    assert_eq!(
+        knocks["knocks"][0]["endpoint_id"],
+        a_hex.as_str(),
+        "复位进待办"
+    );
+    assert_eq!(knocks["knocks"][0]["count"], 2, "复位不重置聚合计数");
+    assert_eq!(knocks["pending_count"], 3);
+    // undismiss 幂等（B 本就在待办）
+    let (s, _) = admin_json(
+        &server,
+        "POST",
+        &format!("/admin/knocks/{b_hex}/undismiss"),
+        Some(&serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    // unknown endpoint → 404 no-match envelope
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        &format!("/admin/knocks/{}/dismiss", "ee".repeat(32)),
+        Some(&serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(s, 404, "{body}");
+    assert_eq!(error_code_of(&body), "no-match");
+
+    // 敲门台一键定位：dismiss C → from-knock 授予（带别名 + 30 天）
+    let (s, _) = admin_json(
+        &server,
+        "POST",
+        &format!("/admin/knocks/{c_hex}/dismiss"),
+        Some(&serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        "/admin/visitors/from-knock",
+        Some(&serde_json::json!({
+            "endpoint_id": c_hex,
+            "alias": "night-guest",
+            "expires_in_days": 30,
+        })),
+    )
+    .await;
+    let receipt = parse_ok(s, &body);
+    assert_eq!(receipt["op"], "visitor-grant");
+    assert_eq!(receipt["endpoint_id"], c_hex.as_str());
+    assert!(receipt["expires_at"].as_u64().unwrap() > now_ms());
+    // 名册：alias/expires_at/granted_at 齐
+    let (s, body) = admin_json(&server, "GET", "/admin/visitors", None).await;
+    let visitors = parse_ok(s, &body);
+    let entry = find_by_endpoint(&visitors["visitors"], &c_hex);
+    assert_eq!(entry["alias"], "night-guest");
+    assert!(entry["expires_at"].as_u64().unwrap() > now_ms());
+    assert!(entry["granted_at"].as_u64().unwrap() > 0);
+
+    // 定位后无票重连放行（敲门→访客全链路闭环）——以常驻 Endpoint 保持
+    // 在线（raw 形态 connect 后即 drop，无法稳定观测在线投影）
+    let c_ep = iroh_endpoint(relay, c.clone(), None).await;
+    await_online(&c_ep).await;
+
+    // status 增量：knocks_pending（A、B 未处置）+ visitors_active=1 + codes_active=0
+    let (s, body) = http_get_with_auth(
+        server.gateway,
+        "/admin/status",
+        &format!("Bearer {ROLES_ADMIN_TOKEN}"),
+    )
+    .await;
+    let status = parse_ok(s, &body);
+    assert_eq!(status["knocks_pending"], 2);
+    assert_eq!(status["visitors_active"], 1);
+    assert_eq!(status["codes_active"], 0);
+    assert_eq!(status["visitors_online"], 1, "C 在线（常驻连接）");
+    drop(c_ep);
+    drop(server);
+}
+
+#[tokio::test]
+async fn e31_codes_admin_issue_redeem_roster_and_revoke() {
+    let dir = TempDir::new().unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+            ("DWEB_REGISTER_RATE_PER_MIN", "1000"),
+        ],
+        &[],
+        false,
+    );
+
+    // 签发：码全文仅此一次 + 缺省 1/7/30
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        "/admin/codes",
+        Some(&serde_json::json!({"alias_hint": "e2e-onboarding"})),
+    )
+    .await;
+    let issue = parse_ok(s, &body);
+    assert_eq!(issue["op"], "code-issue");
+    let code = issue["code"].as_str().unwrap().to_string();
+    assert!(code.starts_with("dwebc1."), "{code}");
+    assert_eq!(code[7..].split('-').count(), 4);
+    let code_hash_hex = issue["code_hash"].as_str().unwrap().to_string();
+    assert_eq!(issue["max_uses"], 1);
+    assert_eq!(issue["default_ttl_days"], 30);
+
+    // 列表：只回哈希与计数 + denied 投影在位（false）——绝无码全文
+    let (s, body) = admin_json(&server, "GET", "/admin/codes", None).await;
+    let list = parse_ok(s, &body);
+    assert!(!body.contains(&code), "列表不得含码全文");
+    let entry = list["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code_hash"] == code_hash_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["used_count"], 0);
+    assert_eq!(entry["revoked"], false);
+    assert_eq!(entry["denied"], false);
+    assert_eq!(entry["alias_hint"], "e2e-onboarding");
+
+    // 兑换（复用 1b /register 全链）：租户入册带 30 天到期
+    let fabric = [0x31; 32];
+    let root_key = SigningKey::from_bytes(&[0x32; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    // used_count 推进
+    let (s, body) = admin_json(&server, "GET", "/admin/codes", None).await;
+    let list = parse_ok(s, &body);
+    let entry = list["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code_hash"] == code_hash_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["used_count"], 1);
+
+    // 名册出现该租户：到期 ≈ now+30d、status=active、alias 空（alias 经 PATCH）
+    let root_hex = hex::encode(root_key.verifying_key().to_bytes());
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let owner = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == root_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(owner["fabric_id"], hex::encode(fabric));
+    assert_eq!(owner["status"], "active");
+    let expires = owner["expires_at"].as_u64().unwrap();
+    assert!(expires > now_ms() + 29 * 24 * 3_600_000, "{expires}");
+    assert!(owner["expires_in"].as_u64().unwrap() > 29 * 24 * 3_600_000);
+
+    // 元数据 PATCH：alias 落名册（空串清除的反向面在 e34 钉死）
+    let (s, body) = admin_json(
+        &server,
+        "PATCH",
+        &format!("/admin/owners/{}/{}", hex::encode(fabric), root_hex),
+        Some(&serde_json::json!({"alias": "e2e-tenant"})),
+    )
+    .await;
+    assert_eq!(parse_ok(s, &body)["op"], "owner-meta");
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let owner = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == root_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(owner["alias"], "e2e-tenant", "名册出现带 alias 的兑换租户");
+
+    // admin renew（permanent）：名册到期转 null + 回执 op=renew
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        &format!("/admin/owners/{}/{}/renew", hex::encode(fabric), root_hex),
+        Some(&serde_json::json!({"permanent": true})),
+    )
+    .await;
+    assert_eq!(parse_ok(s, &body)["op"], "renew");
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let owner = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == root_hex.as_str())
+        .unwrap()
+        .clone();
+    assert!(owner["expires_at"].is_null(), "permanent → null");
+    assert!(owner["expires_in"].is_null());
+    assert_eq!(owner["alias"], "e2e-tenant", "renew 保留元数据");
+
+    // 第二码（全缺省参数——body 为空 JSON 对象）：吊销后兑换立即拒绝
+    // （code-invalid）——签发→吊销→兑换的完整弧
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        "/admin/codes",
+        Some(&serde_json::json!({})),
+    )
+    .await;
+    let second = parse_ok(s, &body);
+    let second_code = second["code"].as_str().unwrap().to_string();
+    let second_hash = second["code_hash"].as_str().unwrap().to_string();
+    let (s, body) = admin_json(
+        &server,
+        "DELETE",
+        &format!("/admin/codes/{second_hash}"),
+        None,
+    )
+    .await;
+    assert_eq!(parse_ok(s, &body)["op"], "code-revoke");
+    let other = SigningKey::from_bytes(&[0x39; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&second_code, &fabric, &other, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(error_code_of(&body), "code-invalid");
+    drop(server);
+}
+
+/// spec Scenario「续期恢复准入」：到期租户的有效票被拒 owner-expired（且
+/// 该 deny 记入敲门台账作为到期提醒类别）→ `POST .../renew {expires_in_days:30}`
+/// → 同一票立即接入成功。
+#[tokio::test]
+async fn e32_admin_renew_restores_expired_tenant_admission() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xE2);
+    let root = owner.issuer.verifying_key().to_bytes();
+    // 文件入口：已过期的在册租户（CLI 无到期参数）
+    std::fs::write(
+        dir.path().join("owners.jsonl"),
+        format!(
+            "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":{}}}\n",
+            hex::encode(owner.fabric_id),
+            hex::encode(root),
+            now_ms() - 1
+        ),
+    )
+    .unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+        ],
+        &[],
+        true,
+    );
+    let server_id = fetch_server_id(server.gateway).await;
+    let client = SecretKey::generate();
+    let token = owner.token_for(&server_id, &client.public(), CAP_RELAY);
+
+    // 到期：owner-expired（在册但过期的区分 reason）+ 敲门台账记入该类别
+    let reason = expect_denied(server.relay_addr(), &client, Some(token.clone())).await;
+    assert_eq!(reason, "dweb/owner-expired");
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks", None).await;
+    let knocks = parse_ok(s, &body);
+    let knock = find_by_endpoint(&knocks["knocks"], &hex::encode(client.public().as_bytes()));
+    assert_eq!(knock["last_reason"], "dweb/owner-expired", "到期提醒类别");
+
+    // 名册 status=expired、expires_in=0
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let entry = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == hex::encode(root))
+        .unwrap()
+        .clone();
+    assert_eq!(entry["status"], "expired");
+    assert_eq!(entry["expires_in"], 0);
+
+    // admin renew 30 天 → 同一票接入成功（无需重签/重启）
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        &format!(
+            "/admin/owners/{}/{}/renew",
+            hex::encode(owner.fabric_id),
+            hex::encode(root)
+        ),
+        Some(&serde_json::json!({"expires_in_days": 30})),
+    )
+    .await;
+    let receipt = parse_ok(s, &body);
+    assert_eq!(receipt["op"], "renew");
+    assert!(receipt["expires_at"].as_u64().unwrap() > now_ms() + 29 * 24 * 3_600_000);
+    expect_connected(server.relay_addr(), &client, Some(token)).await;
+
+    // 名册翻 active
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let entry = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == hex::encode(root))
+        .unwrap()
+        .clone();
+    assert_eq!(entry["status"], "active");
+    // 恰好其一：双键 → 400 invalid-request
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        &format!(
+            "/admin/owners/{}/{}/renew",
+            hex::encode(owner.fabric_id),
+            hex::encode(root)
+        ),
+        Some(&serde_json::json!({"expires_in_days": 7, "permanent": true})),
+    )
+    .await;
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(error_code_of(&body), "invalid-request");
+    drop(server);
+}
+
+/// 黑名单管理面：endpoint 维度**有效票不豁免**（同票拒）+ fabric 维度 +
+/// 列表（kind/id/reason）+ 移除恢复。
+#[tokio::test]
+async fn e33_admin_blocklist_same_ticket_rejected_both_dimensions() {
+    let dir = TempDir::new().unwrap();
+    let owner = Owner::new(0xE3);
+    owner.register(dir.path());
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+        ],
+        &[],
+        true,
+    );
+    let server_id = fetch_server_id(server.gateway).await;
+    let client = SecretKey::generate();
+    let endpoint_hex = hex::encode(client.public().as_bytes());
+    let token = owner.token_for(&server_id, &client.public(), CAP_RELAY);
+
+    // 基线：有效票接入成功
+    expect_connected(server.relay_addr(), &client, Some(token.clone())).await;
+
+    // endpoint 维度拉黑：同票（有效 capability）被拒 dweb/blocked
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        "/admin/blocklist",
+        Some(&serde_json::json!({
+            "kind": "endpoint",
+            "id": endpoint_hex,
+            "reason": "e2e abuse",
+        })),
+    )
+    .await;
+    assert_eq!(parse_ok(s, &body)["op"], "block-add");
+    let reason = expect_denied(server.relay_addr(), &client, Some(token.clone())).await;
+    assert_eq!(reason, "dweb/blocked", "有效票不豁免黑名单");
+    // dweb/blocked 不入敲门台账（排除项）
+    let (s, body) = admin_json(&server, "GET", "/admin/knocks?include_dismissed=true", None).await;
+    let knocks = parse_ok(s, &body);
+    assert!(
+        knocks["knocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["endpoint_id"] != endpoint_hex.as_str()),
+        "blocked deny 不入台账"
+    );
+
+    // 列表：kind/id/reason/ts 齐
+    let (s, body) = admin_json(&server, "GET", "/admin/blocklist", None).await;
+    let entries = parse_ok(s, &body)["entries"].clone();
+    let entry = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == endpoint_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["kind"], "endpoint");
+    assert_eq!(entry["reason"], "e2e abuse");
+    assert!(entry["ts"].as_u64().unwrap() > 0);
+
+    // 移除 endpoint 维度 → 恢复接入
+    let (s, _) = admin_json(
+        &server,
+        "DELETE",
+        &format!("/admin/blocklist/endpoint/{endpoint_hex}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200);
+    expect_connected(server.relay_addr(), &client, Some(token.clone())).await;
+
+    // fabric 维度：拉黑租户 fabric → 同票拒
+    let fabric_hex = hex::encode(owner.fabric_id);
+    let (s, _) = admin_json(
+        &server,
+        "POST",
+        "/admin/blocklist",
+        Some(&serde_json::json!({"kind": "fabric", "id": fabric_hex})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let reason = expect_denied(server.relay_addr(), &client, Some(token.clone())).await;
+    assert_eq!(reason, "dweb/blocked");
+    let (s, _) = admin_json(
+        &server,
+        "DELETE",
+        &format!("/admin/blocklist/fabric/{fabric_hex}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 200);
+    expect_connected(server.relay_addr(), &client, Some(token)).await;
+    // 移除不存在的维度 → 404 no-match
+    let (s, body) = admin_json(
+        &server,
+        "DELETE",
+        &format!("/admin/blocklist/fabric/{fabric_hex}"),
+        None,
+    )
+    .await;
+    assert_eq!(s, 404, "{body}");
+    assert_eq!(error_code_of(&body), "no-match");
+    drop(server);
+}
+
+/// 元数据 PATCH 全链（owners/visitors）：设置→列表回显→空串清除→缺省保留
+/// + owner-meta 回执可用 services.json ServerId 验签 + 404 面。
+#[tokio::test]
+async fn e34_admin_metadata_patch_owners_and_visitors() {
+    let dir = TempDir::new().unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+        ],
+        &[],
+        false,
+    );
+    let server_id = fetch_server_id(server.gateway).await;
+    let (fabric, root) = ([0x41; 32], [0x42; 32]);
+    let (fabric_hex, root_hex) = (hex::encode(fabric), hex::encode(root));
+
+    // 注册（既有 admin 路由）→ PATCH 设置
+    let (s, _) = admin_json(
+        &server,
+        "POST",
+        "/admin/owners",
+        Some(&serde_json::json!({"fabric_id_hex": fabric_hex, "root_hex": root_hex})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, body) = admin_json(
+        &server,
+        "PATCH",
+        &format!("/admin/owners/{fabric_hex}/{root_hex}"),
+        Some(&serde_json::json!({"alias": "alpha", "note": "first"})),
+    )
+    .await;
+    let receipt = parse_ok(s, &body);
+    assert_eq!(receipt["op"], "owner-meta");
+    assert_eq!(receipt["alias"], "alpha");
+    // 回执验签（e14 同款：canonical 103B，op=0x0D）
+    let canonical = admin_receipt_canonical(
+        0x0D,
+        &fabric,
+        &root,
+        receipt["ts"].as_u64().unwrap(),
+        receipt["generation"].as_u64().unwrap(),
+    );
+    use ed25519_dalek::Verifier;
+    let sig: [u8; 64] = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        receipt["receipt_sig"].as_str().unwrap(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    ed25519_dalek::VerifyingKey::from_bytes(&server_id)
+        .unwrap()
+        .verify(&canonical, &ed25519_dalek::Signature::from_bytes(&sig))
+        .expect("owner-meta 回执可验签");
+
+    // 列表回显 → 空串清除 note（alias 缺省保留）
+    let (s, body) = admin_json(
+        &server,
+        "PATCH",
+        &format!("/admin/owners/{fabric_hex}/{root_hex}"),
+        Some(&serde_json::json!({"note": ""})),
+    )
+    .await;
+    let receipt = parse_ok(s, &body);
+    assert!(receipt.get("note").is_none(), "空串=清除");
+    assert_eq!(receipt["alias"], "alpha", "缺省保留");
+    // 重启归并：磁盘携带终值（1b 潜在漂移的回归钉）
+    drop(server);
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+        ],
+        &[],
+        false,
+    );
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let entry = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == root_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["alias"], "alpha", "重启归并不丢元数据");
+    assert!(entry.get("note").is_none(), "清除跨重启成立");
+
+    // visitor PATCH：grant → 设置/清除 → 名册回显 → unknown 404
+    let ep = "d4".repeat(32);
+    let (s, _) = admin_json(
+        &server,
+        "POST",
+        "/admin/visitors",
+        Some(&serde_json::json!({"endpoint_id": ep, "alias": "old"})),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, body) = admin_json(
+        &server,
+        "PATCH",
+        &format!("/admin/visitors/{ep}"),
+        Some(&serde_json::json!({"alias": "", "note": "kept-note"})),
+    )
+    .await;
+    let receipt = parse_ok(s, &body);
+    assert_eq!(receipt["op"], "visitor-meta");
+    assert!(receipt.get("alias").is_none(), "清除");
+    assert_eq!(receipt["note"], "kept-note");
+    let (s, body) = admin_json(&server, "GET", "/admin/visitors", None).await;
+    let entry = find_by_endpoint(&parse_ok(s, &body)["visitors"], &ep);
+    assert!(entry.get("alias").is_none());
+    assert_eq!(entry["note"], "kept-note");
+    let (s, body) = admin_json(
+        &server,
+        "PATCH",
+        &format!("/admin/visitors/{}", "ee".repeat(32)),
+        Some(&serde_json::json!({"alias": "x"})),
+    )
+    .await;
+    assert_eq!(s, 404, "{body}");
+    assert_eq!(error_code_of(&body), "no-match");
+    drop(server);
+}
+
+/// 真实 kill-between-fsyncs 崩溃注入（1b e24 磁盘等价态构型的升级）：真码经
+/// 1c 签发路由落地 → codes.jsonl 置 0444 → /register 完成 owners register
+/// fsync 后 consume 追加失败（500、pending 挂起、码入 deny-set——运维投影
+/// denied=true）→ **SIGKILL 真实杀死服务进程**（非手工构造磁盘态）→ 恢复
+/// 可写并重启 → 启动 reconciliation 补齐 consume → denied=false、同键回放
+/// 200、他键耗尽。
+#[tokio::test]
+#[cfg(unix)]
+async fn e35_real_kill_between_fsyncs_recovery_and_deny_set_projection() {
+    if nix::unistd::Uid::effective().is_root() {
+        return; // root 无视 0444——e25/e26 同款跳过纪律
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let mut server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+            ("DWEB_REGISTER_RATE_PER_MIN", "1000"),
+        ],
+        &[],
+        false,
+    );
+
+    // 真码：经 1c 签发路由（不再手工构造 codes.jsonl）
+    let (s, body) = admin_json(
+        &server,
+        "POST",
+        "/admin/codes",
+        Some(&serde_json::json!({"alias_hint": "kill-window"})),
+    )
+    .await;
+    let issue = parse_ok(s, &body);
+    let code = issue["code"].as_str().unwrap().to_string();
+    let code_hash_hex = issue["code_hash"].as_str().unwrap().to_string();
+
+    // 锁 consume 追加：register ①（owners fsync）durable、② 失败 → 500
+    let codes_path = dir.path().join("codes.jsonl");
+    std::fs::set_permissions(&codes_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let fabric = [0x51; 32];
+    let root_key = SigningKey::from_bytes(&[0x52; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 500, "{body}");
+    let owners_text = std::fs::read_to_string(dir.path().join("owners.jsonl")).unwrap();
+    assert!(
+        owners_text.contains(&format!("\"via_code_hash\":\"{code_hash_hex}\"")),
+        "跨台账提交 ① 已 durable（kill 窗口达成）"
+    );
+
+    // deny-set 运维投影（1b 遗留）：GET /admin/codes 的 denied=true
+    let (s, body) = admin_json(&server, "GET", "/admin/codes", None).await;
+    let list = parse_ok(s, &body);
+    let entry = list["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code_hash"] == code_hash_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["denied"], true, "补写失败的码显式 fail-closed 呈现");
+
+    // 真实 kill：SIGKILL 杀死 pending 挂起中的进程（Server guard 的 kill+wait
+    // 幂等——对已死进程的二次 kill 返回 Err 被忽略）
+    server.child.kill().expect("SIGKILL 崩溃注入");
+    let _ = server.child.wait();
+    drop(server);
+
+    // 恢复可写 → 重启：启动 reconciliation 补齐 consume（完整兑换）
+    std::fs::set_permissions(&codes_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let server = Server::spawn(
+        dir.path(),
+        &[
+            ("DWEB_ACCESS_MODE", "restricted"),
+            ("DWEB_ADMIN_TOKEN", ROLES_ADMIN_TOKEN),
+            ("DWEB_REGISTER_RATE_PER_MIN", "1000"),
+        ],
+        &[],
+        false,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let codes_text = std::fs::read_to_string(&codes_path).unwrap();
+        if codes_text.contains("\"op\":\"consume\"") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "重启 reconciliation 未补齐 consume：{codes_text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // denied=false（投影复位）+ used_count=1 + 租户在册
+    let (s, body) = admin_json(&server, "GET", "/admin/codes", None).await;
+    let list = parse_ok(s, &body);
+    let entry = list["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code_hash"] == code_hash_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["denied"], false, "补写成功即从 deny-set 移除");
+    assert_eq!(entry["used_count"], 1);
+    let (s, body) = admin_json(&server, "GET", "/admin/owners", None).await;
+    let owners = parse_ok(s, &body);
+    let root_hex = hex::encode(root_key.verifying_key().to_bytes());
+    let entry = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["root"] == root_hex.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(entry["status"], "active", "完整兑换：烧码无租户不发生");
+
+    // 同键重试 → 200 幂等回放（回执可用 ServerId 验签）；他键 → 耗尽
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &root_key, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 200, "{body}");
+    let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let canonical = register_receipt_canonical(
+        &hex::decode(&code_hash_hex).unwrap().try_into().unwrap(),
+        &fabric,
+        &root_key.verifying_key().to_bytes(),
+        replay["ts"].as_u64().unwrap(),
+        replay["generation"].as_u64().unwrap(),
+    );
+    use ed25519_dalek::Verifier;
+    let sig: [u8; 64] = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        replay["receipt_sig"].as_str().unwrap(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let server_id = fetch_server_id(server.gateway).await;
+    ed25519_dalek::VerifyingKey::from_bytes(&server_id)
+        .unwrap()
+        .verify(&canonical, &ed25519_dalek::Signature::from_bytes(&sig))
+        .expect("回放回执可验签");
+    let other = SigningKey::from_bytes(&[0x53; 32]);
+    let (s, body) = http_post_json(
+        server.gateway,
+        "/register",
+        &register_body(&code, &fabric, &other, now_ms()),
+        &[],
+    )
+    .await;
+    assert_eq!(s, 400, "{body}");
+    assert_eq!(error_code_of(&body), "code-exhausted");
+    drop(server);
+}
