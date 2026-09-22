@@ -303,6 +303,7 @@
 | owner-meta 0x0D | fabric_id | root | `fabric_id`/`root`/`alias?`/`note?` |
 | visitor-meta 0x0E | 零 | endpoint_id | `endpoint_id`/`alias?`/`note?` |
 
+**实现期冻结（1c 增补）**：① `permanent` 的 wire 形态=回执/兑换响应 `expires_at: u64::MAX`（恒数字，与回放回落先例一致）、owners 列表 `expires_at: null`；② 回执 wire 显式携带两槽位字段（未用维度为 64 个 "0"，与 canonical 置零同步——客户端零特例重建）；③ visitors/blocklist 台账在 **open 模式下同样加载**（管理面与门禁执行面正交；O-9 冻结不变——open 不装 gate、门禁不生效；open 下坏行同样 fail-fast）；④ revoke/dismiss 族对 unknown 目标=404 no-match 且不写无效事件；重复 blocklist DELETE 第二次 404（幂等收敛）。
 **client-sdk 同步义务**：`packages/client-sdk` 的 `./admin` subpath MUST 同步扩展 op 映射（0x04-0x0C）、Receipt 类型 union 与 canonical builder；`receipt-vector.json` fixture MUST 增补新 op 向量（Rust 生成断言 + TS 只读对拍，重生走既有 `DWEB_REGEN_FIXTURES=1` 门）；`register-receipt/v1` 的客户端验签 helper 随 `opendweb join` 提供。输入校验上限（越界 400 `invalid-request`）：`alias ≤ 32` UTF-8 字节、`note ≤ 256`、`alias_hint ≤ 32`、`max_uses ≤ 1000`、`expires_in_days ≥ 1`（0 非法）、`permanent:true` 与 `expires_in_days` 恰好其一；**到期边界冻结**：`now >= expires_at` 即过期（等值=过期）。
 
 - **敲门**：`GET /admin/knocks`（排序冻结：dismissed 在前与否分组——未处置在前、组内 seq 降序（last_at 仅展示）、endpoint_id 升序 tie-break；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss` 与 `POST /admin/knocks/{endpoint_id}/undismiss`（均幂等，回执 op=knock-dismiss/knock-undismiss）。

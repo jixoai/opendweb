@@ -279,6 +279,11 @@ P1×12、P2×4 均已落入 spec/design/tasks。
 - r3（codex-review-sar-r3.md，6.8/10）：码级 pending 预留+幂等键、
   热重载 reconciliation、KnockLog seq 主键统一、PM resolve 残留
   清除、O-9 收敛、重放/代理日志红线、webui-console 基座增补落地。
+- r4-r7（7.2/7.6/8.0/**8.4 设计层 GO**）：校验序终态（PoP 前置）/首启
+  整服务 fail-fast/seq 唯一排序/同键回放不刷新（续期=持新码）/基座
+  场景排除 switch——九条实现验收基线见 codex-review-sar-r7.md §4。
+- 实现期增补：元数据 PATCH 0x0D/0x0E（d999ae7）；1b 六项接口冻结
+  回写（ce3cf0b）；1c 四项 wire/加载/404 语义回写。
 遗留（非阻塞、实现期观察）：
 - fabric_id 自声明残余：UI 钓鱼警示 + 二元组呈现已冻结；genesis 绑定
   proof（FabricId 可验派生）列 Phase 2 候选
