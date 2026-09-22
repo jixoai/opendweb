@@ -18,3 +18,6 @@ packages/server-binary/bin/dweb-server-aarch64-apple-darwin
 
 # webui SPA 预构建产物入库（webui-console design §1 冻结：dist 随包分发）
 !packages/webui/dist/
+
+# opendweb CLI 测试以默认 DWEB_HOME 生成的本地数据（测试产物，不入库）
+packages/opendweb/dweb-data/
