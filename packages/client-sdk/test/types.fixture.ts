@@ -227,3 +227,73 @@ type ActiveUrlOnEvent = POST_INTEGRATION extends true
 export type { ActiveUrlOnEvent, ActiveUrlOnStatus };
 
 void optsCaps;
+
+// ---- sdk-mgmt-surface tasks 2.1/3.1：./admin 与 ./token 子路径类型面 ---------------
+// .mjs 运行时 + .d.mts 类型（NodeNext 下 ./admin/index.mjs → ./admin/index.d.mts）；
+// 两 subpath 零运行时依赖、ESM-only（import 载入）。
+
+import { AdminClient, adminPublicKeyFromServices, receiptCanonical, verifyReceipt } from "../admin/index.mjs";
+import type {
+  AdminConnectionsView,
+  AdminDisconnectReceipt,
+  AdminRegisterReceipt,
+  AdminStatus,
+  ReceiptVerifier,
+} from "../admin/index.mjs";
+import { decodeCapability, decodeInvite } from "../token/index.mjs";
+import type { DecodedCapability, DecodedInvite } from "../token/index.mjs";
+
+const admin = new AdminClient({ baseUrl: "https://dweb.example", token: "admin-token" });
+const adminTimeout = new AdminClient({ baseUrl: "https://dweb.example/", token: "t", timeoutMs: 250 });
+
+async function adminRoundtrip(): Promise<void> {
+  const st: AdminStatus = await admin.status();
+  const view: AdminConnectionsView = await admin.connections();
+  const owners = await admin.listOwners();
+  const reg: AdminRegisterReceipt = await admin.registerOwner("ab".repeat(32), "cd".repeat(32));
+  await admin.unregisterOwner("ab".repeat(32), "cd".repeat(32));
+  await admin.disconnect({ endpointId: "ef".repeat(32) });
+  await admin.disconnect({ fabricId: "ef".repeat(32) });
+  const probe: true = await adminTimeout.probeEnabled();
+  void st; void view; void owners; void reg; void probe;
+}
+void adminRoundtrip;
+
+const registerReceipt: AdminRegisterReceipt = {
+  op: "register",
+  fabric_id: "ab".repeat(32),
+  root: "cd".repeat(32),
+  ts: 1789012345678,
+  generation: 4,
+  receipt_sig: "AA",
+};
+const disconnectReceipt: AdminDisconnectReceipt = {
+  op: "disconnect",
+  fabric_id: "ab".repeat(32),
+  endpoint_id: "cd".repeat(32),
+  ts: 1,
+  generation: 1,
+  receipt_sig: "AA",
+};
+const canonical: Uint8Array = receiptCanonical(registerReceipt);
+const verifier: ReceiptVerifier = (message, signature) => message.length === 103 && signature.length === 64;
+const verified: Promise<boolean> = verifyReceipt(disconnectReceipt, verifier);
+const pk: string = adminPublicKeyFromServices({
+  server: "dweb",
+  version: "0.6.0",
+  gateway: null,
+  services: [],
+  server_id: "ab".repeat(32),
+});
+void canonical; void verified; void pk;
+
+const invite: DecodedInvite = decodeInvite("dweb2.material");
+const inviteUrl: string = invite.relays[0]?.url ?? "";
+const inviteHasCap: boolean = invite.relays[0]?.hasCapability ?? false;
+void inviteUrl; void inviteHasCap; void invite.recipient; void invite.expiresAtMs; void invite.directAddrs;
+
+const cap: DecodedCapability = decodeCapability("dwebr1.material");
+const capRelay: boolean = cap.caps.relay;
+const capRdzAnnounce: boolean = cap.caps.rdzAnnounce;
+const capRdzResolve: boolean = cap.caps.rdzResolve;
+void capRelay; void capRdzAnnounce; void capRdzResolve; void cap.serverId; void cap.issuedAt; void cap.expiresAt; void cap.capsBits; void cap.signature;

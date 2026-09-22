@@ -25,6 +25,14 @@
     "./http/internals": {
       "types": "./http/internals.d.ts",
       "default": "./http/internals.js"
+    },
+    "./admin": {
+      "types": "./admin/index.d.mts",
+      "default": "./admin/index.mjs"
+    },
+    "./token": {
+      "types": "./token/index.d.mts",
+      "default": "./token/index.mjs"
     }
   },
   "napi": {
@@ -38,6 +46,7 @@
     "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
     "test": "npm run test:types && node --test --test-force-exit test/*.test.mjs",
     "test:types": "tsc --noEmit -p test/tsconfig.fixture.json",
+    "test:pack": "node scripts/pack-gate.mjs",
     "typecheck": "tsc --noEmit",
     "build:win": "PATH=\"$HOME/.cargo/bin:$PATH\" LIBNODE_PATH=\"$HOME/libnode-win\" cargo build --release --target x86_64-pc-windows-gnu -p dweb-client-sdk && cp \"$HOME/.cargo-target/dweb/x86_64-pc-windows-gnu/release/dweb_client_sdk.dll\" dweb.win32-x64.node"
   },
@@ -52,6 +61,8 @@
     "index.d.ts",
     "net",
     "http",
+    "admin",
+    "token",
     "dweb.darwin-arm64.node",
     "dweb.win32-x64.node"
   ],

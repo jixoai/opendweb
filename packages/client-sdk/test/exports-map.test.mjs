@@ -77,15 +77,19 @@ test("exports map: unknown subpath rejects (fail-loud)", () => {
 });
 
 // 相对路径形态（模拟外部消费者按 exports map 目标文件直接取用）
-test("exports map: relative file targets exist for all five entries", () => {
+test("exports map: relative file targets exist for all entries (final set: 5 CJS + admin/token ESM)", () => {
   const pkg = require("../package.json");
   const entries = Object.keys(pkg.exports);
+  // sdk-mgmt-surface task 2.2 完成态断言：最终 exports 全集 = . /net /net/internals
+  // /http /http/internals /admin /token（design §3 共享面协议冻结）
   assert.deepEqual(entries.sort(), [
     ".",
+    "./admin",
     "./http",
     "./http/internals",
     "./net",
     "./net/internals",
+    "./token",
   ]);
   for (const key of entries) {
     const target = pkg.exports[key];
@@ -94,5 +98,38 @@ test("exports map: relative file targets exist for all five entries", () => {
     const fs = require("node:fs");
     assert.ok(fs.existsSync(jsPath), `${key}: ${jsPath}`);
     assert.ok(fs.existsSync(dtsPath), `${key}: ${dtsPath}`);
+  }
+});
+
+// sdk-mgmt-surface task 2.1：./admin 与 ./token 为 .mjs + .d.mts 纯 ESM
+// entrypoint（CJS 包内合法共存；ESM-only 契约——import 载入，不承诺 require()）
+test("exports map: admin/token ESM subpaths resolve and import (self-reference)", async () => {
+  const adminPath = require.resolve("@jixo/opendweb-client-sdk/admin");
+  const tokenPath = require.resolve("@jixo/opendweb-client-sdk/token");
+  assert.ok(adminPath.endsWith("admin/index.mjs"), adminPath);
+  assert.ok(tokenPath.endsWith("token/index.mjs"), tokenPath);
+
+  const admin = await import("@jixo/opendweb-client-sdk/admin");
+  assert.equal(typeof admin.AdminClient, "function");
+  assert.equal(typeof admin.AdminError, "function");
+  assert.equal(typeof admin.receiptCanonical, "function");
+  assert.equal(typeof admin.verifyReceipt, "function");
+  assert.equal(typeof admin.adminPublicKeyFromServices, "function");
+
+  const token = await import("@jixo/opendweb-client-sdk/token");
+  assert.equal(typeof token.decodeInvite, "function");
+  assert.equal(typeof token.decodeCapability, "function");
+  assert.equal(typeof token.TokenError, "function");
+});
+
+// 隔离规则（design §2.1）：两 subpath 源码零 import——MUST NOT 引包内
+// root/net/http（无传递 native 加载）。静态断言：源码不出现任何模块加载语句。
+test("exports map: admin/token sources contain no module loading (native isolation)", () => {
+  const fs = require("node:fs");
+  for (const file of ["admin/index.mjs", "token/index.mjs"]) {
+    const src = fs.readFileSync(path.join(here, "..", file), "utf8");
+    assert.ok(!/(?:^|\n)\s*import[\s("'{*]/.test(src), `${file}: 不含 import 语句`);
+    assert.ok(!/(?:^|\n)\s*export[\s{*]+from\s/.test(src), `${file}: 不含 re-export`);
+    assert.ok(!/\brequire\s*\(/.test(src), `${file}: 不含 require() 调用`);
   }
 });
