@@ -836,6 +836,52 @@ test("adaptive e2e: plugin --help renders zero-exec usage, exit 0", async () => 
   assert.match(r.out, /greet by name/);
 });
 
+// ---------------------------------------------------------------------------
+// 单命令折叠派发 e2e（webui-console）：单命令 manifest 可省略命令 token
+// ---------------------------------------------------------------------------
+
+/** 在 e2e 环境追加安装单命令 fixture（opendweb-solo：唯一命令 solo，无 required） */
+async function soloProjectEnv() {
+  const env = await pluginProjectEnv();
+  await fsp.cp(path.join(FIXTURES_DIR, "opendweb-solo"), path.join(env.dir, "node_modules", "opendweb-solo"), { recursive: true });
+  return env;
+}
+
+test("adaptive e2e: single-command plugin folds the command token (flag-first and empty argv)", async () => {
+  const env = await soloProjectEnv();
+  // flag 首形态：opendweb solo --server X ≡ opendweb solo solo --server X
+  const folded = await runCli(["solo", "--server", "X"], env);
+  assert.equal(folded.code, 0, folded.err);
+  assert.match(folded.out, /solo run command=solo server=X loud=false/);
+  // 空 argv：同样折叠派发唯一命令（不再落 help 渲染）
+  const bare = await runCli(["solo"], env);
+  assert.equal(bare.code, 0, bare.err);
+  assert.match(bare.out, /solo run command=solo server=- loud=false/);
+});
+
+test("adaptive e2e: single-command plugin keeps the explicit command token form (equivalent)", async () => {
+  const env = await soloProjectEnv();
+  const explicit = await runCli(["solo", "solo", "--server", "Y", "--loud"], env);
+  assert.equal(explicit.code, 0, explicit.err);
+  assert.match(explicit.out, /solo run command=solo server=Y loud=true/);
+});
+
+test("adaptive e2e: single-command folding does not affect --help zero execution", async () => {
+  const env = await soloProjectEnv();
+  const r = await runCli(["solo", "--help"], env);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /opendweb solo solo \[--server <string> --loud\]/);
+  // 零执行：help 只渲染清单声明，不触发 run
+  assert.ok(!r.out.includes("solo run"), `run executed in help path: ${r.out}`);
+});
+
+test("adaptive e2e: multi-command manifest does not fold (unknown command lists available)", async () => {
+  const env = await pluginProjectEnv(); // echo fixture: commands hello + fail
+  const r = await runCli(["echo", "--loud"], env);
+  assert.equal(r.code, 2);
+  assert.match(r.err, /plugin echo has no command "--loud" \(available: hello, fail\)/);
+});
+
 test("adaptive e2e: malformed installed plugin is a hard error (no silent skip)", async () => {
   const env = await pluginProjectEnv();
   await fsp.cp(path.join(FIXTURES_DIR, "opendweb-bad"), path.join(env.dir, "node_modules", "opendweb-bad"), { recursive: true });

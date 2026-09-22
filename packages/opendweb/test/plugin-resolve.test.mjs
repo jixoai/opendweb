@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { resolveAdaptive, resolvePluginEntry, BUILTIN_COMMANDS, PluginNotResolved } from "../src/plugin-resolve.mjs";
-import { parseCommandArgs, dispatchPluginCommand, renderPluginHelp, PluginManifestSchema } from "../src/plugin-contract.mjs";
+import { parseCommandArgs, dispatchPluginCommand, renderPluginHelp, foldSingleCommand, PluginManifestSchema } from "../src/plugin-contract.mjs";
 import { candidatesFor, DEFAULT_GLOBS } from "../src/marketplace.mjs";
 import { CliExit } from "../src/util.mjs";
 
@@ -282,6 +282,53 @@ test("renderPluginHelp: zero-execution help from manifest declarations", async (
 test("PluginManifestSchema.safeParse catches missing commands / bad name shape", () => {
   assert.equal(PluginManifestSchema.safeParse({ name: "x", apiVersion: 1, commands: [], run: () => {} }).success, false);
   assert.equal(PluginManifestSchema.safeParse({ name: "Bad_Name", apiVersion: 1, commands: [{ name: "c" }], run: () => {} }).success, false);
+});
+
+// 单命令折叠派发（webui-console）：单命令 manifest 的非命令首 token（flag
+// 或空 argv）折叠派发唯一命令；多命令 manifest 与显式命令 token 零变化。
+// --help 零执行由调用方在派发前判定（wantsPluginHelp），不受折叠影响。
+test("foldSingleCommand: single-command manifest folds non-command token; multi and explicit forms unchanged", () => {
+  const solo = {
+    name: "solo",
+    apiVersion: 1,
+    commands: [{ name: "solo", description: "", args: { type: "object", properties: {}, required: [] } }],
+    run: async () => ({ exit: 0 }),
+  };
+  // 单命令 + flag 首 token：折叠为唯一命令，argv 原样作为命令参数
+  assert.deepEqual(
+    foldSingleCommand({ manifest: solo, rest: ["--server", "X"] }),
+    { command: "solo", argv: ["--server", "X"] },
+  );
+  // 单命令 + 空 argv：同样折叠（直达唯一命令）
+  assert.deepEqual(foldSingleCommand({ manifest: solo, rest: [] }), { command: "solo", argv: [] });
+  // 单命令 + 显式命令 token：既有拆分语义（token 之后为 argv）
+  assert.deepEqual(
+    foldSingleCommand({ manifest: solo, rest: ["solo", "--server", "X"] }),
+    { command: "solo", argv: ["--server", "X"] },
+  );
+
+  const multi = {
+    name: "echo",
+    apiVersion: 1,
+    commands: [
+      { name: "hello", description: "", args: { type: "object", properties: {}, required: [] } },
+      { name: "fail", description: "", args: { type: "object", properties: {}, required: [] } },
+    ],
+    run: async () => ({ exit: 0 }),
+  };
+  // 多命令 + 非 command 首 token：不折叠——原样返回，交由 dispatchPluginCommand
+  // 走「no command」错误路径报可用命令
+  assert.deepEqual(
+    foldSingleCommand({ manifest: multi, rest: ["--loud"] }),
+    { command: "--loud", argv: [] },
+  );
+  // 多命令 + 空 argv：command undefined → help 渲染（既有行为）
+  assert.deepEqual(foldSingleCommand({ manifest: multi, rest: [] }), { command: undefined, argv: [] });
+  // 多命令 + 显式命令 token：既有拆分语义
+  assert.deepEqual(
+    foldSingleCommand({ manifest: multi, rest: ["hello", "--name", "ada"] }),
+    { command: "hello", argv: ["--name", "ada"] },
+  );
 });
 
 // 2026-08-30 alias 体系：plugins.json 的 alias -> package 记录是信任锚——

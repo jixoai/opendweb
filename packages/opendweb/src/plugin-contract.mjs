@@ -86,6 +86,29 @@ export function parseCommandArgs(spec, argv) {
 }
 
 /**
+ * 单命令折叠派发判定（webui-console「零安装直达」）：自适应解析命中插件后，
+ * 依据 manifest 与插件名 token 之后的 argv 决定派发形态。首 token 为 manifest
+ * 任一命令名（显式命令 token）时按既有语义拆分；首 token 非命令 token（flag
+ * 或空 argv）且 manifest 恰声明一个命令时，折叠派发该唯一命令——整个 argv
+ * 作为命令参数（`opendweb webui --server X` ≡ `opendweb webui webui --server X`）。
+ * 多命令 manifest 不折叠：返回原首 token，由 dispatchPluginCommand 走既有
+ * 「no command」错误路径报可用命令清单。调用方负责在派发前完成 --help 判定
+ * （零执行路径不受折叠影响）。
+ * @param {{ manifest: { commands: Array<import("zod").infer<typeof CommandSpecSchema>> }, rest: string[] }} input
+ * @returns {{ command: string | undefined, argv: string[] }} command 为 undefined 表示无命令 token（多命令 manifest 的 help 形态）
+ */
+export function foldSingleCommand({ manifest, rest }) {
+  const [first, ...argv] = rest;
+  if (first !== undefined && manifest.commands.some((c) => c.name === first)) {
+    return { command: first, argv };
+  }
+  if (manifest.commands.length === 1) {
+    return { command: manifest.commands[0].name, argv: rest.slice() };
+  }
+  return { command: first, argv };
+}
+
+/**
  * 插件命令执行包装器：错误归一化、ASCII 纪律、退出码映射（design D3）。
  * run 收 { command, args, log, cwd, stdout, stderr }——stdout/stderr 即包装器
  * 所用的同一流（交互式插件如 cf 的引导直接写 stdout，错误 rethrow 后由

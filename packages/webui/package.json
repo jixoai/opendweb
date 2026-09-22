@@ -1,0 +1,28 @@
+{
+  "name": "opendweb-webui",
+  "version": "0.1.0",
+  "description": "opendweb local management console - sidecar (same-origin admin proxy with pairing) and prebuilt SPA",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "bin": {
+    "opendweb-webui": "./src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/sidecar.mjs",
+    "./opendweb-plugin": "./src/plugin.mjs"
+  },
+  "files": [
+    "src",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/opendweb.git"
+  }
+}

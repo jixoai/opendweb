@@ -1,0 +1,9 @@
+{
+  "name": "opendweb-solo",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "test fixture plugin (single-command manifest for folding dispatch)",
+  "exports": {
+    "./opendweb-plugin": "./plugin.js"
+  }
+}

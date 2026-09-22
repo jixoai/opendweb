@@ -22,7 +22,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { loadMarketplace, marketplaceAdd, marketplaceRemove } from "../src/marketplace.mjs";
 import { resolveAdaptive, wantsPluginHelp, PluginNotResolved } from "../src/plugin-resolve.mjs";
-import { dispatchPluginCommand, renderPluginHelp } from "../src/plugin-contract.mjs";
+import { dispatchPluginCommand, renderPluginHelp, foldSingleCommand } from "../src/plugin-contract.mjs";
 import { pluginAdd, pluginRemove, pluginList, pluginUpdate, latestVersion, loadLockfile, readInstalledVersion } from "../src/plugin-registry.mjs";
 import { discoverConfig, loadConfigFile } from "../src/config-file.mjs";
 import { loadDeclaredPlugins, fireHook } from "../src/plugin-runtime.mjs";
@@ -910,7 +910,10 @@ async function runAdaptive(name, rest) {
     );
   }
   const { manifest } = resolved;
-  const [command, ...argv] = rest;
+  // 单命令折叠（webui-console）：单命令 manifest 的非命令首 token（flag 或
+  // 空 argv）直接派发唯一命令；多命令 manifest 与显式命令 token 行为零变化。
+  // --help 判定仍基于完整 argv（含命令 token），折叠不改变零执行路径
+  const { command, argv } = foldSingleCommand({ manifest, rest });
   if (command === undefined || wantsPluginHelp({ argv: rest })) {
     console.log(renderPluginHelp({ name, manifest }));
     return 0;
@@ -1001,6 +1004,8 @@ Usage:
   opendweb <plugin-name> [command] [...]     (or: opendweb use <plugin-name> ...)
       Adaptive plugin dispatch. Non-builtin first tokens resolve via the
       marketplace globs to an installed package's ./opendweb-plugin export.
+      Plugins declaring exactly one command accept its flags directly
+      (opendweb webui --server X equals opendweb webui webui --server X).
       Missing plugins are fetched automatically on first use (get ?? add;
       first candidate wins, so official scoped packages are preferred);
       set DWEB_NO_AUTO_INSTALL=1 to require explicit installation.
