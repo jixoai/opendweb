@@ -1,5 +1,5 @@
 <script lang="ts">
-	// 应用壳：启动失败面 / setup 世界 / ready 世界（§3.2 结构图）。
+	// 应用壳：启动失败面 / setup 世界 / ready 世界（三角色管理台 IA）。
 	// 副作用生命周期在此接线；状态与动作全部在 console store。
 	import { Button } from "$lib/components/ui/button";
 	import { Skeleton } from "$lib/components/ui/skeleton";
@@ -11,31 +11,32 @@
 	import SideNav from "./components/SideNav.svelte";
 	import InsecureStrip from "./components/InsecureStrip.svelte";
 	import OverviewView from "./components/OverviewView.svelte";
-	import AccessView from "./components/AccessView.svelte";
+	import TenantsView from "./components/TenantsView.svelte";
+	import VisitorsView from "./components/VisitorsView.svelte";
+	import OnlineView from "./components/OnlineView.svelte";
 
-	// store 生命周期（hash 监听 + sidecar state 首拉）
+	// store 生命周期（hash 监听（含旧路由收敛）+ sidecar state 首拉）
 	$effect(() => {
 		cs.start();
 		return () => cs.stop();
 	});
 
-	// ready 态常驻轮询（phase 翻转时重启；切页不消失，5s 驱动顶栏健康灯）
+	// ready 态常驻轮询（phase 翻转时重启；切页不消失，5s 驱动顶栏健康灯与待办徽章）
 	$effect(() => {
 		if (cs.phase === "ready") cs.$poll();
 	});
 
-	// 旧路由 #/connect 在 ready 态收敛为「总览 + 连接详情面板」（§3.1 裁决 1）
+	// 各页数据拉取：总览需要名册计数；租户页需要名册+邀请码；门禁页需要
+	// 敲门/访客/黑名单——进页即拉，动作后各自刷新。
 	$effect(() => {
-		if (cs.route.panel === true && cs.phase === "ready") cs.toggleDetails(true);
-	});
-
-	// 名册拉取：总览需要所有者计数；名册视角需要列表——两处共享同一 state
-	$effect(() => {
-		if (
-			cs.phase === "ready" &&
-			(cs.route.view === "overview" || (cs.route.view === "access" && cs.route.section === "roster"))
-		) {
-			void cs.refreshOwners();
+		if (cs.phase !== "ready") return;
+		const view = cs.route.view;
+		if (view === "overview" || view === "tenants") void cs.refreshOwners();
+		if (view === "tenants") void cs.refreshCodes();
+		if (view === "visitors") {
+			void cs.refreshKnocks();
+			void cs.refreshVisitors();
+			void cs.refreshBlocklist();
 		}
 	});
 
@@ -84,8 +85,12 @@
 				<div class="mx-auto flex w-full max-w-6xl flex-col">
 					{#if cs.route.view === "overview"}
 						<OverviewView />
+					{:else if cs.route.view === "tenants"}
+						<TenantsView />
+					{:else if cs.route.view === "visitors"}
+						<VisitorsView />
 					{:else}
-						<AccessView />
+						<OnlineView />
 					{/if}
 				</div>
 			</main>

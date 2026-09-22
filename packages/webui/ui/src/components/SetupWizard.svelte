@@ -33,7 +33,7 @@
 				<Card.Title class="text-xl">已连接。正在进入总览…</Card.Title>
 				<Card.Description>
 					目标已锁定：<span class="font-mono">{cs.sidecar?.server_host_masked ?? "-"}</span>
-					——本进程运行期间不能改指其他服务器。
+					——运行期间经顶栏「节点簿」切换到其他已保存的节点。
 				</Card.Description>
 			</Card.Header>
 			<Card.Footer class="justify-center">
@@ -145,7 +145,7 @@
 							{/if}
 						</Button>
 						<p class="text-xs leading-relaxed text-muted-foreground">
-							连接成功后目标即锁定——本进程运行期间不能改指其他服务器；需要更换时，退出并在终端重新运行命令。
+							连接成功后目标即锁定——本进程运行期间不能经此表单改指；需要换节点时，用顶栏「节点簿」切换已保存的节点。
 						</p>
 					</div>
 				</form>

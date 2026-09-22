@@ -39,7 +39,7 @@
 			<dt class="text-muted-foreground">时间</dt>
 			<dd>{formatTime(receipt.ts)}</dd>
 			<dt class="text-muted-foreground">名册版本</dt>
-			<dd class="font-mono" title="每次所有者名册变更后加 1，用于确认变更已生效">
+			<dd class="font-mono" title="每次租户名册变更后加 1，用于确认变更已生效">
 				v{receipt.generation ?? "-"}
 			</dd>
 			<dt class="text-muted-foreground">目标</dt>

@@ -36,7 +36,7 @@ export function errorCopy(error: AdminError | null | undefined): { title: string
     case "no-match":
       return {
         title: "目标不在线",
-        detail: "所操作的端点或所有者已不在线或已被移除。在线表已刷新，请核对后再试。",
+        detail: "所操作的端点或租户已不在线或已被移除。在线表已刷新，请核对后再试。",
         retry: true,
       };
     case "timeout":
@@ -136,7 +136,8 @@ export function connectErrorCopy(error: AdminError | null | undefined): { title:
     case "target-frozen":
       return {
         title: "目标已锁定",
-        detail: "本进程已连接过服务器，生命周期内不能改指。需要更换目标：退出本页，在终端重新运行命令。",
+        detail:
+          "本进程已连接过服务器，不能经此表单改指。需要换节点：用顶栏「节点簿」切换到已保存的节点；还没保存的节点，先在节点簿里添加。",
       };
     case "pairing-in-progress":
       return {

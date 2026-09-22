@@ -28,23 +28,29 @@ import { DISCONNECT_PHASE_LABEL, modeBadge, policyLabel, OP_LABEL } from "../ui/
 
 test.afterEach(() => resetApiFetch());
 
-// ---- 路由收敛：两个世界 + 旧 hash 落位（§3.1 / §7.1） ------------------------------
+// ---- 路由收敛：两个世界 + 旧 hash 落位（server-access-roles specs/webui 冻结映射） ----
+// 更新注记（spec 取代 v1）：#/owners→#/tenants、#/access→#/visitors、未知→#/overview；
+// 缩写规则首3***尾3 取代 v1 前 8 位；受限模式 hover 更新为三角色话术——均为
+// server-access-roles 跨 change 规范更替（spec 明示取代旧规则）。
 
 test("routeFor: ready 态默认落地总览，旧 hash 收敛到正确去处", () => {
 	assert.deepEqual(routeFor("#/", "ready"), { view: "overview" });
 	assert.deepEqual(routeFor("", "ready"), { view: "overview" });
-	assert.deepEqual(routeFor("#/xyz-unknown", "ready"), { view: "overview" });
+	assert.deepEqual(routeFor("#/xyz-unknown", "ready"), { view: "overview" }); // 未知 → 总览（不 404）
+	assert.deepEqual(routeFor("#/overview", "ready"), { view: "overview" });
 	assert.deepEqual(routeFor("#/status", "ready"), { view: "overview" }); // 旧状态页 → 总览
-	assert.deepEqual(routeFor("#/connect", "ready"), { view: "overview", panel: true }); // 旧配对页 → 总览+连接详情
-	assert.deepEqual(routeFor("#/owners", "ready"), { view: "access", section: "roster" }); // 旧 Owners → 名册
-	assert.deepEqual(routeFor("#/connections", "ready"), { view: "access", section: "online" }); // 旧连接页 → 在线
-	assert.deepEqual(routeFor("#/access", "ready"), { view: "access", section: "roster" });
-	assert.deepEqual(routeFor("#/access/roster", "ready"), { view: "access", section: "roster" });
-	assert.deepEqual(routeFor("#/access/online", "ready"), { view: "access", section: "online" });
+	assert.deepEqual(routeFor("#/connect", "ready"), { view: "overview" }); // 旧配对页 → 总览（面板意图由 store 保留）
+	assert.deepEqual(routeFor("#/owners", "ready"), { view: "tenants" }); // 旧 Owners → 租户管理
+	assert.deepEqual(routeFor("#/tenants", "ready"), { view: "tenants" });
+	assert.deepEqual(routeFor("#/access", "ready"), { view: "visitors" }); // 旧访问管理 → 访客与门禁
+	assert.deepEqual(routeFor("#/visitors", "ready"), { view: "visitors" });
+	assert.deepEqual(routeFor("#/access/online", "ready"), { view: "online" }); // 旧在线视角 → 在线连接
+	assert.deepEqual(routeFor("#/connections", "ready"), { view: "online" }); // 旧连接页 → 在线
+	assert.deepEqual(routeFor("#/online", "ready"), { view: "online" });
 });
 
 test("routeFor: setup 态任何 hash（含全部旧业务路由）一律落全屏引导", () => {
-	for (const h of ["", "#/", "#/connect", "#/status", "#/owners", "#/connections", "#/access/online"]) {
+	for (const h of ["", "#/", "#/connect", "#/status", "#/owners", "#/connections", "#/access/online", "#/tenants", "#/visitors"]) {
 		assert.deepEqual(routeFor(h, "setup"), { view: "setup" }, `hash ${h}`);
 	}
 });
@@ -196,7 +202,7 @@ test("connect error copy: bad-pairing / target-frozen / invalid-request semantic
 	assert.ok(badPairing.detail.includes("终端"));
 
 	assert.equal(connectErrorCopy(new AdminError("target-frozen", "")).title, "目标已锁定");
-	assert.ok(connectErrorCopy(new AdminError("target-frozen", "")).detail.includes("重新运行命令"));
+	assert.ok(connectErrorCopy(new AdminError("target-frozen", "")).detail.includes("节点簿")); // 切换需经节点簿（design §3.4）
 	assert.equal(connectErrorCopy(new AdminError("invalid-request", "")).title, "信息不完整");
 	assert.equal(connectErrorCopy(new AdminError("bad-origin-host", "")).title, "来源校验失败");
 	assert.ok(connectErrorCopy(new AdminError("bad-target", "not http(s)")).detail.includes("--allow-insecure"));
@@ -217,9 +223,9 @@ test("formatTime: local time + relative time; never ISO 8601", () => {
 	assert.match(fmtClock(1_789_123_456_789), /^\d{2}:\d{2}:\d{2}$/);
 });
 
-test("hex display helpers: abbreviation, validation, signature digest prefix", () => {
+test("hex display helpers: abbreviation (first3***last3), validation, signature digest prefix", () => {
 	const fabric = "ab".repeat(32);
-	assert.equal(shortHex(fabric), `${fabric.slice(0, 8)}…`);
+	assert.equal(shortHex(fabric), `${fabric.slice(0, 3)}***${fabric.slice(-3)}`); // server-access-roles 缩写规则
 	assert.equal(shortHex("abc"), "abc");
 	assert.equal(shortHex(null), "-");
 
@@ -238,7 +244,7 @@ test("hex display helpers: abbreviation, validation, signature digest prefix", (
 // ---- 术语投影（§5.1/§8.3） -----------------------------------------------------------
 
 test("term projections: mode badge, policy label, op verbs — no raw engineering terms", () => {
-	assert.deepEqual(modeBadge("restricted"), { label: "受限模式", title: "只有名册内的所有者可以接入" });
+	assert.deepEqual(modeBadge("restricted"), { label: "受限模式", title: "租户与访客可进，陌生人敲门待放行" }); // 三角色话术（PM §5.1）
 	assert.deepEqual(modeBadge("open"), { label: "开放模式", title: "未启用身份验证，任何人都能接入" });
 	assert.equal(modeBadge(undefined), null);
 	assert.equal(policyLabel("static"), "静态名册");

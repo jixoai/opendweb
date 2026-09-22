@@ -106,6 +106,50 @@ export function fetchSidecarState(): Promise<SidecarState> {
   return jsonFetch("/sidecar/state") as Promise<SidecarState>;
 }
 
+// ---- /sidecar/nodes* 本地控制面（server-access-roles 节点簿；响应零 token） ------
+
+export interface SidecarNode {
+  id: string;
+  name: string;
+  server_host: string;
+  added_at: number;
+  current: boolean;
+}
+
+/** GET /sidecar/nodes → {nodes:[{id,name,server_host,added_at,current}]}。 */
+export function fetchSidecarNodes(): Promise<{ nodes: SidecarNode[] }> {
+  return jsonFetch("/sidecar/nodes") as Promise<{ nodes: SidecarNode[] }>;
+}
+
+/**
+ * POST /sidecar/nodes（添加节点：{pairing_code, server, token, name?}）。
+ * 配对码只出现在终端；token 仅随本请求走一次，调用方提交后必须清空输入框。
+ */
+export function addSidecarNode(payload: { pairing_code: string; server: string; token: string; name?: string }): Promise<{ node: SidecarNode }> {
+  return jsonFetch("/sidecar/nodes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }) as Promise<{ node: SidecarNode }>;
+}
+
+/**
+ * POST /sidecar/nodes/switch {node_id}：唯一被许可的运行时重指向通道——
+ * 仅接受已存 node_id（任何 URL/host 字段 400）；进程内原子切换（无重启）。
+ */
+export function switchSidecarNode(nodeId: string): Promise<{ ok: boolean; node: SidecarNode }> {
+  return jsonFetch("/sidecar/nodes/switch", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ node_id: nodeId }),
+  }) as Promise<{ ok: boolean; node: SidecarNode }>;
+}
+
+/** DELETE /sidecar/nodes/{id}（当前节点 409——先切走）。 */
+export function deleteSidecarNode(nodeId: string): Promise<{ ok: boolean }> {
+  return jsonFetch(`/sidecar/nodes/${encodeURIComponent(nodeId)}`, { method: "DELETE" }) as Promise<{ ok: boolean }>;
+}
+
 /**
  * POST /sidecar/connect（配对面提交 {pairing_code, server, token}）。
  * 失败码：bad-pairing / bad-origin-host / bad-target / invalid-request /
@@ -130,6 +174,13 @@ export interface OwnerEntry {
   fabric_id: string;
   root: string;
   registered_at: number;
+  /** 三角色增量（旧服务端无这些字段 = 永久/无别名；未知字段忽略规则延续） */
+  alias?: string | null;
+  note?: string | null;
+  expires_at?: number | null;
+  /** 剩余毫秒（服务端投影；客户端亦可由 expires_at 推导） */
+  expires_in?: number | null;
+  status?: "active" | "expired";
 }
 
 export interface OwnersData {
@@ -149,9 +200,11 @@ export interface ConnectionsData {
   quota: { configured?: boolean; max_connections_per_owner?: number };
   per_endpoint: { endpoint_id: string; fabric_id: string; connections: number }[];
   per_owner: { fabric_id: string; connections: number }[];
+  /** 三角色增量：访客在线投影（fabric=None 的连接；endpoint_id 字典序） */
+  per_visitor?: { endpoint_id: string; connections: number }[];
 }
 
-/** GET /api/connections → {mode, relay_enabled, quota{}, per_endpoint[], per_owner[]} */
+/** GET /api/connections → {mode, relay_enabled, quota{}, per_endpoint[], per_owner[], per_visitor?[]} */
 export function loadConnections(): Promise<ConnectionsData> {
   return jsonFetch("/api/connections") as Promise<ConnectionsData>;
 }
@@ -164,6 +217,11 @@ export interface StatusData {
   active_connections: { endpoint_id: string; fabric_id: string; connections: number }[];
   per_owner_connections?: { fabric_id: string; connections: number }[];
   relay_enabled?: boolean;
+  /** 三角色增量（旧服务端无这些字段；总览四问的数据源） */
+  knocks_pending?: number;
+  visitors_active?: number;
+  codes_active?: number;
+  visitors_online?: number;
 }
 
 /** POST /api/owners（注册 (fabric_id, root)）→ 回执。入参先过 hex64 客户端校验。 */
@@ -207,4 +265,144 @@ export function disconnectByFabric(fabricId: string): Promise<{ receipts: Receip
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ fabric_id: fabricId }),
   }) as Promise<{ receipts: Receipt[] }>;
+}
+
+// ---- 三角色业务面（server-access-roles specs/webui 路径契约：一律 /api/* → /admin/*） ---
+
+export interface KnockEntry {
+  endpoint_id: string;
+  seq: number;
+  first_at: number;
+  last_at: number;
+  count: number;
+  last_reason: string;
+  dismissed?: boolean;
+}
+
+export interface KnocksData {
+  knocks: KnockEntry[];
+  pending_count: number;
+}
+
+/** GET /api/knocks（排序冻结：未处置在前、组内 seq 降序——以服务端 seq 为准，客户端不再排序）。 */
+export function loadKnocks(): Promise<KnocksData> {
+  return jsonFetch("/api/knocks") as Promise<KnocksData>;
+}
+
+/** POST /api/knocks/{endpoint_id}/dismiss（幂等；忽略 = 待办离场，门禁不变）。 */
+export function dismissKnock(endpointId: string): Promise<Receipt> {
+  return jsonFetch(`/api/knocks/${encodeURIComponent(endpointId)}/dismiss`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }) as Promise<Receipt>;
+}
+
+/** POST /api/knocks/{endpoint_id}/undismiss（幂等；toast 撤销路径）。 */
+export function undismissKnock(endpointId: string): Promise<Receipt> {
+  return jsonFetch(`/api/knocks/${encodeURIComponent(endpointId)}/undismiss`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  }) as Promise<Receipt>;
+}
+
+export interface VisitorEntry {
+  endpoint_id: string;
+  alias?: string | null;
+  note?: string | null;
+  granted_at: number;
+  expires_at?: number | null;
+}
+
+/** GET /api/visitors → {visitors:[{endpoint_id,alias,note,granted_at,expires_at}]}。 */
+export function loadVisitors(): Promise<{ visitors: VisitorEntry[] }> {
+  return jsonFetch("/api/visitors") as Promise<{ visitors: VisitorEntry[] }>;
+}
+
+/** POST /api/visitors（授权访客：endpoint_id 必填；缺省=永久）。 */
+export function grantVisitor(payload: { endpoint_id: string; alias?: string; note?: string; expires_in_days?: number }): Promise<Receipt> {
+  return jsonFetch("/api/visitors", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }) as Promise<Receipt>;
+}
+
+/** POST /api/visitors/from-knock（敲门台一键定位——语义糖，等同 POST）。 */
+export function grantVisitorFromKnock(payload: { endpoint_id: string; alias?: string }): Promise<Receipt> {
+  return jsonFetch("/api/visitors/from-knock", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }) as Promise<Receipt>;
+}
+
+/** DELETE /api/visitors/{endpoint_id}（移出访客名册）。 */
+export function revokeVisitor(endpointId: string): Promise<Receipt> {
+  return jsonFetch(`/api/visitors/${encodeURIComponent(endpointId)}`, { method: "DELETE" }) as Promise<Receipt>;
+}
+
+export interface CodeEntry {
+  code_hash: string;
+  max_uses: number;
+  used_count: number;
+  expires_at: number;
+  alias_hint?: string | null;
+  revoked?: boolean;
+  default_ttl_days?: number | null;
+}
+
+/** GET /api/codes → {codes:[…]}——列表只含哈希与计数，绝无码全文。 */
+export function loadCodes(): Promise<{ codes: CodeEntry[] }> {
+  return jsonFetch("/api/codes") as Promise<{ codes: CodeEntry[] }>;
+}
+
+/** POST /api/codes（签发；**响应含 code 全文——仅此一次**）。 */
+export function issueCode(payload: { alias_hint?: string; max_uses?: number; expires_in_days?: number; default_ttl_days?: number }): Promise<{ code: string } & Receipt> {
+  return jsonFetch("/api/codes", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }) as Promise<{ code: string } & Receipt>;
+}
+
+/** DELETE /api/codes/{code_hash}（吊销：未用次数立即作废；已注册租户不受影响）。 */
+export function revokeCode(codeHash: string): Promise<Receipt> {
+  return jsonFetch(`/api/codes/${encodeURIComponent(codeHash)}`, { method: "DELETE" }) as Promise<Receipt>;
+}
+
+/** POST /api/owners/{fabric_id}/{root}/renew（续期：expires_in_days 或 permanent 恰好其一）。 */
+export function renewOwner(fabricId: string, root: string, body: { expires_in_days?: number; permanent?: boolean }): Promise<Receipt & { expires_at?: number }> {
+  return jsonFetch(`/api/owners/${encodeURIComponent(fabricId)}/${encodeURIComponent(root)}/renew`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }) as Promise<Receipt & { expires_at?: number }>;
+}
+
+export interface BlockEntry {
+  kind: "endpoint" | "fabric";
+  id: string;
+  reason?: string | null;
+  ts: number;
+}
+
+/** GET /api/blocklist → {blocklist:[{kind,id,reason,ts}]}。 */
+export function loadBlocklist(): Promise<{ blocklist: BlockEntry[] }> {
+  return jsonFetch("/api/blocklist") as Promise<{ blocklist: BlockEntry[] }>;
+}
+
+/** POST /api/blocklist（拉黑：kind=endpoint|fabric；先于一切准入判定生效）。 */
+export function addBlocklist(payload: { kind: "endpoint" | "fabric"; id: string; reason?: string }): Promise<Receipt> {
+  return jsonFetch("/api/blocklist", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  }) as Promise<Receipt>;
+}
+
+/** DELETE /api/blocklist/{kind}/{id}（移出黑名单）。 */
+export function removeBlocklist(kind: "endpoint" | "fabric", id: string): Promise<Receipt> {
+  return jsonFetch(`/api/blocklist/${encodeURIComponent(kind)}/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<Receipt>;
 }

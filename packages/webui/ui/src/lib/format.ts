@@ -32,3 +32,37 @@ export function formatTime(ts: number, now: number = Date.now()): string {
   if (typeof ts !== "number" || !Number.isFinite(ts)) return "-";
   return `${fmtLocal(ts)}（${relativeTime(ts, now)}）`;
 }
+
+/** 毫秒时间戳 → 本地日期 YYYY-MM-DD（到期日等纯日期呈现）。 */
+export function fmtDate(ts: number): string {
+  if (typeof ts !== "number" || !Number.isFinite(ts)) return "-";
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** 租期状态（server-access-roles 流 C）：permanent / active / expiring(≤7 天) / expired。
+ * 到期边界冻结：now >= expires_at 即过期（等值=过期）。 */
+export interface LeaseState {
+  state: "permanent" | "active" | "expiring" | "expired";
+  daysLeft: number | null;
+  label: string;
+}
+
+export function leaseState(expiresAt: number | null | undefined, now: number = Date.now()): LeaseState {
+  if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
+    return { state: "permanent", daysLeft: null, label: "在租 · 永久" };
+  }
+  if (now >= expiresAt) return { state: "expired", daysLeft: 0, label: "已到期" };
+  const daysLeft = Math.max(1, Math.ceil((expiresAt - now) / 86_400_000));
+  if (daysLeft <= 7) return { state: "expiring", daysLeft, label: `临期 · 剩 ${daysLeft} 天` };
+  return { state: "active", daysLeft, label: `在租 · 剩 ${daysLeft} 天` };
+}
+
+/** 邀请码展示分组：`dwebc1.` 前缀 + 本体每 4 字符一组（4-4-4-4；只对 dwebc1. 形态重组，其他字符串原样）。 */
+export function groupInviteCode(code: string | null | undefined): string {
+  const raw = String(code ?? "");
+  const m = /^(dwebc1\.)([0-9A-Za-z-]+)$/.exec(raw);
+  if (m === null) return raw;
+  const body = m[2].replace(/-/g, "").replace(/(.{4})(?=.)/g, "$1-");
+  return `${m[1]}${body}`;
+}

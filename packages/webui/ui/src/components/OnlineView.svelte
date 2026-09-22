@@ -19,6 +19,9 @@
 		Array.isArray(cs.connData?.per_endpoint) ? cs.connData!.per_endpoint : [],
 	);
 	const perOwnerAll = $derived(Array.isArray(cs.connData?.per_owner) ? cs.connData!.per_owner : []);
+	const perVisitorAll = $derived(
+		Array.isArray(cs.connData?.per_visitor) ? cs.connData!.per_visitor : [],
+	);
 	const perEndpoint = $derived(
 		cs.onlineFilter !== null ? perEndpointAll.filter((e) => e.fabric_id === cs.onlineFilter) : perEndpointAll,
 	);
@@ -29,8 +32,8 @@
 		cs.connData?.quota?.configured === true ? (cs.connData.quota.max_connections_per_owner ?? "-") : "未设置",
 	);
 	const loading = $derived(cs.connData === null && cs.connError === null);
-	const disconnectNoun = $derived(cs.disconnect?.kind === "fabric" ? "所有者" : "端点");
-	const confirmNoun = $derived(cs.connConfirm?.kind === "fabric" ? "所有者" : "端点");
+	const disconnectNoun = $derived(cs.disconnect?.kind === "fabric" ? "租户" : "端点");
+	const confirmNoun = $derived(cs.connConfirm?.kind === "fabric" ? "租户" : "端点");
 	const phaseFinal = $derived(
 		cs.disconnect?.phase === "converged" || cs.disconnect?.phase === "unconfirmed",
 	);
@@ -45,7 +48,7 @@
 		<div
 			class="flex w-fit items-center gap-2 rounded-full border bg-muted/50 py-1 pr-1.5 pl-3 text-sm"
 		>
-			只看所有者
+			只看租户
 			<span class="font-mono text-[13px]" title={cs.onlineFilter}>{shortHex(cs.onlineFilter)}</span>
 			<Button
 				variant="ghost"
@@ -153,15 +156,15 @@
 			</Card.Header>
 			<Card.Content>
 				{#if perEndpointAll.length === 0}
-					<Empty.Root class="py-6">
-						<Empty.Header>
-							<Empty.Media variant="icon"><WifiOff /></Empty.Media>
-							<Empty.Title>当前没有在线连接。</Empty.Title>
-							<Empty.Description>已注册的所有者建立组网后，连接会实时出现在这里。</Empty.Description>
-						</Empty.Header>
-					</Empty.Root>
-				{:else if perEndpoint.length === 0}
-					<p class="text-sm text-muted-foreground">该所有者当前没有在线连接。</p>
+						<Empty.Root class="py-6">
+							<Empty.Header>
+								<Empty.Media variant="icon"><WifiOff /></Empty.Media>
+								<Empty.Title>当前没有在线连接。</Empty.Title>
+								<Empty.Description>已注册的租户建立组网后，连接会实时出现在这里。</Empty.Description>
+							</Empty.Header>
+						</Empty.Root>
+					{:else if perEndpoint.length === 0}
+						<p class="text-sm text-muted-foreground">该租户当前没有在线连接。</p>
 				{:else}
 					<Table.Root>
 						<Table.Header>
@@ -201,13 +204,13 @@
 
 		<Card.Root class="gap-4 py-5">
 			<Card.Header>
-				<Card.Title class="text-base">按所有者</Card.Title>
+				<Card.Title class="text-base">按租户</Card.Title>
 			</Card.Header>
 			<Card.Content>
 				{#if perOwnerAll.length === 0}
-					<p class="text-sm text-muted-foreground">没有所有者正在使用。</p>
+					<p class="text-sm text-muted-foreground">没有租户正在使用。</p>
 				{:else if perOwner.length === 0}
-					<p class="text-sm text-muted-foreground">该所有者当前没有在线连接。</p>
+					<p class="text-sm text-muted-foreground">该租户当前没有在线连接。</p>
 				{:else}
 					<Table.Root>
 						<Table.Header>
@@ -237,6 +240,51 @@
 									</Table.Cell>
 								</Table.Row>
 							{/each}
+					</Table.Body>
+						</Table.Root>
+					{/if}
+				</Card.Content>
+		</Card.Root>
+
+		<!-- 按访客（server-access-roles 在线投影增量：per_visitor 数组） -->
+		<Card.Root class="gap-4 py-5" data-section="visitors-online">
+			<Card.Header>
+				<Card.Title class="text-base">按访客</Card.Title>
+			</Card.Header>
+			<Card.Content>
+				{#if perVisitorAll.length === 0}
+					<p class="text-sm text-muted-foreground" data-empty="visitors-online">
+						当前没有访客在线。被定位为访客的设备连接后，会出现在这里。
+					</p>
+				{:else}
+					<Table.Root>
+						<Table.Header>
+							<Table.Row>
+								<Table.Head>端点</Table.Head>
+								<Table.Head class="text-right">连接数</Table.Head>
+								<Table.Head class="w-2"></Table.Head>
+							</Table.Row>
+						</Table.Header>
+						<Table.Body>
+							{#each perVisitorAll as v (v.endpoint_id)}
+								<Table.Row>
+									<Table.Cell><HexValue value={v.endpoint_id} kind="端点" /></Table.Cell>
+									<Table.Cell class="text-right font-mono tabular-nums">{v.connections}</Table.Cell>
+									<Table.Cell>
+										<div class="flex justify-end">
+											<Button
+												variant="ghost"
+												size="sm"
+												class="h-7 text-destructive hover:text-destructive"
+												onclick={() => cs.askDisconnect("endpoint", v.endpoint_id, v.connections)}
+											>
+												<CircleX data-icon="inline-start" />
+												断开
+											</Button>
+										</div>
+									</Table.Cell>
+								</Table.Row>
+							{/each}
 						</Table.Body>
 					</Table.Root>
 				{/if}
@@ -260,7 +308,7 @@
 			</p>
 		{:else if cs.connConfirm !== null}
 			<p class="text-foreground">
-				将向服务器下发断开指令，所有者
+				将向服务器下发断开指令，租户
 				<span class="font-mono text-[13px]" title={cs.connConfirm.id}>{shortHex(cs.connConfirm.id)}</span>
 				名下的 <strong class="font-medium">{cs.connConfirm.count} 条连接</strong>会被关闭。
 			</p>
