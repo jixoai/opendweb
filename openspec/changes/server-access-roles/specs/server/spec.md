@@ -1,0 +1,251 @@
+## MODIFIED Requirements
+
+### Requirement: Server 访问策略（owner registry 与 access mode）
+
+服务端 SHALL 维护 owner registry（`<data_dir>/owners.jsonl`，append-only，register/unregister 事件归并出活跃集合）：每条记录为 `(fabric_id, root EndpointId)` 二元组，并可携带元数据 `alias`/`note` 与有效期 `expires_at`（u64 毫秒时间戳；**新增字段 MUST `serde(default)` 兼容——旧格式条目（无这些字段）解析为「永久、无别名」，MUST NOT 因缺字段启动失败**）。活跃集合的判定含时间维度：`expires_at` 已过的条目视为不活跃（L1b 拒绝，见"relay capability 验证"的 `dweb/owner-expired`）。access mode 经 `--access-mode`（CLI）与 `DWEB_ACCESS_MODE`（env）与 config.toml `[server.access]` 配置（优先级 flag > env > config > default），取值 `open`（默认）或 `restricted`。`restricted` 模式下 L2 准入策略由 `policy` 配置项选择 provider：`static`（默认，无票必拒 + 有效票放行）或 `callback`（见"动态策略回调" requirement；`callback_url`/`callback_token` 必填，缺失时启动 fail-fast）。空 registry 语义按 policy 分裂：`static` + 空 registry MUST 拒绝一切 relay 接入（fail-closed）；`callback` + 空 registry = 一切票据被 L1b 拒绝，仅 webhook 放行的无票端点（A_cb(S)，identity-only 动态名单，admin 自担）可达。registry 变更 MUST 持久化并在重启后恢复，且 MUST 使缓存 generation+1（清空策略缓存）。registry 移除 Owner、Owner 到期、加入黑名单的语义一致：**新连接即时拒绝**；已建立的存量连接保持至自然断开或重连收敛（主动断连经管理面 disconnect）。Server Admin（本地配置管理者）与 Relay Owner（registry 内 fabric root，UI 呈现层称「租户」）是不同身份；Owner 自助注册仅经邀请码兑换端点（见"租户邀请码与公开自助注册"），管理面注册仍是 Admin 动作。
+
+服务端 SHALL 另维护两个同构 append-only 台账（同一 registry 存储模式：事件归并出活跃/当前集合、坏行启动 fail-fast、变更 generation+1、mtime 热重载、全字段 `serde(default)` 向后兼容）：
+
+- **访客名册** `<data_dir>/visitors.jsonl`：事件 `{"op":"grant"|"revoke","endpoint_id":"<64hex>","alias"?, "note"?, "expires_at"?, "ts"}`。活跃访客 = 最新 grant 未 revoke 且未过期（`expires_at` 缺省 = 永久）。访客准入语义：relay 握手已密码学认证 endpoint_id（E1 链），设备 key 即身份——**无票接入按以下次序裁决，次序 MUST NOT 重排**：① 黑名单 endpoint 维度命中 → 拒 `dweb/blocked`；② 访客表命中（活跃）→ 放行（不咨询 callback webhook）；③ policy=callback → webhook 裁决（A_cb(S)）；④ 拒 `dweb/no-capability` 并记敲门（见"敲门日志"）。访客的可达面 MUST 限定为 relay 通行 + rendezvous resolve（见"rendezvous 访问控制"）；访客不属于任何 fabric、不出现在 per-owner 投影。访客在线连接计入独立配额 `DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR`（默认 4；超限拒绝 `dweb/visitor-quota-exceeded`），不受（也不占）per-owner 配额。
+- **黑名单** `<data_dir>/blocklist.jsonl`：事件 `{"op":"add"|"remove","kind":"endpoint"|"fabric","id":"<64hex>","reason"?, "ts"}`，当前集合 = add 未 remove。endpoint 维度在凭证分类（C0）**之前**检查（有票无票同样生效）；fabric 维度在 L1 解析出 issuer 后、L1b 之前检查（命中的 issuer fabric 拒 `dweb/blocked`）。黑名单在 `open` 模式下不生效（open 不装配 gate），部署文档 MUST 明示这一边界。
+
+#### Scenario: 空 registry fail-closed（static）
+
+- **WHEN** `restricted` 且 `policy=static` 且 registry 为空，任何客户端连接 relay
+- **THEN** 全部接入被拒绝
+
+#### Scenario: 空 registry 的 callback 模式为 identity-only
+
+- **WHEN** `restricted` 且 `policy=callback` 且 registry 为空，无票端点连接 relay 且 webhook 返回 allow=true
+- **THEN** 该端点接入成功（A_cb(S) 边界）；出示任何票据的端点均被 L1b 拒绝（`dweb/unknown-owner`）
+
+#### Scenario: registry 持久化
+
+- **WHEN** 注册 owner 后重启服务端
+- **THEN** registry 活跃集合恢复，已注册 owner 签发的有效 capability 仍可通过验证链
+
+#### Scenario: 配置优先级
+
+- **WHEN** 同一配置项在 CLI flag、环境变量、config.toml 中同时以不同值出现
+- **THEN** 生效值为 CLI flag > env > config.toml > default
+
+#### Scenario: unregister 阻断新连接
+
+- **WHEN** 某 owner 被 unregister 后，其名下已签发的 capability 再次用于新连接
+- **THEN** 新连接被拒（`dweb/unknown-owner`）；（存量连接语义见 requirement 正文）
+
+#### Scenario: 二元组精确匹配
+
+- **WHEN** registry 中有 (fabric_A, root_X)，而 capability 的 (fabric_id, issuer) 为 (fabric_B, root_X)
+- **THEN** 接入被拒（`dweb/unknown-owner`）
+
+#### Scenario: 旧格式 owners 条目解析为永久租户
+
+- **WHEN** owners.jsonl 含本变更前格式的条目（无 expires_at/alias 字段），服务端启动
+- **THEN** 启动成功，该条目按「永久、无别名」参与活跃集合（MUST NOT 因缺字段失败）
+
+#### Scenario: 访客裁决次序——名册先于 webhook
+
+- **WHEN** policy=callback，某端点是活跃访客，webhook 若被咨询将返回 allow=false，该端点无票连接 relay
+- **THEN** 接入成功且 webhook 未被咨询（访客表命中即放行，次序 ② 先于 ③）
+
+#### Scenario: 访客过期或吊销后回落原路径
+
+- **WHEN** 某访客的 grant 已过期或被 revoke，policy=static，该端点无票连接 relay
+- **THEN** 按无票路径拒绝（`dweb/no-capability`），并记敲门
+
+#### Scenario: 访客连接配额独立于租户配额
+
+- **WHEN** 活跃访客已建立 4 条连接（默认配额），发起第 5 条
+- **THEN** 拒绝 `dweb/visitor-quota-exceeded`；同访客的连接不出现在任何 per-owner 投影中
+
+#### Scenario: 黑名单 endpoint 维度先于凭证分类
+
+- **WHEN** 某端点被加入黑名单（endpoint 维度），该端点随后持**有效** capability 连接 relay
+- **THEN** 接入被拒 `dweb/blocked`（有效票不豁免黑名单）
+
+#### Scenario: 黑名单 fabric 维度拒整个租户
+
+- **WHEN** 某 fabric_id 被加入黑名单，该 fabric 名下任何 issuer 的有效 capability 连接 relay
+- **THEN** 接入被拒 `dweb/blocked`
+
+#### Scenario: 到期/黑名单/吊销不踢存量连接
+
+- **WHEN** 某 owner 到期（或被加入黑名单、某访客被 revoke）时已有存量连接
+- **THEN** 存量连接保持至自然断开或经管理面 disconnect；仅新连接被拒
+
+### Requirement: relay capability 验证（L1 密码学完整性 + L1b 票有效性底线）
+
+`restricted` 模式下，relay 的每条客户端接入若出示 capability，MUST 先通过不可绕过、不可插拔（与 policy provider 无关）的两级验证：**L1 密码学完整性**（本地、无网络调用，fail-closed 顺序执行）：长度门（≤1KiB）与 base64url 字符集白名单 → `dwebr1.` 格式与字段形状校验 → caps 位图无未知保留位 → issuer Ed25519 验签（域分隔 `dweb/relay-cap/v1`）→ server_id == 本服务端 ServerId → 时间校验（`now >= expires_at` 拒绝；`issued_at` 容忍 120s 时钟偏移；`issued_at <= expires_at`；TTL 验证侧统一上限 180 天）→ recipient == iroh-relay 握手认证的 endpoint_id。**L1b 票有效性底线**：(fabric_id, issuer) ∈ owner registry 活跃集合**且该条目未过期**（时间维度判定；已过期 → 拒 `dweb/owner-expired`，与未注册的 `dweb/unknown-owner` 区分）→ caps 含当前操作所需位（relay 接入需 RELAY）。两级验证均须在接入注册前完成、在任何策略 provider 决策（含 callback webhook）之前完成——策略层只能收紧不能放宽（无效票据 MUST 在到达 webhook 前被拒）。L1 计算成本为 O(1) + 单次验签。capability 是身份绑定凭证而非纯 bearer：仅持有令牌串而无对应私钥者在 relay 面与 rendezvous announce 面 MUST 被拒绝。
+
+#### Scenario: 窃取令牌串不可用（relay 面）
+
+- **WHEN** 攻击者窃取 capability 串并从自己的 endpoint 连接 relay
+- **THEN** recipient 与握手认证 id 不匹配，接入被拒（`dweb/not-recipient`）
+
+#### Scenario: 跨 Server 重放被拒
+
+- **WHEN** 为 Server A 签发的 capability 出示给 Server B
+- **THEN** server_id 不匹配，接入被拒（`dweb/wrong-server`）
+
+#### Scenario: 过期拒绝含等值边界
+
+- **WHEN** 当前时间 == capability 的 expires_at
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: 超长 TTL 被拒
+
+- **WHEN** capability 的 expires_at - issued_at 超过 180 天统一上限
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: 过大的未来签发时间被拒
+
+- **WHEN** capability 的 issued_at 超过当前时间 + 120s 时钟偏移容忍
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: issued_at 晚于 expires_at 被拒
+
+- **WHEN** capability 的 issued_at > expires_at（自相矛盾的时间字段）
+- **THEN** 接入被拒（`dweb/capability-expired`）
+
+#### Scenario: 租户条目过期拒绝且 reason 与未注册区分
+
+- **WHEN** registry 中存在该 (fabric_id, issuer) 二元组但条目 expires_at 已过，持其有效 capability 连接 relay
+- **THEN** 接入被拒，deny reason 为 `dweb/owner-expired`（非 `dweb/unknown-owner`）
+
+### Requirement: rendezvous 访问控制
+
+`restricted` 模式下，rendezvous announce 与 resolve MUST 要求 capability（HTTP `Authorization: Bearer dwebr1.…`），且出示的 capability MUST 通过与 relay 面同一套不可绕过验证器（L1 密码学完整性 + L1b 票有效性底线：registry 二元组等，各失败 reason 一致映射为 HTTP 401 响应体 `{"error":"dweb/<reason>"}`；"存在但非法"的凭证同样不得按无票处理）。announce：capability 的 caps MUST 含 RDZ_ANNOUNCE，且 **capability.recipient MUST == announce 请求体中签名的 EndpointId**（既有签名验证保留，签名私钥即 PoP，窃取 capability 者无法以他人身份登记）；不满足返回 401。resolve：caps MUST 含 RDZ_RESOLVE，为 **bearer-only 语义**（无 HTTP 面身份证明，capability 泄露即可用直至 TTL，属明示的降级承诺；L1 的 recipient==握手身份检查在 resolve 面不适用——无握手身份，仅验密码学有效性）；不满足返回 401。**访客在 rendezvous 面的可达性 v1 冻结为空**：无 capability 的 resolve 维持 401（restricted），无票 announce 亦恒拒——rendezvous HTTP 面无端点身份证明，无法把无票请求绑定到具体访客；访客的可达面为 relay 通行（敲门即连，见"Server 访问策略"）；带访客身份绑定的定向解析（签名 resolve 变体）列为 Phase 2。rendezvous 不接入 callback webhook（动态策略另立 change）。`open` 模式下 announce/resolve 行为与现状一致（签名 announce / 匿名 resolve）。**基础限流**：resolve 与 announce 的 HTTP 面 MUST 实施 per-来源-IP 令牌桶限流（resolve 默认 60 次/分钟、announce 默认 20 次/分钟，`DWEB_RDZ_RATE_RESOLVE_PER_MIN`/`DWEB_RDZ_RATE_ANNOUNCE_PER_MIN` 可配，突发为速率值的一半；超限返回 429 + error envelope），与 access mode 正交（open 模式同样生效）。
+
+#### Scenario: restricted 下匿名 resolve 被拒
+
+- **WHEN** `restricted` 模式下无 capability 的 GET /rendezvous/{id}，且访客名册为空
+- **THEN** 返回 401，不返回任何登记项
+
+#### Scenario: announce 的身份绑定校验
+
+- **WHEN** `restricted` 模式下持 A 的 capability 但以 B 的私钥签名 announce
+- **THEN** 返回 401（recipient ≠ 签名 EndpointId），不产生登记项
+
+#### Scenario: announce 缺 RDZ_ANNOUNCE 位
+
+- **WHEN** capability caps 仅含 RELAY，用于 announce
+- **THEN** 返回 401
+
+#### Scenario: resolve 缺 RDZ_RESOLVE 位
+
+- **WHEN** `restricted` 模式下持仅含 RELAY 位的 capability 执行 GET /rendezvous/{id}
+- **THEN** 返回 401，不返回任何登记项
+
+#### Scenario: 无票 resolve/announce 维持现状（访客可达面为空）
+
+- **WHEN** `restricted` 模式，活跃访客存在，无 capability 的 GET /rendezvous/{id} 或 announce
+- **THEN** 均返回 401（访客的可达面在 relay，不在 rendezvous）
+
+#### Scenario: resolve 限流独立生效
+
+- **WHEN** 同一来源 IP 在一分钟内发起超过配额的 resolve 请求
+- **THEN** 超限请求返回 429 + error envelope（`rate-limited`），与凭证有效性无关
+
+#### Scenario: open 模式现状不变
+
+- **WHEN** `open` 模式下匿名 resolve
+- **THEN** 行为与本变更前一致
+
+## ADDED Requirements
+
+### Requirement: 敲门日志（KnockLog）
+
+`restricted` 模式下，被拒绝的接入尝试 MUST 记入服务端内存敲门台账供管理面观察：relay 面 on_connect 的 Deny 臂与 rendezvous 面的 Deny 臂均为挂点。台账按 endpoint_id 聚合：`{endpoint_id, first_at, last_at, count, last_reason, last_source: "relay"|"rendezvous", dismissed}`；同一端点重复敲门递增 count 并更新 last_at/last_reason。**排除项**：deny reason 为 `dweb/blocked` 的尝试 MUST NOT 记入（已被处置，不是待办）；`dweb/owner-expired` 记入且作为租户到期提醒类别。容量有界：最多 4096 个 endpoint 条目，超限按 last_at 最久未敲门者逐出（重启清空——敲门是运营提示而非审计事实，审计以管理操作回执为准；持久化列为未来工作）。dismiss 标记为管理面动作（幂等），不删除记录。
+
+#### Scenario: 同端点重复敲门聚合计数
+
+- **WHEN** 同一 endpoint_id 无票连接被拒 3 次（不同时间）
+- **THEN** 台账中该端点为单一条目：count=3，first_at 为首次、last_at 为最近，last_reason 为最近一次原因
+
+#### Scenario: 黑名单拒绝不入台账
+
+- **WHEN** 端点命中黑名单被拒 `dweb/blocked`
+- **THEN** 台账不新增/不更新该端点的记录
+
+#### Scenario: 重启清空
+
+- **WHEN** 服务端重启后查询敲门台账
+- **THEN** 台账为空（无持久化承诺）
+
+#### Scenario: dismiss 幂等
+
+- **WHEN** 对同一敲门条目连续两次 dismiss
+- **THEN** 两次均成功返回，条目 dismissed=true，无副作用
+
+### Requirement: 租户邀请码与公开自助注册
+
+服务端 SHALL 提供邀请码台账 `<data_dir>/codes.jsonl`（append-only，同一 registry 存储模式：坏行 fail-fast、generation、热重载、`serde(default)` 向后兼容）：事件 `{"op":"issue"|"revoke","code_hash":"<blake3 64hex>","alias_hint"?, "max_uses","used_count","expires_at","default_ttl_days"?,"ts"}`。码本体格式 `dwebc1.` + base32 16 字符（≥80 bit 熵，crockford 字符集，4-4-4-4 分组展示）；**存储与一切列表响应只含哈希，码全文仅出现在签发响应一次**。签发默认 `max_uses=1`、`expires_at=签发+7天`、`default_ttl_days=30`，逐项可自定义（R4）。
+
+**公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**）。校验序（fail-closed）：per-来源-IP 令牌桶限流（默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at，不重复建条目）；used_count+1；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 签发仍由 root 侧自行完成——server 只认票据不签票据，identity.rs 域纪律不变）。
+
+#### Scenario: 正常兑换与回执验签
+
+- **WHEN** 租户以有效码 + 正确 root 签名调用 POST /register
+- **THEN** 返回 200（op=register 回执字段 + expires_at）；registry 活跃集合出现该 (fabric_id, root)；回执可用 server.key 公钥按 canonical 验签
+
+#### Scenario: 冒名注册被 PoP 拒绝
+
+- **WHEN** 攻击者使用他人已注册的 (fabric_id, root) 与自己的私钥签名调用 POST /register
+- **THEN** 返回 `bad-signature`（验签键为 body.root，攻击者无私钥即不成立）
+
+#### Scenario: 重放窗口
+
+- **WHEN** 同一合法请求在 ts+120s 之后重发
+- **THEN** 返回 `stale-ts`
+
+#### Scenario: 码耗尽与过期
+
+- **WHEN** max_uses=1 的码被第二次兑换（`code-exhausted`）；或码 expires_at 已过（`code-expired`）
+- **THEN** 两次拒绝的错误码互不相同且均不消耗对方状态
+
+#### Scenario: 限流独立于码有效性
+
+- **WHEN** 同一来源 IP 一分钟内第 11 次调用 POST /register（即使前 10 次均为合法拒绝）
+- **THEN** 返回 429 `rate-limited`
+
+#### Scenario: 重复注册为续期
+
+- **WHEN** 已活跃租户持新有效码再次兑换同一 (fabric_id, root)
+- **THEN** 成功返回且 expires_at 被刷新为 now + default_ttl_days（名册不出现重复条目）
+
+### Requirement: 三角色管理面 API（敲门/访客/邀请码/黑名单/续期）
+
+在 sdk-mgmt-surface 冻结的管理面基座（`/admin/*` Bearer token 认证、错误 envelope `{"error":{code,message}}`、未配置 token=零暴露 404、变更类操作 server.key 回执）之上，服务端 SHALL 提供三角色管理增量路由。全部响应 snake_case、未知字段忽略；全部变更类操作返回同构回执（canonical 复用 103B `b"dweb/admin-receipt/v1\0"` 布局，op 枚举扩充：renew=0x04 / visitor-grant=0x05 / visitor-revoke=0x06 / code-issue=0x07 / code-revoke=0x08 / block-add=0x09 / block-remove=0x0A / knock-dismiss=0x0B；不适用的维度 fabric/target 置零字节，code 类 target=code_hash 32B）：
+
+- **敲门**：`GET /admin/knocks`（未处置在前、last_at 降序；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss`（幂等，回执 op=knock-dismiss）。
+- **访客名册**：`GET /admin/visitors`（活跃列表：endpoint_id/alias/note/granted_at/expires_at）；`POST /admin/visitors`（body：endpoint_id 必填、alias/note/expires_in_days 可选，缺省=永久；回执 op=visitor-grant）；`DELETE /admin/visitors/{endpoint_id}`（revoke；回执 op=visitor-revoke）。语义糖路由 `POST /admin/visitors/from-knock`（body 含 endpoint_id，等同 POST，供敲门台一键定位）。
+- **邀请码**：`GET /admin/codes`（列表只含 code_hash/max_uses/used_count/expires_at/alias_hint/revoked/default_ttl_days，**绝不含码全文**）；`POST /admin/codes`（body：alias_hint/max_uses/expires_in_days/default_ttl_days 可选，缺省 1/7/30；**响应含 `code` 全文——仅此一次**；回执 op=code-issue）；`DELETE /admin/codes/{code_hash}`（吊销；回执 op=code-revoke）。
+- **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略。
+- **黑名单**：`GET /admin/blocklist`（当前集合：kind/id/reason/ts）；`POST /admin/blocklist`（body：kind(endpoint|fabric)/id/reason?；回执 op=block-add）；`DELETE /admin/blocklist/{kind}/{id}`（回执 op=block-remove）。
+- **状态增量**：`GET /admin/status` 响应增量字段 `knocks_pending`/`visitors_active`/`codes_active`/`visitors_online`（既有 wire 冻结不变，新字段为纯增量）。
+
+#### Scenario: 敲门列表排序契约
+
+- **WHEN** 存在 2 条未处置与 1 条已处置敲门（未处置的 last_at 较新），`GET /admin/knocks`
+- **THEN** 前两条为未处置且按 last_at 降序，已处置条目不在默认响应中；pending_count=2
+
+#### Scenario: 签发响应码全文仅一次
+
+- **WHEN** `POST /admin/codes` 签发成功
+- **THEN** 响应含 `code` 全文（`dwebc1.` 前缀 + 16 字符）与回执；此后 `GET /admin/codes` 与一切后续响应只含 code_hash
+
+#### Scenario: 吊销后兑换立即拒绝
+
+- **WHEN** 码签发后立即 `DELETE /admin/codes/{code_hash}`，随后持码全文调用 POST /register
+- **THEN** 兑换被拒（`code-invalid`）
+
+#### Scenario: 续期恢复准入
+
+- **WHEN** 租户条目已过期（连接被拒 `dweb/owner-expired`），`POST /admin/owners/{fabric}/{root}/renew` body `{"expires_in_days":30}`
+- **THEN** 回执 op=renew；该租户的有效 capability 随后接入成功
+
+#### Scenario: status 增量字段不破坏旧消费者
+
+- **WHEN** 旧版本消费者（只读 owners_count/active_connections 等既有字段）请求 `GET /admin/status`
+- **THEN** 既有字段语义与 sdk-mgmt-surface 冻结 wire 逐字节一致；新增 knocks_pending 等字段被旧消费者忽略不致错
