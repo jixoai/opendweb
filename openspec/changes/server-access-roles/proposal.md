@@ -34,11 +34,13 @@ fabric 的有效票（root 自签 own cap / 成员经 OK2 附发 member cap）�
 - **访客名册（visitor registry）**：无票准入——`<data_dir>/visitors.jsonl`
   （endpoint_id + alias + 备注 + 授予时间，serde(default) 兼容演进）；
   gate 的 C0 无票路径在 L2 前查表放行（受限前提：访客面默认开启与否
-  与 callback 的关系在设计期冻结）。**访客可 resolve（找房门牌）、
-  不可 announce**（rendezvous 无票路径同表判定）。
-- **敲门日志（KnockLog）**：relay/rendezvous 的 deny 臂记录
-  （endpoint_id/reason/时间/来源面），内存台账 + 有界容量（照
-  OnlineTable 模式），admin API 可读——[R3] 的"看到访客请求"数据面。
+  与 callback 的关系在设计期冻结）。**访客可达面 = relay 通行**；
+  rendezvous 无票 resolve/announce 维持 401（HTTP 面无调用方身份证明，
+  签名 resolve 变体 = Phase 2，见 requirements「范围修订记录」）。
+- **敲门日志（KnockLog）**：**仅 relay deny 臂**记录（E1 握手认证
+  身份；rendezvous 匿名面身份不可信，不入台账——防伪造污染），
+  endpoint_id/reason/时间聚合，内存台账 + 有界容量（照 OnlineTable
+  模式），admin API 可读——[R3] 的"看到访客请求"数据面。
 - **租户过期**：owners.jsonl 条目扩展 `expires_at`（serde(default)：
   旧条目=永久）；L1b `contains_active(fabric, root, now)`，新 deny slug
   `dweb/owner-expired`；注册默认 +30d [R5]（admin 可改/续期/永久）。
@@ -69,9 +71,11 @@ fabric 的有效票（root 自签 own cap / 成员经 OK2 附发 member cap）�
 - **敲门台流** [R3]：敲门列表（谁/何时/为何被拒）→ 一键「定位为访客」/
   「导入为租户」/「加入黑名单」/「忽略」
 - **alias + 缩写** [R6]：全站 key 显示统一 `别名 (abc***xyz)` + 复制全文
-- **节点簿** [R7]：右上角节点信息处切换；本地安全保存多个节点配置
-  （sidecar 侧管理，token 不落浏览器）；切换 = sidecar 重启指向新目标
-  （目标冻结安全模型不变）
+- **节点簿** [R7]：右上角节点信息处切换；本地保存多个节点配置
+  （`~/.opendweb/nodes.json` 0600，sidecar 侧管理，token 不落浏览器——
+  对 webui-console「token 不落文件/目标冻结」两条基座契约的**版本化例外**
+  ，见 specs/webui 节点簿 requirement）；切换 = **进程内原子切换**（不
+  重启，仅允许切到已存节点——无新目标注入通道，目标冻结安全模型保持）
 
 ### SDK/文档
 
@@ -83,8 +87,9 @@ fabric 的有效票（root 自签 own cap / 成员经 OK2 附发 member cap）�
 
 - fabric wire 变更（房门三制的"租户侧门"= fabric 级访客政策——探查实证
   新 FactKind 会让旧节点 HELLO dump 整体解码失败，Phase 2 单独设计评审；
-  本轮"租户名单制"由既有 roster 成员门控承担，`完全放行制` 的房门侧
-  同样 Phase 2）
+  **该延期经 Owner 批准的实施计划放行，裁决链见 requirements.md「范围
+  修订记录」**；本轮"租户名单制"由既有 roster 成员门控承担，
+  `完全放行制`的房门侧同样 Phase 2）
 - 同屏多节点管理、节点远程部署/启停
 - SDK 多密钥对/设备指纹切换
 - 访客票/能力令牌形态（无票名册已覆盖；若未来需要离线票再议）

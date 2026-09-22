@@ -2,7 +2,7 @@
 
 ### Requirement: 三角色管理台信息架构
 
-WebUI SHALL 以三角色心智模型（管理员/租户/访客）组织管理台，在 webui-console 冻结的 sidecar/token 边界/配对流程基座上演进。导航 SHALL 为：**总览**（四问：谁在线/有几个租户/有没有人敲门/邀请码状态 + 待办条）、**租户管理**（租户名册 + 别名 + 到期 + 续期 + 邀请码管理）、**访客与门禁**（敲门台 + 访客名册 + 黑名单）、**在线连接**（既有视图）。节点切换入口 SHALL 位于右上角节点信息区（见"节点簿与节点切换"），一次只呈现一个当前节点。术语：UI 呈现层 SHALL 使用「租户」指称 owner/fabric root、「访客」指称 visitor（术语映射在文档中单点定义；「包租婆」等比喻 MUST NOT 出现在操作文案中，仅限教育性引导文案）。既有 hash 路由 MUST 收敛到新 IA（旧路径重定向，不 404）。
+WebUI SHALL 以三角色心智模型（管理员/租户/访客）组织管理台，在 webui-console 冻结的 sidecar/token 边界/配对流程基座上演进。导航 SHALL 为：**总览**（四问：谁在线/有几个租户/有没有人敲门/邀请码状态 + 待办条）、**租户管理**（租户名册 + 别名 + 到期 + 续期 + 邀请码管理）、**访客与门禁**（敲门台 + 访客名册 + 黑名单）、**在线连接**（既有视图）。节点切换入口 SHALL 位于右上角节点信息区（见"节点簿与节点切换"），一次只呈现一个当前节点。术语：UI 呈现层 SHALL 使用「租户」指称 owner/fabric root、「访客」指称 visitor（术语映射在文档中单点定义；「包租婆」等比喻 MUST NOT 出现在操作文案中，仅限教育性引导文案）。**hash 路由冻结与收敛映射**：新路由 `#/overview`、`#/tenants`、`#/visitors`、`#/online`（邀请码为租户管理内子区块）；旧路由 MUST 301 式收敛（应用内重定向，不 404）：`#/owners`→`#/tenants`、`#/access`→`#/visitors`、`#/online`→`#/online`、`#/overview`→`#/overview`、其余未知 hash →`#/overview`。业务数据调用沿用基座 `/api/*` 同源代理（`/api/*` → `/admin/*`，不引入 `/sidecar/api/*`）。
 
 #### Scenario: 旧路由收敛
 
@@ -68,21 +68,28 @@ WebUI SHALL 在租户管理内提供邀请码管理：签发表单（备注 alia
 
 ### Requirement: 节点簿与节点切换
 
-sidecar SHALL 维护本地节点簿存储（`~/.opendweb/nodes.json`，权限 0600）：条目 `{id, name, server_host, token, added_at}`；**token 只存在 sidecar 侧，MUST NOT 出现在任何 HTTP 响应、日志或浏览器可达状态中**；`GET /sidecar/state` 与节点列表响应只含 `{id, name, server_host, added_at, current}`。节点添加经既有配对面流程（每次新配对码；validateTarget 全量校验与并发一次性消费语义不变），当前节点可多次重复添加新节点。节点切换 `POST /sidecar/nodes/switch {node_id}`：**MUST 仅接受已存储节点的 node_id**（任何 URL/host 字段一律 400——目标冻结安全模型保持，无"新目标注入"通道）；Host/Origin 校验与 connect 面一致；切换为进程内原子替换 target+token（无需重启 sidecar），响应后同源代理面即刻指向新节点。删除 `DELETE /sidecar/nodes/{id}`；当前连接节点不可删除（409，先切走）。UI：右上角节点信息区提供节点切换菜单（一次一个当前节点，无同屏多节点），切换中呈现过渡态。
+sidecar SHALL 维护本地节点簿存储（`~/.opendweb/nodes.json`，权限 0600）：条目 `{id, name, server_host, token, added_at}`；节点列表/状态响应只含 `{id, name, server_host, added_at, current}`，**token MUST NOT 出现在任何 HTTP 响应、日志或浏览器可达状态中**。
+
+**对 webui-console 基座契约的版本化例外（有意变更，非疏漏）**：基座冻结「token MUST NOT 写入任何文件」与「目标一经设定即冻结（重新指向=重启）」——本 requirement 为**节点簿场景引入两条明示例外**，归档 webui-console 时 MUST 附增补说明（条款被 server-access-roles 取代的部分）：(1) **落盘例外**——节点 token 允许持久化于 0600 的 `nodes.json`（威胁模型：单用户工作站、用户主目录私有；文件创建走临时文件+原子 rename，拒绝 symlink 跟随；与 `--token` flag/env 的 OS 可见性同级披露，帮助文本明示）。跨用户主机/共享环境部署文档 MUST 明示不适用；(2) **切换例外**——`POST /sidecar/nodes/switch {node_id}`（本地控制面 `/sidecar/*`）为**唯一被许可的运行时重指向通道**：MUST 仅接受已存储节点的 node_id（任何 URL/host 字段一律 400——目标冻结安全模型保持，无"新目标注入"通道；Host/Origin 校验与配对面一致，无需配对码——无新秘密输入）。切换为进程内原子替换 target+token（无需重启 sidecar）；在途代理请求 MUST 以请求开始时的 target 快照完成（切换不撕裂在途请求）。除此之外基座 target-frozen 拒绝语义不变。节点添加经既有配对面流程（每次新配对码；validateTarget 全量校验与并发一次性消费语义不变）。删除 `DELETE /sidecar/nodes/{id}`；当前连接节点不可删除（409，先切走）。**路径命名冻结**：业务代理面沿用基座 `/api/*` → `/admin/*`（canonical，不引入 `/sidecar/api/*`）；节点簿属本地控制面 `/sidecar/nodes*`。UI：右上角节点信息区提供节点切换菜单（一次一个当前节点，无同屏多节点），切换为进程内即时切换（无进程重启），过渡态呈现「正在切换到 <节点名>…」。
 
 #### Scenario: 切换仅限已存储节点
 
 - **WHEN** `POST /sidecar/nodes/switch` body 为 `{node_id}` 之外的任何形态（含直接给 URL/host）
 - **THEN** 返回 400，不发生任何出站连接；仅已存储 node_id 被接受
 
-#### Scenario: 切换后代理面即刻指向新节点
+#### Scenario: 切换后代理面即刻指向新节点（无重启）
 
-- **WHEN** 切换到节点 B 成功后，浏览器立即请求 `/sidecar/api/status`
-- **THEN** 请求被代理到节点 B 的 admin 面（响应反映 B 的状态）
+- **WHEN** 切换到节点 B 成功后，浏览器立即请求 `/api/status`
+- **THEN** 请求被代理到节点 B 的 `/admin/status`（响应反映 B 的状态；sidecar 进程未重启，本地端口持续可用）
+
+#### Scenario: 在途请求不被切换撕裂
+
+- **WHEN** 切换发生时有对节点 A 的 `/api/connections` 请求在途
+- **THEN** 该请求以切换前的 target 快照完成（响应来自 A 或明确失败，不出现半 A 半 B 的混合）
 
 #### Scenario: token 永不出浏览器
 
-- **WHEN** 调用 state/节点列表/切换/删除任一接口并审查响应与 sidecar 日志
+- **WHEN** 调用节点列表/切换/删除任一接口并审查响应与 sidecar 日志
 - **THEN** 任何位置不含任何节点 token 明文
 
 #### Scenario: 当前节点不可删除

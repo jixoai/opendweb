@@ -37,13 +37,19 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
           → policy=callback? → webhook（A_cb 既有路径，payload 无 cap）
           → 拒 dweb/no-capability（+ 记敲门 §1.2）
   ```
-  visitor Allow **不进 OnlineTable 的 owner 计数**（无 fabric 归属）——
-  在线表条目 fabric_id 置 `visitor` 保留位 `[0xFF*32]`？**否**——Online
-  Table 键为 (endpoint,fabric)；访客条目 fabric 固定
-  `VISITOR_FABRIC_ID = [0u8;32]` 之外的保留字 `0xFF…`（不与真实 fabric
-  碰撞；admin connections 投影 mode 侧标注 visitor 计数字段）。配额：
-  访客不受 per-owner 配额（无 owner），新增 `DWEB_RELAY_MAX_CONNECTIONS_
-  PER_VISITOR`（默认 4，防单访客占满中继）。
+- visitor Allow **不进 OnlineTable 的 owner 计数**（无 fabric 归属）——
+  在线表键升级为 `(endpoint, Option<fabric>)`：访客条目 fabric=None
+  （**MUST NOT 用 sentinel 值**——真实 FabricId 空间不得被保留字污染，
+  r1-P1-7）。投影：`per_endpoint` 仅租户对；新增 `per_visitor` 数组
+  （endpoint_id 字典序）；status 增 `visitors_online`。配额两级：
+  per-endpoint `DWEB_RELAY_MAX_CONNECTIONS_PER_VISITOR`（默认 4）+
+  全局 `DWEB_RELAY_MAX_VISITOR_CONNECTIONS`（默认 64，防多 key 女巫
+  聚合——r1-P1-4；残余：sybil key 无 IP 级 admission，Phase 2）；
+  deny reason 统一 `dweb/visitor-quota-exceeded`；访客→租户不迁移
+  计数（新连接按新身份，存量自然收敛）。
+- **callback 缓存联动**（r1-P1-6）：无票路径 webhook 缓存键纳入复合
+  generation（owners+visitors 世代组合）——visitor grant/revoke 即
+  相关缓存失效，防「revoke 后仍命中旧 allow」。
 - 访客语义边界：**仅 relay 通行**（rendezvous 可达面 v1 为空，见
   §1.6）；不 announce、不归属任何 fabric、租户门控由租户侧 roster
   承担（模式 2 语义天然成立）。
@@ -52,13 +58,21 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 - 内存台账（不落盘，重启清空——O-2 默认裁决：敲门是运营提示不是审计
   事实，审计靠 admin 操作回执）：`Mutex<HashMap<endpoint_id, KnockAgg>>`
-  + 全局容量上限 4096 endpoint（LRU 逐出），照 OnlineTable 投影模式。
-- KnockAgg：`{endpoint_id, first_at, last_at, count, last_reason,
-  last_source: relay|rendezvous, dismissed: bool}`。
-- 挂点：`relay.rs:135-138` Deny 臂 + `rendezvous.rs:234-237` Deny 臂
-  （deny reason 已在手；无 deny tracing 的现状顺带补一条 debug log）。
+  + 全局容量上限 4096 endpoint（按 (last_at, seq) 最久逐出），照
+  OnlineTable 投影模式。
+- **身份来源红线（r1-P0-1）**：只记 **relay 握手认证**（E1 链）的
+  endpoint——rendezvous HTTP 面（匿名 resolve 无调用方身份；announce
+  签名验证前的 ACL 拒绝同样无已验身份）**不入 endpoint 台账**，仅
+  结构化 debug 日志（防伪造污染/诱导授权攻击）。
+- KnockAgg：`{endpoint_id, seq, first_at, last_at, count, last_reason,
+  dismissed: bool}`——seq 进程内单调序号（last_at 相同的排序
+  tie-break）；count u64 饱和递增（r1-P2-2）。
+- 挂点：仅 `relay.rs:135-138` Deny 臂（顺带补一条 deny debug log）。
 - 排除项：`dweb/blocked` 不记敲门（已被处置，不是待办）；
   `dweb/owner-expired` 记为租户到期提醒类别。
+- dismiss/undismiss 均幂等管理动作；**同端点新 deny 自动复位
+  dismissed=false**（再次敲门重新冒出，O-7）；列表排序冻结：
+  未处置在前、组内 last_at 降序、seq 降序、endpoint_id 升序。
 
 ### 1.3 租户有效期
 
@@ -101,6 +115,19 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   expires_at）——避免攻击者用他人已注册二元组+自己签名？不成立（需
   他人 root 签名）。**已注册二元组 + 自己的新签名**：fabric_id+root
   是别人的、自己签不出有效 sig（sig 用 body.root 验）→ 关死。
+- **消费原子性（r1-P0-2）**：codes.jsonl 事件面增 `consume`（携带
+  fabric/root）；used_count=consume 计数由归并推导，不只存内存。兑换
+  判定与 consume 追加在同一临界区按 code_hash 串行；**fsync 成功前
+  不返回 200/回执**（落盘失败=500 无半提交）；max_uses=1 并发双兑
+  恰一成功（e2e 钉死）。
+- **码生成与脱敏（r1-P1-3）**：OS CSPRNG；哈希输入=码本体 16 字符
+  小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（对齐
+  callback_token 纪律）；错误码状态区分为明示产品取舍（排障需要）。
+- **fabric_id 语义（r1-P1-1）**：自声明标签（FabricId 随机生成、无
+  服务端可验 genesis 绑定）；身份键=二元组（与 registry 既有精确
+  匹配一致）；同 fabric 多 root 合法并存，管理面以二元组呈现+钓鱼
+  警示。攻击者注册受害者 fabric_id+自己 root ≠ 获得该 fabric 任何
+  能力（成员资格在租户侧 roster）。
 
 ### 1.5 黑名单（blocklist）
 
@@ -130,7 +157,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 | 路由 | 语义 |
 |---|---|
 | `GET /admin/knocks` | 敲门聚合列表（未处置优先/最近在前；`?include_dismissed`） |
-| `POST /admin/knocks/{endpoint_id}/dismiss` | 标记已处理（幂等；回执） |
+| `POST /admin/knocks/{endpoint_id}/dismiss` / `undismiss` | 处置/恢复待办（均幂等；回执 op=0x0B/0x0C；同端点新 deny 自动复位 dismissed） |
 | `GET/POST/DELETE /admin/visitors` | 名册 CRUD（POST body：endpoint_id/alias/note/expires_in_days?；grant 回执） |
 | `POST /admin/visitors/from-knock` | 敲门台一键定位（body：endpoint_id/alias?——同 POST 语义，语义糖路由） |
 | `GET/POST/DELETE /admin/codes` | 签发（POST：alias_hint?/max_uses=1/expires_in_days=7/default_ttl_days=30——**响应含 code 全文仅此一次**）/列表（只回哈希与计数）/吊销 |
@@ -142,9 +169,10 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 `POST /register` 为**公开路由**（码门控，不走 admin auth_guard；挂
 gateway 根路径）。全部 JSON wire（snake_case/未知字段忽略/错误 envelope）
 在 spec 冻结示例。新变更类操作的回执复用 103B canonical，op 枚举扩充
-（renew=0x04 … knock-dismiss=0x0B，未用维度置零；code 类 target=
-code_hash 32B）——完整枚举与 wire 示例冻结于 spec delta「三角色管理面
-API」。
+（renew=0x04 … knock-dismiss=0x0B / knock-undismiss=0x0C，未用维度置零；
+code 类 target=code_hash 32B；**回执 generation=所属台账的 generation**，
+客户端视为不透明 u64）——完整枚举与槽位映射表冻结于 spec delta
+「三角色管理面 API」。
 
 ## 3. webui（Svelte+shadcn 基座上演进）
 
@@ -174,12 +202,25 @@ added_at——host 非机密（用户亲自输入），token 永不出现在任�
 （不重启进程——实现上 sidecar 的 target 状态从一次性改为可切换的
 受控枚举；冻结文案改「切换需经节点簿」）。删除 = DELETE /sidecar/
 nodes/{id}；当前连接节点不可删（先切走）。
+  **对基座的两条版本化例外**（webui-console 归档时附增补说明）：①
+  token 落盘例外——0600 nodes.json（单用户工作站威胁模型；临时文件+
+  原子 rename、拒 symlink 跟随；帮助文本披露 OS 可见性）；② 切换例外
+  ——switch 是唯一被许可的运行时重指向通道（仅已存 node_id），除此之外
+  target-frozen 拒绝语义不变；在途代理请求以请求开始时的 target 快照
+  完成（切换不撕裂）。路径命名：业务面沿用基座 `/api/*`→`/admin/*`，
+  节点簿属本地控制面 `/sidecar/nodes*`（r1-P1-9）。
 
 ## 4. SDK/文档 [R2]
 
 - `opendweb` CLI 增 `opendweb id`（只读：本机默认 key 的 endpoint_id/
   缩写/数据面路径；复用 SecretStore）；README「一台设备一个默认 key」
   产品化段落 + 多密钥对=高级功能指引（不在本轮实现）。
+- `opendweb join --server <URL> --code <码>`（r1-P1-11，R4 自助入口）：
+  默认设备 key 为 root（本地无 fabric 则生成、有则复用——不静默造
+  第二个）；构造/签名 register canonical、兑换、保存回执与到期；码与
+  私钥不落日志；http 非 loopback 需 --allow-insecure（对齐 sidecar
+  守卫）；失败非零退出无半提交本地状态。含 register-receipt 客户端
+  验签 helper。
 
 ## 5. 测试策略
 
@@ -192,13 +233,19 @@ nodes/{id}；当前连接节点不可删（先切走）。
 | admin e2e | 敲门→定位访客→raw client 重连放行全链路；邀请码签发→兑换→名册出现带 alias/到期；到期租户 deny reason；黑名单同票拒 |
 | rendezvous | 无票 resolve/announce 维持 401（访客可达面为空）；限流触发 429 |
 | webui | node --test 纯逻辑（新 copy/缩写规则/路由收敛）+ apiFetch 注入矩阵扩展 + sidecar 节点簿单测（存储 0600/切换不含新 URL/state 掩码）|
-| 回归 | sdk-mgmt-surface/webui-console 全部既有测试零改动全绿（owners wire 增量字段不破坏旧断言） |
+| 并发/缓存 | 并发双兑恰一成功（fsync 前零响应）；visitor grant/revoke 即刻失效 webhook 缓存（复合 generation） |
+| 投影/wire | per_visitor 数组 + per_endpoint 不含访客；status visitors_online；XFF 伪造不改限流键；client-sdk op 0x04-0x0C 映射 + fixture 对拍增量 |
+| CLI | `opendweb id` 幂等无私钥；`opendweb join` 端到端（新 fabric/复用/失效码三种） |
+| 回归 | sdk-mgmt-surface/webui-console 全部既有测试零改动全绿（owners wire 增量字段不破坏旧断言；基线数字以当日实跑为准） |
 
-## 6. 开放问题（Codex 评审重点）
+## 6. r1 评审处置与遗留开放项
 
-- O-4 已用 PoP 关死（§1.4）——请复核签名域/验签键选择（body.root 自
-  验）是否有残余冒名面
-- 访客配额默认 4 与 per-owner 配额的联动（访客转租户后计数迁移？——
-  现设计：不迁移，新连接按新身份计数）
-- KnockLog 内存上限 4096 endpoint 的运营够用性
-- 节点簿 tokens.json 的本地威胁模型披露文案（与 --token env 同层）
+r1（docs/codex-review-sar-r1.md，5.0/10）22 条全处置：P0×6（rendezvous
+敲门身份→relay-only；consume 事件/CAS/fsync；节点簿两条版本化例外；
+R8 延期裁决链入 requirements 范围修订记录；访客可达面矛盾句清除）、
+P1×12、P2×4 均已落入 spec/design/tasks。遗留（非阻塞、实现期观察）：
+- fabric_id 自声明残余：UI 钓鱼警示 + 二元组呈现已冻结；genesis 绑定
+  proof（FabricId 可验派生）列 Phase 2 候选
+- sybil key 对全局访客上限 64 的压力：Phase 2 IP 级 admission
+- trusted-proxy CIDR（反代下限流聚合）：Phase 2
+- 术语「租户」待 Owner 最终确认（呈现层可低成本翻转）
