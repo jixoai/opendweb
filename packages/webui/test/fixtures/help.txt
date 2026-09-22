@@ -2,4 +2,4 @@ opendweb webui - plugin commands
 
 Usage:
   opendweb webui webui [--server <string> --token <string> --port <number> --allow-insecure --no-open]
-      local management console (sidecar + UI) [note: --token or DWEB_ADMIN_TOKEN is visible to other local processes (shell history, ps, env); prefer the hidden terminal prompt or the browser pairing flow]
+      local management console (sidecar + UI) [note: --token or DWEB_ADMIN_TOKEN is visible to other local processes (shell history, ps, env); prefer the hidden terminal prompt or the browser pairing flow] [note: node book entries persist their admin tokens in ~/.opendweb/nodes.json (0600, readable by your OS user only)]

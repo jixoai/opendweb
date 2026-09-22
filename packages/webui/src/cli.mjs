@@ -12,6 +12,8 @@
 
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import path from "node:path";
+import { homedir } from "node:os";
 import readline from "node:readline";
 import { validateTarget } from "./target.mjs";
 import { startSidecar } from "./sidecar.mjs";
@@ -88,7 +90,7 @@ function coerceArg(type, raw, name) {
 /**
  * CLI 主流程（plugin run envelope 与 bin 共用）。
  * @param {Record<string, unknown>} args
- * @param {{ log?: (line?: string) => void, cwd?: string, stdout?: { write(s: string): void }, stderr?: { write(s: string): void }, env?: Record<string, string | undefined>, stdin?: { isTTY?: boolean }, signal?: import("node:events").EventEmitter, dns?: object, openImpl?: (url: string) => void, platform?: NodeJS.Platform }} [io]
+ * @param {{ log?: (line?: string) => void, cwd?: string, stdout?: { write(s: string): void }, stderr?: { write(s: string): void }, env?: Record<string, string | undefined>, stdin?: { isTTY?: boolean }, signal?: import("node:events").EventEmitter, dns?: object, openImpl?: (url: string) => void, platform?: NodeJS.Platform, nodesFile?: string }} [io]
  * @returns {Promise<{ exit: number }>}
  */
 export async function main(args, io = {}) {
@@ -160,8 +162,12 @@ export async function main(args, io = {}) {
 
   /** @type {import("./sidecar.mjs").Awaited<ReturnType<typeof startSidecar>>} */
   let sidecar;
+  // 节点簿存储（server-access-roles 版本化例外）：<DWEB_HOME>/nodes.json（缺省
+  // ~/.opendweb/），0600 私有文件——仅节点 token 落盘；帮助文本/横幅披露 OS 可见性。
+  const nodesFile =
+    io.nodesFile ?? env.DWEB_WEBUI_NODES_FILE ?? path.join(env.DWEB_HOME ?? homedir(), ".opendweb", "nodes.json");
   try {
-    sidecar = await startSidecar({ target, token, port, log, allowInsecure, dns });
+    sidecar = await startSidecar({ target, token, port, log, allowInsecure, dns, nodesFile });
   } catch (e) {
     stderr.write(`error: webui: cannot start sidecar (${ascii(String(e?.message ?? e))})\n`);
     return { exit: 1 };

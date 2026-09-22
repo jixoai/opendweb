@@ -2,9 +2,14 @@
 // run envelope 为契约既定的 {command, args, log, cwd, stdout, stderr}；
 // URL/port 等语义校验由 cli.mjs 自担。description 尾注承载 --token 的
 // OS 可见性提示（ASCII）——help 渲染器原样呈现，golden fixture 钉住。
+// server-access-roles 节点簿例外披露：节点 token 持久化于 0600 的
+// <DWEB_HOME>/nodes.json（与 --token flag/env 的 OS 可见性同级披露）。
 
 const TOKEN_NOTE =
   "[note: --token or DWEB_ADMIN_TOKEN is visible to other local processes (shell history, ps, env); prefer the hidden terminal prompt or the browser pairing flow]";
+
+const NODES_NOTE =
+  "[note: node book entries persist their admin tokens in ~/.opendweb/nodes.json (0600, readable by your OS user only)]";
 
 const manifest = {
   name: "webui",
@@ -12,7 +17,7 @@ const manifest = {
   commands: [
     {
       name: "webui",
-      description: `local management console (sidecar + UI) ${TOKEN_NOTE}`,
+      description: `local management console (sidecar + UI) ${TOKEN_NOTE} ${NODES_NOTE}`,
       args: {
         type: "object",
         properties: {
