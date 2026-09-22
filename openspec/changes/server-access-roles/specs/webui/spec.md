@@ -21,7 +21,7 @@ WebUI SHALL 以三角色心智模型（管理员/租户/访客）组织管理台
 
 ### Requirement: 敲门台（待办处置）
 
-WebUI SHALL 提供敲门台页：列表呈现聚合敲门（谁（key 缩写/别名）/次数/首次/最近/原因），未处置在前、最近在前；每行提供四个动作，成品文案采用 PRODUCT-DESIGN §4 冻结稿：**定位访客**（预填 endpoint_id 的访客授权表单 + 确认）、**导入租户**（租户注册表单——敲门记录无 fabric 归属，表单 MUST 提示「敲门记录只有敲门人的钥匙，没有房间号：请用邀请码让 TA 自助注册，或手工输入 fabric_id+root」）、**拉黑**（二次确认后加入黑名单）、**忽略**（dismiss + 带「撤销」入口的 toast）。列表数据经 `/sidecar/*` 同源代理取自 `GET /admin/knocks`；四个动作分别调用对应 admin 路由，失败走既有六类错误态渲染。
+WebUI SHALL 提供敲门台页：列表呈现聚合敲门（谁（key 缩写/别名）/次数/首次/最近/原因），未处置在前、最近在前；每行提供四个动作，成品文案采用 PRODUCT-DESIGN §4 冻结稿：**定位访客**（预填 endpoint_id 的访客授权表单 + 确认）、**导入租户**（租户注册表单——敲门记录无 fabric 归属，表单 MUST 提示「敲门记录只有敲门人的钥匙，没有房间号：请用邀请码让 TA 自助注册，或手工输入 fabric_id+root」）、**拉黑**（二次确认后加入黑名单）、**忽略**（dismiss + 带「撤销」入口的 toast）。列表数据经业务代理面 `/api/*`（→ `/admin/knocks`）获取；四个动作分别调用对应 `/api/*` 路由，失败走既有六类错误态渲染（业务请求一律走 `/api/*`；`/sidecar/*` 仅为本地控制面——r2-P1-2 路径契约）。
 
 #### Scenario: 一键定位访客全链路
 
@@ -54,7 +54,7 @@ WebUI 全站 SHALL 统一 key 呈现为 `别名 (abc***xyz)`：缩写规则为 h
 
 ### Requirement: 邀请码管理页
 
-WebUI SHALL 在租户管理内提供邀请码管理：签发表单（备注 alias_hint 可选、次数默认 1、有效期默认 7 天、注册后默认有效期默认 30 天——均可改）；签发成功 MUST 以**仅此一次**的醒目视图呈现码全文（`dwebc1.` 前缀、4-4-4-4 分组）+ 复制按钮 + 「关闭后无法再次查看」警示；列表只呈现哈希缩写/计数（used/max）/状态（可用/耗尽/过期/已吊销）/到期；吊销为二次确认动作。列表与动作经 `/sidecar/*` 代理对应 admin 路由。
+WebUI SHALL 在租户管理内提供邀请码管理：签发表单（备注 alias_hint 可选、次数默认 1、有效期默认 7 天、注册后默认有效期默认 30 天——均可改）；签发成功 MUST 以**仅此一次**的醒目视图呈现码全文（`dwebc1.` 前缀、4-4-4-4 分组）+ 复制按钮 + 「关闭后无法再次查看」警示；列表只呈现哈希缩写/计数（used/max）/状态（可用/耗尽/过期/已吊销）/到期；吊销为二次确认动作。列表与动作经业务代理面 `/api/*` 调用对应 admin 路由。
 
 #### Scenario: 码全文仅签发时可见
 
@@ -70,7 +70,7 @@ WebUI SHALL 在租户管理内提供邀请码管理：签发表单（备注 alia
 
 sidecar SHALL 维护本地节点簿存储（`~/.opendweb/nodes.json`，权限 0600）：条目 `{id, name, server_host, token, added_at}`；节点列表/状态响应只含 `{id, name, server_host, added_at, current}`，**token MUST NOT 出现在任何 HTTP 响应、日志或浏览器可达状态中**。
 
-**对 webui-console 基座契约的版本化例外（有意变更，非疏漏）**：基座冻结「token MUST NOT 写入任何文件」与「目标一经设定即冻结（重新指向=重启）」——本 requirement 为**节点簿场景引入两条明示例外**，归档 webui-console 时 MUST 附增补说明（条款被 server-access-roles 取代的部分）：(1) **落盘例外**——节点 token 允许持久化于 0600 的 `nodes.json`（威胁模型：单用户工作站、用户主目录私有；文件创建走临时文件+原子 rename，拒绝 symlink 跟随；与 `--token` flag/env 的 OS 可见性同级披露，帮助文本明示）。跨用户主机/共享环境部署文档 MUST 明示不适用；(2) **切换例外**——`POST /sidecar/nodes/switch {node_id}`（本地控制面 `/sidecar/*`）为**唯一被许可的运行时重指向通道**：MUST 仅接受已存储节点的 node_id（任何 URL/host 字段一律 400——目标冻结安全模型保持，无"新目标注入"通道；Host/Origin 校验与配对面一致，无需配对码——无新秘密输入）。切换为进程内原子替换 target+token（无需重启 sidecar）；在途代理请求 MUST 以请求开始时的 target 快照完成（切换不撕裂在途请求）。除此之外基座 target-frozen 拒绝语义不变。节点添加经既有配对面流程（每次新配对码；validateTarget 全量校验与并发一次性消费语义不变）。删除 `DELETE /sidecar/nodes/{id}`；当前连接节点不可删除（409，先切走）。**路径命名冻结**：业务代理面沿用基座 `/api/*` → `/admin/*`（canonical，不引入 `/sidecar/api/*`）；节点簿属本地控制面 `/sidecar/nodes*`。UI：右上角节点信息区提供节点切换菜单（一次一个当前节点，无同屏多节点），切换为进程内即时切换（无进程重启），过渡态呈现「正在切换到 <节点名>…」。
+**对 webui-console 基座契约的版本化例外（有意变更，非疏漏；supersedes 关系冻结）**：基座冻结「token MUST NOT 写入任何文件」与「目标一经设定即冻结（重新指向=重启）」——本 requirement 为**节点簿场景引入两条明示例外**，**优先级规则**：server-access-roles 归档后，webui capability 基线中与下述两条例外冲突的条款**按本 change 的增补修订生效**（spec 同步时 MUST 将例外写为基线正式条款并附「由 server-access-roles 引入」标注，非可选括注）；在 webui-console 与本 change 均未归档的实现窗口内，以本 requirement 为准（后 change 覆盖前 change 的同面条款）。同步义务（tasks Phase 2b 验收项）：归档时任一 change 时 MUST 在 specs/webui 基线落增补 + 负向测试清单（仅 nodes.json 允许落盘、仅 node_id switch 允许重指向，其余路径仍 target-frozen/token-frozen）：(1) **落盘例外**——节点 token 允许持久化于 0600 的 `nodes.json`（威胁模型：单用户工作站、用户主目录私有；文件创建走临时文件+原子 rename，拒绝 symlink 跟随；与 `--token` flag/env 的 OS 可见性同级披露，帮助文本明示）。跨用户主机/共享环境部署文档 MUST 明示不适用；(2) **切换例外**——`POST /sidecar/nodes/switch {node_id}`（本地控制面 `/sidecar/*`）为**唯一被许可的运行时重指向通道**：MUST 仅接受已存储节点的 node_id（任何 URL/host 字段一律 400——目标冻结安全模型保持，无"新目标注入"通道；Host/Origin 校验与配对面一致，无需配对码——无新秘密输入）。切换为进程内原子替换 target+token（无需重启 sidecar）；在途代理请求 MUST 以请求开始时的 target 快照完成（切换不撕裂在途请求）。除此之外基座 target-frozen 拒绝语义不变。节点添加经既有配对面流程（每次新配对码；validateTarget 全量校验与并发一次性消费语义不变）。删除 `DELETE /sidecar/nodes/{id}`；当前连接节点不可删除（409，先切走）。**路径命名冻结**：业务代理面沿用基座 `/api/*` → `/admin/*`（canonical，不引入 `/sidecar/api/*`）；节点簿属本地控制面 `/sidecar/nodes*`。UI：右上角节点信息区提供节点切换菜单（一次一个当前节点，无同屏多节点），切换为进程内即时切换（无进程重启），过渡态呈现「正在切换到 <节点名>…」。
 
 #### Scenario: 切换仅限已存储节点
 

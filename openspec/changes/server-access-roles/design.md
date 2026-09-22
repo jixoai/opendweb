@@ -25,7 +25,9 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 - 存储：`<data_dir>/visitors.jsonl`，append-only 事件日志（照
   OwnerRegistry 模式：`registry.rs:33-47` 的行格式纪律 + generation
-  AtomicU64 + mtime 热重载 + 坏行硬错误 + CLI 三入口收敛）：
+  AtomicU64 + mtime 热重载 + 坏行硬错误；**入口= admin API + 文件
+  两入口**，不新增 CLI mutation——owners 既有 CLI 入口保持不动不扩
+  （r2-P1-3 裁定：v1 面收敛，管理动作集中在 admin 面，权限边界单一））：
   `{"op":"grant"|"revoke","endpoint_id":"<hex64>","alias":"<str?>",`
   `"note":"<str?>","expires_at":<u64ms?>,"ts":<u64ms>}`
   —— serde 全字段 default 兼容演进；活跃集合 = 归并后 grant 未 revoke
@@ -33,7 +35,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 - **gate 挂点**（`gate.rs` C0 无票路径，`gate.rs:430-455` 之后）：
   ```
   C0 无票 → blocklist(endpoint)? → 拒 dweb/blocked
-          → visitor 表命中(未过期)? → Allow（仅 relay/resolve 面）
+          → visitor 表命中(未过期)? → Allow（仅 relay 面；rendezvous 可达面为空）
           → policy=callback? → webhook（A_cb 既有路径，payload 无 cap）
           → 拒 dweb/no-capability（+ 记敲门 §1.2）
   ```
@@ -89,7 +91,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 
 ### 1.4 租户邀请码
 
-- 存储：`<data_dir>/codes.jsonl`：`{"op":"issue"|"revoke","code_hash":`
+- 存储：`<data_dir>/codes.jsonl`：`{"op":"issue"|"revoke"|"consume","code_hash":`
   `"<blake3 hex>","alias_hint":"<str?>","max_uses":<u32,"expires_at":<u64ms>,`
   `"default_ttl_days":<u32?>,"ts":<u64ms>}`。码本体 `dwebc1.` + base32
   16 字符（80 bit 熵，仅签发响应显示一次；库存只留哈希）。
@@ -105,7 +107,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   genesis root——首次注册无第三方可证；PoP 保证的是"root 密钥持有者
   本人请求"，冒名注册他人已存在的 (fabric_id, root) 需要他人 root 私钥
   签名，不成立）→ registry 追加 register（expires_at = code.default_
-  ttl_days ?? +30d）→ used_count+1 → server.key 回执（新域
+  ttl_days ?? +30d）→ consume 事件 → server.key 回执（新域
   `b"dweb/register-receipt/v1\0"`，canonical 含 code_hash/fabric/root/ts/
   generation——**回执不含 code 本体**）。
 - 限流：/register per-IP 令牌桶（默认 10/min，突发 5；`DWEB_REGISTER_
@@ -118,8 +120,19 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
 - **消费原子性（r1-P0-2）**：codes.jsonl 事件面增 `consume`（携带
   fabric/root）；used_count=consume 计数由归并推导，不只存内存。兑换
   判定与 consume 追加在同一临界区按 code_hash 串行；**fsync 成功前
-  不返回 200/回执**（落盘失败=500 无半提交）；max_uses=1 并发双兑
-  恰一成功（e2e 钉死）。
+  不返回 200/回执**（落盘失败=500）；max_uses=1 并发双兑恰一成功
+  （e2e 钉死）。
+- **跨台账提交协议（r2-P0-1）**：consume 与 owners register 分属两个
+  jsonl，无跨文件事务——冻结为**先 register 后 consume + 启动恢复**：
+  ① owners.jsonl 追加 register 事件（携带 `via_code_hash` 字段，
+  serde(default) 兼容旧行）+ fsync；② codes.jsonl 追加 consume + fsync；
+  ③ 双 fsync 成功后才返回 200/回执。**启动恢复**：归并时对每个带
+  via_code_hash 且无匹配 consume 的 register 事件，自动补齐缺失的
+  consume 事件（完成提交；generation 相应递增）——崩溃窗口的结果
+  恒为「完整兑换」或「码完好」，**不存在烧码无租户**。② 失败（进程
+  存活）=500 且内存挂起补写：同码重试幂等完成（register 续期 +
+  consume 补写）。回执 generation=**owners 世代**（r2-P1-5，客户端
+  不透明）。故障注入 e2e：① 后崩溃→重启→码已消费且租户在册。
 - **码生成与脱敏（r1-P1-3）**：OS CSPRNG；哈希输入=码本体 16 字符
   小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（对齐
   callback_token 纪律）；错误码状态区分为明示产品取舍（排障需要）。
@@ -147,7 +160,7 @@ L1/L1b 判定逐字节不变（server-access-policy 冻结语义）。
   GET 面无端点身份证明，"访客查表放行 resolve"不可实现（名册非空即
   全局放行的开关语义已否决：泥泞且扩大面）；带身份绑定的签名
   resolve 变体 = Phase 2。announce 仍需有票（现状）。rendezvous
-  Deny 臂照记敲门。
+  Deny 臂仅结构化 debug 日志（不入 KnockLog——身份不可信，见 §1.2）。
 - resolve/announce 面基础限流：per-IP 令牌桶（resolve 60/min、
   announce 20/min）——探查实证当前 HTTP 面零限流；实现与 §1.4 共用
   令牌桶组件。
@@ -228,11 +241,11 @@ nodes/{id}；当前连接节点不可删（先切走）。
 |---|---|
 | gate 单测 | 访客矩阵（命中/过期/revoked/无票非访客/callback 分流/访客配额）、blocklist（endpoint 早判/fabric 晚判/open 不生效）、owner-expired 边界（到期当日/续期恢复） |
 | registry 单测 | 旧格式条目（无 expires_at/alias）解析=永久无 alias；坏行硬错误；generation 递增 |
-| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/重复注册=续期/回执验签 |
-| KnockLog 单测 | 聚合/LRU/排除 blocked/dismiss 幂等 |
+| 兑换单测+e2e | 正常兑换/错 sig/重放窗口/耗尽/过期/吊销/per-IP 限流/重复注册=续期/回执验签/**register 后崩溃恢复补 consume**（故障注入）/unknown endpoint dismiss/undismiss=404/pending_count 恒为未处置数 |
+| KnockLog 单测 | 聚合/LRU/排除 blocked/dismiss+undismiss 幂等/新 deny 复位/seq tie-break（每次 deny 分配新 seq，排序键 seq desc，last_at 仅展示——时钟回拨免疫） |
 | admin e2e | 敲门→定位访客→raw client 重连放行全链路；邀请码签发→兑换→名册出现带 alias/到期；到期租户 deny reason；黑名单同票拒 |
 | rendezvous | 无票 resolve/announce 维持 401（访客可达面为空）；限流触发 429 |
-| webui | node --test 纯逻辑（新 copy/缩写规则/路由收敛）+ apiFetch 注入矩阵扩展 + sidecar 节点簿单测（存储 0600/切换不含新 URL/state 掩码）|
+| webui | node --test 纯逻辑（新 copy/缩写规则/路由收敛）+ apiFetch 注入矩阵扩展 + sidecar 节点簿单测（存储 0600/原子 rename/拒 symlink/切换不含新 URL/state 掩码/在途快照）+ 业务调用路径契约（敲门台/邀请码仅 /api/*，本地控制面仅 /sidecar/nodes*） |
 | 并发/缓存 | 并发双兑恰一成功（fsync 前零响应）；visitor grant/revoke 即刻失效 webhook 缓存（复合 generation） |
 | 投影/wire | per_visitor 数组 + per_endpoint 不含访客；status visitors_online；XFF 伪造不改限流键；client-sdk op 0x04-0x0C 映射 + fixture 对拍增量 |
 | CLI | `opendweb id` 幂等无私钥；`opendweb join` 端到端（新 fabric/复用/失效码三种） |

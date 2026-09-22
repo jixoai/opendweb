@@ -156,7 +156,7 @@
 
 ### Requirement: 敲门日志（KnockLog）
 
-`restricted` 模式下，被拒绝的接入尝试 MUST 记入服务端内存敲门台账供管理面观察。**身份来源冻结（P0 红线）**：台账只接受 **relay 握手密码学认证的 endpoint_id**（E1 链）——rendezvous HTTP 面的 deny（匿名 resolve 无调用方身份；announce 签名验证前的 ACL 拒绝同样无已验身份）**MUST NOT 记入 endpoint 台账**（仅结构化 debug 日志；可另设 per-IP abuse 计数器，但不得伪装成"谁在敲门"）。挂点为 relay on_connect 的 Deny 臂。台账按 endpoint_id 聚合：`{endpoint_id, seq, first_at, last_at, count, last_reason, dismissed}`；同一端点重复敲门递增 count（u64 饱和递增，不回绕）并更新 last_at/last_reason；`seq` 为进程内单调序号，作为 last_at 相同时的排序 tie-break。**排除项**：deny reason 为 `dweb/blocked` 的尝试 MUST NOT 记入；`dweb/owner-expired` 记入且作为租户到期提醒类别。**dismiss 语义**：dismiss 为幂等管理动作（不删除记录）；**该端点再次发生 deny 时 `dismissed` 自动复位为 false**（重新进入待办）；`undismiss` 为对等管理动作（手动恢复待办，幂等）。容量有界：最多 4096 个 endpoint 条目，超限按 (last_at, seq) 最久者逐出（重启清空——敲门是运营提示而非审计事实，审计以管理操作回执为准；持久化列为未来工作）。
+`restricted` 模式下，被拒绝的接入尝试 MUST 记入服务端内存敲门台账供管理面观察。**身份来源冻结（P0 红线）**：台账只接受 **relay 握手密码学认证的 endpoint_id**（E1 链）——rendezvous HTTP 面的 deny（匿名 resolve 无调用方身份；announce 签名验证前的 ACL 拒绝同样无已验身份）**MUST NOT 记入 endpoint 台账**（仅结构化 debug 日志；可另设 per-IP abuse 计数器，但不得伪装成"谁在敲门"）。挂点为 relay on_connect 的 Deny 臂。台账按 endpoint_id 聚合：`{endpoint_id, seq, first_at, last_at, count, last_reason, dismissed}`；同一端点重复敲门递增 count（u64 饱和递增，不回绕）并更新 last_at/last_reason；`seq` 为进程内单调序号，**每次 deny 分配新 seq**（排序键 = seq 降序——seq 单调故时钟回拨不影响排序，last_at 仅作展示字段）。dismiss/undismiss/新 deny/容量逐出 MUST 在同一锁内原子完成；并发 dismiss 与新 deny 的胜者 = 后获得锁者（deny 置 dismissed=false，dismiss 置 true，无 CAS 需求）。对不存在条目的 dismiss/undismiss 返回 404 no-match（与 disconnect 判定一致）；**`pending_count` 恒为未 dismissed 条目数**（`include_dismissed` 不改变该字段语义）。**排除项**：deny reason 为 `dweb/blocked` 的尝试 MUST NOT 记入；`dweb/owner-expired` 记入且作为租户到期提醒类别。**dismiss 语义**：dismiss 为幂等管理动作（不删除记录）；**该端点再次发生 deny 时 `dismissed` 自动复位为 false**（重新进入待办）；`undismiss` 为对等管理动作（手动恢复待办，幂等）。容量有界：最多 4096 个 endpoint 条目，超限按 (last_at, seq) 最久者逐出（重启清空——敲门是运营提示而非审计事实，审计以管理操作回执为准；持久化列为未来工作）。
 
 #### Scenario: 同端点重复敲门聚合计数
 
@@ -192,7 +192,8 @@
 
 服务端 SHALL 提供邀请码台账 `<data_dir>/codes.jsonl`（append-only，同一 registry 存储模式：坏行 fail-fast、generation、热重载、`serde(default)` 向后兼容）：事件 `{"op":"issue"|"revoke"|"consume","code_hash":"<blake3 64hex>","alias_hint"?,"max_uses"?,"expires_at","default_ttl_days"?,"fabric_id"?,"root"?,"ts"}`——**`consume` 为消费事件**（携带兑换出的 fabric_id/root），`used_count` 由事件归并推导（= consume 事件计数），MUST NOT 只存在于内存。码本体格式 `dwebc1.` + base32 16 字符（crockford 字符集，4-4-4-4 分组展示）；**生成 MUST 使用 OS CSPRNG**；**哈希输入规范化冻结**：取码本体 16 字符的小写规范化形态（剥离 `dwebc1.` 前缀与分组连字符）后 blake3；**存储与一切列表响应只含哈希，码全文仅出现在签发响应一次；日志/指标/错误消息 MUST NOT 含码全文或其可逆变换**（对齐 callback_token 脱敏纪律）。签发默认 `max_uses=1`、`expires_at=签发+7天`、`default_ttl_days=30`，逐项可自定义（R4）；输入上限：`max_uses ≤ 1000`、`expires_in_days ≥ 1`、`default_ttl_days ≥ 1`、`alias_hint ≤ 32` UTF-8 字节，越界 400 `invalid-request`。**fabric_id 语义（P1 明示）**：fabric_id 是**租户自声明标签**（FabricId 由 Roster 随机生成、无服务端可验的 genesis 绑定），身份键 = (fabric_id, root) 二元组（与 owners registry 既有精确匹配语义一致）；同 fabric_id 多 root 为合法并存条目，管理面 MUST 以二元组呈现租户身份（不可单显 fabric），同 fabric 多 root 时 UI 附钓鱼警示。错误码 `code-invalid`/`code-exhausted`/`code-expired` 的**状态区分为有意的产品取舍**（排障需要），属明示的信息泄露面。
 
-**公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**root PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**；残余面=自声明 fabric_id，见上）。校验序（fail-closed）：per-来源-IP 令牌桶限流（**直连 TCP peer 地址，XFF 不采信**；默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。**消费原子性**：兑换判定与 consume 事件追加 MUST 在同一临界区内按 code_hash 串行（同码并发兑换互斥；`max_uses=1` 时并发双兑 MUST 恰一个成功，另一个 `code-exhausted`）；**consume 事件落盘成功（fsync）之前 MUST NOT 返回成功响应/签发回执**；落盘失败=兑换失败（500，不产生半提交状态）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，checked 运算防溢出；缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at、保留 alias/note，不重复建条目）；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 由 root 侧自行签发——server 只认票据不签票据，identity.rs 域纪律不变）。**客户端入口**：`opendweb join` CLI（见 cli/identity capability）承担 root 选取/fabric 生成/签名/兑换/回执保存，HTTP 面不要求租户手工构造。
+**公开兑换端点 `POST /register`**（挂 gateway 根路径，不经 admin token；请求/响应体 ≤4KiB）：body `{"code","fabric_id":"<64hex>","root":"<64hex>","ts","sig"}`，其中 `sig` 为 body.root 对应 Ed25519 私钥对 `b"dweb/register/v1\0" || code || fabric_id || root || ts(u64BE)` 的签名（**root PoP：冒名注册他人 (fabric_id, root) 需要他人 root 私钥，不成立**；残余面=自声明 fabric_id，见上）。校验序（fail-closed）：per-来源-IP 令牌桶限流（**直连 TCP peer 地址，XFF 不采信**；默认 10 次/分钟，突发 5，`DWEB_REGISTER_RATE_PER_MIN` 可配；超限 429 `rate-limited`）→ 字段形状 → ts 窗口 ±120s（拒绝 `stale-ts`）→ 码哈希命中且未吊销未耗尽未过期（`code-invalid`/`code-exhausted`/`code-expired`）→ PoP 验签（`bad-signature`）。**消费原子性**：兑换判定与 consume 事件追加 MUST 在同一临界区内按 code_hash 串行（同码并发兑换互斥；`max_uses=1` 时并发双兑 MUST 恰一个成功，另一个 `code-exhausted`）。
+**跨台账提交协议（consume 与 register 分属两个 jsonl，顺序冻结）**：① owners.jsonl 追加 register 事件（携带 `via_code_hash` 字段，`serde(default)` 兼容旧行）并 fsync；② codes.jsonl 追加 consume 事件并 fsync；③ **双 fsync 成功后才允许返回成功响应/签发回执**。**启动恢复**：归并时对每个带 via_code_hash 且无匹配 consume 事件的 register 事件，MUST 自动补齐缺失的 consume 事件（完成提交，相关 generation 递增）——崩溃窗口的结果恒为「完整兑换」或「码完好」，MUST NOT 出现「码已消费但租户不在册」（烧码无租户）。② 落盘失败且进程存活 = 500 且挂起补写（同码重试幂等完成：register 走续期语义 + consume 补写）；回执的 `generation` 字段 = **owners registry 世代**（register 为兑换的主效果；客户端视为不透明 u64）。通过后：registry 追加 register 事件（expires_at = now + default_ttl_days×24h，checked 运算防溢出；缺省 30 天——R5）；**同 (fabric_id, root) 已活跃 = 续期语义**（刷新 expires_at、保留 alias/note，不重复建条目）；返回 server.key 签名回执（canonical：`b"dweb/register-receipt/v1\0" || code_hash 32B || fabric_id 32B || root 32B || ts u64BE || generation u64BE`；**回执不含 code 本体**）。注册后该 root 即可经 capability 签发面获得 relay 准入（capability 由 root 侧自行签发——server 只认票据不签票据，identity.rs 域纪律不变）。**客户端入口**：`opendweb join` CLI（见 cli/identity capability）承担 root 选取/fabric 生成/签名/兑换/回执保存，HTTP 面不要求租户手工构造。
 
 #### Scenario: 正常兑换与回执验签
 
@@ -233,6 +234,21 @@
 
 - **WHEN** 审查签发后的全部服务端日志、指标与错误响应
 - **THEN** 不含码全文或其可逆变换（只允许哈希形态）
+
+#### Scenario: register 落盘后崩溃，恢复补齐 consume
+
+- **WHEN** 兑换完成 owners register（含 via_code_hash）fsync 后、consume 落盘前进程崩溃，重启后再次兑换同码
+- **THEN** 启动归并补齐缺失 consume；租户在册且码计数正确（完整兑换）；若重启前有并发重试，同码幂等收敛不产生第二次租户条目
+
+#### Scenario: unknown 敲门条目的处置动作
+
+- **WHEN** 对不在台账的 endpoint_id 调用 dismiss 或 undismiss
+- **THEN** 返回 404 + `no-match` envelope，无副作用
+
+#### Scenario: pending_count 语义恒定
+
+- **WHEN** `GET /admin/knocks?include_dismissed=true`
+- **THEN** 响应包含已处置条目，但 `pending_count` 仍且仅为未 dismissed 条目数
 
 #### Scenario: 重复注册为续期
 

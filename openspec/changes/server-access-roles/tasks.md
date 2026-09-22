@@ -26,13 +26,14 @@
 
 - [ ] codes.jsonl 台账（issue/revoke/**consume** 三事件，serde(default)；used_count=consume 计数归并推导）
 - [ ] 码生成：OS CSPRNG `dwebc1.`+base32×16；哈希输入=码本体小写规范化（剥前缀/连字符）；日志/指标/错误零码全文（r1-P1-3）
-- [ ] `POST /register` 公开端点：直连 TCP peer 限流（10/min 突发 5，**XFF 不采信**——r1-P1-2）→ 形状 → ts±120s → 码校验 → PoP 验签（域含 root）；**兑换判定+consume 追加同临界区按 code_hash 串行、fsync 成功前零响应**（r1-P0-2）→ register 事件（续期语义）→ 回执域 `dweb/register-receipt/v1\0`
+- [ ] `POST /register` 公开端点：直连 TCP peer 限流（10/min 突发 5，**XFF 不采信**——r1-P1-2）→ 形状 → ts±120s → 码校验 → PoP 验签（域含 root）；**兑换判定+consume 追加同临界区按 code_hash 串行、fsync 成功前零响应**（r1-P0-2）→ 回执域 `dweb/register-receipt/v1\0`（generation=owners 世代）
+- [ ] **跨台账提交协议（r2-P0-1）**：① owners register 事件带 `via_code_hash`（serde(default)）先 fsync → ② codes consume 后 fsync → ③ 双成功才响应；**启动恢复**=归并时补齐带 via_code_hash 且无匹配 consume 的缺失事件（恒「完整兑换」或「码完好」，无烧码无租户）；②失败存活=500+挂起补写（同码重试幂等完成）
 - [ ] rendezvous per-IP 限流（resolve 60/min、announce 20/min，429 envelope；直连 peer；令牌桶组件与 /register 共用）
-- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/续期/回执验签/**并发双兑恰一成功**）+ 旧格式 codes/owners 条目兼容
+- [ ] 绿门：兑换矩阵 e2e（正常/错 sig/重放/耗尽/过期/吊销/限流/XFF 伪造/续期/回执验签/**并发双兑恰一成功**/**register 后崩溃恢复补 consume 故障注入**）+ 旧格式 codes/owners 条目兼容（含 via_code 缺省）
 
 ## 4. Phase 1c —— 三角色管理面 API
 
-- [ ] knocks（GET 排序契约：未处置前/last_at desc/seq desc/endpoint_id asc + dismiss/**undismiss**）、visitors CRUD + from-knock、codes 三路（签发响应含全文仅一次）、renew、blocklist CRUD、status 增量四字段
+- [ ] knocks（GET 排序契约：未处置前/**seq desc**/endpoint_id asc——每次 deny 分配新 seq，时钟回拨免疫 + dismiss/**undismiss**（unknown endpoint=404 no-match）；**pending_count 恒为未处置数**（include_dismissed 不改变）；dismiss/deny/逐出同锁原子、后写胜）、visitors CRUD + from-knock、codes 三路（签发响应含全文仅一次）、renew、blocklist CRUD、status 增量四字段
 - [ ] 回执 op 枚举 0x04-0x0C（103B canonical 未用维度置零；code 类 target=code_hash；**generation=所属台账 generation**——r1-P1-12 按 spec 槽位映射表逐项实现）
 - [ ] 输入上限与边界（r1-P2-3）：alias≤32/note≤256/alias_hint≤32/max_uses≤1000/expires_in_days≥1/checked 运算/now>=expires_at 等值=过期
 - [ ] client-sdk 同步（r1-P1-8）：`./admin` op 映射 0x04-0x0C + Receipt 类型 union + canonical builder；receipt-vector.json 增补新 op 向量（Rust 生成断言 + TS 只读对拍，`DWEB_REGEN_FIXTURES=1` 门）
@@ -44,13 +45,14 @@
 - [ ] 敲门台四动作（定位访客/导入租户引导/拉黑确认/忽略+撤销 toast→undismiss）——PM §4 文案逐字
 - [ ] key 显示规范落地（`别名 (abc***xyz)` 首3***尾3，取代前 8 位；复制全文）；租户身份=二元组呈现 + 同 fabric 多 root 钓鱼警示（r1-P1-1）
 - [ ] 邀请码管理页（签发一次全文视图/列表哈希缩写/吊销确认）
-- [ ] 绿门：node --test（copy/缩写/路由收敛/错误态矩阵扩展——新增五 requirement 各自有 UI/API/错误态测试，不以旧测试全绿代替新面覆盖）+ vision 子代理视觉走查
+- [ ] 绿门：node --test（copy/缩写/路由收敛/错误态矩阵扩展——新增五 requirement 各自有 UI/API/错误态测试，不以旧测试全绿代替新面覆盖）+ **业务路径契约测试**（敲门台/邀请码调用仅 `/api/*`，本地控制面仅 `/sidecar/nodes*`）+ vision 子代理视觉走查
 
 ## 6. Phase 2b —— 节点簿
 
 - [ ] sidecar `~/.opendweb/nodes.json`（0600；临时文件+原子 rename、拒 symlink 跟随——版本化例外条款落地）+ 配对面可重复添加 + switch 仅已存 node_id + 进程内原子切换（在途请求按请求开始时 target 快照完成）+ 删除（当前节点 409）
 - [ ] state/列表响应零 token 披露；Host/Origin 守卫延续；帮助文本 OS 可见性披露
 - [ ] UI：右上角节点切换菜单（一次一个当前节点；行内过渡态「正在切换到…」，无重启文案）
+- [ ] **归档增补义务（r2-P1-4）**：webui-console 或本 change 归档时，specs/webui 基线落 supersedes 增补 + 负向测试清单（仅 nodes.json 允许落盘、仅 node_id switch 允许重指向，其余路径仍 token-frozen/target-frozen）
 - [ ] 绿门：sidecar 单测（0600/原子 rename/symlink 拒绝/切换拒绝新 URL/在途快照/409/token 零披露）+ e2e 切换后 `/api/status` 指向新节点
 
 ## 7. Phase 3 —— CLI/文档
