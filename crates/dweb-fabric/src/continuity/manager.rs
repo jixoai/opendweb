@@ -108,7 +108,9 @@ async fn dial_and_adopt(
         }
     }
     let addr = endpoint_addr_for(inner, remote).await?;
-    let conn = match inner.endpoint.connect(addr, super::ALPN_CONTINUITY).await {
+    // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+    let endpoint = inner.require_endpoint()?;
+    let conn = match endpoint.connect(addr, super::ALPN_CONTINUITY).await {
         Ok(c) => c,
         Err(e) => {
             state

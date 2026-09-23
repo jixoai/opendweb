@@ -246,6 +246,26 @@ pub struct FabricConfig {
     pub bind_addr: Option<String>,
 }
 
+/// [H8] Phase 0（home-hub §2.1）：`create_root`/`open` 的双扩展选项——
+/// 既有 [`FabricConfig`] 字面量调用面零改动（独立选项结构，缺省 = 既有
+/// eager 行为逐字节不变）。
+///
+/// - `defer_start`：true = deferred 构造——**零网络出站**（不 bind、不等
+///   online、不连接 relay；本地 relay.caps.json 预检允许），原构造期语义
+///   （缓存票据合并注入 + bind + online）后移到 [`Fabric::start`]。
+/// - `fabric_id`：roster 显式 fabric_id 采纳。仅 `create_root` 生效（提供时
+///   roster 持久化并采纳该值，`fabric_id_hex()` 读回逐字相等）；`open` 将其
+///   用作 tuple 校验期望值（不匹配 =
+///   [`crate::roster::RosterError::DirFabricMismatch`] 明确错误）；`attach`
+///   忽略（fabric_id 经独立参数给出）。缺省 None = SDK 随机生成。roster 已
+///   存在（同 data_dir）时 createRoot 一律 AlreadyExists——复用一律走 open
+///   （open 负责校验，不重复 Genesis、不覆盖 roster）。
+#[derive(Debug, Clone, Default)]
+pub struct FabricStartOptions {
+    pub defer_start: bool,
+    pub fabric_id: Option<[u8; 32]>,
+}
+
 impl std::fmt::Debug for FabricConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FabricConfig")
@@ -548,6 +568,73 @@ fn upsert_relay_caps(store: &mut Vec<(String, String)>, incoming: &[(String, Str
     changed
 }
 
+/// [H8] Phase 0：deferred 构造的缓存票据预检（design §2.1 r9-P1-1 冻结）。
+/// 逐条 decode 校验 tuple `(relay_url ∈ 配置, fabric_id == roster,
+/// issuer == roster root, server_id == 配置条目)` 且未过期（过期条目已被
+/// [`load_relay_caps`] 读取侧丢弃）；不匹配 = 忽略 + 诊断记录（tracing），
+/// 匹配 = 留待 start() 注入。纯本地计算——deferred 构造零网络出站的
+/// 前置条件之一。root 未知（attach 空名册）时 issuer 无法验证，全量忽略。
+fn preflight_relay_caps(
+    caps: &[(String, String)],
+    roster: &Roster,
+    relay: &RelayConfig,
+) -> Vec<(String, String)> {
+    let fabric_id = roster.fabric_id();
+    let root = roster.root();
+    // 配置条目视图：(url, Option<server_id>)——Custom 无 server_id 位。
+    let configured: Vec<(&str, Option<[u8; 32]>)> = match relay {
+        RelayConfig::Custom(urls) => urls.iter().map(|u| (u.as_str(), None)).collect(),
+        RelayConfig::CustomWithCaps(entries) => entries
+            .iter()
+            .map(|e| (e.url.as_str(), e.server_id))
+            .collect(),
+        // n0/disabled 无自定义 relay 面：缓存票据的 url 不可能匹配配置。
+        RelayConfig::Disabled | RelayConfig::N0Default => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(caps.len());
+    for (url, cap) in caps {
+        let decoded = match crate::protocol::RelayCapV1::decode(cap) {
+            Ok(d) => d,
+            // load_relay_caps 已校验过 decode；此处防御性忽略（诊断）
+            Err(e) => {
+                tracing::debug!(url, error = %e, "relay capability preflight: undecodable, ignored");
+                continue;
+            }
+        };
+        let Some((_, cfg_server)) = configured.iter().find(|(cu, _)| same_relay_url(cu, url))
+        else {
+            tracing::debug!(
+                url,
+                "relay capability preflight: url not in configured relays, ignored"
+            );
+            continue;
+        };
+        if decoded.fabric_id != fabric_id {
+            tracing::debug!(
+                url,
+                "relay capability preflight: fabric_id mismatch, ignored"
+            );
+            continue;
+        }
+        if !matches!(root, Some(root) if root == decoded.issuer) {
+            tracing::debug!(
+                url,
+                "relay capability preflight: issuer is not the roster root, ignored"
+            );
+            continue;
+        }
+        if *cfg_server != Some(decoded.server_id) {
+            tracing::debug!(
+                url,
+                "relay capability preflight: server_id mismatch, ignored"
+            );
+            continue;
+        }
+        out.push((url.clone(), cap.clone()));
+    }
+    out
+}
+
 /// 中继状态快照（relay_status() 与 relay 事件 payload 同构；D4）。
 #[derive(Debug, Clone)]
 pub struct RelayStatusSnapshot {
@@ -750,7 +837,10 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
             "shutdown",
         )
         .await;
-    inner.endpoint.close().await;
+    // [H8] deferred 未启动即 shutdown：endpoint 从未 bind，无网络面可关。
+    if let Some(endpoint) = inner.endpoint.get() {
+        endpoint.close().await;
+    }
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
     // 生产者可以把晚到 child push 到已 take 的表中。
     let accept_loop = { inner.accept_loop_task.lock().unwrap().take() };
@@ -848,6 +938,160 @@ fn same_relay_url(a: &str, b: &str) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
     }
+}
+
+// ==== [H8] Phase 0：启动航班组成件 ============================================
+
+/// 启动航班网络段：合并注入 → bind → endpoint 登记 → online 沉降 → 快照初值。
+/// 全部 await 点都在本函数内——取消（select 丢弃）只会落在这几步上，之后的
+/// 常驻任务 spawn 由调用方在无 await 的同步尾部执行（不会中途被丢弃）。
+async fn start_flight_work(inner: &Arc<FabricInner>) -> Result<(), FabricError> {
+    // shutdown 已开始（构造与 shutdown 的极端竞态）：按取消收尾，不起网络面
+    if inner.lifecycle_closing() {
+        return Err(FabricError::Shutdown);
+    }
+    // 合并注入（r9-P1-1 冻结优先级）：本次 ensure 且断言过的票最高优先——
+    // 同 URL 的缓存票/静态票一律不覆盖 ensured；缓存票仅注入 tuple 预检
+    // 通过的条目（preflight 已滤）。eager 构造 ensured 恒空（构造器未返回，
+    // 无人能调 ensure），等价既有“构造期注入缓存+静态票”语义。
+    if let Some(map) = &inner.relay_map {
+        let ensured = inner.ensured_caps.lock().unwrap().clone();
+        let is_ensured = |url: &str| ensured.iter().any(|(eu, _)| same_relay_url(eu, url));
+        let mut to_inject: Vec<(String, String)> = Vec::new();
+        {
+            let pending = inner.pending_cache_caps.lock().unwrap();
+            for (url, token) in pending.iter() {
+                if !is_ensured(url) {
+                    to_inject.push((url.clone(), token.clone()));
+                }
+            }
+        }
+        if let RelayConfig::CustomWithCaps(entries) = &inner.relay {
+            for entry in entries {
+                if let Some(token) = entry.local_token()
+                    && !is_ensured(&entry.url)
+                {
+                    to_inject.push((entry.url.clone(), token.to_owned()));
+                }
+            }
+        }
+        inject_relay_tokens(map, &to_inject);
+    }
+    // endpoint 重建 + bind（[H8]：builder 选项在 inner 保存至本刻）
+    let endpoint = build_and_bind(inner).await?;
+    // 登记（OnceLock 首写即终态；关闭责任随登记转移给 shutdown/取消路径）
+    let _ = inner.endpoint.set(endpoint.clone());
+    // R3 P1-3：10s online 等待仅作为“沉降触发”——其布尔结果不写入快照；
+    // 快照的 online 与 active_url 一律来自下方同一次 watcher 聚合观测。
+    if !matches!(inner.relay, RelayConfig::Disabled) {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await;
+    }
+    // HB 8.1 + R3 P1-3：初始快照的 online / active_url / last_error 来自同一
+    // 次 watcher 聚合观测（快照自洽不变量：active_url ⇔ online=true）。
+    if !matches!(inner.relay, RelayConfig::Disabled) {
+        let config_urls = inner.relay_snapshot.lock().unwrap().urls.clone();
+        let mut status_watcher = endpoint.home_relay_status();
+        let current: Vec<RelayStatusView> = status_watcher.get().iter().map(Into::into).collect();
+        let agg = aggregate_relay_status(&config_urls, &current);
+        let mut snap = inner.relay_snapshot.lock().unwrap();
+        snap.online = Some(agg.online);
+        snap.active_url = agg.online_url;
+        snap.last_error = agg.last_error;
+    }
+    Ok(())
+}
+
+/// 按 inner 保存的内核级选项重建 endpoint builder 并 bind。
+async fn build_and_bind(inner: &Arc<FabricInner>) -> Result<Endpoint, FabricError> {
+    let mut builder = match &inner.relay {
+        RelayConfig::Disabled => {
+            Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(RelayMode::Disabled)
+        }
+        RelayConfig::Custom(_) | RelayConfig::CustomWithCaps(_) => {
+            let map = inner
+                .relay_map
+                .as_ref()
+                .expect("custom relay modes carry a RelayMap handle")
+                .clone();
+            Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(RelayMode::Custom(map))
+        }
+        RelayConfig::N0Default => Endpoint::builder(iroh::endpoint::presets::N0),
+    };
+    // 代理所有权映射（D7）：None=不设；FromEnv=proxy_from_env；Url=proxy_url。
+    builder = match &inner.http_proxy_cfg {
+        HttpProxyConfig::None => builder,
+        HttpProxyConfig::FromEnv => builder.proxy_from_env(),
+        HttpProxyConfig::Url(u) => builder.proxy_url(parse_proxy_url(u)?.into()),
+    };
+    if let Some(bind) = &inner.bind_addr_cfg {
+        builder = builder.bind_addr(bind.as_str()).map_err(|e| {
+            FabricError::Session(SessionError::Connect(format!("bind {bind}: {e}")))
+        })?;
+    }
+    // HB 5.1：受限信任枚举 -> iroh 上游 CA 配置（PlatformRoot = 不设置，
+    // 保持 iroh 默认内置根；CustomPem = 仅自定义根）。
+    if let Some(ca) = inner.relay_tls_cfg.to_ca_tls_config()? {
+        builder = builder.ca_tls_config(ca);
+    }
+    builder = builder
+        .secret_key(inner.identity.secret_key().clone())
+        .alpns(vec![
+            ALPN_REGULAR.to_vec(),
+            ALPN_REDEEM.to_vec(),
+            crate::continuity::ALPN_CONTINUITY.to_vec(),
+        ]);
+    Ok(builder.bind().await?)
+}
+
+/// 启动尾部常驻任务 spawn + 登记（同步序列，无 await——不会中途被取消）。
+/// watcher/manager/accept 的登记字段与 drain 的收割字段同源；返回
+/// AbortHandle 集合供「完成与 shutdown 裁判竞态」分支撤销刚 spawn 的任务。
+fn spawn_runtime_tasks(inner: &Arc<FabricInner>) -> Vec<tokio::task::AbortHandle> {
+    let endpoint = inner
+        .endpoint
+        .get()
+        .expect("start flight registers the endpoint before spawning runtime tasks")
+        .clone();
+    let mut aborts = Vec::with_capacity(3);
+    // relay watcher（D4）：直接消费 iroh home_relay_status 状态流；Disabled 不启动。
+    let watcher = if !matches!(inner.relay, RelayConfig::Disabled) {
+        let status_stream = RelayViewStream(endpoint.home_relay_status().stream());
+        let snapshot = inner.relay_snapshot.clone();
+        let events_tx = inner.events.clone();
+        let config_urls = inner.relay_snapshot.lock().unwrap().urls.clone();
+        let lifecycle_gate = inner.lifecycle_gate.clone();
+        let shutdown_started = inner.shutdown_started.clone();
+        let task = tokio::spawn(async move {
+            relay_watch_loop(
+                status_stream,
+                config_urls,
+                snapshot,
+                lifecycle_gate,
+                shutdown_started,
+                events_tx,
+            )
+            .await;
+        });
+        aborts.push(task.abort_handle());
+        Some(task)
+    } else {
+        None
+    };
+    *inner.relay_watcher_task.lock().unwrap() = watcher;
+    // c2：会话自动重连监管 manager 常驻（消费意外死亡通知派发退避重拨）
+    let reconnect_rx = inner
+        .reconnect_rx
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap_or_else(|| tokio::sync::mpsc::unbounded_channel().1);
+    let manager = spawn_reconnect_manager(inner, reconnect_rx);
+    aborts.push(manager.abort_handle());
+    *inner.reconnect_manager_task.lock().unwrap() = Some(manager);
+    let accept = spawn_accept_loop(inner, endpoint);
+    aborts.push(accept.abort_handle());
+    *inner.accept_loop_task.lock().unwrap() = Some(accept);
+    aborts
 }
 
 /// relay deny reason 提取（task 2.5 透出通道的第一段）：iroh 上游把
@@ -1029,6 +1273,17 @@ pub enum FabricError {
     /// capability 是 bearer 凭证，损坏不静默吞掉）。
     #[error("relay capability store {path}: {reason}")]
     RelayCapsStore { path: PathBuf, reason: String },
+    /// [H8] Phase 0：deferStart 形态未 `start()` 即调用网络操作（join/connect/
+    /// continuity 拨号等）。Closed 态的 start/ensure 用 [`FabricError::Shutdown`]。
+    #[error(
+        "fabric is not started: this Fabric was constructed with deferStart; call start() \
+         before network operations"
+    )]
+    NotStarted,
+    /// [H8] Phase 0：start 航班失败的共享副本——single-flight 等待者得到同一
+    /// 失败的只读克隆（Display 与底层错误一致；错误载荷含原因）。
+    #[error("{0}")]
+    StartFailedShared(Arc<FabricError>),
 }
 
 struct PeerEntry {
@@ -1040,6 +1295,67 @@ struct PeerEntry {
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// 连接代次：旧连接的 watcher 只允许删除同代次条目
     epoch: u64,
+}
+
+// ==== [H8] Phase 0：deferStart 生命周期状态机（design §2.1 转移表冻结） ========
+
+/// 生命周期相位（eager 构造完成后即 Started；deferred 构造从 Deferred 起步）。
+///
+/// 转移表（操作 × 当前态，表驱动测试覆盖每条合法/拒绝边）：
+///
+/// | 当前态 \ 操作 | start() | ensureRelayCapabilities() | shutdown() |
+/// |---|---|---|---|
+/// | Deferred | →Starting | 允许（零网络） | →Closed（清理资源，无网络面） |
+/// | Starting | single-flight 复用同一 Future | 允许 | 取消启动→Closed（返回后无晚到 bind/网络事件） |
+/// | Started | 幂等 no-op | 允许 | →Closed（正常停机语义） |
+/// | Failed | →Starting（重试） | 允许 | →Closed |
+/// | Closed | 明确错误 | 明确错误 | 幂等 no-op |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    /// deferred 构造完成：零网络出站，等待 `start()`。
+    Deferred,
+    /// `start()` 在途（single-flight）。
+    Starting,
+    /// `start()` 完成（eager 构造直接落此态）。
+    Started,
+    /// `start()` 底层失败（可重试 → Starting）。
+    Failed,
+    /// shutdown 终态（start/ensure 明确错误；shutdown 幂等）。
+    Closed,
+}
+
+/// `start()` 的成功语义（取消三分法 r13-P2-3 的可观察面）：
+/// ①shutdown 主动取消——resolve「已取消」（非错误；Closed 不可重试）；
+/// ②底层启动失败——reject（错误载荷含原因；Failed 可重试）；
+/// ③调用方放弃 Future——状态机不感知，启动照常完成（single-flight 后续
+/// start 仍得同一结果）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// 本次调用完成启动，或此前已完成（幂等 no-op 同面）。
+    Started,
+    /// shutdown 取消了在途启动（本航班以非错误收尾；状态 = Closed）。
+    CancelledByShutdown,
+}
+
+/// 生命周期核（std 锁，短临界区，绝不跨 await 持有）。
+#[derive(Debug)]
+struct LifecycleCore {
+    phase: LifecyclePhase,
+    /// 最近一次 start 航班的结果（该航班的等待者共享同一结果；Failed 载荷
+    /// 为 `Arc` 只读克隆——Display 与底层错误一致）。
+    flight_result: Option<Result<StartOutcome, Arc<FabricError>>>,
+    /// 航班代号（每次进入 Starting 递增；`lifecycle_tx` 广播此值唤醒等待者）。
+    flight_gen: u64,
+}
+
+impl LifecycleCore {
+    fn new(phase: LifecyclePhase) -> Self {
+        Self {
+            phase,
+            flight_result: None,
+            flight_gen: 0,
+        }
+    }
 }
 
 /// single-flight 航班条目：(generation, completed watch sender)
@@ -1119,7 +1435,10 @@ pub struct FabricInner {
     pub(crate) roster: Arc<Mutex<Roster>>,
     /// [R8-1] 所有运行时名册写入的提交锁；shutdown 先等它，再置生命周期门。
     roster_commit: Mutex<()>,
-    pub(crate) endpoint: Endpoint,
+    /// [H8] Phase 0：endpoint 在启动航班内 bind 完成后填充（eager 构造 =
+    /// 构造期立即启动；deferred 构造 = `start()` 时）。OnceLock 首写即终态
+    /// ——shutdown/取消路径据读取判定关闭责任。
+    pub(crate) endpoint: std::sync::OnceLock<Endpoint>,
     peers: Arc<Mutex<HashMap<EndpointId, PeerEntry>>>,
     events: broadcast::Sender<FabricEvent>,
     pub(crate) relay: RelayConfig,
@@ -1133,6 +1452,13 @@ pub struct FabricInner {
     /// 成员 relay capability 内存视图（加载自 relay.caps.json；join OK2
     /// 后 upsert + 回写）。std 锁：读写均为短临界区，无 await。
     relay_caps: std::sync::Mutex<Vec<(String, String)>>,
+    /// [H8] deferred 构造预检通过、留待 start() 注入的缓存票据（eager 构造
+    /// = 全量非过期票据，注入语义与既有行为一致）。
+    pending_cache_caps: std::sync::Mutex<Vec<(String, String)>>,
+    /// [H8] 本实例 `ensure_relay_capabilities` 已断言并注入的票（url→token）。
+    /// start() 的合并注入以它为最高优先——同 URL 缓存/静态票不得覆盖
+    /// （r9-P1-1：ensured > tuple 校验缓存票）。
+    ensured_caps: std::sync::Mutex<Vec<(String, String)>>,
     /// 从邀请令牌/连接学到的对端可达信息（relay URL 或 ip:port）；
     /// 有界（HB 3.1：per-endpoint 1024 地址 / 全局 65536 endpoint，FIFO 淘汰）。
     pub(crate) known_addrs: Mutex<KnownAddrs>,
@@ -1171,6 +1497,9 @@ pub struct FabricInner {
     /// c2 会话自动重连：意外死亡通知通道（closed_task 同代次分支发送；
     /// UnboundedSender clone 进 FabricInner，manager 消费）。
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<EndpointId>,
+    /// c2 会话自动重连通道的接收端（启动航班尾部被 manager 消费；
+    /// std 锁 + Option——每个 Fabric 恰消费一次）。
+    reconnect_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<EndpointId>>>,
     /// c2 会话自动重连监管 manager（start() 常驻；shutdown 显式 abort + join）。
     reconnect_manager_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 外层 accept loop 本身也纳入 shutdown 收敛证明。
@@ -1181,6 +1510,18 @@ pub struct FabricInner {
     proxy_is_none: bool,
     /// join 总时限（毫秒）。
     join_timeout_ms: u64,
+    /// [H8] 启动航班重建 endpoint builder 所需的内核级选项（deferred 态
+    /// 保存至 start()；eager 态即时消费）。
+    http_proxy_cfg: HttpProxyConfig,
+    bind_addr_cfg: Option<String>,
+    relay_tls_cfg: RelayTlsTrust,
+    /// [H8] 生命周期相位核（std 锁，短临界区；绝不跨 await 持有）。
+    lifecycle_core: std::sync::Mutex<LifecycleCore>,
+    /// [H8] 相位/航班变更广播（值为 flight_gen；等待者 async 唤醒面）。
+    lifecycle_tx: tokio::sync::watch::Sender<u64>,
+    /// [H8] 启动取消旗（shutdown 在 Starting 态置位；在途航班的 select
+    /// 立即唤醒并以「已取消」收尾——三分法①）。
+    startup_cancel: tokio::sync::watch::Sender<bool>,
     /// continuity 连接状态面（app-protocol-layer Phase 1）：快照/epoch/
     /// stateSeq watch；死亡重连只进 watch，不发 FabricEvent。
     pub(crate) continuity: crate::continuity::ContinuityState,
@@ -1191,6 +1532,23 @@ pub struct FabricInner {
     pub(crate) continuity_sessions: crate::continuity::session::SessionRegistry,
     /// continuity 发起侧 campaign 登记（R3-3c：双端并发 INIT 的全序裁决面）。
     pub(crate) continuity_campaigns: crate::continuity::session::CampaignMap,
+}
+
+impl FabricInner {
+    /// endpoint 句柄（未启动 = None）。
+    pub(crate) fn endpoint(&self) -> Option<Endpoint> {
+        self.endpoint.get().cloned()
+    }
+
+    /// endpoint 句柄或 NotStarted 错误（deferred 未 start 即网络操作）。
+    pub(crate) fn require_endpoint(&self) -> Result<Endpoint, FabricError> {
+        self.endpoint().ok_or(FabricError::NotStarted)
+    }
+
+    /// [H8] 当前生命周期相位（状态机观测面）。
+    pub(crate) fn lifecycle_phase(&self) -> LifecyclePhase {
+        self.lifecycle_core.lock().unwrap().phase
+    }
 }
 
 impl FabricInner {
@@ -1717,6 +2075,14 @@ impl Fabric {
     /// 创建新 fabric（本节点成为 root）。既有 roster 先报 AlreadyExists——
     /// 在解析/写入身份之前检查，失败路径不留任何 identity 副作用。
     pub async fn create_root(config: FabricConfig) -> Result<Self, FabricError> {
+        Self::create_root_with(config, FabricStartOptions::default()).await
+    }
+
+    /// [`Fabric::create_root`] 的 [H8] 双扩展形态（deferStart / fabricId）。
+    pub async fn create_root_with(
+        config: FabricConfig,
+        opts: FabricStartOptions,
+    ) -> Result<Self, FabricError> {
         // 配置完整校验先于一切持久化副作用（P1-3）：非法配置不写目录
         config.validate()?;
         if crate::roster::roster_file_path(&config.data_dir).exists() {
@@ -1727,20 +2093,36 @@ impl Fabric {
             ));
         }
         let identity = Self::resolve_identity(&config, true)?;
-        let (roster, _fid) = Roster::create(&identity, &config.data_dir, now_ms())?;
-        Self::start(identity, roster, config).await
+        let adopted = opts
+            .fabric_id
+            .map(crate::protocol::FabricId)
+            .unwrap_or_else(crate::protocol::FabricId::random);
+        let (roster, _fid) =
+            Roster::create_with_fabric_id(&identity, &config.data_dir, now_ms(), adopted)?;
+        Self::launch(identity, roster, config, opts.defer_start).await
     }
 
     /// 打开已有 fabric。**缺失身份是错误**（不静默生成新身份——那会制造一个
     /// 无成员关系的孤儿身份）；身份必须是 root 或有效成员（seed-roster 一致性）。
     pub async fn open(config: FabricConfig) -> Result<Self, FabricError> {
+        Self::open_with(config, FabricStartOptions::default()).await
+    }
+
+    /// [`Fabric::open`] 的 [H8] 双扩展形态（deferStart / fabricId tuple 校验）。
+    pub async fn open_with(
+        config: FabricConfig,
+        opts: FabricStartOptions,
+    ) -> Result<Self, FabricError> {
         config.validate()?;
         let identity = Self::resolve_identity(&config, false)?;
-        let fid = crate::roster::peek_fabric_id(&config.data_dir)?.ok_or(
-            crate::roster::RosterError::NotFound {
-                path: crate::roster::roster_file_path(&config.data_dir),
-            },
-        )?;
+        let fid = match opts.fabric_id {
+            Some(expected) => crate::protocol::FabricId(expected),
+            None => crate::roster::peek_fabric_id(&config.data_dir)?.ok_or(
+                crate::roster::RosterError::NotFound {
+                    path: crate::roster::roster_file_path(&config.data_dir),
+                },
+            )?,
+        };
         let roster = Roster::open(&config.data_dir, fid)?;
         let id = identity.endpoint_id();
         if !roster.is_member(&id, now_ms()) {
@@ -1748,7 +2130,7 @@ impl Fabric {
                 &id,
             )));
         }
-        Self::start(identity, roster, config).await
+        Self::launch(identity, roster, config, opts.defer_start).await
     }
 
     /// 以加入者身份起步（空名册，等待 join 写入事实）；允许创建新身份。
@@ -1769,7 +2151,7 @@ impl Fabric {
                 )));
             }
         }
-        Self::start(identity, roster, config).await
+        Self::launch(identity, roster, config, false).await
     }
 
     /// 显式导出身份（identity export，不含 roster）为 `dwebkey1.` 加密串。
@@ -1780,10 +2162,209 @@ impl Fabric {
         )?)
     }
 
-    async fn start(
+    /// [H8] Phase 0：启动航班执行体——原构造期语义（缓存票据合并注入 +
+    /// bind + online + watcher/重连监管/accept loop 常驻）。eager 构造内联
+    /// 调用（失败 = 构造错误）；deferred 由 [`Fabric::start`] 以 detached
+    /// 任务持有（调用方放弃 Future 不中断启动——三分法③）。
+    async fn start_flight(
+        inner: &Arc<FabricInner>,
+        flight: u64,
+    ) -> Result<StartOutcome, FabricError> {
+        let mut cancel_rx = inner.startup_cancel.subscribe();
+        // 订阅后先标记当前值：订阅前已置位的取消不会经由 changed() 送达
+        let cancelled_upfront = *cancel_rx.borrow_and_update();
+        let work = start_flight_work(inner);
+        let res = if cancelled_upfront {
+            None
+        } else {
+            tokio::select! {
+                _ = cancel_rx.changed() => None,
+                result = work => Some(result),
+            }
+        };
+        match res {
+            // 取消三分法①：shutdown 主动取消——resolve「已取消」（非错误）；
+            // 相位已由 shutdown 路径同步置 Closed（此处兜底幂等）。
+            None => {
+                {
+                    let mut core = inner.lifecycle_core.lock().unwrap();
+                    if core.flight_gen == flight {
+                        if core.phase == LifecyclePhase::Starting {
+                            core.phase = LifecyclePhase::Closed;
+                        }
+                        if core.flight_result.is_none() {
+                            core.flight_result = Some(Ok(StartOutcome::CancelledByShutdown));
+                        }
+                        let _ = inner.lifecycle_tx.send(core.flight_gen);
+                    }
+                }
+                // bind 已完成但未到 spawn 段的 endpoint：显式关闭——
+                // shutdown 返回后无晚到网络事件（watcher 从未启动）。
+                if let Some(endpoint) = inner.endpoint.get() {
+                    endpoint.close().await;
+                }
+                Ok(StartOutcome::CancelledByShutdown)
+            }
+            // 正常完成：同步尾部 spawn（序列内无 await——取消只能落在 work
+            // 的 await 点上，spawn 序列不会中途被丢弃）。
+            Some(Ok(())) => {
+                let aborts = spawn_runtime_tasks(inner);
+                let won = {
+                    let mut core = inner.lifecycle_core.lock().unwrap();
+                    if core.flight_gen == flight && core.phase == LifecyclePhase::Starting {
+                        core.phase = LifecyclePhase::Started;
+                        core.flight_result = Some(Ok(StartOutcome::Started));
+                        let _ = inner.lifecycle_tx.send(core.flight_gen);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if won {
+                    Ok(StartOutcome::Started)
+                } else {
+                    // 极端竞态：work 完成与 shutdown 裁判同时就绪且 shutdown
+                    // 先落 Closed——撤销刚 spawn 的常驻任务 + 关 endpoint，
+                    // 保持「shutdown 返回后无晚到网络事件」。
+                    if let Some(endpoint) = inner.endpoint.get() {
+                        endpoint.close().await;
+                    }
+                    for abort in aborts {
+                        abort.abort();
+                    }
+                    Ok(StartOutcome::CancelledByShutdown)
+                }
+            }
+            // 取消三分法②：底层启动失败——reject（错误载荷含原因）→Failed
+            // 可重试。shutdown 已获胜（phase Closed）时按「已取消」收尾。
+            Some(Err(e)) => {
+                let shared = Arc::new(e);
+                let won_shutdown = {
+                    let mut core = inner.lifecycle_core.lock().unwrap();
+                    if core.flight_gen == flight {
+                        if core.phase == LifecyclePhase::Starting {
+                            core.phase = LifecyclePhase::Failed;
+                            core.flight_result = Some(Err(shared.clone()));
+                            let _ = inner.lifecycle_tx.send(core.flight_gen);
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if won_shutdown {
+                    if let Some(endpoint) = inner.endpoint.get() {
+                        endpoint.close().await;
+                    }
+                    Ok(StartOutcome::CancelledByShutdown)
+                } else {
+                    Err(FabricError::StartFailedShared(shared))
+                }
+            }
+        }
+    }
+
+    /// [H8] Phase 0：显式启动（deferred 形态）。执行原构造期语义——缓存票据
+    /// 合并注入（ensured > tuple 预检缓存票，同 URL ensured 胜）→ bind →
+    /// online。状态机（转移表逐格）：
+    /// - Deferred/Failed → Starting（Failed 为重试）→ Started | Failed；
+    /// - Started → 幂等 no-op（Ok）；
+    /// - Closed → 明确错误；
+    /// - 并发调用 single-flight 同一航班结果；在途航班被 shutdown 取消时
+    ///   以 `Ok(CancelledByShutdown)` 收尾（非错误、不可重试）；
+    /// - 调用方放弃 Future（不 await）状态机不感知——detached 任务持航班，
+    ///   后续 start() 经相位读得同一结果。
+    pub async fn start(&self) -> Result<StartOutcome, FabricError> {
+        let mut rx = self.inner.lifecycle_tx.subscribe();
+        // 是否已加入某个在途航班（等待者得该航班同一结果——含失败与取消）
+        let mut joined_flight: Option<u64> = None;
+        enum Step {
+            Done(Result<StartOutcome, FabricError>),
+            Wait,
+            Own(u64),
+        }
+        loop {
+            let step = {
+                let mut core = self.inner.lifecycle_core.lock().unwrap();
+                match core.phase {
+                    LifecyclePhase::Started => Step::Done(Ok(StartOutcome::Started)),
+                    LifecyclePhase::Closed => {
+                        // 曾加入的航班以「已取消」收尾 → 等待者得非错误结果
+                        // （resolve「已取消」，不可重试）；未曾加入 = Closed 拒绝边
+                        if joined_flight == Some(core.flight_gen)
+                            && matches!(
+                                core.flight_result,
+                                Some(Ok(StartOutcome::CancelledByShutdown))
+                            )
+                        {
+                            Step::Done(Ok(StartOutcome::CancelledByShutdown))
+                        } else {
+                            Step::Done(Err(FabricError::Shutdown))
+                        }
+                    }
+                    LifecyclePhase::Starting => {
+                        joined_flight = Some(core.flight_gen);
+                        Step::Wait
+                    }
+                    LifecyclePhase::Failed => {
+                        // 所等航班以失败收尾 → 得同一失败（错误载荷含原因）；
+                        // 此后新到的 start() 走重试（→Starting）
+                        if joined_flight == Some(core.flight_gen)
+                            && let Some(Err(e)) = &core.flight_result
+                        {
+                            Step::Done(Err(FabricError::StartFailedShared(e.clone())))
+                        } else {
+                            core.phase = LifecyclePhase::Starting;
+                            core.flight_gen += 1;
+                            core.flight_result = None;
+                            let flight = core.flight_gen;
+                            let _ = self.inner.lifecycle_tx.send(flight);
+                            Step::Own(flight)
+                        }
+                    }
+                    LifecyclePhase::Deferred => {
+                        core.phase = LifecyclePhase::Starting;
+                        core.flight_gen += 1;
+                        core.flight_result = None;
+                        let flight = core.flight_gen;
+                        let _ = self.inner.lifecycle_tx.send(flight);
+                        Step::Own(flight)
+                    }
+                }
+            };
+            match step {
+                Step::Done(result) => return result,
+                Step::Wait => {
+                    let _ = rx.changed().await;
+                    continue;
+                }
+                Step::Own(flight) => {
+                    // detached 持有：调用方放弃 Future 只是不再等待（JoinHandle
+                    // await cancel-safe），航班照常完成/失败（三分法③）。
+                    let inner = Arc::clone(&self.inner);
+                    let handle =
+                        tokio::spawn(async move { Self::start_flight(&inner, flight).await });
+                    return match handle.await {
+                        Ok(result) => result,
+                        Err(e) => Err(FabricError::Session(SessionError::Connect(format!(
+                            "start task failed: {e}"
+                        )))),
+                    };
+                }
+            }
+        }
+    }
+
+    /// 构造 Fabric（[H8] 后拆分自原 `start`）：本地装配（身份/名册/RelayMap/
+    /// 快照/事件面——零网络出站），随后 eager 立即执行启动航班（既有行为
+    /// 逐字节不变），deferred 停在 [`LifecyclePhase::Deferred`]。
+    async fn launch(
         identity: NodeIdentity,
         roster: Roster,
         config: FabricConfig,
+        defer_start: bool,
     ) -> Result<Self, FabricError> {
         // 构造期校验（D3/D7/join 时限）：非法配置不进入运行。
         config.validate()?;
@@ -1823,88 +2404,33 @@ impl Fabric {
             }
         };
         // task 2.3：成员端持久化 capability（上次兑换的 OK2 附发令牌）在
-        // endpoint 构造前加载——构造期即注入 RelayMap；损坏文件 fail-fast
-        //（capability 是 bearer 凭证，不静默丢弃）。
+        // endpoint 构造前加载；损坏文件 fail-fast（capability 是 bearer
+        // 凭证，不静默丢弃）。
+        // [H8] Phase 0：deferred 构造对缓存票据做 tuple 预检（不匹配=忽略+
+        // 诊断，匹配=留待 start() 注入）；eager 构造维持全量注入语义不变。
         let persisted_relay_caps = load_relay_caps(&config.data_dir)?;
+        let pending_inject = if defer_start {
+            preflight_relay_caps(&persisted_relay_caps, &roster, &config.relay)
+        } else {
+            persisted_relay_caps.clone()
+        };
         // task 2.2：Custom/CustomWithCaps 显式构造 RelayMap（CustomWithCaps
-        // 条目带 auth token），保留共享句柄——iroh socket 持同一内部 RwLock，
-        // 运行期（join 注入 bootstrap/member capability）热更新即时生效。
+        // 条目级 token 与缓存票据的注入统一后移到启动航班的合并步——eager
+        // 构造器内联等待航班，观察面与既有“构造期注入”等价），保留共享句柄
+        // ——iroh socket 持同一内部 RwLock，运行期热注入即时生效。
         // N0Default/Disabled 不持句柄（上游预设内部构造，无注入面）。
-        let mut relay_map_handle: Option<iroh_relay::RelayMap> = None;
-        let mut builder = match &config.relay {
-            RelayConfig::Disabled => {
-                Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(RelayMode::Disabled)
-            }
+        let relay_map_handle: Option<iroh_relay::RelayMap> = match &config.relay {
             RelayConfig::Custom(urls) => {
                 let parsed: Result<Vec<_>, _> =
                     urls.iter().map(|u| u.parse::<iroh::RelayUrl>()).collect();
                 let parsed = parsed.map_err(|e: iroh::RelayUrlParseError| {
                     FabricError::Session(SessionError::Connect(e.to_string()))
                 })?;
-                // 等价 RelayMode::custom(parsed)（其内部就是 from_iter），
-                // 仅多保留一个共享句柄
-                let map = iroh_relay::RelayMap::from_iter(parsed);
-                inject_relay_tokens(
-                    &map,
-                    &persisted_relay_caps
-                        .iter()
-                        .map(|(u, c)| (u.clone(), c.clone()))
-                        .collect::<Vec<_>>(),
-                );
-                relay_map_handle = Some(map.clone());
-                Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .relay_mode(RelayMode::Custom(map))
+                Some(iroh_relay::RelayMap::from_iter(parsed))
             }
-            RelayConfig::CustomWithCaps(entries) => {
-                let map = iroh_relay::RelayMap::empty();
-                // 静态 token（配置显式给出的现成凭证）+ 成员持久化 capability；
-                // server_id 条目的 own capability 由 ensure_relay_capabilities
-                // 显式签发注入（root 语义，不在构造期隐式执行）
-                let mut tokens: Vec<(String, String)> = persisted_relay_caps.clone();
-                for e in entries {
-                    if let Some(t) = e.local_token() {
-                        tokens.push((e.url.clone(), t.to_owned()));
-                    }
-                }
-                inject_relay_tokens(&map, &tokens);
-                relay_map_handle = Some(map.clone());
-                Endpoint::builder(iroh::endpoint::presets::Minimal)
-                    .relay_mode(RelayMode::Custom(map))
-            }
-            RelayConfig::N0Default => Endpoint::builder(iroh::endpoint::presets::N0),
+            RelayConfig::CustomWithCaps(_) => Some(iroh_relay::RelayMap::empty()),
+            RelayConfig::Disabled | RelayConfig::N0Default => None,
         };
-        // 代理所有权映射（D7）：None=不设；FromEnv=proxy_from_env；Url=proxy_url。
-        builder = match &config.http_proxy {
-            HttpProxyConfig::None => builder,
-            HttpProxyConfig::FromEnv => builder.proxy_from_env(),
-            HttpProxyConfig::Url(u) => builder.proxy_url(parse_proxy_url(u)?.into()),
-        };
-        if let Some(bind) = &config.bind_addr {
-            builder = builder.bind_addr(bind.as_str()).map_err(|e| {
-                FabricError::Session(SessionError::Connect(format!("bind {bind}: {e}")))
-            })?;
-        }
-        // HB 5.1：受限信任枚举 -> iroh 上游 CA 配置（PlatformRoot = 不设置，
-        // 保持 iroh 默认内置根；CustomPem = 仅自定义根）。
-        if let Some(ca) = config.relay_tls_trust.to_ca_tls_config()? {
-            builder = builder.ca_tls_config(ca);
-        }
-        builder = builder
-            .secret_key(identity.secret_key().clone())
-            .alpns(vec![
-                ALPN_REGULAR.to_vec(),
-                ALPN_REDEEM.to_vec(),
-                crate::continuity::ALPN_CONTINUITY.to_vec(),
-            ]);
-        let endpoint = builder.bind().await?;
-        // R3 P1-3：10s online 等待仅作为“沉降触发”——其布尔结果**不**写入快照
-        //（与随后的 watcher 观测分属两个时刻，会产生 online/active_url 错配）；
-        // 快照的 online 与 active_url 一律来自下方同一次 watcher 聚合观测。
-        if !matches!(config.relay, RelayConfig::Disabled) {
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(10), endpoint.online()).await;
-        }
-
         let (events, _) = broadcast::channel(256);
         let lifecycle_gate = Arc::new(std::sync::Mutex::new(false));
         let shutdown_started = Arc::new(std::sync::Mutex::new(false));
@@ -1913,60 +2439,31 @@ impl Fabric {
             RelayConfig::Custom(_) | RelayConfig::CustomWithCaps(_) => "custom",
             RelayConfig::N0Default => "n0",
         };
-        // HB 8.1 + R3 P1-3：初始快照的 online / active_url / last_error 来自
-        // **同一次** watcher 聚合观测（快照自洽不变量：active_url ⇔ online=true）。
-        let mut initial_online = None;
-        let mut initial_active_url = None;
-        let mut initial_last_error = None;
-        if !matches!(config.relay, RelayConfig::Disabled) {
-            let mut status_watcher = endpoint.home_relay_status();
-            let current: Vec<RelayStatusView> =
-                status_watcher.get().iter().map(Into::into).collect();
-            let agg = aggregate_relay_status(&relay_config_urls, &current);
-            initial_online = Some(agg.online);
-            initial_active_url = agg.online_url;
-            initial_last_error = agg.last_error;
-        }
+        // HB 8.1 + R3 P1-3：快照自洽不变量（active_url ⇔ online=true）——
+        // deferred 构造的初始快照 online=Some(false)（非 Disabled；未 bind
+        // 无网络观测可言），启动航班尾部以同一次 watcher 聚合观测覆写。
         let relay_snapshot = Arc::new(std::sync::Mutex::new(RelayStatusSnapshot {
             mode,
             urls: relay_config_urls.clone(),
             online: if matches!(config.relay, RelayConfig::Disabled) {
                 None
             } else {
-                initial_online
+                Some(false)
             },
-            active_url: initial_active_url,
-            last_error: initial_last_error,
+            active_url: None,
+            last_error: None,
         }));
-        // relay watcher（D4）：直接消费 iroh home_relay_status 状态流；Disabled 不启动。
-        let relay_watcher_task = if !matches!(config.relay, RelayConfig::Disabled) {
-            let status_stream = RelayViewStream(endpoint.home_relay_status().stream());
-            let snapshot = relay_snapshot.clone();
-            let events_tx = events.clone();
-            let config_urls = relay_config_urls.clone();
-            let lifecycle_gate = lifecycle_gate.clone();
-            let shutdown_started = shutdown_started.clone();
-            Some(tokio::spawn(async move {
-                relay_watch_loop(
-                    status_stream,
-                    config_urls,
-                    snapshot,
-                    lifecycle_gate,
-                    shutdown_started,
-                    events_tx,
-                )
-                .await;
-            }))
-        } else {
-            None
-        };
         // c2：会话自动重连通道（closed_task 发送 -> manager 消费派发 worker）
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        // [H8] 生命周期状态机（eager 内联航班从 gen 1 起步）
+        let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
+        let (startup_cancel, _) = tokio::sync::watch::channel(false);
+        let eager_start = !defer_start;
         let inner = Arc::new(FabricInner {
             identity,
             roster: Arc::new(Mutex::new(roster)),
             roster_commit: Mutex::new(()),
-            endpoint,
+            endpoint: std::sync::OnceLock::new(),
             peers: Arc::new(Mutex::new(HashMap::new())),
             events,
             relay: config.relay.clone(),
@@ -1976,13 +2473,15 @@ impl Fabric {
             relay_map: relay_map_handle,
             data_dir: config.data_dir.clone(),
             relay_caps: std::sync::Mutex::new(persisted_relay_caps),
+            pending_cache_caps: std::sync::Mutex::new(pending_inject),
+            ensured_caps: std::sync::Mutex::new(Vec::new()),
             known_addrs: Mutex::new(KnownAddrs::default()),
             recent_disconnects: Mutex::new(HashMap::new()),
             connect_inflight: Mutex::new(InflightState::default()),
             flight_generation: std::sync::atomic::AtomicU64::new(0),
             peer_epoch: std::sync::atomic::AtomicU64::new(0),
             relay_snapshot,
-            relay_watcher_task: std::sync::Mutex::new(relay_watcher_task),
+            relay_watcher_task: std::sync::Mutex::new(None),
             detached_connects: std::sync::Mutex::new(DetachedConnects::default()),
             // shutdown 完成门（R3 P1-1）：started 与 done 配对——首次调用执行
             // drain 并在完成时 send(true)；并发晚到调用等待同一完成通知后才
@@ -1991,6 +2490,7 @@ impl Fabric {
             lifecycle_gate,
             accept_children: std::sync::Mutex::new(AcceptChildren::default()),
             reconnect_tx: reconnect_tx.clone(),
+            reconnect_rx: std::sync::Mutex::new(Some(reconnect_rx)),
             continuity: crate::continuity::ContinuityState::new(),
             continuity_dialing: crate::continuity::manager::DialingGuard::default(),
             continuity_sessions: crate::continuity::session::SessionRegistry::new(),
@@ -2000,13 +2500,37 @@ impl Fabric {
             shutdown_done: tokio::sync::watch::channel(false).0,
             proxy_is_none: matches!(config.http_proxy, HttpProxyConfig::None),
             join_timeout_ms: config.join_timeout_ms,
+            http_proxy_cfg: config.http_proxy.clone(),
+            bind_addr_cfg: config.bind_addr.clone(),
+            relay_tls_cfg: config.relay_tls_trust.clone(),
+            lifecycle_core: std::sync::Mutex::new(LifecycleCore::new(if eager_start {
+                LifecyclePhase::Starting
+            } else {
+                LifecyclePhase::Deferred
+            })),
+            lifecycle_tx,
+            startup_cancel,
         });
-        // c2：会话自动重连监管 manager 常驻（消费意外死亡通知派发退避重拨）
-        let reconnect_manager = spawn_reconnect_manager(&inner, reconnect_rx);
-        *inner.reconnect_manager_task.lock().unwrap() = Some(reconnect_manager);
-        let accept_loop = spawn_accept_loop(&inner);
-        *inner.accept_loop_task.lock().unwrap() = Some(accept_loop);
-        Ok(Fabric { inner })
+        let fabric = Fabric { inner };
+        if eager_start {
+            // eager：内联执行启动航班（原构造期语义；失败=构造错误）。
+            // 构造器尚未返回、Fabric 未泄露，无并发 shutdown/cancel 可能。
+            {
+                let mut core = fabric.inner.lifecycle_core.lock().unwrap();
+                core.flight_gen = 1;
+            }
+            fabric.settle_eager_start().await?;
+        }
+        Ok(fabric)
+    }
+
+    /// eager 构造的内联启动：调用 [`Fabric::start_flight`]（航班 1），航班
+    /// 结果直接决定构造成败（Started | Err）。
+    async fn settle_eager_start(&self) -> Result<StartOutcome, FabricError> {
+        let inner = Arc::clone(&self.inner);
+        let outcome = Self::start_flight(&inner, 1).await?;
+        debug_assert_eq!(outcome, StartOutcome::Started);
+        Ok(outcome)
     }
 
     // ---- 查询 ----
@@ -2069,6 +2593,19 @@ impl Fabric {
             // Disabled 模式从未启动：视为已退出（无任务残留）
             None => true,
         }
+    }
+
+    /// [H8] Phase 0：当前生命周期相位（deferStart 状态机观测面；
+    /// 与 design §2.1 转移表同名）。
+    pub fn lifecycle_phase(&self) -> LifecyclePhase {
+        self.inner.lifecycle_phase()
+    }
+
+    /// [H8] Phase 0：endpoint 是否已 bind（deferred 构造 = false，构造期
+    /// 零网络出站的直接观测；start() 成功后 = true）。
+    #[doc(hidden)]
+    pub fn endpoint_bound(&self) -> bool {
+        self.inner.endpoint.get().is_some()
     }
 
     /// single-flight 航班表当前条目数（R5 P1-1；测试确定性等待 owner 登记
@@ -2279,7 +2816,15 @@ impl Fabric {
     /// 复用（如转交/审计）。own capability 不持久化——root 每次启动重签
     /// （Ed25519 确定性 + 幂等覆盖，无状态漂移）。非 root 调用报
     /// [`crate::roster::RosterError::NotRoot`]（与名册 root-only 操作同源）。
+    ///
+    /// [H8] Phase 0：deferred 态可执行（root roster 与 RelayMap 数据面在构造
+    /// 期已就绪——注入是纯本地操作，零网络出站）；Closed 态明确错误
+    /// （转移表拒绝边）。本实例 ensure 出的票记为最高优先——后续 start()
+    /// 的合并注入不得以缓存/静态票覆盖（r9-P1-1）。
     pub async fn ensure_relay_capabilities(&self) -> Result<Vec<(String, String)>, FabricError> {
+        if self.inner.lifecycle_phase() == LifecyclePhase::Closed {
+            return Err(FabricError::Shutdown);
+        }
         let entries = match &self.inner.relay {
             RelayConfig::CustomWithCaps(entries) => entries,
             _ => return Ok(Vec::new()),
@@ -2322,6 +2867,11 @@ impl Fabric {
         }
         if let Some(map) = &self.inner.relay_map {
             inject_relay_tokens(map, &out);
+        }
+        // [H8] 记为 ensured（合并优先级最高）：同 url upsert，最新 ensure 胜。
+        {
+            let mut ensured = self.inner.ensured_caps.lock().unwrap();
+            upsert_relay_caps(&mut ensured, &out);
         }
         Ok(out)
     }
@@ -2468,8 +3018,10 @@ impl Fabric {
         );
         // 7：deadline 包住 connect + redeem（到期取消等待并关闭已建立的连接）。
         // token 克隆进 deadline 工作流（错误归因探针仍需原令牌字段）
+        // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+        let endpoint = self.inner.require_endpoint()?;
         let join_err = join_with_deadline(
-            &self.inner.endpoint,
+            &endpoint,
             &self.inner.detached_connects,
             &addr,
             &crate::protocol::InviteVersion::V1(token.clone()),
@@ -2614,8 +3166,10 @@ impl Fabric {
         );
         // 7：deadline 包住 connect + redeem（token 克隆进工作流；后续错误
         // 归因仍需原令牌的 relay 列表）
+        // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+        let endpoint = self.inner.require_endpoint()?;
         let join_err = join_with_deadline(
-            &self.inner.endpoint,
+            &endpoint,
             &self.inner.detached_connects,
             &addr,
             &crate::protocol::InviteVersion::V2(token.clone()),
@@ -2875,11 +3429,9 @@ impl Fabric {
             // connect 本身不施加超时：取消中的 iroh connect 会留下半开连接，
             // 卡死该 NodeId 的后续拨号（实证）。握手在传输层毫秒级完成，
             // 无界风险由 HELLO 阶段超时 + 干净 close 兜底。
-            let conn = self
-                .inner
-                .endpoint
-                .connect(addr.clone(), ALPN_REGULAR)
-                .await?;
+            // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+            let endpoint = self.inner.require_endpoint()?;
+            let conn = endpoint.connect(addr.clone(), ALPN_REGULAR).await?;
             match tokio::time::timeout(CONNECT_HELLO_TIMEOUT, self.register_dialed(conn.clone()))
                 .await
             {
@@ -2998,6 +3550,11 @@ impl Fabric {
     /// abort + join 确认退出），然后关闭 endpoint；释放 data-dir 排他锁（幂等）。
     /// R3 P1-1：共享完成门——只有首次调用执行 drain；并发晚到调用等待同一
     /// 完成通知后返回（返回即满足"无任务残留、无后续事件"完成语义）。
+    /// [H8] Phase 0：各相位幂等——Deferred/Failed → Closed（清理资源，无
+    /// 网络面或已失败面）；Starting → 取消启动转 Closed（在途 start 航班以
+    /// 「已取消」resolve，不可重试；drain 归零后无晚到 bind/online 事件——
+    /// 航班工作体经 select 丢弃，watcher 从未启动，endpoint 若已 bind 由
+    /// drain/取消分支关闭）；Started → 既有停机语义；Closed → 幂等 no-op。
     pub async fn shutdown(&self) -> Result<(), FabricError> {
         // R3/R4 P1-1：共享完成门。守卫严格限定在同步块内（async fn 需 Send，
         // std MutexGuard 不得跨 await）。
@@ -3016,6 +3573,26 @@ impl Fabric {
                 let _ = rx.changed().await;
             }
             return Ok(());
+        }
+        // [H8] 相位裁决：在 drain 之前同步完成——drain 归零后无在途 start，
+        // 后到的 start()/ensure() 见 Closed 即拒绝。shutdown_started 已在
+        // 上方置位（事件门先于取消，杜绝取消路径的晚到事件）。
+        {
+            let mut core = self.inner.lifecycle_core.lock().unwrap();
+            if core.phase != LifecyclePhase::Closed {
+                let was_starting = core.phase == LifecyclePhase::Starting;
+                core.phase = LifecyclePhase::Closed;
+                if was_starting {
+                    // 取消三分法①：在途 start Promise resolve「已取消」（非错误，
+                    // 不可重试）——等待者经 flight_result 得同一结果。
+                    if core.flight_result.is_none() {
+                        core.flight_result = Some(Ok(StartOutcome::CancelledByShutdown));
+                    }
+                    // 唤醒在途航班的 select（工作体被丢弃，不再 bind/spawn）
+                    self.inner.startup_cancel.send_replace(true);
+                }
+                let _ = self.inner.lifecycle_tx.send(core.flight_gen);
+            }
         }
         // R4 P1-1：drain 交给后台任务持有——首调用的 Future 被取消（drop）只
         // 是不再等待 JoinHandle，不中断 drain 本身；完成通知由任务收尾发出，
@@ -3097,10 +3674,12 @@ impl Fabric {
     }
 
     /// 邀请内的直连地址提示：endpoint.addr() 的网卡地址 + 127.0.0.1 回环提示（同机场景）。
+    /// [H8] deferred 未启动 = 无网络面，返回空列表。
     fn direct_addr_hints(&self) -> Vec<String> {
-        let mut hints: Vec<String> = self
-            .inner
-            .endpoint
+        let Some(endpoint) = self.inner.endpoint() else {
+            return Vec::new();
+        };
+        let mut hints: Vec<String> = endpoint
             .addr()
             .addrs
             .iter()
@@ -3109,13 +3688,7 @@ impl Fabric {
                 _ => None,
             })
             .collect();
-        if let Some(port) = self
-            .inner
-            .endpoint
-            .bound_sockets()
-            .first()
-            .map(|sa| sa.port())
-        {
+        if let Some(port) = endpoint.bound_sockets().first().map(|sa| sa.port()) {
             let loopback = format!("127.0.0.1:{port}");
             if !hints.contains(&loopback) {
                 hints.push(loopback);
@@ -3480,14 +4053,16 @@ fn spawn_reconnect_manager(
 }
 
 /// 接受循环：按 ALPN 分派；regular 做成员门控；redeem 仅 root 受理。
-fn spawn_accept_loop(inner: &Arc<FabricInner>) -> tokio::task::JoinHandle<()> {
+/// [H8]：endpoint 经参数传入（spawn 时点它已登记进 inner——OnceLock 首写
+/// 即终态，读取与传值等价）。
+fn spawn_accept_loop(inner: &Arc<FabricInner>, endpoint: Endpoint) -> tokio::task::JoinHandle<()> {
     let inner = Arc::clone(inner);
     tokio::spawn(async move {
         loop {
             if inner.lifecycle_closing() {
                 break;
             }
-            let Some(incoming) = inner.endpoint.accept().await else {
+            let Some(incoming) = endpoint.accept().await else {
                 break;
             };
             let conn = match incoming.accept() {

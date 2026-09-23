@@ -209,6 +209,19 @@ impl Roster {
         data_dir: &Path,
         now_ms: u64,
     ) -> Result<(Self, FabricId), RosterError> {
+        Self::create_with_fabric_id(identity, data_dir, now_ms, FabricId::random())
+    }
+
+    /// [`Roster::create`] 的显式 fabric_id 形态（[H8] Phase 0：home-hub 身份
+    /// tuple 同源机制的采纳侧——调用方（如 CLI join 路径经 SDK 的
+    /// `FabricOptions.fabricId`）提供租约/决策已有的 fabric_id，roster 持久化
+    /// 并采纳该值；随机生成分叉在构造层被消灭）。
+    pub fn create_with_fabric_id(
+        identity: &NodeIdentity,
+        data_dir: &Path,
+        now_ms: u64,
+        fabric_id: FabricId,
+    ) -> Result<(Self, FabricId), RosterError> {
         std::fs::create_dir_all(data_dir).map_err(|source| RosterError::Persistence {
             path: data_dir.to_path_buf(),
             source,
@@ -217,7 +230,6 @@ impl Roster {
         if roster_path.exists() {
             return Err(RosterError::AlreadyExists { path: roster_path });
         }
-        let fabric_id = FabricId::random();
         let genesis = crate::protocol::genesis(identity, fabric_id, now_ms)?;
         let mut roster = Self::empty(data_dir, fabric_id)?;
         match roster.validate_and_insert(&genesis) {

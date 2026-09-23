@@ -9,11 +9,12 @@ pub mod secret;
 pub mod session;
 
 pub use fabric::{
-    Fabric, FabricConfig, FabricError, FabricEvent, HttpProxyConfig, InviteOptions,
-    JOIN_TIMEOUT_MS_DEFAULT, JOIN_TIMEOUT_MS_MAX, JOIN_TIMEOUT_MS_MIN, JoinErrorCode, MemberInfo,
-    RelayConfig, RelayEntry, RelayProbeFn, RelayStatusSnapshot, RelayStatusView, RelayTlsTrust,
-    SecretInjection, inject_relay_tokens, normalize_advertise_addrs, precheck_join_token,
-    precheck_join_token_v2, set_relay_probe_for_tests,
+    Fabric, FabricConfig, FabricError, FabricEvent, FabricStartOptions, HttpProxyConfig,
+    InviteOptions, JOIN_TIMEOUT_MS_DEFAULT, JOIN_TIMEOUT_MS_MAX, JOIN_TIMEOUT_MS_MIN,
+    JoinErrorCode, LifecyclePhase, MemberInfo, RelayConfig, RelayEntry, RelayProbeFn,
+    RelayStatusSnapshot, RelayStatusView, RelayTlsTrust, SecretInjection, StartOutcome,
+    inject_relay_tokens, normalize_advertise_addrs, precheck_join_token, precheck_join_token_v2,
+    set_relay_probe_for_tests,
 };
 pub use session::{LinkStatus, RedeemError, SessionError};
 
