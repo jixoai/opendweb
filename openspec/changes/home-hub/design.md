@@ -1,8 +1,8 @@
 # Design: home-hub（家庭中枢与三视角控制台）
 
-> 依据：requirements.md 裁决 [H0]-[H7] + PRODUCT-DESIGN.md v1.2。本设计不
-> 触碰 dweb-server 内核产品代码（唯一 Rust 面=relay_failover.rs 新增 G-3
-> 测试用例，test-only）。
+> 依据：requirements.md 裁决 [H0]-[H8] + PRODUCT-DESIGN.md v1.2。Rust 边界
+> （[H8] 修订）：dweb-server 零改动；**dweb-fabric 允许最小生命周期扩展**
+> （deferStart，§2.1，含配套测试）；G-3 用例 test-only（relay_failover.rs）。
 >
 > 事实底座（2026-09-23，agent-facts-r1/g3-r1）：registration.json 单对象且
 > 唯一读者是 join；`opendweb server` 前台常驻、配置发现基于 process.cwd()、
@@ -157,21 +157,26 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   不签票；SDK `ensureRelayCapabilities` 既有实现）——租约条目已含
   server_id，消费材料齐备；capability 由 SDK 内存态自签/刷新，**不入
   leases.json**（无新增凭证落盘面）。
-- **签发时序冻结（r5-P1-1+r6-P1-1 收口——构造器限定）**：租约消费
-  连接器 MUST 按以下顺序执行且不得跳步：①构造
-  `FabricOptions.relay={mode:"custom",relays:[{url:relay_url,
-  serverId:server_id}]}` 并以 **`createRoot`（或 open 既有 root）** 构造
-  Fabric——**构造器限定为 root 形态**（home-hub 租约消费=join 注册形态：
-  设备以本机 key 为自己 fabric 的 root；`ensureRelayCapabilities` 要求
-  调用者即 roster root，`attach` 空成员路径按字面必败 `requires root`，
-  **不在本时序内**——attach/invite 成员入网属 SDK 既有机制（bootstrap/
-  OK2 member capability），不作为 home-hub 租约消费路径）；②**显式
-  `await ensureRelayCapabilities()`**；③断言其返回条目覆盖租约的
-  (relay_url, server_id) 且 token 已注入**同一 Fabric 实例**的 RelayMap；
-  ④此后才允许任何 join/connect（首次拨号前完成）。签发失败/非 root/
-  server_id 或 URL 与租约不匹配/token 未出现在 RelayMap=MUST fail-closed
-  （连接终止并明确报错，不得静默降级为无凭证、不得写租约）。端到端
-  Scenario MUST 断言 root 身份前提（createRoot 形态）与时序。
+- **签发时序冻结（r5/r6/r8 三轮收口——deferStart 五步，[H8]）**：租约
+  消费连接器 MUST 按以下顺序执行且不得跳步：
+  ①构造 `FabricOptions.relay={mode:"custom",relays:[{url:relay_url,
+  serverId:server_id}]}` 并以 **`createRoot`/`open`（既有 root）的
+  `deferStart` 形态**构造 Fabric——**构造期零网络行为**（不 bind、不等
+  online、不加载缓存票据连接；r8-P1-1 的构造期先连冲突由 [H8] 裁决的
+  dweb-fabric 最小生命周期扩展根治：deferStart 下 `start()` 语义后移）；
+  构造器限定 root 形态（attach 空成员路径对 ensure 必败 `requires root`，
+  不在本时序内——invite/attach 属 SDK 既有机制）；
+  ②**显式 `await ensureRelayCapabilities()`**（deferred 态可执行：root
+  roster 与 RelayMap 数据面已就绪）；
+  ③断言返回条目覆盖租约 (relay_url, server_id) 且 token 注入**同一实例**；
+  ④`await fabric.start()`——此时才执行原构造期语义（加载缓存票据+注入+
+  bind+online；票据已就绪，首次 relay 接触即带有效 capability）；
+  ⑤此后才允许任何 join/connect。②③任一不符（签发失败/非 root/server_id
+  或 URL 与租约不匹配/token 未注入）=MUST fail-closed（不调 start、明确
+  报错、不得静默降级为无凭证、不得写租约）。**SDK 扩展契约**：deferStart
+  形态构造 MUST NOT 产生任何网络出站；start() 幂等；扩展附配套单测；
+  dweb-server 零改动。端到端 Scenario MUST 断言：deferred 构造期零出站、
+  首次 relay 接触晚于 ensure、root 身份前提。
 - **身份 tuple 同源冻结（r7-P1-1——杜绝 register 与票据消费的 fabric
   分叉）**：register body 与 lease 条目的 `(fabric_id, root)` 的**唯一
   数据源 = SDK roster 实际值**——join 消费前以与 register 相同的设备
@@ -184,10 +189,26 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   == lease.fabric_id`、`Fabric.endpoint_id() == lease.root`、capability 的
   (fabric_id, issuer, server_id) 覆盖租约——任一不符/旧 roster/不同
   seed/server 或 URL 不匹配=fail-closed（首拨前拒绝，不写不更新
-  leases）。Scenario 双向：正向 fresh createRoot→register→ensure→
-  restricted 握手成功；负向（篡改 lease.fabric_id/另一 data_dir seed/
-  stale roster）在首拨前拒绝且账本不变——不得把「实际握手失败」当
-  唯一发现手段。端到端断言：restricted 中枢注册后
+  leases）。Scenario 三向：正向 fresh createRoot→register→ensure→
+  restricted 握手成功；**重开正向**（open 同一 data_dir/seed：register
+  与 lease tuple 不变、ensure 重签/恢复 capability 后握手成功）；负向
+  （篡改 lease.fabric_id/另一 data_dir seed/stale roster）在首拨前拒绝
+  且账本不变——不得把「实际握手失败」当唯一发现手段。
+
+```text
+租约消费连接时序（[H8] deferStart 五步）
+──────────────────────────────────────────────
+ createRoot/open(deferStart)   ← 零网络（不 bind/不 online/不连 relay）
+        │
+ ensureRelayCapabilities()     ← root 自签（deferred 态）
+        │
+ 断言 (relay_url, server_id) 覆盖租约 + token 注入同实例
+        │  ├─ 不符 → fail-closed（不 start / 不写租约）
+ fabric.start()                ← 加载缓存票据+注入+bind+online
+        │                        （首次 relay 接触已带有效 capability）
+ join / connect（首次拨号）
+──────────────────────────────────────────────
+```端到端断言：restricted 中枢注册后
   实际 relay 握手成功、无票连接被拒 `dweb/no-capability`、跨 server
   capability 被拒、SDK relay mode=custom（非 N0Default）；malformed
   server_id/URL 在落租约前失败。
@@ -442,7 +463,8 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r7 | NOT-READY 7.8，P1×1（租约 tuple 与 SDK roster 不同源可 unknown-owner） | 全处置（v8，本版）：身份 tuple 唯一数据源=SDK roster 实际值（join 独立选 fabric_id 的现状被改造；roster 只 open 不另建/seed 不另生）+首拨前三元组连续性断言（fabric/root/capability 覆盖）+正负 Scenario（§2.1） |
+| r8 | NOT-READY 7.9，P1×1（SDK 构造期 bind/online 先于 ensure——[H8] Owner 拍板选项 A） | 全处置（v9，本版）：deferStart 五步时序（deferred 构造零网络→ensure→断言→start→拨号）；Rust 边界修订（dweb-fabric 最小生命周期扩展+配套测试；server 零改动）；P2-1 open 重开正向 Scenario（§2.1 Scenario 集补充）；P2-2 身份/拨号链 ASCII 流程图（§2.1 末） |
+| r7 | NOT-READY 7.8，P1×1（租约 tuple 与 SDK roster 不同源可 unknown-owner） | 全处置（v8）：身份 tuple 唯一数据源=SDK roster 实际值（join 独立选 fabric_id 的现状被改造；roster 只 open 不另建/seed 不另生）+首拨前三元组连续性断言（fabric/root/capability 覆盖）+正负 Scenario（§2.1） |
 | r6 | NOT-READY 7.8，P1×1（attach 非 root 必败） | 全处置（v7）：采纳选项 A——构造器限定 createRoot/open 既有 root（租约消费=join 注册形态=root 身份）；attach/invite 成员路径排除出本时序（SDK 既有机制另行使用）；Scenario 断言 root 前提（§2.1） |
 | r5 | NOT-READY 7.8，P1×1+P2×2（十条基线 8 PASS+2 CONDITIONAL） | 全处置（v6）：P1-1 capability 签发时序冻结（构造→显式 ensureRelayCapabilities→断言覆盖与同实例注入→方可拨号；任何不符 fail-closed）（§2.1）；P2-1 preflight「恰一」与「第一条合法者」措辞冲突修正为「至少一条+多候选取第一条」（§2.1）；P2-2 PM 证据基线补 [H7] |
 | r4 | NOT-READY 7.5，P1×1+P2×4（十条基线 9 PASS+1 BLOCKED） | 全处置（v5）：P1-1 消费契约改为 relays:[{url,serverId}]（CustomWithCaps，root 自签 capability，杜绝 no-capability 主路径阻断）+端到端 Scenario（§2.1）；P2-1 join preflight 顺序冻结（register 前恰一可用 relay+URL 校验+复核+幂等回放补偿路径）（§2.1）；P2-2 PM 头部裁决范围 [H0]-[H7]；P2-3 encode_canonical/decode_accepts 两集合拆分+测试表格（§3.1）；P2-4 batch golden 帧补样例（§6） |

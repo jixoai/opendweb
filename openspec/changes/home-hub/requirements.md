@@ -101,6 +101,18 @@ join 自报 hostname 为 alias（register 增量字段，自声明标签，管�
 **解读**：三视角控制台与 hub 命令族的命名基准全部落定，设计文档
 直接以组 B 与 `hub` 族行文，不再携带候选方案。
 
+### [H8] relay 凭证装配的 SDK 时序冲突修复路线（2026-09-23，Owner 拍板）
+
+> 背景（Codex 设计评审 r8 唯一阻塞项）：SDK `createRoot/open` 构造期即
+> `bind()` 并等 `endpoint.online()`（加载缓存票据并连 relay），早于调用方
+> `ensureRelayCapabilities()`——「先签票后首拨」契约在构造期被打破。
+>
+> **Owner 拍板：选项 A——允许最小 SDK 扩展**（dweb-fabric 增生命周期 API：
+> createRoot/open 可推迟 bind/online，调用方完成 ensure 与 tuple 断言后再
+> 启动 Endpoint）。此前的「Rust 零产品改动」边界为编排方自定而非 Owner
+> 裁决，本条修订为：**允许 dweb-fabric 最小生命周期扩展（含其配套测试）；
+> dweb-server 仍零改动；G-3 用例仍 test-only**。
+
 ## 走查发现（2026-09-23 三角色 ego-browser 亲测，非裁决——设计吸收项）
 
 全故事（包租婆 webui / 访客敲门 / 租户 join）跑通，[H6] 三断言全过；
