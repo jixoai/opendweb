@@ -40,6 +40,7 @@ import {
 	revokeCode,
 	revokeVisitor,
 	switchSidecarNode,
+	toAdminError,
 	undismissKnock,
 	unregisterOwner,
 	type BlockEntry,
@@ -294,7 +295,7 @@ class ConsoleStore {
 			this.sidecar = await fetchSidecarState();
 			this.sidecarError = null;
 		} catch (e) {
-			this.sidecarError = e as AdminError;
+			this.sidecarError = toAdminError(e);
 		}
 	}
 
@@ -329,7 +330,7 @@ class ConsoleStore {
 			this.statusData = await loadStatus();
 			this.statusError = null;
 		} catch (e) {
-			this.statusError = e as AdminError;
+			this.statusError = toAdminError(e);
 			this.statusLastFailAt = Date.now();
 		}
 	}
@@ -338,7 +339,7 @@ class ConsoleStore {
 			this.connData = await loadConnections();
 			this.connError = null;
 		} catch (e) {
-			this.connError = e as AdminError;
+			this.connError = toAdminError(e);
 		}
 	}
 	async refreshOwners(): Promise<void> {
@@ -346,7 +347,7 @@ class ConsoleStore {
 			this.ownersData = await loadOwners();
 			this.ownersError = null;
 		} catch (e) {
-			this.ownersError = e as AdminError;
+			this.ownersError = toAdminError(e);
 		}
 	}
 	async refreshKnocks(): Promise<void> {
@@ -354,7 +355,7 @@ class ConsoleStore {
 			this.knocksData = await loadKnocks();
 			this.knocksError = null;
 		} catch (e) {
-			this.knocksError = e as AdminError;
+			this.knocksError = toAdminError(e);
 		}
 	}
 	async refreshVisitors(): Promise<void> {
@@ -362,7 +363,7 @@ class ConsoleStore {
 			this.visitorsData = await loadVisitors();
 			this.visitorsError = null;
 		} catch (e) {
-			this.visitorsError = e as AdminError;
+			this.visitorsError = toAdminError(e);
 		}
 	}
 	async refreshBlocklist(): Promise<void> {
@@ -370,7 +371,7 @@ class ConsoleStore {
 			this.blocklistData = await loadBlocklist();
 			this.blocklistError = null;
 		} catch (e) {
-			this.blocklistError = e as AdminError;
+			this.blocklistError = toAdminError(e);
 		}
 	}
 	async refreshCodes(): Promise<void> {
@@ -378,7 +379,7 @@ class ConsoleStore {
 			this.codesData = await loadCodes();
 			this.codesError = null;
 		} catch (e) {
-			this.codesError = e as AdminError;
+			this.codesError = toAdminError(e);
 		}
 	}
 	async refreshNodes(): Promise<void> {
@@ -386,7 +387,7 @@ class ConsoleStore {
 			this.nodesData = await fetchSidecarNodes();
 			this.nodesError = null;
 		} catch (e) {
-			this.nodesError = e as AdminError;
+			this.nodesError = toAdminError(e);
 		}
 	}
 
@@ -415,7 +416,7 @@ class ConsoleStore {
 		} catch (e) {
 			// 失败：就地呈现，表单保留已填内容——但凭证框除外（不回显）
 			this.connectForm.token = "";
-			this.connectResult = { ok: false, error: e as AdminError };
+			this.connectResult = { ok: false, error: toAdminError(e) };
 		} finally {
 			this.connectBusy = false;
 		}
@@ -448,7 +449,7 @@ class ConsoleStore {
 			this.ownerForm = { fabricId: "", root: "" };
 			await Promise.all([this.refreshOwners(), this.refreshStatus()]); // 名册版本/租户数即时反映
 		} catch (e) {
-			this.ownersError = e as AdminError;
+			this.ownersError = toAdminError(e);
 		} finally {
 			this.ownerBusy = false;
 		}
@@ -471,7 +472,7 @@ class ConsoleStore {
 			// 名册版本/租户数 + 在线表（名下连接被一并断开）都要反映
 			await Promise.all([this.refreshOwners(), this.refreshStatus(), this.refreshConnections()]);
 		} catch (e) {
-			this.ownersError = e as AdminError;
+			this.ownersError = toAdminError(e);
 		} finally {
 			this.ownerBusy = false;
 		}
@@ -514,7 +515,7 @@ class ConsoleStore {
 			this.receipt = receipt;
 			await Promise.all([this.refreshOwners(), this.refreshStatus()]);
 		} catch (e) {
-			this.ownersError = e as AdminError;
+			this.ownersError = toAdminError(e);
 		} finally {
 			this.renewBusy = false;
 		}
@@ -590,8 +591,8 @@ class ConsoleStore {
 			return { ok: true };
 		} catch (e) {
 			// 失败走既有错误态（名册 ErrorBanner）；编辑态保留以便修正后重试
-			if (edit.kind === "owner") this.ownersError = e as AdminError;
-			else this.visitorsError = e as AdminError;
+			if (edit.kind === "owner") this.ownersError = toAdminError(e);
+			else this.visitorsError = toAdminError(e);
 			return { ok: false };
 		} finally {
 			this.aliasBusy = false;
@@ -623,7 +624,7 @@ class ConsoleStore {
 			this.receipt = await grantVisitorFromKnock(payload);
 			await Promise.all([this.refreshKnocks(), this.refreshVisitors(), this.refreshStatus()]);
 		} catch (e) {
-			this.knocksError = e as AdminError;
+			this.knocksError = toAdminError(e);
 		} finally {
 			this.knockBusy = false;
 		}
@@ -646,7 +647,7 @@ class ConsoleStore {
 			await Promise.all([this.refreshKnocks(), this.refreshOwners(), this.refreshStatus()]);
 			this.ownerConfirm = null;
 		} catch (e) {
-			this.knocksError = e as AdminError;
+			this.knocksError = toAdminError(e);
 		} finally {
 			this.knockBusy = false;
 		}
@@ -666,7 +667,7 @@ class ConsoleStore {
 			this.receipt = await addBlocklist({ kind: "endpoint", id: endpointId });
 			await Promise.all([this.refreshKnocks(), this.refreshBlocklist(), this.refreshStatus()]);
 		} catch (e) {
-			this.blocklistError = e as AdminError;
+			this.blocklistError = toAdminError(e);
 		} finally {
 			this.knockBusy = false;
 		}
@@ -679,7 +680,7 @@ class ConsoleStore {
 			await this.refreshKnocks();
 			this.#pendingUndo = knock.endpoint_id;
 		} catch (e) {
-			this.knocksError = e as AdminError;
+			this.knocksError = toAdminError(e);
 		}
 	}
 
@@ -692,7 +693,7 @@ class ConsoleStore {
 			await undismissKnock(endpointId);
 			await Promise.all([this.refreshKnocks(), this.refreshStatus()]);
 		} catch (e) {
-			this.knocksError = e as AdminError;
+			this.knocksError = toAdminError(e);
 		}
 	}
 
@@ -716,7 +717,7 @@ class ConsoleStore {
 			this.visitorForm = { endpointId: "", alias: "" };
 			await Promise.all([this.refreshVisitors(), this.refreshStatus()]);
 		} catch (e) {
-			this.visitorsError = e as AdminError;
+			this.visitorsError = toAdminError(e);
 		} finally {
 			this.visitorBusy = false;
 		}
@@ -738,7 +739,7 @@ class ConsoleStore {
 			this.receipt = await revokeVisitor(endpointId);
 			await Promise.all([this.refreshVisitors(), this.refreshStatus()]);
 		} catch (e) {
-			this.visitorsError = e as AdminError;
+			this.visitorsError = toAdminError(e);
 		} finally {
 			this.visitorBusy = false;
 		}
@@ -759,7 +760,7 @@ class ConsoleStore {
 			this.receipt = await removeBlocklist(kind ?? "endpoint", id);
 			await this.refreshBlocklist();
 		} catch (e) {
-			this.blocklistError = e as AdminError;
+			this.blocklistError = toAdminError(e);
 		}
 	}
 
@@ -794,7 +795,7 @@ class ConsoleStore {
 			this.codeForm = { aliasHint: "", maxUses: 1, expiresInDays: 7, defaultTtlDays: 30 };
 			await Promise.all([this.refreshCodes(), this.refreshStatus()]);
 		} catch (e) {
-			this.codesError = e as AdminError;
+			this.codesError = toAdminError(e);
 		} finally {
 			this.codeBusy = false;
 		}
@@ -820,7 +821,7 @@ class ConsoleStore {
 			this.receipt = await revokeCode(codeHash);
 			await Promise.all([this.refreshCodes(), this.refreshStatus()]);
 		} catch (e) {
-			this.codesError = e as AdminError;
+			this.codesError = toAdminError(e);
 		} finally {
 			this.codeBusy = false;
 		}
@@ -862,7 +863,7 @@ class ConsoleStore {
 			const finalPhase: DisconnectPhase = converged ? "converged" : "unconfirmed";
 			if (this.disconnect !== null) this.disconnect = { ...this.disconnect, phase: finalPhase };
 		} catch (e) {
-			const err = e as AdminError;
+			const err = toAdminError(e);
 			// no-match：目标已自行离线——刷新在线表供核对（§4.3 C-2 步 5）
 			if (err?.code === "no-match") void this.refreshConnections();
 			if (this.disconnect !== null) this.disconnect = { ...this.disconnect, error: err };
@@ -894,7 +895,7 @@ class ConsoleStore {
 			await this.refreshNodes();
 		} catch (e) {
 			this.addNodeForm.token = "";
-			this.addNodeError = e as AdminError;
+			this.addNodeError = toAdminError(e);
 		} finally {
 			this.addNodeBusy = false;
 		}
@@ -929,7 +930,7 @@ class ConsoleStore {
 			]);
 			await Promise.all([this.refreshOwners(), this.refreshKnocks(), this.refreshVisitors(), this.refreshBlocklist(), this.refreshCodes()]);
 		} catch (e) {
-			this.nodesError = e as AdminError;
+			this.nodesError = toAdminError(e);
 		} finally {
 			this.switchingTo = null;
 		}
@@ -944,7 +945,7 @@ class ConsoleStore {
 			await deleteSidecarNode(nc.node.id);
 			await this.refreshNodes();
 		} catch (e) {
-			this.nodesError = e as AdminError;
+			this.nodesError = toAdminError(e);
 		}
 	}
 

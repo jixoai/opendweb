@@ -20,7 +20,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs",
-    "build": "vite build",
+    "build": "vite build && node -e \"const fs=require('node:fs');for(const f of fs.readdirSync('dist/assets')){if(f.endsWith('.js')){const p='dist/assets/'+f;const b=fs.readFileSync(p,'utf8');const s=b.replace(/[ \\t\\r\\n]+$/,'');if(s!==b)fs.writeFileSync(p,s+'\\n');}}\"",
     "dev": "vite",
     "start": "node src/cli.mjs"
   },

@@ -68,6 +68,9 @@ export class NodeStore {
     this.nodes = [];
   }
 
+  /** 变更串行化尾链（r8-P2-1/P1-2 共用的事务边界：add/remove 互斥完成「候选构造→落盘→内存替换」） */
+  #tail = Promise.resolve();
+
   /** 启动加载（文件缺失 = 空簿；symlink/损坏 JSON/坏条目 = 硬错误）。 */
   async load() {
     await assertNotSymlink(this.file);
@@ -100,8 +103,10 @@ export class NodeStore {
   /**
    * 原子落盘：临时文件（0600 + O_EXCL + fsync）→ rename 覆盖。
    * 失败时清理临时文件；rename 之前既有 nodes.json 若为 symlink 已被拒绝。
+   * @param {Array<{ id: string, name: string, server_host: string, token: string, added_at: number }>} nodes
+   *   待持久化的候选数组（事务语义：先落盘成功、后替换内存——r8-P2-1）。
    */
-  async #save() {
+  async #save(nodes) {
     await assertNotSymlink(this.file);
     const dir = path.dirname(this.file);
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -109,7 +114,7 @@ export class NodeStore {
       dir,
       `.${path.basename(this.file)}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`,
     );
-    const payload = `${JSON.stringify({ version: NODES_FILE_VERSION, nodes: this.nodes }, null, 2)}\n`;
+    const payload = `${JSON.stringify({ version: NODES_FILE_VERSION, nodes }, null, 2)}\n`;
     try {
       const fh = await open(tmp, "wx", 0o600);
       try {
@@ -132,30 +137,55 @@ export class NodeStore {
   }
 
   /**
-   * 追加节点并落盘。
+   * 变更互斥段（r8-P2-1）：同一时刻至多一个 add/remove 在「候选构造→#save→
+   * 内存替换」全程内——并发变更不交错覆盖彼此的落盘结果；任一失败不影响
+   * 后续变更继续。
+   * @template T
+   * @param {() => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  #mutate(fn) {
+    const run = this.#tail.then(fn);
+    this.#tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /**
+   * 追加节点并落盘（事务语义：候选数组构造 → #save 成功 → 才替换内存；
+   * 落盘失败时内存与磁盘均不变，异常上抛）。
    * @param {{ name?: string, server_host: string, token: string, added_at: number, id?: string }} input
    */
-  async add(input) {
-    const entry = {
-      id: input.id ?? randomBytes(8).toString("hex"),
-      name: String(input.name ?? ""),
-      server_host: String(input.server_host),
-      token: String(input.token),
-      added_at: input.added_at,
-    };
-    if (!validEntry(entry)) throw new NodeStoreError("node entry invalid");
-    this.nodes.push(entry);
-    await this.#save();
-    return entry;
+  add(input) {
+    return this.#mutate(async () => {
+      const entry = {
+        id: input.id ?? randomBytes(8).toString("hex"),
+        name: String(input.name ?? ""),
+        server_host: String(input.server_host),
+        token: String(input.token),
+        added_at: input.added_at,
+      };
+      if (!validEntry(entry)) throw new NodeStoreError("node entry invalid");
+      const candidates = [...this.nodes, entry];
+      await this.#save(candidates);
+      this.nodes = candidates;
+      return entry;
+    });
   }
 
   /** @param {string} id */
-  async remove(id) {
-    const i = this.nodes.findIndex((n) => n.id === id);
-    if (i === -1) return null;
-    const [removed] = this.nodes.splice(i, 1);
-    await this.#save();
-    return removed;
+  remove(id) {
+    return this.#mutate(async () => {
+      const i = this.nodes.findIndex((n) => n.id === id);
+      if (i === -1) return null;
+      const removed = this.nodes[i];
+      const candidates = this.nodes.filter((_, j) => j !== i);
+      await this.#save(candidates);
+      this.nodes = candidates;
+      return removed;
+    });
   }
 }
 

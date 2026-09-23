@@ -1,9 +1,10 @@
 // 节点簿单测（server-access-roles Phase 2b / specs/webui「节点簿与节点切换」）。
 // 覆盖冻结 requirement 的全部场景：
 // 1. 存储：nodes.json 0600；临时文件+原子 rename（无 .tmp 残留）；symlink 拒绝
-//    （读侧拒启 + 写侧拒绝）；损坏 JSON 拒启；
+//    （读侧拒启 + 写侧拒绝）；损坏 JSON 拒启；写盘失败内存/磁盘均不变（r8-P2-1 事务）；
 // 2. 添加：配对码（终端打印/成功后轮换/连败 5 次轮换/坏目标不烧码/单飞锁）；
-//    validateTarget 全量校验；Host/Origin 守卫；
+//    validateTarget 全量校验；Host/Origin 守卫；并发双发同一码恰一成功（r8-P1-2）；
+//    落盘失败保留配对码可重试；
 // 3. 切换：仅接受已存 node_id（任何 URL/host/server 字段 400 且零出站）；
 //    unknown node_id 404；切换后 /api/* 即刻指向新节点（进程未重启、同端口）；
 //    在途请求按请求开始时的 target 快照完成；当前未入簿目标切走前自动入簿；
@@ -12,15 +13,16 @@
 //    /sidecar/state 形状不变；未启用节点簿时 /sidecar/nodes* 404。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import http from "node:http";
+import { chmod, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { startSidecar } from "../src/sidecar.mjs";
 import { NodeStore, NodeStoreError, publicNode } from "../src/nodes.mjs";
-import { fakeUpstream, postJson, request } from "./helpers.mjs";
+import { delay, fakeUpstream, postJson, request } from "./helpers.mjs";
 
-/** ready 态 sidecar + 假上游 + 注入 nodesFile */
-async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", logs = [] } = {}) {
+/** ready 态 sidecar + 假上游 + 注入 nodesFile（或 nodesStore 慢存储替身） */
+async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", logs = [], nodesStore = null } = {}) {
   const sc = await startSidecar({
     target: {
       scheme: "http",
@@ -32,7 +34,7 @@ async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", l
       insecure: false,
     },
     token,
-    nodesFile,
+    ...(nodesStore !== null ? { nodesStore } : { nodesFile }),
     log: (line) => logs.push(line),
   });
   return { sc, logs };
@@ -109,6 +111,32 @@ test("nodes store unit: add/remove/get + publicNode projection never carries tok
   assert.equal(await store.remove(entry.id), null);
 });
 
+test("nodes store unit: save failure leaves memory AND disk unchanged (transactional add/remove, r8-P2-1)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-tx-"));
+  t.after(async () => {
+    await chmod(dir, 0o700).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+  const file = path.join(dir, "nodes.json");
+  const store = new NodeStore(file);
+  await store.load();
+  const e1 = await store.add({ name: "one", server_host: "https://a.example:1", token: "s1", added_at: 1 });
+  const beforeDisk = await readFile(file, "utf8");
+  await chmod(dir, 0o500); // 只读目录：临时文件创建失败（EACCES）
+  await assert.rejects(() => store.add({ name: "two", server_host: "https://b.example:2", token: "s2", added_at: 2 }));
+  await assert.rejects(() => store.remove(e1.id));
+  assert.equal(store.nodes.length, 1, "memory unchanged after failed add");
+  assert.deepEqual(store.nodes.map((n) => n.id), [e1.id], "memory unchanged after failed remove");
+  assert.equal(await readFile(file, "utf8"), beforeDisk, "disk byte-identical after failed add/remove");
+  assert.deepEqual((await readdir(dir)).filter((f) => f.endsWith(".tmp")), [], "no tmp leftovers on failed save");
+  await chmod(dir, 0o700); // 恢复可写：同一 store 继续可用（事务边界不残留半开状态）
+  const e2 = await store.add({ name: "two", server_host: "https://b.example:2", token: "s2", added_at: 2 });
+  assert.equal(store.nodes.length, 2);
+  assert.equal(JSON.parse(await readFile(file, "utf8")).nodes.length, 2);
+  assert.equal(await store.remove(e2.id), e2);
+  assert.equal(JSON.parse(await readFile(file, "utf8")).nodes.length, 1);
+});
+
 // ---- 添加面：配对码纪律 -----------------------------------------------------------------
 
 test("node add: wrong code 5 times rotates the code (fresh code then works)", async (t) => {
@@ -146,6 +174,80 @@ test("node add: bad target does not burn the code; consumed code rotates (each a
   assert.notEqual(sc.nodePairingCode(), first, "code rotated after successful add");
   const replay = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstream.url, { pairing_code: first }));
   assert.equal(replay.status, 400, "consumed code is single-use");
+});
+
+test("node add: concurrent double-spend of one code -> exactly one 200 + one durable entry (r8-P1-2)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-race-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const upstream = await fakeUpstream({ handler: (req, res) => { res.writeHead(200); res.end("{}"); } });
+  t.after(() => upstream.close());
+  const file = path.join(dir, "nodes.json");
+  // 慢存储注入（r5 慢 DNS 手法的存储侧对偶）：NodeStore.add 提交段延迟
+  // 150ms——覆盖 validateTarget 返回后的 fsync/rename await 窗口（真竞态点；
+  // 旧实现的锁只罩 validateTarget，此处窗口内旧码仍可用）
+  class SlowStore extends NodeStore {
+    async add(input) {
+      await delay(150);
+      return super.add(input);
+    }
+  }
+  const { sc } = await sidecarWithNodes(upstream, file, { nodesStore: new SlowStore(file) });
+  t.after(() => sc.close());
+  const code = sc.nodePairingCode();
+  // 独立 http Agent 强制真并发（全局 agent 的 keep-alive 会串行化两请求，测不出竞态）
+  const buf = JSON.stringify(nodeBody(sc, upstream.url, { token: "node-token-b" }));
+  const post = () =>
+    request(sc.port, {
+      method: "POST",
+      path: "/sidecar/nodes",
+      headers: { "content-type": "application/json" },
+      body: buf,
+      agent: new http.Agent(),
+    });
+  const [a, b] = await Promise.all([post(), post()]);
+  const statuses = [a.status, b.status].sort((x, y) => x - y);
+  assert.equal(statuses[0], 200, `exactly one success, got ${a.status}/${b.status}`);
+  assert.equal(statuses[1], 409, `the other must be 409 pairing-in-progress, got ${statuses}`);
+  const rejected = a.status === 409 ? a : b;
+  assert.equal(JSON.parse(rejected.text).error.code, "pairing-in-progress");
+  // 恰一条持久条目；内存名册与磁盘一致
+  const persisted = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(persisted.nodes.length, 1, "exactly one durable entry");
+  const list = JSON.parse((await request(sc.port, { path: "/sidecar/nodes" })).text);
+  assert.equal(list.nodes.length, 1, "in-memory roster matches disk");
+  // 顺序重放旧码仍拒绝（成功已轮换，旧码 single-use——既有纪律保绿）
+  const replay = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstream.url, { pairing_code: code, token: "node-token-c" }));
+  assert.equal(replay.status, 400);
+  assert.equal(JSON.parse(replay.text).error.code, "bad-pairing");
+  assert.equal(JSON.parse(await readFile(file, "utf8")).nodes.length, 1, "rejected replay adds nothing");
+});
+
+test("node add: persist failure keeps the code retryable and leaves no entry (r8-P1-2 rollback)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-retry-"));
+  t.after(async () => {
+    await chmod(dir, 0o700).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  });
+  const upstream = await fakeUpstream();
+  t.after(() => upstream.close());
+  const file = path.join(dir, "nodes.json");
+  const { sc } = await sidecarWithNodes(upstream, file);
+  t.after(() => sc.close());
+  const code = sc.nodePairingCode();
+  await chmod(dir, 0o500); // 只读目录：临时文件创建失败（save 注入失败）
+  const failed = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstream.url));
+  assert.equal(failed.status, 500, failed.text);
+  assert.equal(JSON.parse(failed.text).error.code, "internal");
+  assert.equal(sc.nodePairingCode(), code, "code preserved on persist failure (retryable)");
+  const list = JSON.parse((await request(sc.port, { path: "/sidecar/nodes" })).text);
+  assert.deepEqual(list.nodes, [], "no in-memory entry after failed commit");
+  assert.equal((await readdir(dir)).filter((f) => f.endsWith(".json")).length, 0, "no durable entry");
+  // 目录恢复可写后：同一码重试成功（码只随成功消费）
+  await chmod(dir, 0o700);
+  const retry = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstream.url));
+  assert.equal(retry.status, 200, retry.text);
+  assert.notEqual(sc.nodePairingCode(), code, "code rotates only on successful add");
+  assert.equal(JSON.parse(await readFile(file, "utf8")).nodes.length, 1);
 });
 
 test("node add: cross-origin and bad-Host rejected (same guard as connect)", async (t) => {

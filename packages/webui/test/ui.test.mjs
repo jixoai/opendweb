@@ -20,6 +20,7 @@ import {
 	postConnect,
 	resetApiFetch,
 	setApiFetch,
+	toAdminError,
 } from "../ui/src/lib/api.ts";
 import { connectErrorCopy, errorCopy, healthCopy } from "../ui/src/lib/copy.ts";
 import { fmtClock, formatTime, relativeTime } from "../ui/src/lib/format.ts";
@@ -118,6 +119,45 @@ test("apiFetch transport mapping: thrown TypeError → network; TimeoutError →
 	});
 	const timeout = await rejected(loadStatus());
 	assert.equal(timeout.code, "timeout");
+});
+
+test("r8-P2-2: sidecar state boundary validation rejects malformed shapes", async () => {
+	// 合法形状直通
+	setApiFetch(
+		async () =>
+			new Response(JSON.stringify({ phase: "ready", server_host_masked: "https://***.example", insecure: false }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+	);
+	assert.deepEqual(await fetchSidecarState(), { phase: "ready", server_host_masked: "https://***.example", insecure: false });
+
+	// 畸形：phase 非法 / masked 类型错 / insecure 缺失 / 整体 null——一律 invalid-response，不进组件状态
+	const malformedBodies = [
+		JSON.stringify({ phase: "weird", server_host_masked: null, insecure: false }),
+		JSON.stringify({ phase: "ready", server_host_masked: 7, insecure: false }),
+		JSON.stringify({ phase: "setup", server_host_masked: null }),
+		"null",
+	];
+	for (const body of malformedBodies) {
+		setApiFetch(async () => new Response(body, { status: 200, headers: { "content-type": "application/json" } }));
+		const err = await rejected(fetchSidecarState());
+		assert.ok(err instanceof AdminError, body);
+		assert.equal(err.code, "invalid-response", body);
+	}
+});
+
+test("r8-P2-2: toAdminError normalizes unknown caught values (no as-casts at catch sites)", () => {
+	const original = new AdminError("no-match", "x", 404);
+	assert.equal(toAdminError(original), original, "AdminError passthrough");
+	const timedOut = new Error("t");
+	timedOut.name = "TimeoutError";
+	assert.equal(toAdminError(timedOut).code, "timeout");
+	const network = toAdminError(new TypeError("unexpected"));
+	assert.ok(network instanceof AdminError);
+	assert.equal(network.code, "network");
+	assert.equal(toAdminError("string error").code, "network");
+	assert.equal(toAdminError(null).code, "network");
 });
 
 test("postConnect normalization: sidecar envelope codes flow through the injectable layer", async () => {

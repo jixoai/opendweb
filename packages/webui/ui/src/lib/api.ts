@@ -76,6 +76,13 @@ function transportError(err: unknown): AdminError {
   return new AdminError("network", `request failed: ${detail}`, null);
 }
 
+/** catch 边界归一（r8-P2-2）：unknown → AdminError。AdminError 原样透传，其余按
+ * 传输层语义归一（timeout/network）——store/组件层不再对 caught 值 as 直断。 */
+export function toAdminError(e: unknown): AdminError {
+  if (e instanceof AdminError) return e;
+  return transportError(e);
+}
+
 /** JSON 往返（全部网络访问的单一出口——注入点在此生效）。 */
 async function jsonFetch(path: string, init?: RequestInit): Promise<unknown> {
   let res: Response;
@@ -101,9 +108,20 @@ export interface SidecarState {
   insecure: boolean;
 }
 
-/** GET /sidecar/state → {phase, server_host_masked, insecure}。 */
+/** SidecarState 结构守卫（r8-P2-2 API 边界校验）：畸形 JSON 不进组件状态。 */
+function parseSidecarState(v: unknown): SidecarState {
+  const bad = () => new AdminError("invalid-response", "sidecar state response malformed");
+  if (v === null || typeof v !== "object" || Array.isArray(v)) throw bad();
+  const o = v as Record<string, unknown>;
+  if (o.phase !== "setup" && o.phase !== "ready") throw bad();
+  if (o.server_host_masked !== null && typeof o.server_host_masked !== "string") throw bad();
+  if (typeof o.insecure !== "boolean") throw bad();
+  return { phase: o.phase, server_host_masked: o.server_host_masked, insecure: o.insecure };
+}
+
+/** GET /sidecar/state → {phase, server_host_masked, insecure}（经边界结构校验）。 */
 export function fetchSidecarState(): Promise<SidecarState> {
-  return jsonFetch("/sidecar/state") as Promise<SidecarState>;
+  return jsonFetch("/sidecar/state").then(parseSidecarState);
 }
 
 // ---- /sidecar/nodes* 本地控制面（server-access-roles 节点簿；响应零 token） ------

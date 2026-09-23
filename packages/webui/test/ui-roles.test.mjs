@@ -277,7 +277,11 @@ test("path contract: local control plane stays on /sidecar/{state,connect,nodes*
 	const paths = [];
 	setApiFetch(async (path, init) => {
 		paths.push(path);
-		return new Response(JSON.stringify({ phase: "ready", nodes: [], ok: true, node: {} }), { status: 200 });
+		// 单一 body 需同时满足 /sidecar/state 的边界结构校验（r8-P2-2）与 nodes 面的最小形状
+		return new Response(
+			JSON.stringify({ phase: "ready", server_host_masked: null, insecure: false, nodes: [], ok: true, node: {} }),
+			{ status: 200 },
+		);
 	});
 	await Promise.all([
 		fetchSidecarState(),

@@ -1,0 +1,7 @@
+# 生成的 minified bundle 不做 whitespace 检查（r8-P2-3）：
+# vite/esbuild 会把 svelte 运行时常量（internal/shared/attributes.js 的
+# whitespace 字符集）以含原始控制字符的模板字面量内联——字符串内容里的
+# space/tab 后随真实换行，构成「行尾空白」。这是字符串语义的一部分
+# （class 修剪字符集），改写会破坏运行时行为，故对该产物关闭
+# git diff --check 的 whitespace 检查（构建脚本另对文件尾做 EOF 规范化）。
+dist/assets/*.js -whitespace

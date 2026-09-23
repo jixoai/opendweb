@@ -154,10 +154,11 @@ function constantTimeEqual(a, b) {
 
 /**
  * 启动 sidecar。
- * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null }} [opts]
+ * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null }} [opts]
  *   - target：validateTarget 成功值（给出即 ready；缺省 setup 模式）
  *   - token：admin token（内存 + 节点簿例外下的 0600 nodes.json；不落任何日志/响应）
- *   - dns/now/nodesFile：注入面（测试）；nodesFile 给出即启用节点簿
+ *   - dns/now/nodesFile/nodesStore：注入面（测试）；nodesFile 给出即启用节点簿；
+ *     nodesStore 直接注入 NodeStore 实例（慢存储竞态注入用，优先于 nodesFile）
  * @returns {Promise<{ port: number, origin: string, url: string, mode: () => "setup" | "ready", pairingCode: string | null, nodePairingCode: () => string | null, close: () => Promise<void> }>}
  */
 export async function startSidecar(opts = {}) {
@@ -171,14 +172,15 @@ export async function startSidecar(opts = {}) {
     dns,
     now = () => Date.now(),
     nodesFile = null,
+    nodesStore = null,
   } = opts;
   if (target && (typeof token !== "string" || token === "")) {
     throw new Error("startSidecar: target requires a token");
   }
   const distRoot = path.resolve(distDir);
 
-  /** 节点簿存储（nodesFile 注入即启用；损坏/symlink = fail-fast 拒启） */
-  const nodes = nodesFile === null ? null : new NodeStore(path.resolve(nodesFile));
+  /** 节点簿存储（nodesFile/nodesStore 注入即启用；损坏/symlink = fail-fast 拒启） */
+  const nodes = nodesStore ?? (nodesFile === null ? null : new NodeStore(path.resolve(nodesFile)));
   if (nodes !== null) await nodes.load();
 
   /** 目标生命周期状态机：setup → ready（运行期重指向仅 /sidecar/nodes/switch 例外） */
@@ -201,7 +203,7 @@ export async function startSidecar(opts = {}) {
   const nodePairing =
     nodes === null ? null : { code: generatePairingCode(), expiresAt: now() + LIMITS.pairingTtlMs, failures: 0 };
   if (nodePairing !== null) log(nodeAddCodeLine(nodePairing.code));
-  /** 节点添加/切换的单飞锁（并发第二次请求 409） */
+  /** 节点添加/切换的单飞锁（并发第二次请求 409；r8-P1-2 起覆盖提交段全程） */
   let nodePairingInFlight = false;
   let nodeSwitchInFlight = false;
 
@@ -586,30 +588,34 @@ export async function startSidecar(opts = {}) {
       logAccess(req, 400, startedAt);
       return;
     }
-    // 单飞消费锁（与 connect 面同语义：校验让出窗口内并发第二请求被拒）
+    // 单飞消费锁（r8-P1-2）：覆盖「验证→durable 落盘→码轮换→成功响应」全程。
+    // 旧实现锁只罩 validateTarget，NodeStore.add 的 fsync/rename await 窗口内
+    // 第二请求可用未轮换的旧码再添一条（一次性终端码双消费）；现在轮换只随
+    // 成功发生，任何失败（bad-target/落盘异常）保留配对码可重试。
     if (nodePairingInFlight) {
       sendJson(res, 409, { error: { code: "pairing-in-progress", message: "another node add request is in flight" } });
       logAccess(req, 409, startedAt);
       return;
     }
     nodePairingInFlight = true;
-    let v;
     try {
-      v = await validateTarget(server, { allowInsecure, dns });
+      const v = await validateTarget(server, { allowInsecure, dns });
+      if (!v.ok) {
+        // 目标守卫失败不烧码（URL 笔误可重试——与 connect 面一致）
+        sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      // 提交段在锁内：NodeStore.add 事务性落盘（失败内存/磁盘均不变，异常上抛
+      // → 500 internal，配对码未轮换可重试）
+      const entry = await nodes.add({ name, server_host: server, token, added_at: now() });
+      rotateNodePairing(); // 每次成功添加消费一个码，新码立即打印终端
+      sendJson(res, 200, { node: publicNode(entry, entry.id === state.currentNodeId) });
+      log(`sidecar: node added (${entry.id.slice(0, 8)})`);
+      logAccess(req, 200, startedAt);
     } finally {
       nodePairingInFlight = false;
     }
-    if (!v.ok) {
-      // 目标守卫失败不烧码（URL 笔误可重试——与 connect 面一致）
-      sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
-      logAccess(req, 400, startedAt);
-      return;
-    }
-    const entry = await nodes.add({ name, server_host: server, token, added_at: now() });
-    rotateNodePairing(); // 每次成功添加消费一个码，新码立即打印终端
-    sendJson(res, 200, { node: publicNode(entry, entry.id === state.currentNodeId) });
-    log(`sidecar: node added (${entry.id.slice(0, 8)})`);
-    logAccess(req, 200, startedAt);
   }
 
   /**
@@ -658,36 +664,37 @@ export async function startSidecar(opts = {}) {
       logAccess(req, 404, startedAt);
       return;
     }
+    // 单飞锁覆盖提交段全程（r8-P1-2 同纪律）：校验→自动入簿→进程内原子替换→
+    // 响应——旧实现的自动入簿 nodes.add 在锁外，并发切换可重复入簿当前目标。
     nodeSwitchInFlight = true;
-    let v;
     try {
       // 切换前全量重校验目标（DNS 守卫同配对面）——失败不切换（原子性）
-      v = await validateTarget(entry.server_host, { allowInsecure, dns });
+      const v = await validateTarget(entry.server_host, { allowInsecure, dns });
+      if (!v.ok) {
+        sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      // 当前目标未入簿（来自 --server/setup 配对）→ 切走前自动入簿（可切回）
+      if (state.currentNodeId === null && state.target !== null) {
+        const cur = await nodes.add({
+          name: "",
+          server_host: `${state.target.scheme}://${state.target.hostHeader}`,
+          token: state.token,
+          added_at: now(),
+        });
+        state.currentNodeId = cur.id;
+      }
+      state.target = v.value;
+      state.token = entry.token;
+      state.currentNodeId = entry.id;
+      state.mode = "ready";
+      sendJson(res, 200, { ok: true, node: publicNode(entry, true) });
+      log(`sidecar: switched to node ${entry.id.slice(0, 8)} (${v.value.scheme}://${v.value.hostHeader})`);
+      logAccess(req, 200, startedAt);
     } finally {
       nodeSwitchInFlight = false;
     }
-    if (!v.ok) {
-      sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
-      logAccess(req, 400, startedAt);
-      return;
-    }
-    // 当前目标未入簿（来自 --server/setup 配对）→ 切走前自动入簿（可切回）
-    if (state.currentNodeId === null && state.target !== null) {
-      const cur = await nodes.add({
-        name: "",
-        server_host: `${state.target.scheme}://${state.target.hostHeader}`,
-        token: state.token,
-        added_at: now(),
-      });
-      state.currentNodeId = cur.id;
-    }
-    state.target = v.value;
-    state.token = entry.token;
-    state.currentNodeId = entry.id;
-    state.mode = "ready";
-    sendJson(res, 200, { ok: true, node: publicNode(entry, true) });
-    log(`sidecar: switched to node ${entry.id.slice(0, 8)} (${v.value.scheme}://${v.value.hostHeader})`);
-    logAccess(req, 200, startedAt);
   }
 
   /** DELETE /sidecar/nodes/{id}：当前连接节点不可删（409，先切走）。 */
