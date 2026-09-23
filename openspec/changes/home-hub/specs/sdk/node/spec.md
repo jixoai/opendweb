@@ -21,7 +21,7 @@ client-sdk Node 面 SHALL 提供 `FabricOptions.deferStart?: boolean`（**仅对
 
 ### Requirement: Roster 显式 fabric_id 采纳（FabricOptions.fabricId，[H8]）
 
-client-sdk Node 面 SHALL 提供 `FabricOptions.fabricId?: string`（**仅 `createRoot` 生效**；64 hex 小写校验，非法=构造错误；缺省=SDK 随机生成既有行为不变）：提供时 roster **持久化并采纳该值**，`fabricIdHex()` 读回值 MUST 逐字等于所提供值；roster 已存在（同 data_dir）时提供 fabricId=校验一致则继续、不一致=明确错误（不静默改写既有 roster）。该参数是 home-hub 身份 tuple 同源机制的采纳侧（CLI join 为唯一生成点，见 cli/leases delta；**[H8] 二次拍板明文授权 roster 身份语义扩展**）；**身份 seed 供给**：home-hub 消费路径 MUST 显式以 join 所用 `<DWEB_HOME>/identity.key` 的 seed 构造（roster dataDir 可独立但不决定身份 seed）；集成测试 MUST 断言 createRoot(fabricId=X, 同 DWEB_HOME seed) 读回==X 且 `endpointId()`==register.root==lease.root（重启后仍相等）；另一 seed 构造的 endpointId 不等于 lease.root=首拨前 fail-closed。
+client-sdk Node 面 SHALL 提供 `FabricOptions.fabricId?: string`（**仅 `createRoot` 生效**；64 hex 小写校验，非法=构造错误；缺省=SDK 随机生成既有行为不变）：提供时 roster **持久化并采纳该值**，`fabricIdHex()` 读回值 MUST 逐字等于所提供值；roster 已存在（同 data_dir）时提供 fabricId=校验一致则继续、不一致=明确错误（不静默改写既有 roster）。该参数是 home-hub 身份 tuple 同源机制的采纳侧（CLI join 为唯一生成点，见 cli/leases delta；**[H8] 二次拍板明文授权 roster 身份语义扩展**）；**身份 seed 供给（目录供给方案，零新 API）**：home-hub 消费路径 MUST 以 `dataDir=<DWEB_HOME>` 构造——SDK 既有 `resolve_identity(Default)` 由此读取 join 的 `<DWEB_HOME>/identity.key`（同文件同源；不新增 seed 供给 API，SecretSeedHandle/importSecret 面不动，seed 永不进 JS 字符串）；dataDir≠DWEB_HOME=home-hub 消费路径构造前禁止；identity.key 缺失/损坏/权限不足=构造前明确错误；集成测试 MUST 断言 createRoot(fabricId=X, dataDir=DWEB_HOME) 读回==X 且 `endpointId()`==register.root==lease.root（重启后仍相等）；异 data_dir 构造的 endpointId 不等于 lease.root=首拨前 fail-closed。
 
 #### Scenario: 采纳与读回一致
 
