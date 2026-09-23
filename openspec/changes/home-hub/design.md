@@ -69,6 +69,13 @@
 - **DWEB_DATA_DIR**：链入口从 hub.json 解析 data_dir 绝对路径注入 env
   （优先级：hub 注入 > 继承环境）；readiness 后**核实** owners.jsonl/server.key
   实际落 hub.json.data_dir（防静默写错目录；不符=启动失败）。
+- **DWEB_ADMIN_TOKEN（r3-P1-1）**：链入口读取 hub-token 内容，以子进程 env
+  `DWEB_ADMIN_TOKEN` 注入（server 仅在该 env 存在时挂载 /admin/*——
+  main.rs:478-503 事实）；**hub 注入优先于继承的同名 env**（覆盖而非透传）；
+  绝不进 argv/plist/启动脚本/日志。readiness 后以本机请求断言 admin 面已
+  挂载：无 token 请求 `/admin/status` 得 **401（挂载）而非 404（未挂载）**，
+  再以 hub-token 请求得 200；断言失败=启动失败（停机+清 lock，不假成功）。
+  四宿主（前台/detached/LaunchAgent/Windows Startup）同一注入路径。
 - **cwd 与配置上下文**：全宿主统一 `cwd=<DWEB_HOME>`；配置发现=hub.json.
   config_path（有则 `--config` 显式传入，无则无配置）。**不依赖 cwd 插件
   发现**——三宿主（前台/detached/系统服务）钩子与配置上下文逐一致
@@ -87,6 +94,10 @@
 - 联动：autostart on 时 `hub start`=安装/加载服务不另起 detached（服务
   child 经 DWEB_HUB_SERVICE=1 自识别，不重复 load、不写 pid）；`hub stop`
   =卸载服务+停残留；off 时 detached 直起/杀。安装/卸载失败不更新 hub.json。
+- **生成物 quoting 冻结（r3-P2-3）**：plist ProgramArguments=数组序列化
+  （XML 转义，无 shell 参与）；Windows .cmd 对含空格/`%`/`&`/非 ASCII 的
+  路径做 cmd 转义（引号包裹+`%%` 双写），生成前对路径做包含性检查；测试
+  含 path-with-spaces 与非 ASCII 用户目录的生成物快照 Scenario。
 - **测试分层（r2-P2-5）**：单测=生成物文本快照（含真实绝对路径断言），
   不 load；**生命周期 acceptance**（install→登录触发→stop 不复活→start
   恢复→off 卸载）=实现期在真实账户手工/VM 执行一次并留验收记录
@@ -130,11 +141,17 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
 
 - 键=(server 归一化 origin, fabric_id, root)；**id**=创建时随机 10 字符
   不透明键（label 路由与 UI 引用的稳定句柄，r2-P2-4）。
-- **relay_url（r2-P1-1 入网闭环）**：join 已访问 `/services.json` 校验
-  server_id——同时读取其 relay URL 并随租约落盘。**成员连接该 server 时
-  MUST 经此 relay**（custom 模式指向中枢——G-3 承诺的入网前提；knock.mjs
-  即此形态的现成示范）。leases 消费者（未来连接器/到访探测 relay 层）以
-  此为唯一 relay 真源，不回落 N0Default。
+- **relay_url（r2-P1-1 入网闭环；r3-P1-2 补 null/disabled 语义）**：join
+  已访问 `/services.json` 校验 server_id——relay 选择规则冻结：取
+  `services[]` 中 `name=="relay" && enabled==true && url` 非空 null 的条目
+  → relay_url=该值；**relay disabled 或 url=null → join fail-closed**
+  （明确报错「中枢未启用中转，无法完成家庭接入」，不落租约条目——不产生
+  「宣称已加入却不可连接」的租约；G-3 家庭链前提由此保证）。**成员连接
+  该 server 时 MUST 经此 relay**：连接器从租约构造
+  `FabricOptions.relay={mode:"custom",urls:[relay_url]}`（SDK 默认
+  N0Default 不适用；knock.mjs 即此形态示范）；leases 消费者以此为唯一
+  relay 真源。实现期端到端断言：join→读 lease→SDK relay mode=custom 且
+  url=relay_url（非 N0Default）。
 - **expires_at=本机最后一次成功兑换的租期快照（r2-P1-5 冻结）**：管理端
   renew 只改服务端 owners，**不回写本机**（无成员侧查询协议——Phase 2
   候选，超出本 change 的 Rust 零改动边界）；租约页以「本地快照」呈现，
@@ -174,11 +191,20 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   （不含 CRC 自身）**；参数 poly=0x1021/init=0xFFFF/refin=false/refout=
   false/xorout=0x0000（校验向量 "123456789"→0x29B1）。
 - **编码**：crockford-base32 **MSB-first**（自最高位每 5 bit 一字符），
-  小写无 padding；**末尾不足 5 bit 右侧补零**；解码时：歧义字符按
-  crockford 映射（o→0、i/l→1）、**非零 padding 位=拒绝**、多余/缺失
-  字符=拒绝、非法字符=拒绝（非规范等价串不接受，r2-P1-8）。
-- **长度**：IPv4=15 字符（5-5-5 分组）、IPv6=34 字符（4×8+2）；呈现
-  `dwebh1.` 前缀+连字符分组（解码忽略连字符）。
+  小写无 padding；**末尾不足 5 bit 右侧补零**。
+- **解码 canonical 规则（r3-P1-3 修订，消除歧义映射 vs 非规范拒绝的矛盾）**：
+  **严格 canonical 模式**——①仅接受 crockford 32 字符集（`0-9` +
+  `abcdefghjkmnpqrstvwxyz`）；**歧义字符 o/i/l/u 出现即拒绝**（错误提示
+  「o→0、i/l→1、u→v」但不自动映射）；②大小写折叠（全大写输入归一为小写
+  后比对，混合大小写接受）；③连字符**仅允许出现在固定分组位置**且整组
+  可省略（canonical 串=无连字符形态；IPv4 分组 5-5-5、IPv6 4×8+2；其他
+  位置连字符=拒绝）；④前缀 `dwebh1.` 大小写不敏感；⑤非零 padding 位=
+  拒绝、多余/缺失字符=拒绝（非规范等价串一律不接受）。测试变体清单：
+  逐位篡改/歧义字符（o、i、l、u 各一）/错误位置连字符/末字符零位变体/
+  超长/缺字符。
+- **IPv6 URL 冻结**：解码结果 URL 形态 `http://[<ip>]:<port>`（字面量带
+  方括号）；V2 断言=`http://[fd00::13]:8787`。
+- **长度**：IPv4=15 字符（5-5-5 分组）、IPv6=34 字符（4×8+2）。
 - **link-local 拒绝（r2-P2-6）**：编码端 fe80::/10 → 明确错误（提示用
   ULA/global）；解码端同样拒绝。
 - **设计级 golden vectors（CLI/webui 共用同向量对拍）**：
@@ -252,9 +278,12 @@ packages/webui/src/
   - **open=宿主注入回调**：`opts.opener(url)` 必填（CLI 壳注入既有
     openImpl，tray 注入自己的壳行为）；**core 不自带浏览器 spawn**
     （消除与「core 无进程语义」的矛盾）；
-  - `urlFor` 返回的 URL 可含 sidecar **会话 capability**（一次性随机，
-    即基线 pairingCode 族——**非 hub-token/admin token**）；hub-token/
-    admin token 绝不入 URL/浏览器可见状态/IPC；
+  - `urlFor` 返回的 URL 可含 sidecar **会话 capability v1（r3-P2-4 冻结）**：
+    ≥128-bit CSPRNG、绑定 sidecar 实例（跨实例无效）、**单次消费**（重放=
+    403+记录）、TTL（默认 120s）、close/进程退出立即失效；**非 hub-token/
+    admin token**——hub-token/admin token 绝不入 URL/浏览器可见状态/IPC；
+    URL query 参数不落访问日志（sidecar 自身日志纪律）、SPA 页面不外发
+    referrer（`no-referrer` 政策）；重放/过期/跨实例/close 后使用=明确 403；
   - 事件 schema v1：`{v:1, type:"state-change"|"node-switch"|"knock-pending"
     |"error", payload, ts}`；disposer；close 后事件静默/再订阅抛错；
   - getSnapshot=调用时刻同步快照（三视角数据取齐）。
@@ -280,10 +309,14 @@ packages/webui/src/
 → {"jsonrpc":"2.0","method":"open-console"}            ← notification：拒绝
 ← {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"notifications not supported"}}
 → [超长帧 >64KB]
-← {"jsonrpc":"2.0","id":<若前缀可解析出 id 则透传，否则 null>,"error":{"code":-32601,"message":"frame too large"}}
+← {"jsonrpc":"2.0","id":<前缀可解析则透传，否则 null>,"error":{"code":-32601,"message":"frame too large"}}
 → {坏 JSON}
 ← {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}
 ```
+
+**所有响应帧（含全部 error）都携带 `"jsonrpc":"2.0"` 字段（r3-P1-4）**——
+契约测试以严格 JSON-RPC 2.0 validator 逐帧校验；错误帧的 id 提取=语法解析
+前的受限前缀扫描（非任意 JSON 执行）。
 
   stdin EOF=优雅退出；stderr 只归日志；hub-token 不经任何面暴露；进程
   退出（含崩溃）后心跳 mtime 停止（壳侧失联判定）。
@@ -308,9 +341,13 @@ n0 公共 relay 的用户）不在本结论内。
   测试 server 并 join；②断言 `link_status==Direct`；③**停整个 server
   进程**；④双向 send ≥300s 零中断；⑤同窗口新节点 join 失败；⑥重启
   server→新成员 join 成功。**relay-only 对照**：docker 双 bridge 隔离
-  UDP 为必需尝试；**若实现期证不可行**：降级路径=（a）设计记录环境
-  限制与证据链，（b）PM 文案的自动恢复时限降级为「时限依网络环境」
-  （已按此口径书写，见 PRODUCT-DESIGN §1.2），（c）不得宣称已自动断言。
+  UDP 为必需尝试；**降级的客观封存条件（r3-P2-2）**：仅当 acceptance
+  记录（docs/acceptance-home-hub-g3.md，模板六字段：环境/镜像与网络拓扑/
+  命令清单/时间窗口/原始日志摘要/结论）以可复现实验证据写明
+  `NOT-EXECUTABLE` 及原因时方可降级（尝试义务=至少一次可复现实验+失败
+  时限记录）；降级后 PM 文案维持「时限依网络环境」口径（已按此书写，
+  见 PRODUCT-DESIGN §1.2），发布清单必须引用该记录——不得把设计级 G-3
+  表述标注为已断言。
 - 「无限期」废除；文案口径「已直连不受影响+借道自动恢复」（PM 已同步）。
 
 ## 8. 测试策略
@@ -349,4 +386,5 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r2 | NOT-READY 7.0，P1×9+P2×7 | 全处置（v3，本版）：P1-1 入网闭环=join 落 relay_url（§2.1）+delta Scenario+G-3 验收义务（§7）；P1-2 hub open 命令+五行分流表 hub 本机行（§1.1/§4.2）；P1-3 DWEB_DATA_DIR 全宿主注入+启动后核实（§1.3）；P1-4 cwd 统一 DWEB_HOME+config_path 冻结+承诺面改为三宿主间一致（§1.3）；P1-5 expires_at=本地快照冻结+PM 文案同步（§2.1）；P1-6 pid 三元组（start_identity+argv 摘要）三重核验（§1.2）；P1-7 接管=尽力探测+强制人工确认+data_dir 唯一规则（§1.6）；P1-8 字节修正 9/21+CRC 覆盖范围+MSB/padding 位/非规范拒绝+设计级 golden vectors V1/V2（§3.1）；P1-9 urlFor+open=注入 opener+url 会话 capability 非 admin token（§5.1）；P2-1 PM/proposal 残留清理（已裁决记录化/平台同步）；P2-2 写路由 Origin 严格策略（存在且匹配，不沿用基线放行）（§4.2）；P2-3 visits 回归访客语义（join 不写）+五类映射（§2.2）；P2-4 label 用不透明 id+空串归一 null（§2.1/§4.2）；P2-5 RPC 完整 golden 帧+notification/batch 拒绝+服务验收分层（§1.4/§6）；P2-6 link-local 拒绝（§1.5/§3.1）；P2-7 默认不启动负向 Scenario（§1.1） |
+| r3 | NOT-READY 7.3，P1×4+P2×4 | 全处置（v4，本版）：P1-1 DWEB_ADMIN_TOKEN 链入口注入（覆盖继承 env）+readiness 双探断言（无 token 401≠404 + token 200）+失败停机清锁（§1.3）；P1-2 relay null/disabled=join fail-closed 不落租约+连接器从租约构造 custom（§2.1）；P1-3 短码严格 canonical（歧义字符拒绝不映射+连字符仅固定分组位置+大小写折叠）+IPv6 bracket URL 冻结 V2 断言（§3.1）；P1-4 全部 error 帧补 jsonrpc 字段+严格 validator 逐帧校验（§6）；P2-1 proposal/PM 旧词残留清理+rg 门禁；P2-2 G-3 acceptance 模板六字段+NOT-EXECUTABLE 客观条件（§7）；P2-3 生成物 quoting 冻结+特殊路径 Scenario（§1.4）；P2-4 capability v1 冻结（§5.1） |
+| r2 | NOT-READY 7.0，P1×9+P2×7 | 全处置（v3）：P1-1 入网闭环=join 落 relay_url（§2.1）+delta Scenario+G-3 验收义务（§7）；P1-2 hub open 命令+五行分流表 hub 本机行（§1.1/§4.2）；P1-3 DWEB_DATA_DIR 全宿主注入+启动后核实（§1.3）；P1-4 cwd 统一 DWEB_HOME+config_path 冻结+承诺面改为三宿主间一致（§1.3）；P1-5 expires_at=本地快照冻结+PM 文案同步（§2.1）；P1-6 pid 三元组（start_identity+argv 摘要）三重核验（§1.2）；P1-7 接管=尽力探测+强制人工确认+data_dir 唯一规则（§1.6）；P1-8 字节修正 9/21+CRC 覆盖范围+MSB/padding 位/非规范拒绝+设计级 golden vectors V1/V2（§3.1）；P1-9 urlFor+open=注入 opener+url 会话 capability 非 admin token（§5.1）；P2-1 PM/proposal 残留清理（已裁决记录化/平台同步）；P2-2 写路由 Origin 严格策略（存在且匹配，不沿用基线放行）（§4.2）；P2-3 visits 回归访客语义（join 不写）+五类映射（§2.2）；P2-4 label 用不透明 id+空串归一 null（§2.1/§4.2）；P2-5 RPC 完整 golden 帧+notification/batch 拒绝+服务验收分层（§1.4/§6）；P2-6 link-local 拒绝（§1.5/§3.1）；P2-7 默认不启动负向 Scenario（§1.1） |

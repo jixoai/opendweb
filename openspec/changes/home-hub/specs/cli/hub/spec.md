@@ -40,12 +40,17 @@
 
 ### Requirement: 中枢守护进程模型（统一执行链与环境冻结）
 
-`hub start` 的 detached 与 `--foreground` SHALL 执行同一链（node CLI 完整 server 编排：插件钩子/配置解析/startServer/readiness/单飞停机）；detached=自举 spawn（`spawn(process.execPath, [bin/opendweb.mjs 绝对路径, hub, start, --foreground], {detached, stdio→<data_dir>/hub.log})` 后 unref，pid 记录三元组）。**全宿主环境冻结**：①链入口从 hub.json 解析 data_dir 绝对路径注入 `DWEB_DATA_DIR`（优先级=hub 注入>继承环境），readiness 后 MUST 核实 owners.jsonl/server.key 实际落在 hub.json.data_dir（不符=启动失败，不假成功）；②全宿主统一 `cwd=<DWEB_HOME>`、配置=config_path 显式传入（无则无配置），**不依赖 cwd 插件发现**——前台/detached/系统服务三宿主的插件钩子与配置上下文 MUST 逐一致（承诺面=三宿主间一致+与 init 冻结配置一致）。stop 对 detached 守护进程 SIGINT（单飞停机级联）→5s→SIGKILL。
+`hub start` 的 detached 与 `--foreground` SHALL 执行同一链（node CLI 完整 server 编排：插件钩子/配置解析/startServer/readiness/单飞停机）；detached=自举 spawn（`spawn(process.execPath, [bin/opendweb.mjs 绝对路径, hub, start, --foreground], {detached, stdio→<data_dir>/hub.log})` 后 unref，pid 记录三元组）。**全宿主环境冻结**：①链入口从 hub.json 解析 data_dir 绝对路径注入 `DWEB_DATA_DIR`（优先级=hub 注入>继承环境），readiness 后 MUST 核实 owners.jsonl/server.key 实际落在 hub.json.data_dir（不符=启动失败，不假成功）；②**链入口读取 hub-token 内容以子进程 env `DWEB_ADMIN_TOKEN` 注入**（server 仅在该 env 存在时挂载 `/admin/*`；hub 注入 MUST 覆盖继承的同名 env；绝不进 argv/plist/启动脚本/日志）；readiness 后 MUST 以本机双探断言 admin 面挂载：无 token 请求 `/admin/status` 得 **401（已挂载）而非 404**，再以 hub-token 请求得 200——断言失败=启动失败（停机+清 hub.lock，不假成功）；③全宿主统一 `cwd=<DWEB_HOME>`、配置=config_path 显式传入（无则无配置），**不依赖 cwd 插件发现**——前台/detached/系统服务三宿主的插件钩子与配置上下文 MUST 逐一致（承诺面=三宿主间一致+与 init 冻结配置一致）。stop 对 detached 守护进程 SIGINT（单飞停机级联）→5s→SIGKILL。
 
 #### Scenario: data_dir 注入与核实
 
 - **WHEN** 继承环境中存在指向别处的 DWEB_DATA_DIR，且以 detached/前台/服务三种宿主分别启动 hub
 - **THEN** 三种宿主下 server 实际数据目录均为 hub.json.data_dir（owners.jsonl 落该目录）；hub 注入优先于继承值
+
+#### Scenario: admin 面挂载断言（四宿主）
+
+- **WHEN** 分别以前台/detached/LaunchAgent/Windows Startup 四宿主启动 hub
+- **THEN** readiness 后无 token 请求 `/admin/status` 得 401（非 404）、以 hub-token 请求得 200；hub-token 不出现在 argv/plist/脚本/日志任何面；断言失败时启动失败并清理 hub.lock
 
 #### Scenario: 三宿主插件钩子一致
 
@@ -82,12 +87,12 @@
 
 ### Requirement: 接入短码（离线自解 wire 冻结）
 
-短码 SHALL 为跨端 wire contract：载荷=**IPv4 9 字节 / IPv6 21 字节**（`ver(1B: 0x01/0x02) || ip(4/16B) || port(2B 大端)`），后接 `crc16(2B 大端)`；**CRC-16/CCITT-FALSE 覆盖 `ver||ip||port` 全部载荷字节（不含 CRC 自身）**，参数 poly=0x1021/init=0xFFFF/refin=false/refout=false/xorout=0x0000（校验向量 "123456789"→0x29B1）。编码=crockford-base32 **MSB-first**、小写、无 padding、末尾不足 5 bit 右侧补零；长度冻结 IPv4=15 字符（5-5-5 分组）/IPv6=34 字符（4×8+2）；呈现 `dwebh1.` 前缀+连字符（解码忽略）。解码 MUST 离线且：歧义字符按 crockford 映射（o→0、i/l→1）、**非零 padding 位拒绝、多余/缺失字符拒绝、非法字符拒绝**（非规范等价串不接受）。**link-local（fe80::/10）编码与解码均拒绝**（提示用 ULA/global）。**设计级 golden vectors（CLI/webui 共用对拍）**：V1 `192.168.2.13:8787`→payload+crc `01c0a8020d22537afd`→`dwebh1.070ag-0gd49-9qnz8`；V2 `[fd00::13]:8787`→`02fd0000000000000000000000000000132253e506`→`dwebh1.0byg-0000-0000-0000-0000-0000-009j-4mz5-0r`。**接收端**：`opendweb join --server` MUST 直收短码（`dwebh1.` 前缀→离线 decode→`http://<ip>:<port>`；失败即明确报错、不发网络请求）。实现单源（CLI util，webui workspace 复用）。
+短码 SHALL 为跨端 wire contract：载荷=**IPv4 9 字节 / IPv6 21 字节**（`ver(1B: 0x01/0x02) || ip(4/16B) || port(2B 大端)`），后接 `crc16(2B 大端)`；**CRC-16/CCITT-FALSE 覆盖 `ver||ip||port` 全部载荷字节（不含 CRC 自身）**，参数 poly=0x1021/init=0xFFFF/refin=false/refout=false/xorout=0x0000（校验向量 "123456789"→0x29B1）。编码=crockford-base32 **MSB-first**、小写、无 padding、末尾不足 5 bit 右侧补零；长度冻结 IPv4=15 字符（5-5-5 分组）/IPv6=34 字符（4×8+2）；呈现 `dwebh1.` 前缀+连字符。**解码严格 canonical**：①仅接受 crockford 32 字符集，**歧义字符 o/i/l/u 出现即拒绝**（提示 o→0、i/l→1、u→v，不自动映射）；②大小写折叠（全大写归一小写）；③连字符仅允许固定分组位置且整组可省略（canonical=无连字符形态；其他位置连字符拒绝）；④非零 padding 位/多余/缺失字符/非法字符拒绝（非规范等价串不接受）。**IPv6 URL 冻结**：解码结果 `http://[<ip>]:<port>`（V2 断言=`http://[fd00::13]:8787`）。**link-local（fe80::/10）编码与解码均拒绝**（提示用 ULA/global）。**设计级 golden vectors（CLI/webui 共用对拍）**：V1 `192.168.2.13:8787`→payload+crc `01c0a8020d22537afd`→`dwebh1.070ag-0gd49-9qnz8`；V2 `[fd00::13]:8787`→`02fd0000000000000000000000000000132253e506`→`dwebh1.0byg-0000-0000-0000-0000-0000-009j-4mz5-0r`。**接收端**：`opendweb join --server` MUST 直收短码（`dwebh1.` 前缀→离线 decode→`http://<ip>:<port>`；失败即明确报错、不发网络请求）。实现单源（CLI util，webui workspace 复用）。
 
 #### Scenario: golden vectors 往返与篡改
 
-- **WHEN** 对 V1/V2 编码后解码、逐位替换载荷字符、以及把末字符替换为其零 padding 位变体（非规范等价串）
-- **THEN** 完整往返还原相同 ip:port；逐位篡改与非规范等价串均解码失败
+- **WHEN** 对 V1/V2 编码后解码（断言 V2 URL=`http://[fd00::13]:8787`）、逐位替换载荷字符、把末字符替换为零 padding 位变体、注入歧义字符（o/i/l/u 各一）、在非分组位置插连字符
+- **THEN** 完整往返还原相同 ip:port 与 bracket URL；逐位篡改/零位变体/歧义字符/错位连字符均解码失败（歧义字符错误含映射提示）
 
 #### Scenario: link-local 拒绝
 
