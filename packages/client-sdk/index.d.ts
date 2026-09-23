@@ -39,9 +39,17 @@ export interface RelayStatusJs {
  * 工厂：Fabric.createRoot / Fabric.open / Fabric.attach；完成后调用 shutdown 释放资源。
  */
 export declare class Fabric {
-  /** 创建新 fabric（本节点成为 root，可签发邀请与撤销）。 */
+  /**
+   * 创建新 fabric（本节点成为 root，可签发邀请与撤销）。
+   * [H8] deferStart=true = 构造零网络出站（后续显式 start()）；
+   * fabricId = roster 显式采纳（仅本工厂生效）。
+   */
   static createRoot(opts: FabricOptions, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
-  /** 打开已有 fabric（数据目录已含名册）。 */
+  /**
+   * 打开已有 fabric（数据目录已含名册）。
+   * [H8] deferStart=true = 构造零网络出站；fabricId = tuple 校验期望值
+   * （不匹配 = [wrong-fabric] 明确错误）。
+   */
   static open(opts: FabricOptions, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
   /** 以加入者身份起步（空名册；随后调用 join 兑换邀请）。 */
   static attach(opts: FabricOptions, fabricIdHex: string, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
@@ -54,6 +62,17 @@ export declare class Fabric {
    *  分派（OK2 兑换 + member capability 持久化）。
    */
   static joinWithToken(opts: FabricOptions, token: string, secret?: SecretSeedHandle | undefined | null): Promise<Fabric>
+  /**
+   * [H8] home-hub Phase 0：deferStart 形态的显式启动——执行原构造期语义
+   * （缓存票据合并注入（ensured 优先）→ bind → online）。
+   * 状态机：Deferred/Failed→Starting→Started|Failed；Started 后幂等 no-op
+   * （resolve）；Closed 后明确错误；并发调用 single-flight 同结果；
+   * Starting 态 shutdown 取消启动——resolve（非错误）且不可重试；
+   * 底层失败 reject（错误载荷含原因）可重试；调用方放弃 Promise 不影响
+   * 状态机（后续 start() 得同一结果）。缺省（非 deferStart）Fabric 构造
+   * 完成即 Started——本方法幂等 no-op。
+   */
+  start(): Promise<void>
   /** 本节点 EndpointId（z-base-32，52 字符） */
   get endpointId(): string
   /** fabric id（hex） */
@@ -311,6 +330,21 @@ export interface FabricOptions {
   joinTimeoutMs?: number
   /** 本端 QUIC 绑定地址（host:port；e2e 组网需要固定端口对拨时使用） */
   bindAddr?: string
+  /**
+   * [H8] home-hub Phase 0：延迟启动——true = 构造（createRoot/open）零网络
+   * 出站（不 bind、不等 online、不连 relay；本地 relay.caps.json 预检允许），
+   * 原构造期语义（缓存票据合并注入 + bind + online）后移到 `start()`。
+   * 缺省 false = 既有 eager-start 行为不变。
+   */
+  deferStart?: boolean
+  /**
+   * [H8] home-hub Phase 0：roster 显式 fabric id 采纳（64 位小写 hex，非法
+   * 构造 reject）。仅 createRoot 生效采纳（roster 持久化该值，
+   * fabricIdHex() 读回逐字相等）；open 用作 tuple 校验期望值（不匹配 =
+   * [wrong-fabric] 明确错误）；既有 roster 时 createRoot 一律 AlreadyExists
+   * （复用走 open）。缺省 = SDK 随机生成。
+   */
+  fabricId?: string
 }
 
 /** fetchHttp 请求初始化（本阶段静态 body 分块；AsyncIterable body 后续 phase）。 */

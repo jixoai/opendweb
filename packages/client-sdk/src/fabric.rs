@@ -10,8 +10,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64;
 use dweb_fabric::secret::SecretSeed;
 use dweb_fabric::{
-    Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, HttpProxyConfig,
-    LinkStatus, RelayConfig, RelayStatusSnapshot, RelayTlsTrust, SecretInjection,
+    Fabric as RustFabric, FabricConfig as RustFabricConfig, FabricEvent, FabricStartOptions,
+    HttpProxyConfig, LinkStatus, RelayConfig, RelayStatusSnapshot, RelayTlsTrust, SecretInjection,
 };
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -81,6 +81,17 @@ pub struct FabricOptions {
     pub join_timeout_ms: Option<f64>,
     /// 本端 QUIC 绑定地址（host:port；e2e 组网需要固定端口对拨时使用）
     pub bind_addr: Option<String>,
+    /// [H8] home-hub Phase 0：延迟启动——true = 构造（createRoot/open）零网络
+    /// 出站（不 bind、不等 online、不连 relay；本地 relay.caps.json 预检允许），
+    /// 原构造期语义（缓存票据合并注入 + bind + online）后移到 `start()`。
+    /// 缺省 false = 既有 eager-start 行为不变。
+    pub defer_start: Option<bool>,
+    /// [H8] home-hub Phase 0：roster 显式 fabric id 采纳（64 位小写 hex，非法
+    /// 构造 reject）。仅 createRoot 生效采纳（roster 持久化该值，
+    /// fabricIdHex() 读回逐字相等）；open 用作 tuple 校验期望值（不匹配 =
+    /// [wrong-fabric] 明确错误）；既有 roster 时 createRoot 一律 AlreadyExists
+    /// （复用走 open）。缺省 = SDK 随机生成。
+    pub fabric_id: Option<String>,
 }
 
 /// invite 逃生阀选项（D3）。
@@ -156,6 +167,33 @@ fn parse_server_id(hex64: &str, url: &str) -> Result<[u8; 32]> {
     Ok(buf)
 }
 
+/// fabricId hex64（严格小写）→ 32B（[H8]：身份 tuple 同源机制的采纳侧——
+/// 形态错误在构造期 fail-fast；大写/非 hex/长度≠64 一律明确报错）。
+fn parse_fabric_id(hex64: &str) -> Result<[u8; 32]> {
+    let valid_len = hex64.len() == 64;
+    let valid_chars = hex64
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !valid_len || !valid_chars {
+        return Err(Error::new(
+            Status::GenericFailure,
+            format!(
+                "fabricId must be exactly 64 lowercase hex characters, got {} character{}",
+                hex64.len(),
+                if hex64.len() == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    let mut buf = [0u8; 32];
+    hex::decode_to_slice(hex64, &mut buf).map_err(|_| {
+        Error::new(
+            Status::GenericFailure,
+            "fabricId must be exactly 64 lowercase hex characters",
+        )
+    })?;
+    Ok(buf)
+}
+
 /// relays 条目 → RelayEntry（token 原样透传；serverId hex64 解码）。
 fn to_relay_entries(relays: Vec<RelayEntryOptions>) -> Result<Vec<dweb_fabric::RelayEntry>> {
     relays
@@ -212,12 +250,12 @@ fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
                         );
                     }
                     match r.relays {
-                        Some(relays) if !relays.is_empty() => Ok(RelayConfig::CustomWithCaps(
-                            to_relay_entries(relays)?,
-                        )),
-                        Some(_) => bad(
-                            "relay mode 'custom' requires at least one relay entry".into(),
-                        ),
+                        Some(relays) if !relays.is_empty() => {
+                            Ok(RelayConfig::CustomWithCaps(to_relay_entries(relays)?))
+                        }
+                        Some(_) => {
+                            bad("relay mode 'custom' requires at least one relay entry".into())
+                        }
                         None => match r.urls {
                             Some(urls) if !urls.is_empty() => Ok(RelayConfig::Custom(urls)),
                             _ => bad("relay mode 'custom' requires at least one relay URL".into()),
@@ -282,10 +320,12 @@ fn to_join_timeout_ms(v: Option<f64>) -> Result<u64> {
 }
 
 /// 原子 take 配置构造：无 check-then-act 竞态；返回留存副本供失败归还。
+/// [H8] Phase 0：同时解析 deferStart/fabricId（fabricId 形态错误在此
+/// fail-fast——校验先于 seed take，失败不消费句柄）。
 fn take_options(
     opts: &FabricOptions,
     secret: Option<&SecretSeedHandle>,
-) -> Result<(RustFabricConfig, Option<SecretSeed>)> {
+) -> Result<(RustFabricConfig, FabricStartOptions, Option<SecretSeed>)> {
     let base = || -> Result<RustFabricConfig> {
         Ok(RustFabricConfig {
             data_dir: opts.data_dir.clone().into(),
@@ -298,15 +338,22 @@ fn take_options(
             relay_tls_trust: RelayTlsTrust::PlatformRoot,
         })
     };
+    let start_opts = FabricStartOptions {
+        defer_start: opts.defer_start.unwrap_or(false),
+        fabric_id: match &opts.fabric_id {
+            Some(h) => Some(parse_fabric_id(h)?),
+            None => None,
+        },
+    };
     // P1-2：先完整解析/校验配置，再 take 句柄——校验失败不消费 seed，
     // 调用方可修正配置后重试同一句柄。
     let mut cfg = base()?;
     match secret {
-        None => Ok((cfg, None)),
+        None => Ok((cfg, start_opts, None)),
         Some(handle) => {
             let seed = handle.take()?;
             cfg.secret = SecretInjection::Seed(seed.clone());
-            Ok((cfg, Some(seed)))
+            Ok((cfg, start_opts, Some(seed)))
         }
     }
 }
@@ -431,20 +478,28 @@ pub struct Fabric {
 #[napi]
 impl Fabric {
     /// 创建新 fabric（本节点成为 root，可签发邀请与撤销）。
+    /// [H8] deferStart=true = 构造零网络出站（后续显式 start()）；
+    /// fabricId = roster 显式采纳（仅本工厂生效）。
     #[napi(factory)]
     pub async fn create_root(
         opts: FabricOptions,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        let (cfg, seed) = take_options(&opts, secret)?;
-        Self::build_with_handle(RustFabric::create_root(cfg).await, secret, seed)
+        let (cfg, start_opts, seed) = take_options(&opts, secret)?;
+        Self::build_with_handle(
+            RustFabric::create_root_with(cfg, start_opts).await,
+            secret,
+            seed,
+        )
     }
 
     /// 打开已有 fabric（数据目录已含名册）。
+    /// [H8] deferStart=true = 构造零网络出站；fabricId = tuple 校验期望值
+    /// （不匹配 = [wrong-fabric] 明确错误）。
     #[napi(factory)]
     pub async fn open(opts: FabricOptions, secret: Option<&SecretSeedHandle>) -> Result<Fabric> {
-        let (cfg, seed) = take_options(&opts, secret)?;
-        Self::build_with_handle(RustFabric::open(cfg).await, secret, seed)
+        let (cfg, start_opts, seed) = take_options(&opts, secret)?;
+        Self::build_with_handle(RustFabric::open_with(cfg, start_opts).await, secret, seed)
     }
 
     /// 以加入者身份起步（空名册；随后调用 join 兑换邀请）。
@@ -454,7 +509,7 @@ impl Fabric {
         fabric_id_hex: String,
         secret: Option<&SecretSeedHandle>,
     ) -> Result<Fabric> {
-        let (cfg, seed) = take_options(&opts, secret)?;
+        let (cfg, _start_opts, seed) = take_options(&opts, secret)?;
         Self::build_with_handle(RustFabric::attach(cfg, &fabric_id_hex).await, secret, seed)
     }
 
@@ -477,7 +532,7 @@ impl Fabric {
             let decoded = dweb_fabric::precheck_join_token(&token).map_err(fabric_err)?;
             hex::encode(decoded.invite.fabric_id.as_bytes())
         };
-        let (cfg, seed) = take_options(&opts, secret)?;
+        let (cfg, _start_opts, seed) = take_options(&opts, secret)?;
         let fabric = match RustFabric::attach(cfg, &fabric_id).await {
             Ok(f) => f,
             Err(e) => {
@@ -531,6 +586,22 @@ impl Fabric {
                 }
                 Err(e)
             }
+        }
+    }
+
+    /// [H8] home-hub Phase 0：deferStart 形态的显式启动——执行原构造期语义
+    /// （缓存票据合并注入（ensured 优先）→ bind → online）。
+    /// 状态机：Deferred/Failed→Starting→Started|Failed；Started 后幂等 no-op
+    /// （resolve）；Closed 后明确错误；并发调用 single-flight 同结果；
+    /// Starting 态 shutdown 取消启动——resolve（非错误）且不可重试；
+    /// 底层失败 reject（错误载荷含原因）可重试；调用方放弃 Promise 不影响
+    /// 状态机（后续 start() 得同一结果）。缺省（非 deferStart）Fabric 构造
+    /// 完成即 Started——本方法幂等 no-op。
+    #[napi]
+    pub async fn start(&self) -> Result<()> {
+        match self.inner.start().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(fabric_err(e)),
         }
     }
 
@@ -702,7 +773,10 @@ impl Fabric {
         )
         .await
         .map_err(crate::session::session_err)?;
-        Ok(crate::session::SessionHandle::new(session, self.inner.clone()))
+        Ok(crate::session::SessionHandle::new(
+            session,
+            self.inner.clone(),
+        ))
     }
 
     /// continuity：对端连接状态快照（design §3.1；Phase 1 task 2.3 补课投影）。

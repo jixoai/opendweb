@@ -56,6 +56,15 @@ const optsCaps: FabricOptions = {
   },
 };
 const optsDefault: FabricOptions = { dataDir: "/tmp/dweb-d" }; // 全缺省
+// [H8] home-hub Phase 0：deferStart / fabricId（可选布尔/可选 hex64 字符串；
+// 契约语义见 index.d.ts——deferStart 构造零出站，start() 后移原构造期语义）
+const optsDeferred: FabricOptions = {
+  dataDir: "/tmp/dweb-defer",
+  relay: { mode: "custom", relays: [{ url: "https://relay1.example", serverId: "ab".repeat(32) }] },
+  deferStart: true,
+  fabricId: "cd".repeat(32),
+};
+const optsEagerExplicit: FabricOptions = { dataDir: "/tmp/dweb-eager", deferStart: false };
 
 // 非法形态必须编译失败（取消注释任一行即应红灯——契约的负向形态）：
 // const badProxy: FabricOptions = { dataDir: "x", httpProxy: "socks5" };
@@ -72,9 +81,16 @@ async function construct(): Promise<void> {
   const joined = await Fabric.joinWithToken(optsDefault, "dweb1.example-token");
   const fabricId: string = await root.fabricIdHex();
   const endpointId: string = root.endpointId;
-  await Promise.all([root, opened, attached, joined].map((f) => f.shutdown()));
+  // [H8] deferStart 全链类型面：deferred 构造 → start(): Promise<void>（幂等）
+  const deferredRoot = await Fabric.createRoot(optsDeferred);
+  const started: void = await deferredRoot.start();
+  await deferredRoot.start(); // Started 后幂等 no-op
+  const deferredOpened = await Fabric.open(optsEagerExplicit);
+  await deferredOpened.start(); // eager 缺省相位已 Started——同样幂等
+  await Promise.all([root, opened, attached, joined, deferredRoot, deferredOpened].map((f) => f.shutdown()));
   void fabricId;
   void endpointId;
+  void started;
 }
 
 // ---- on() 订阅：relay-* 事件 payload（与 relayStatus() 同构）----------------------
