@@ -24,12 +24,19 @@
 //! 补写/发布——与全部写入共享同一台账锁，单一写序列化协议），孤儿匹配
 //! 按完整三元组（旧行/管理员直加行无 via_code_hash 永不补写）。
 //!
-//! 失败分级（r4-P1-3；r9-P1-1 细化）：(a) 台账加载/归并失败（含首启）=
-//! 调用方（main）fail-fast 拒绝启动；(b) 加载成功后的补写 append 失败 =
-//! 受影响码入**进程内 deny-set**（不落盘）+ 告警（code_hash/原因/重试
-//! 数）。**reload 路径部分失败 = 保留既有 current snapshot（generation/
-//! 内容不变），仅合并 deny；补写全部成功才发布新快照 + 清 deny + 释放
-//! 匹配 pending**（首启 load 无旧快照可保，按磁盘事实发布）。deny 的
+//! 失败分级（r4-P1-3；r9-P1-1 细化；r10-P1-1 扩面）：(a) 台账加载/归并
+//! 失败（含首启）= 调用方（main）fail-fast 拒绝启动；(b) 加载成功后的补写
+//! append 失败 = 受影响码入**进程内 deny-set**（不落盘）+ 告警（code_hash/
+//! 原因/重试数）。**reload 路径部分失败 = 保留既有 current snapshot
+//! （generation/内容不变），仅合并 deny——r10-P1-1：deny 面 = 本轮全部孤儿
+//! 中未被已发布快照 consumed 覆盖的 code hash**（补写成功的孤儿 consume
+//! 同样已 durable 落盘但随旧快照保留而未发布，used_count 不推进——不 deny
+//! 即可按旧计数再次兑换绕过 max_uses）；**补写全部成功才发布新快照 + 清
+//! deny + 释放匹配 pending**（首启 load 无旧快照可保，按磁盘事实发布——
+//! 成功补写直接入快照，无未发布窗口）。同键 pending 补写成功可完成当前
+//! 请求（幂等恢复路径保持），但**不提前清除 Reconciliation 来源 deny**
+//! （Redemption 来源照旧自愈）——唯一解除通道 = 整轮成功的 reload 发布
+//! 新快照（快照 consumed 届时覆盖全部 durable 三元组）。deny 的
 //! 兑换语义按来源裁决（r9，见 [`DenySource`]）：reconciliation 失败的码
 //! 他键兑换 **503 `code-unavailable` 优先于 pending 409**；redeem 首次
 //! consume append 失败的 pending 窗口他键仍 409；**同键重试恒为幂等补写
@@ -53,7 +60,7 @@ use super::registry::OwnerRegistry;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -189,9 +196,12 @@ struct PendingEntry {
 /// deny-set 失败来源（r9-P1-1 裁决：他键兑换错误优先级的判别依据）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DenySource {
-    /// 加载/reload 的 reconciliation 补写失败（spec「该码禁止兑换」：
-    /// pending 期间他键兑换 **503 `code-unavailable` 优先于 409**；同键
-    /// 仍走幂等补写恢复路径，不因 deny 阻断）
+    /// 加载/reload 的 reconciliation 补写失败或孤儿 consume 未被已发布
+    /// 快照覆盖（r10-P1-1 扩面；spec「该码禁止兑换」：pending 期间他键兑换
+    /// **503 `code-unavailable` 优先于 409**；同键仍走幂等补写恢复路径，
+    /// 不因 deny 阻断——且补写成功也**不提前清除**本 deny：同 hash 可能
+    /// 还有其他 durable 但未入快照的孤儿，唯一解除通道 = 整轮成功的 reload
+    /// 发布新快照）
     Reconciliation,
     /// redeem 首次 consume append 失败（pending 挂起窗口：他键仍 409
     /// `code-pending`——spec「pending 期间第二幂等键被拒」语义不回退；
@@ -426,6 +436,8 @@ impl CodeLedger {
                 Ok(()) => {
                     consumed.insert(key, (record.ts, None));
                     generation = ledger::next_generation();
+                    #[cfg(test)]
+                    test_hooks::fire_orphan_appended_hook();
                 }
                 Err(e) => {
                     let reason = format!("{e:#}");
@@ -470,14 +482,20 @@ impl CodeLedger {
     /// 加载成功分开表达**——任一孤儿补写 append 失败 = **保留既有 current
     /// snapshot**（generation/内容不变；冻结 spec「补写失败 = 保留当前快照 +
     /// 受影响码进 deny-set」+ 热重载场景「补写 IO 失败时保留旧快照」），
-    /// 仅把失败 hash 合并入 deny（来源改判 Reconciliation——该码他键兑换
-    /// 自此 503 优先于 pending 409）。已有 deny 条目本轮补写成功也**不提前
-    /// 移除**：快照未发布、used_count 未推进，提前放行会绕过 max_uses；
-    /// 统一由 watcher 的「deny 非空强制重试」在磁盘恢复后的整轮成功中解除。
+    /// deny 面 = **本轮全部孤儿中未被已发布快照 consumed 覆盖的 code hash**
+    /// （r10-P1-1 扩面——补写成功的孤儿 consume 已 durable 但未发布，同样
+    /// 存在「按旧 used_count 再次兑换绕过 max_uses」的窗口；append 失败的
+    /// hash 恒在覆盖差集内，已发布快照已覆盖全部孤儿三元组的 hash 不入
+    /// deny——孤儿全集含历史兑换，无差别 deny 全部孤儿 hash 会把无关码一并
+    /// 503）。来源统一改判 Reconciliation——该码他键兑换自此 503 优先于
+    /// pending 409。已有 deny 条目本轮补写成功也**不提前移除**：快照未
+    /// 发布、used_count 未推进，提前放行会绕过 max_uses；统一由 watcher 的
+    /// 「deny 非空强制重试」在磁盘恢复后的整轮成功中解除。
     /// pending 同样保留（同键补写恢复路径不中断）。**补写全部成功（含无
     /// 孤儿）**才原子替换快照 + generation+1 + deny 重建为空 + **释放匹配
     /// pending（r8-P1-1 语义保持）**：快照 consumed 键集合 = 本轮 durable
-    /// 三元组全集（磁盘既有行 + 本轮补写），预留键命中即清除——同码他键
+    /// 三元组全集（磁盘既有行 + 本轮补写）——覆盖此前全部被 deny 隐藏的
+    /// durable 孤儿（deny 全量清空因此安全），预留键命中即清除——同码他键
     /// 不再滞留 409 code-pending。
     pub fn reload(&self, orphans: &[RedeemKey]) -> Result<()> {
         let mut state = self.state.lock().unwrap();
@@ -486,16 +504,46 @@ impl CodeLedger {
         test_hooks::fire_reload_read_hook();
         if !deny.is_empty() {
             // 部分失败：保留既有 current snapshot（generation/内容不变），
-            // 仅合并失败 hash 的 deny——重试计数在既有条目上递增，来源统一
-            // 改判 Reconciliation（该码自此进入 503 优先的 fail-closed 态）
-            for (hash, entry) in deny {
+            // 仅合并 deny——重试计数在既有条目上递增，来源统一改判
+            // Reconciliation（该码自此进入 503 优先的 fail-closed 态）。
+            // r10-P1-1：fail-closed 面 = 本轮全部孤儿中未被已发布快照
+            // consumed 覆盖的 code hash（按 hash 去重）——本轮补写**成功**
+            // 的孤儿 consume 已 durable 落盘，但旧快照保留即未发布、
+            // used_count 不推进，不 deny 则该码他键可按旧计数再次兑换绕过
+            // max_uses；此前轮次/外部文件入口写入的 durable 孤儿同理。
+            // append 失败的 hash 恒在差集内（失败 ⇒ 不在候选 consumed ⇒
+            // 不在已发布快照）；已发布快照已覆盖全部孤儿三元组的 hash 无
+            // 未发布窗口，不入 deny（避免可用性无谓回退）。唯一解除通道
+            // = 整轮成功的 reload 发布新快照（下方 deny 重建为空）。
+            let uncovered: HashSet<[u8; 32]> = orphans
+                .iter()
+                .filter(|(hash, fabric, root)| {
+                    !state
+                        .current
+                        .consumed
+                        .contains_key(&(*hash, *fabric, *root))
+                })
+                .map(|(hash, _, _)| *hash)
+                .collect();
+            for hash in uncovered {
+                let reason = deny.get(&hash).map_or_else(
+                    || {
+                        "orphan consume durable but snapshot not published (partial reload round)"
+                            .to_string()
+                    },
+                    |failed| failed.reason.clone(),
+                );
                 let merged = match state.deny.remove(&hash) {
                     Some(prev) => DenyEntry {
-                        reason: entry.reason,
+                        reason,
                         retries: prev.retries + 1,
                         source: DenySource::Reconciliation,
                     },
-                    None => entry,
+                    None => DenyEntry {
+                        reason,
+                        retries: 1,
+                        source: DenySource::Reconciliation,
+                    },
                 };
                 state.deny.insert(hash, merged);
             }
@@ -507,6 +555,9 @@ impl CodeLedger {
                 .contains_key(&(*hash, p.fabric_id, p.root))
         });
         state.current = snapshot;
+        // 整轮成功 = 快照 consumed 覆盖全部 durable 三元组（磁盘既有行含
+        // 此前被 deny 隐藏的孤儿 + 本轮补写）——不再存在未发布窗口，deny
+        // 全量重建为空（r10-P1-1 恢复断言的落点）
         state.deny = deny;
         Ok(())
     }
@@ -755,7 +806,10 @@ fn consume_record(code_hash: &[u8; 32], fabric_id: &[u8; 32], root: &[u8; 32], t
 }
 
 /// pending 补写（同键幂等完成 / 新兑换第 ② 步共用）：append consume + fsync；
-/// 成功 = pending 释放 + deny 移除 + 快照推进；失败 = deny 记录/递增重试
+/// 成功 = pending 释放 + **来源判定式 deny 移除（r10-P1-1：仅 Redemption
+/// 来源自愈；Reconciliation 来源保持到整轮成功的 reload 发布新快照——同
+/// hash 可能仍有其他 durable 但未入快照的孤儿，提前解除会让该码他键按旧
+/// 计数越过 max_uses）** + 快照推进；失败 = deny 记录/递增重试
 /// （来源保守合并：已有 Reconciliation 判定保持——他键 503 不降级；否则
 /// Redemption——pending 窗口他键 409。reload 的 reconciliation 失败会把
 /// 来源改判 Reconciliation，见 [`CodeLedger::reload`]）并上抛（pending
@@ -797,8 +851,21 @@ fn complete_pending(
         );
         return Err(e.context("codes consume append failed"));
     }
-    if state.deny.remove(&key.0).is_some() {
+    // r10-P1-1：补写成功的 deny 移除仅限 Redemption 来源（本进程首兑失败的
+    // pending 窗口自愈）；Reconciliation 来源（reload 部分失败轮）**保持**：
+    // 同 hash 可能仍有其他 durable 但未入已发布快照的孤儿 consume，提前解除
+    // 会让该码他键按旧计数越过 max_uses；唯一解除通道 = 整轮成功的 reload
+    // 发布新快照（快照 consumed 届时覆盖全部 durable 三元组）。
+    let deny_is_redemption =
+        matches!(state.deny.get(&key.0), Some(d) if d.source == DenySource::Redemption);
+    if deny_is_redemption {
+        state.deny.remove(&key.0);
         tracing::info!(code_hash = %hex::encode(key.0), "code recovered from deny-set");
+    } else if state.deny.contains_key(&key.0) {
+        tracing::info!(
+            code_hash = %hex::encode(key.0),
+            "consume append recovered; reconciliation deny retained until snapshot republish"
+        );
     }
     state.pending.remove(&key.0);
     let mut consumed = state.current.consumed.clone();
@@ -929,14 +996,30 @@ mod test_hooks {
     }
 
     static RELOAD_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+    static ORPHAN_APPEND_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 
     /// 安装屏障（单次生效：fire 后自动卸载）
     pub fn arm(fired: Sender<()>, release: Receiver<()>) {
         *RELOAD_HOOK.lock().unwrap() = Some(Hook { fired, release });
     }
 
+    /// r10-P1-1 回归专用：armed 时 load_inner 在**首个孤儿补写 append 成功
+    /// 后**（持台账锁）触发一次并阻塞至释放——用于在同一轮内制造「部分
+    /// 孤儿补写成功、其余失败」的混合结果（fired 窗口内测试侧 chmod 0444）
+    pub fn arm_orphan_append(fired: Sender<()>, release: Receiver<()>) {
+        *ORPHAN_APPEND_HOOK.lock().unwrap() = Some(Hook { fired, release });
+    }
+
     pub(super) fn fire_reload_read_hook() {
         let mut guard = RELOAD_HOOK.lock().unwrap();
+        if let Some(hook) = guard.take() {
+            let _ = hook.fired.send(());
+            let _ = hook.release.recv();
+        }
+    }
+
+    pub(super) fn fire_orphan_appended_hook() {
+        let mut guard = ORPHAN_APPEND_HOOK.lock().unwrap();
         if let Some(hook) = guard.take() {
             let _ = hook.fired.send(());
             let _ = hook.release.recv();
@@ -1967,6 +2050,198 @@ mod tests {
             RedeemOutcome::Exhausted
         ));
         assert_eq!(f.codes.snapshot().used_count(&hash), 1);
+    }
+
+    /// ⑨（r10-P1-1，混合 hash）：同轮两个不同 code hash 的孤儿补写产生
+    /// **混合结果**——首个孤儿 append 成功（hook 暂停后 chmod 0444）、同轮
+    /// 第二个孤儿 append 失败 = 部分失败轮。成功侧的 consume 已 durable
+    /// 落盘，但旧快照保留（未发布、used_count 不推进）：fail-closed 面 =
+    /// 未被已发布快照覆盖的全部孤儿 hash，**成功侧与失败侧均入 deny**
+    /// （Reconciliation 来源）——成功侧的他键请求 503，不得按旧 used_count
+    /// 放行（旧实现成功侧不在 deny → 他键可再兑 → durable 计数超出
+    /// max_uses）。整轮成功恢复后两侧计数覆盖全部 durable 三元组、deny
+    /// 清空、他键按码状态裁决。孤儿序由 BTreeSet 字节序决定，断言对两侧
+    /// 对称成立。
+    #[test]
+    #[cfg(unix)]
+    fn reload_partial_failure_mixed_hashes_fail_closed() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (f, hash_a) = RedeemFixture::new(1);
+        let (_, hash_b) = f.codes.issue(IssueParams::default()).unwrap();
+        let orphan_a = (hash_a, key(1), key(2));
+        let orphan_b = (hash_b, key(3), key(4));
+        // owners 侧两个孤儿 register（文件入口 durable）
+        let expires = now_ms() + 30 * 24 * 3_600_000;
+        std::fs::write(
+            f.owners.path(),
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":1,\"expires_at\":{expires},\"via_code_hash\":\"{}\"}}\n{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":1,\"expires_at\":{expires},\"via_code_hash\":\"{}\"}}\n",
+                hex::encode(key(1)),
+                hex::encode(key(2)),
+                hex::encode(hash_a),
+                hex::encode(key(3)),
+                hex::encode(key(4)),
+                hex::encode(hash_b),
+            ),
+        )
+        .unwrap();
+        let orphans = f.owners.reload_for_orphans().unwrap();
+        assert_eq!(orphans.len(), 2);
+        // barrier hook：首个孤儿补写 append 成功后暂停（持台账锁）——期间
+        // chmod 0444，同轮第二个孤儿补写失败 = 真实混合结果（成功侧 append
+        // 有磁盘副作用，非「预先 durable」等价构型）
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        test_hooks::arm_orphan_append(fired_tx, release_rx);
+        let f = std::sync::Arc::new(f);
+        let orphans_thread = orphans.clone();
+        let reloader = {
+            let f = std::sync::Arc::clone(&f);
+            std::thread::spawn(move || f.codes.reload(&orphans_thread).unwrap())
+        };
+        fired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("首个孤儿补写 append 已成功（hook 暂停）");
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        release_tx.send(()).expect("恢复 reload（后续补写将失败）");
+        reloader.join().unwrap();
+        // 部分失败轮：旧快照保留（成功侧 durable consume 不入计数）+ 两侧
+        // 孤儿 hash 均 deny——成功侧未被已发布快照覆盖（r10-P1-1 核心）
+        let snap = f.codes.snapshot();
+        assert_eq!(snap.used_count(&hash_a), 0, "成功侧 durable 但快照未发布");
+        assert_eq!(snap.used_count(&hash_b), 0);
+        assert!(f.codes.is_denied(&hash_a), "成功侧孤儿必须 fail-closed");
+        assert!(f.codes.is_denied(&hash_b), "失败侧孤儿照旧 deny");
+        // 成功侧的他键：503（不得按旧计数 used=0 < max_uses=1 放行——旧实现
+        // 此处可 Completed，durable consume 变 2 > max_uses=1）
+        assert!(matches!(
+            f.redeem(&hash_a, key(5), key(6), now_ms()),
+            RedeemOutcome::Unavailable
+        ));
+        // 恢复（整轮成功）：快照计数覆盖全部 durable 三元组 + deny 清空
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        f.codes.reload(&orphans).unwrap();
+        let snap = f.codes.snapshot();
+        assert_eq!(snap.used_count(&hash_a), 1, "成功侧 durable consume 入计数");
+        assert_eq!(snap.used_count(&hash_b), 1, "失败侧整轮补写成功入计数");
+        assert!(snap.is_consumed(&orphan_a));
+        assert!(snap.is_consumed(&orphan_b));
+        assert_eq!(f.codes.deny_count(), 0, "整轮成功清空 deny");
+        // 他键按码状态裁决：两侧均 max_uses=1 已耗尽（不复活）
+        assert!(matches!(
+            f.redeem(&hash_a, key(5), key(6), now_ms()),
+            RedeemOutcome::Exhausted
+        ));
+        assert!(matches!(
+            f.redeem(&hash_b, key(5), key(6), now_ms()),
+            RedeemOutcome::Exhausted
+        ));
+    }
+
+    /// ⑩（r10-P1-1，同 hash 多孤儿）：max_uses=2 的同码两个孤儿——K1 为本
+    /// 进程 pending（首兑 consume 失败），K2 的 consume 已 durable 落盘但
+    /// 未入快照（文件入口）。部分失败轮（K1 补写失败）把该码判入
+    /// Reconciliation deny；随后**同键 K1 恢复成功**（幂等补写完成当前请求）
+    /// 时 deny **不得被 complete_pending 成功分支提前清除**（旧实现无条件
+    /// 移除）——K2 仍被旧快照隐藏，剩余他键 K3 若放行则 durable 计数 =
+    /// K1+K2+K3 = 3 > max_uses=2。整轮成功恢复后快照计数覆盖 K1/K2 全部
+    /// durable 三元组、deny 清空、他键按码状态裁决。
+    #[test]
+    #[cfg(unix)]
+    fn reload_partial_failure_same_hash_pending_completion_keeps_deny() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (f, hash) = RedeemFixture::new(2);
+        let now = now_ms();
+        // K1 首兑：owners register durable、codes consume append 失败（0444）
+        // → Io + pending + deny（来源 Redemption）
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(matches!(
+            f.redeem(&hash, key(1), key(2), now),
+            RedeemOutcome::Io(_)
+        ));
+        // K2 孤儿：codes consume 已 durable 落盘（文件入口，对内存快照隐藏）
+        // + owners register（via_code_hash，追加保留 K1 行）
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        ledger::append_line(
+            f.codes.path(),
+            "codes",
+            &ledger::record_line(&consume_record(&hash, &key(3), &key(4), 100)).unwrap(),
+        )
+        .unwrap();
+        let expires = now + 30 * 24 * 3_600_000;
+        {
+            use std::io::Write as _;
+            let mut owners = std::fs::OpenOptions::new()
+                .append(true)
+                .open(f.owners.path())
+                .unwrap();
+            writeln!(
+                owners,
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":{expires},\"via_code_hash\":\"{}\"}}",
+                hex::encode(key(3)),
+                hex::encode(key(4)),
+                hex::encode(hash)
+            )
+            .unwrap();
+        }
+        let orphans = f.owners.reload_for_orphans().unwrap();
+        assert_eq!(orphans.len(), 2, "K1 + K2 两个孤儿（via_code 全集）");
+        // 部分失败轮（codes 仍 0444）：K2 consume 已在磁盘（归并跳过补写）、
+        // K1 补写 append 失败 → 旧快照保留 + 同码 deny（来源 Reconciliation）
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        f.codes.reload(&orphans).unwrap();
+        assert_eq!(
+            f.codes.snapshot().used_count(&hash),
+            0,
+            "K2 durable consume 仍被旧快照隐藏"
+        );
+        assert_eq!(f.codes.deny_count(), 1);
+        assert!(matches!(
+            f.redeem(&hash, key(3), key(4), now + 1),
+            RedeemOutcome::Unavailable
+        ));
+        // 同键 K1 恢复成功（磁盘恢复可写）：当前请求完成（幂等恢复路径保持）
+        // 但 Reconciliation deny 不清（K2 仍未入已发布快照）
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let e = completed_expires(f.redeem(&hash, key(1), key(2), now + 2));
+        assert_eq!(e, now + 30 * 24 * 3_600_000, "补写不重新计算租期");
+        assert_eq!(f.codes.snapshot().used_count(&hash), 1, "仅 K1 入计数");
+        assert!(
+            f.codes.is_denied(&hash),
+            "Reconciliation deny 不得被同键补写成功提前清除（r10-P1-1）"
+        );
+        // 剩余他键 K3：503 fail-closed——不得按旧计数越过配额（旧实现：deny
+        // 已被清 → used=1 < 2 放行 K3 → durable K1+K2+K3 = 3 > max_uses=2）
+        assert!(matches!(
+            f.redeem(&hash, key(5), key(6), now + 3),
+            RedeemOutcome::Unavailable
+        ));
+        // 整轮成功恢复：快照计数覆盖全部 durable 三元组（K1+K2）+ deny 清空
+        f.codes.reload(&orphans).unwrap();
+        let snap = f.codes.snapshot();
+        assert_eq!(snap.used_count(&hash), 2, "K1/K2 全部 durable 三元组入计数");
+        assert!(snap.is_consumed(&(hash, key(1), key(2))));
+        assert!(snap.is_consumed(&(hash, key(3), key(4))));
+        assert_eq!(f.codes.deny_count(), 0, "整轮成功清空 deny");
+        // 他键按码状态裁决 → exhausted；K1/K2 同键 = 幂等回放
+        assert!(matches!(
+            f.redeem(&hash, key(5), key(6), now + 4),
+            RedeemOutcome::Exhausted
+        ));
+        assert!(matches!(
+            f.redeem(&hash, key(1), key(2), now + 5),
+            RedeemOutcome::Replay { .. }
+        ));
+        assert!(matches!(
+            f.redeem(&hash, key(3), key(4), now + 6),
+            RedeemOutcome::Replay { .. }
+        ));
     }
 
     /// ④（r8-P0-1，锁序压力）：并发 redeem（codes→owners 单向锁序）与
