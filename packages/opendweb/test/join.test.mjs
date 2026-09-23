@@ -16,8 +16,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
-import { CliExit } from "../src/util.mjs";
-import { parseJoinArgs, validateServerUrl, selectFabricId, runJoin, loadRegistration, saveRegistration } from "../src/join.mjs";
+import { CliExit, machineName, truncateUtf8Bytes, ALIAS_MAX_BYTES } from "../src/util.mjs";
+import { parseJoinArgs, validateServerUrl, selectFabricId, runJoin, loadRegistration, saveRegistration, resolveSelfAlias } from "../src/join.mjs";
 import { endpointIdHexFromSeed, signDetached, verifyDetached } from "../src/ed25519.mjs";
 import { buildRegisterCanonical, buildRegisterReceiptCanonical, toBase64UrlNoPad } from "../src/register.mjs";
 import { ensureDeviceSeed, deviceKeyFile, loadDeviceSeed } from "../src/device-key.mjs";
@@ -117,6 +117,97 @@ test("parseJoinArgs: 必填/等号形/未知选项/空值", () => {
   assert.throws(() => parseJoinArgs(["--server", "s", "--code", "c", "--fabric"]), /missing value/);
   assert.throws(() => parseJoinArgs(["--server", "s", "--code", ""]), /must not be empty/);
   assert.throws(() => parseJoinArgs(["--server", "s", "--code", "c", "--allow-insecure=1"]), /takes no value/);
+});
+
+// ---- [H6] 自报别名（默认=本机机器名） ------------------------------------------
+
+test("parseJoinArgs [H6]: --alias 空间/等号双形式、缺省 undefined、空值/缺值拒绝", () => {
+  const ok = parseJoinArgs(["--server", "http://127.0.0.1:8787", "--code", "c", "--alias", "my-box"]);
+  assert.equal(ok.alias, "my-box");
+  assert.equal(parseJoinArgs(["--server", "s", "--code", "c", "--alias=box2"]).alias, "box2");
+  assert.equal(parseJoinArgs(["--server", "s", "--code", "c"]).alias, undefined);
+  assert.throws(() => parseJoinArgs(["--server", "s", "--code", "c", "--alias"]), /missing value/);
+  assert.throws(() => parseJoinArgs(["--server", "s", "--code", "c", "--alias", ""]), /must not be empty/);
+});
+
+test("resolveSelfAlias [H6]: 机器名默认（剥 .local，大小写不敏感）/--alias 覆盖/超限截断到字符边界/空→无自报", () => {
+  assert.deepEqual(resolveSelfAlias({ alias: undefined, hostname: "kzf-MacBook.local" }), { alias: "kzf-MacBook", truncated: false });
+  assert.deepEqual(resolveSelfAlias({ alias: undefined, hostname: "kzf-MacBook" }), { alias: "kzf-MacBook", truncated: false });
+  assert.deepEqual(resolveSelfAlias({ alias: undefined, hostname: "Box.LOCAL" }), { alias: "Box", truncated: false });
+  assert.deepEqual(resolveSelfAlias({ alias: "explicit", hostname: "whatever.local" }), { alias: "explicit", truncated: false });
+  // ASCII 40B → 截 32B
+  const r = resolveSelfAlias({ alias: "a".repeat(40), hostname: "h" });
+  assert.deepEqual(r, { alias: "a".repeat(32), truncated: true });
+  // CJK：漢=3B，11 个=33B → 截到 10 个（30B，不劈字符）
+  const r2 = resolveSelfAlias({ alias: "漢".repeat(11), hostname: "h" });
+  assert.equal(r2.alias, "漢".repeat(10));
+  assert.equal(Buffer.byteLength(/** @type {string} */ (r2.alias), "utf8"), 30);
+  assert.equal(r2.truncated, true);
+  // 恰 32B 不截
+  const exact = "漢".repeat(10) + "ab";
+  assert.deepEqual(resolveSelfAlias({ alias: exact, hostname: "h" }), { alias: exact, truncated: false });
+  // 极端：hostname 为空 → 无自报
+  assert.deepEqual(resolveSelfAlias({ alias: undefined, hostname: "" }), { alias: null, truncated: false });
+});
+
+test("util [H6]: machineName/truncateUtf8Bytes 纯函数边界", () => {
+  assert.equal(machineName(".local"), "");
+  assert.equal(machineName("a.local.local"), "a.local", "仅剥尾部一段");
+  assert.deepEqual(truncateUtf8Bytes("abc", 32), { value: "abc", truncated: false });
+  assert.deepEqual(truncateUtf8Bytes("漢漢", 4), { value: "漢", truncated: true });
+  assert.deepEqual(truncateUtf8Bytes("漢漢", 6), { value: "漢漢", truncated: false });
+  assert.deepEqual(truncateUtf8Bytes("漢", 0), { value: "", truncated: true });
+  assert.equal(ALIAS_MAX_BYTES, 32, "与服务端 ALIAS_MAX_BYTES 同拍");
+});
+
+test("runJoin [H6]: body.alias 自报（hostname 默认/剥 .local/--alias 覆盖/空 hostname 无字段）+ 输出呈现", async () => {
+  const serverSeed = crypto.randomBytes(32);
+  /** @type {any[]} */
+  const bodies = [];
+  const outputs = [];
+  const mkFetch = () => {
+    return async (url, init) => {
+      const u = String(url);
+      if (u.endsWith("/register")) {
+        const body = JSON.parse(String(init?.body));
+        bodies.push(body);
+        return new Response(
+          JSON.stringify(signedReceipt(serverSeed, { fabricId: body.fabric_id, root: body.root })),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u.endsWith("/services.json")) {
+        return new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+  };
+  const run = async (argv, hostname) => {
+    const cap = capture();
+    const code = await runJoin(argv, { home: await tmpHome(), now: () => FIXED_TS, fetchImpl: mkFetch(), stdout: cap.stdout, hostname });
+    assert.equal(code, 0);
+    outputs.push(cap.lines.join("\n"));
+  };
+
+  // ① 默认：hostname 带 .local → 自报剥除形态
+  await run(["--server", "http://127.0.0.1:8787", "--code", CODE], "kzf-MacBook.local");
+  assert.equal(bodies[0].alias, "kzf-MacBook", "body.alias = 机器名（剥 .local）");
+  assert.match(outputs[0], /alias\s+kzf-MacBook \(self-reported\)/, "输出呈现自报别名");
+  // ② --alias 显式覆盖
+  await run(["--server", "http://127.0.0.1:8787", "--code", CODE, "--alias", "studio-box"], "kzf-MacBook.local");
+  assert.equal(bodies[1].alias, "studio-box", "--alias 覆盖机器名");
+  // ③ 空 hostname（极端环境）→ body 无 alias 字段、输出无 alias 行
+  await run(["--server", "http://127.0.0.1:8787", "--code", CODE], "");
+  assert.ok(!("alias" in bodies[2]), "空机器名 = 无自报字段");
+  assert.ok(!/^\s{2}alias/m.test(outputs[2]), "无 alias 输出行");
+  // ④ 超长 --alias：截断 + note 提示；body 恒 ≤32 UTF-8 字节
+  await run(["--server", "http://127.0.0.1:8787", "--code", CODE, "--alias", "x".repeat(40)], "h");
+  assert.equal(bodies[3].alias, "x".repeat(32));
+  assert.equal(Buffer.byteLength(String(bodies[3].alias), "utf8"), 32);
+  assert.match(outputs[3], /exceeded 32 UTF-8 bytes and was truncated/, "截断提示");
+  // ⑤ 多字节边界：33B CJK → 30B 合法截断
+  await run(["--server", "http://127.0.0.1:8787", "--code", CODE, "--alias", "漢".repeat(11)], "h");
+  assert.equal(bodies[4].alias, "漢".repeat(10));
 });
 
 // ---- 明文守卫（sidecar 语义对齐） ---------------------------------------------
@@ -560,11 +651,19 @@ test("e2e join: 持有效码完整兑换（loopback http 免 --allow-insecure）
   // 服务端收到了可验签的 PoP（mock 已验签）+ services.json 拉取序
   assert.equal(mock.seen.filter((s) => s.path === "/register").length, 1);
   assert.equal(mock.seen.filter((s) => s.path === "/services.json").length, 1);
+  // [H6] 自报别名：子进程 CLI 以本机机器名（剥 .local）入 body + 输出呈现
+  const regBody = /** @type {{ path: string, body: any }} */ (mock.seen.find((s) => s.path === "/register")).body;
+  assert.equal(regBody.alias, machineName(os.hostname()), "body.alias = 本机机器名（剥 .local）");
+  assert.match(r.stdout, /alias\s+\S+ \(self-reported\)/, "join 成功输出呈现自报别名");
 
-  // opendweb id 与 join 的 root 一致（同一设备身份）
+  // opendweb id 与 join 的 root 一致（同一设备身份）；[H6] 增机器名行
   const idr = await runCli("id", [], { env });
   assert.equal(idr.code, 0);
   assert.match(idr.stdout, new RegExp(reg.root));
+  assert.ok(
+    idr.stdout.includes(`hostname     ${machineName(os.hostname())}`),
+    `id 输出本机机器名（实际：${idr.stdout}）`,
+  );
 
   // 第二次 join（持新有效码=同码再兑）：fabric 复用、root 不变
   const firstFabric = String(reg.fabric_id);

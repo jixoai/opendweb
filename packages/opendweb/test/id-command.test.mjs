@@ -132,6 +132,20 @@ test("runId: 输出 endpoint_id/缩写/路径；重复执行完全一致；目�
   assert.equal(statAfter.mtimeMs, statBefore.mtimeMs);
 });
 
+test("runId [H6]: 输出本机机器名行（剥 .local；与 join 自报别名同规范化）", async () => {
+  const home = await tmpHome();
+  await ensureDeviceSeed(home);
+  const run = async (hostname) => {
+    /** @type {string[]} */
+    const lines = [];
+    await runId({ home, stdout: (l) => lines.push(l), hostname });
+    return lines;
+  };
+  assert.ok((await run("kzf-MacBook.local")).includes("hostname     kzf-MacBook"), "剥 .local 后缀");
+  assert.ok((await run("kzf-MacBook")).includes("hostname     kzf-MacBook"), "无后缀原样");
+  assert.ok((await run("Box.LOCAL")).includes("hostname     Box"), "后缀剥除大小写不敏感");
+});
+
 // ---- e2e（子进程 CLI，DWEB_HOME 隔离） ----------------------------------------
 
 test("e2e opendweb id: 无 key → 非零+指引；join 写入 key 后 → 一致输出", async () => {

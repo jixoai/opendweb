@@ -10,13 +10,17 @@
 //   - https 默认期望；http 仅 loopback 放行（判定语义与 webui sidecar
 //     target.mjs 明文守卫逐条对齐：字面 IP 直判、域名含 localhost 走 DNS
 //     全记录校验、混合记录=非 loopback），非 loopback 明文需 --allow-insecure
+// 意图（2026-09-23，home-hub [H6]）：join 自报别名——默认=本机机器名
+// （os.hostname() 剥 .local），--alias 显式覆盖；≤32 UTF-8 字节超限截断
+// 到合法字符边界并提示。alias 是 body 增量字段（不进 PoP canonical——
+// 服务端优先级 body.alias > alias_hint > 无，首写语义）。
 
 import net from "node:net";
 import os from "node:os";
 import { lookup as dnsLookup } from "node:dns/promises";
 import { readFile, mkdir, open, rename, rm } from "node:fs/promises";
 import path from "node:path";
-import { CliExit, asciiEscape } from "./util.mjs";
+import { CliExit, asciiEscape, ALIAS_MAX_BYTES, machineName, truncateUtf8Bytes } from "./util.mjs";
 import { ensureDeviceSeed, loadDeviceSeed } from "./device-key.mjs";
 import {
   buildRegisterCanonical,
@@ -51,14 +55,15 @@ export const REGISTER_ERROR_TEXT = {
 };
 
 /**
- * 解析 join 参数：--server <URL> 与 --code <码> 必填，--fabric <hex64> 与
- * --allow-insecure 可选；--opt value 与 --opt=value 双形式；未知选项退出码 2
- * （与 server/plugin 子命令同纪律，防静默忽略）。
+ * 解析 join 参数：--server <URL> 与 --code <码> 必填，--fabric <hex64>、
+ * --alias <别名> 与 --allow-insecure 可选；--opt value 与 --opt=value 双
+ * 形式；未知选项退出码 2（与 server/plugin 子命令同纪律，防静默忽略）。
  * @param {string[]} argv
- * @returns {{ server: string, code: string, fabric: string | undefined, allowInsecure: boolean }}
+ * @returns {{ server: string, code: string, fabric: string | undefined, alias: string | undefined, allowInsecure: boolean }}
  */
+const JOIN_USAGE = "usage: opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--alias <name>] [--allow-insecure]";
 export function parseJoinArgs(argv) {
-  const out = { fabric: undefined, allowInsecure: false };
+  const out = { fabric: undefined, alias: undefined, allowInsecure: false };
   for (let i = 0; i < argv.length; i++) {
     const t = argv[i];
     const eq = t.indexOf("=");
@@ -69,7 +74,7 @@ export function parseJoinArgs(argv) {
       out.allowInsecure = true;
       continue;
     }
-    if (name !== "--server" && name !== "--code" && name !== "--fabric") {
+    if (name !== "--server" && name !== "--code" && name !== "--fabric" && name !== "--alias") {
       throw new CliExit(`unknown option ${name}`, 2);
     }
     if (value === undefined) {
@@ -79,11 +84,27 @@ export function parseJoinArgs(argv) {
     if (value === "") throw new CliExit(`${name} must not be empty`, 2);
     if (name === "--server") out.server = value;
     else if (name === "--code") out.code = value;
+    else if (name === "--alias") out.alias = value;
     else out.fabric = value;
   }
-  if (!out.server) throw new CliExit("usage: opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--allow-insecure]", 2);
-  if (!out.code) throw new CliExit("usage: opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--allow-insecure]", 2);
-  return /** @type {{ server: string, code: string, fabric: string | undefined, allowInsecure: boolean }} */ (out);
+  if (!out.server) throw new CliExit(JOIN_USAGE, 2);
+  if (!out.code) throw new CliExit(JOIN_USAGE, 2);
+  return /** @type {{ server: string, code: string, fabric: string | undefined, alias: string | undefined, allowInsecure: boolean }} */ (out);
+}
+
+/**
+ * 解析自报别名（[H6]）：--alias 显式 > 本机机器名（os.hostname() 剥
+ * `.local`）；≤32 UTF-8 字节超限截断到合法字符边界（服务端同拍上限，
+ * 截断而非拒绝——机器名非用户输入，拒绝会阻塞 join 主流程）。
+ * 空结果（极端环境下 hostname 为空）= 无自报（body 不带 alias 字段）。
+ * @param {{ alias: string | undefined, hostname: string }} input
+ * @returns {{ alias: string | null, truncated: boolean }}
+ */
+export function resolveSelfAlias({ alias, hostname }) {
+  const raw = alias ?? machineName(hostname);
+  if (raw === "") return { alias: null, truncated: false };
+  const { value, truncated } = truncateUtf8Bytes(raw, ALIAS_MAX_BYTES);
+  return { alias: value, truncated };
 }
 
 /**
@@ -285,9 +306,9 @@ export function selectFabricId({ fabric, registration }) {
 /**
  * join 主流程（编排：守卫 → fabric 选取 → 设备 key ensure → canonical 签名 →
  * POST /register → server_id 回执验签 → 原子落盘 → 输出摘要）。
- * 上下文全部可注入（home/now/fetch/dns/stdout），测试零网络。
+ * 上下文全部可注入（home/now/fetch/dns/stdout/hostname），测试零网络。
  * @param {string[]} argv
- * @param {{ home?: string, now?: () => number, fetchImpl?: typeof fetch, dns?: { lookup: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string, family: number }>> }, stdout?: (line: string) => void }} [ctx]
+ * @param {{ home?: string, now?: () => number, fetchImpl?: typeof fetch, dns?: { lookup: (hostname: string, opts: { all: true }) => Promise<Array<{ address: string, family: number }>> }, stdout?: (line: string) => void, hostname?: string }} [ctx]
  * @returns {Promise<number>} 退出码（0 成功；失败 throw CliExit）
  */
 export async function runJoin(argv, ctx = {}) {
@@ -297,6 +318,7 @@ export async function runJoin(argv, ctx = {}) {
     fetchImpl = fetch,
     dns = defaultDns,
     stdout = (line) => console.log(line),
+    hostname = os.hostname(),
   } = ctx;
   const args = parseJoinArgs(argv);
   const guard = await validateServerUrl(args.server, { allowInsecure: args.allowInsecure, dns });
@@ -304,6 +326,11 @@ export async function runJoin(argv, ctx = {}) {
 
   const registration = await loadRegistration(home);
   const { fabricId, origin: fabricOrigin } = selectFabricId({ fabric: args.fabric, registration });
+  // [H6] 自报别名：--alias > 机器名（剥 .local；超限截断到字符边界）
+  const { alias: selfAlias, truncated: aliasTruncated } = resolveSelfAlias({
+    alias: args.alias,
+    hostname,
+  });
 
   // 设备 key：默认设备 key 即 root（R2）；首启生成属设备级引导（重试复用同
   // 一身份），注册状态落盘严格后置于兑换成功——失败无半提交
@@ -315,6 +342,7 @@ export async function runJoin(argv, ctx = {}) {
   const sig = signDetached(seed, canonical);
   const body = JSON.stringify({
     code: args.code,
+    ...(selfAlias !== null ? { alias: selfAlias } : {}),
     fabric_id: fabricId,
     root: rootHex,
     ts,
@@ -425,10 +453,16 @@ export async function runJoin(argv, ctx = {}) {
   stdout(`joined ${asciiEscape(guard.value.origin)} as a tenant`);
   stdout(`  endpoint_id  ${rootHex}`);
   stdout(`  short        ${shortId}`);
+  if (selfAlias !== null) {
+    stdout(`  alias        ${asciiEscape(selfAlias)} (self-reported)`);
+  }
   stdout(`  fabric_id    ${fabricId} (${fabricOrigin === "new" ? "newly generated" : fabricOrigin === "reused" ? "reused local fabric" : "from --fabric"})`);
   stdout(`  expires      ${expiry}`);
   stdout(`  receipt      verified (generation ${parsed.generation})`);
   stdout(`  state        ${asciiEscape(stateFile)}`);
+  if (aliasTruncated) {
+    stdout(`  note         the self-reported alias exceeded ${ALIAS_MAX_BYTES} UTF-8 bytes and was truncated`);
+  }
   if (created) {
     stdout(`  note         a new device key was created at ${asciiEscape(path.join(home, "identity.key"))} (one default key per device)`);
   }

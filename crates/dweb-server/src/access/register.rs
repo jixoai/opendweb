@@ -30,6 +30,13 @@
 //! 一切输出只允许 code_hash 形态。部署红线（r3-P2-2）：反向代理/
 //! access-log/tracing **禁止记录 `POST /register` 请求体**（与码全文脱敏
 //! 同级的红线——spec 冻结的生产部署文档义务）。
+//!
+//! home-hub [H6] 设备自报别名：body 可选 `alias`（≤32 UTF-8 字节，
+//! `serde(default)` 兼容旧客户端），**不进 PoP canonical**（自报是展示层
+//! 标签而非认证载荷——canonical 域冻结不重签）；落 owners 的优先级 =
+//! body.alias（自报）> 码 alias_hint > 无，且为**首写语义**（同键已存在
+//! 时自报不覆盖既有 alias——管理员 PATCH 命名/先前自报均受保护；幂等
+//! 回放路径零 owners 副作用，alias 天然不变）。
 
 use super::codes::{self, CodeLedger, RedeemOutcome};
 use super::identity::ServerIdentity;
@@ -62,6 +69,9 @@ pub const RECEIPT_CANONICAL_LEN: usize = RECEIPT_DOMAIN.len() + 32 * 3 + 8 * 2;
 const TS_WINDOW_MS: u64 = 120_000;
 /// 请求/响应体上限（spec 冻结 ≤4KiB；超限 413）
 pub const MAX_BODY_BYTES: usize = 4096;
+/// 自报别名上限（home-hub [H6]；与 admin PATCH ALIAS_MAX_BYTES / codes
+/// alias_hint 同拍：≤32 UTF-8 字节）
+pub const ALIAS_MAX_BYTES: usize = 32;
 
 /// 共享状态（main 装配：identity 签回执、owners/codes 双台账、per-IP 限流）
 #[derive(Clone)]
@@ -126,6 +136,11 @@ struct RegisterBody {
     root: String,
     ts: u64,
     sig: String,
+    /// 设备自报别名（home-hub [H6]；可选，≤32 UTF-8 字节，空串/超限 =
+    /// 400 invalid-request；`serde(default)` 兼容旧客户端 body）。
+    /// **不进 PoP canonical**（域冻结；自报是展示层标签，非认证载荷）
+    #[serde(default)]
+    alias: Option<String>,
 }
 
 /// 成功响应（CLI parseRegisterResponse 冻结形态：op/code_hash/fabric_id/
@@ -195,6 +210,16 @@ async fn register_endpoint(
             StatusCode::BAD_REQUEST,
             "invalid-request",
             "code must be a non-empty string (<=256 chars)",
+        );
+    }
+    // home-hub [H6]：自报别名形状（str::len = UTF-8 字节数；空串无意义拒收）
+    if let Some(alias) = &body.alias
+        && (alias.is_empty() || alias.len() > ALIAS_MAX_BYTES)
+    {
+        return error_envelope(
+            StatusCode::BAD_REQUEST,
+            "invalid-request",
+            &format!("alias must be a non-empty string (<= {ALIAS_MAX_BYTES} UTF-8 bytes)"),
         );
     }
     let fabric_id = match parse_owner_hex(&body.fabric_id) {
@@ -270,10 +295,16 @@ async fn register_endpoint(
         );
     };
     let code_hash = codes::code_hash(&normalized);
-    // ⑤ 幂等命中 → pending → deny-set → 码状态 → 新兑换（codes 台账锁内）
-    let outcome = state
-        .codes
-        .redeem(&state.owners, &code_hash, &fabric_id, &root, now);
+    // ⑤ 幂等命中 → pending → deny-set → 码状态 → 新兑换（codes 台账锁内）；
+    //    alias（自报 > alias_hint）仅在新兑换路径落 owners（H6）
+    let outcome = state.codes.redeem(
+        &state.owners,
+        &code_hash,
+        &fabric_id,
+        &root,
+        body.alias.as_deref(),
+        now,
+    );
     let expires_at = match outcome {
         RedeemOutcome::Replay { expires_at } => {
             tracing::info!(
@@ -537,18 +568,33 @@ mod tests {
             hex::encode(self.root_key.verifying_key().to_bytes())
         }
 
-        /// CLI 同构组包（canonical 恒小写 hex；code 取请求原文）
+        /// CLI 同构组包（canonical 恒小写 hex；code 取请求原文；alias 不进
+        /// canonical——H6 自报字段仅入 body）
         fn request(&self, code: &str, ts: u64, signer: &SigningKey) -> Request<Body> {
+            self.request_with_alias(code, ts, signer, None)
+        }
+
+        /// 自报别名变体（home-hub [H6]）
+        fn request_with_alias(
+            &self,
+            code: &str,
+            ts: u64,
+            signer: &SigningKey,
+            alias: Option<&str>,
+        ) -> Request<Body> {
             let root_hex = hex::encode(signer.verifying_key().to_bytes());
             let canonical = register_pop_canonical(code, &hex::encode(self.fabric), &root_hex, ts);
             let sig = URL_SAFE_NO_PAD.encode(signer.sign(&canonical).to_bytes());
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "code": code,
                 "fabric_id": hex::encode(self.fabric),
                 "root": root_hex,
                 "ts": ts,
                 "sig": sig,
             });
+            if let Some(alias) = alias {
+                body["alias"] = serde_json::json!(alias);
+            }
             Request::post("/register")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_string(&body).unwrap()))
@@ -790,6 +836,7 @@ mod tests {
             &hash2,
             &f.fabric,
             &f.root_key.verifying_key().to_bytes(),
+            None,
             now,
         ) {
             RedeemOutcome::Completed { expires_at } => {
@@ -967,5 +1014,142 @@ mod tests {
         let key: RedeemKey = (f.code_hash, f.fabric, f.root_key.verifying_key().to_bytes());
         assert!(f.codes.snapshot().is_consumed(&key));
         assert_eq!(f.owners.snapshot().code_orphans(), vec![key]);
+    }
+
+    // ---- home-hub [H6] 设备自报别名 ------------------------------------------
+
+    /// owners 条目别名查找（二元组定位）
+    fn owner_alias(f: &Fixture) -> Option<String> {
+        let root = f.root_key.verifying_key().to_bytes();
+        f.owners
+            .snapshot()
+            .entries()
+            .into_iter()
+            .find(|e| e.fabric_id == f.fabric && e.root == root)
+            .and_then(|e| e.alias)
+    }
+
+    /// 自报落册 + 优先级 body.alias > alias_hint（hint 码同拍组合）+ 回执
+    /// 不回显 alias（成功响应最小冻结不增字段）
+    #[tokio::test]
+    async fn alias_self_report_wins_over_hint() {
+        let f = Fixture::with_params(IssueParams {
+            alias_hint: Some("hint-name".into()),
+            ..Default::default()
+        });
+        let (status, body) = f
+            .send(f.request_with_alias(&f.code_display, now_ms(), &f.root_key, Some("kzf-MacBook")))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            owner_alias(&f).as_deref(),
+            Some("kzf-MacBook"),
+            "body.alias（自报）优先于 alias_hint"
+        );
+        assert!(
+            body.get("alias").is_none(),
+            "回执不回显 alias（响应形态冻结不增字段）"
+        );
+    }
+
+    /// 无自报时 hint 兜底 + 旧客户端兼容：body 无 alias 字段（serde default）
+    /// 照常 200
+    #[tokio::test]
+    async fn alias_hint_fallback_and_legacy_body_compat() {
+        let f = Fixture::with_params(IssueParams {
+            alias_hint: Some("hint-name".into()),
+            ..Default::default()
+        });
+        // request() 组包不含 alias 键 = 旧客户端 body 形态
+        let (status, _) = f
+            .send(f.request(&f.code_display, now_ms(), &f.root_key))
+            .await;
+        assert_eq!(status, StatusCode::OK, "旧 body 无 alias 字段兼容");
+        assert_eq!(owner_alias(&f).as_deref(), Some("hint-name"), "hint 兜底");
+    }
+
+    /// 首写语义全链路：首次自报落册 → 续期（新码）自报不覆盖 → 幂等回放
+    /// 自报不改变
+    #[tokio::test]
+    async fn alias_first_write_renewal_and_replay_no_overwrite() {
+        let f = Fixture::new();
+        let (status, _) = f
+            .send(f.request_with_alias(&f.code_display, now_ms(), &f.root_key, Some("first-name")))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owner_alias(&f).as_deref(), Some("first-name"), "首写落册");
+        // 续期：新码（带 hint）+ 新自报 → alias 不覆盖
+        let (_, hash2) = f
+            .codes
+            .issue(IssueParams {
+                alias_hint: Some("hint-2".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        // 经 HTTP 面需要 code_display；issue 只回 hash——用码正文不可行，
+        // 直接以台账实例同参调用（与 renewal_via_new_code_refreshes 同法）
+        let now = now_ms();
+        match f.codes.redeem(
+            &f.owners,
+            &hash2,
+            &f.fabric,
+            &f.root_key.verifying_key().to_bytes(),
+            Some("second-name"),
+            now,
+        ) {
+            RedeemOutcome::Completed { .. } => {}
+            other => panic!("expected completion, got {other:?}"),
+        }
+        assert_eq!(
+            owner_alias(&f).as_deref(),
+            Some("first-name"),
+            "续期自报不覆盖既有 alias"
+        );
+        // 幂等回放：同码同键 + 不同自报 → 200 但 alias 不变
+        let (status, _) = f
+            .send(f.request_with_alias(&f.code_display, now_ms(), &f.root_key, Some("replay-name")))
+            .await;
+        assert_eq!(status, StatusCode::OK, "幂等回放 200");
+        assert_eq!(
+            owner_alias(&f).as_deref(),
+            Some("first-name"),
+            "幂等回放不改变 alias"
+        );
+    }
+
+    /// 形状矩阵：空串/超长 ASCII/超长多字节（UTF-8 字节计数）→ 400
+    /// invalid-request；恰好 32 字节（含多字节边界）放行
+    #[tokio::test]
+    async fn alias_shape_validation() {
+        let f = Fixture::new();
+        let cases: [(&str, &str, bool); 4] = [
+            ("empty", "", false),
+            ("ascii-33", &"x".repeat(33), false),
+            // 漢 = 3 字节 ×11 = 33 字节（多字节计数按 UTF-8 字节而非字符数）
+            ("cjk-33", &"漢".repeat(11), false),
+            // 漢×10 = 30 字节 + "ab" = 恰 32 字节（放行）
+            ("cjk-exact-32", &format!("{}ab", "漢".repeat(10)), true),
+        ];
+        for (name, alias, ok) in cases {
+            let (status, body) = f
+                .send(f.request_with_alias(&f.code_display, now_ms(), &f.root_key, Some(alias)))
+                .await;
+            if ok {
+                assert_eq!(status, StatusCode::OK, "{name}: {body}");
+            } else {
+                assert_eq!(
+                    (status, body["error"]["code"].as_str().unwrap_or("")),
+                    (StatusCode::BAD_REQUEST, "invalid-request"),
+                    "{name}"
+                );
+                // 拒收请求零副作用（owners 无条目）
+                assert!(f.owners.snapshot().entries().is_empty(), "{name}");
+            }
+        }
+        // 恰 32 字节放行时自报落册
+        assert_eq!(
+            owner_alias(&f).as_deref(),
+            Some(format!("{}ab", "漢".repeat(10)).as_str())
+        );
     }
 }

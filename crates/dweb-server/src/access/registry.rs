@@ -1,7 +1,8 @@
 //! Owner registry：`owners.jsonl` append-only 事件日志 + 活跃集合只读快照
 //! （task 1.2，需求来源 2026-09-17；design §8.2 B1 / §8.5 generation / §11.2；
 //! server-access-roles Phase 1a：条目元数据 expires_at/alias/note + 时间维度
-//! 活跃判定 `contains_active`——R5 租户有效期 / R6 别名）。
+//! 活跃判定 `contains_active`——R5 租户有效期 / R6 别名；home-hub [H6]：
+//! 兑换路径的设备自报 alias 走 `register_via_code` 首写语义）。
 //!
 //! 活跃集合 = (fabric_id, root EndpointId) 二元组集合，由全量 jsonl 归并得出
 //! （register 加入 / unregister 按 fabric_id+root 定位移除——同一 fabric 换
@@ -295,21 +296,42 @@ impl OwnerRegistry {
     /// `via_code_hash` + 兑换租期；**同键已活跃 = 续期语义**——刷新
     /// expires_at 与 registered_at、**保留既有 alias/note**（spec 冻结，
     /// 与 mutate 的覆盖语义有意不同）、不重复建条目。
+    ///
+    /// `alias_candidate` = 设备自报别名（home-hub [H6]，调用方已完成
+    /// body.alias > alias_hint 优先级裁决）的**首写语义**：既有 alias
+    /// （管理员设或先前自报）不被覆盖；仅当条目无 alias 时候选首次写入
+    /// ——这样续期/幂等补写都不会动管理员命名。
     pub fn register_via_code(
         &self,
         fabric_id: &[u8; 32],
         root: &[u8; 32],
         expires_at: Option<u64>,
         via_code_hash: &[u8; 32],
+        alias_candidate: Option<&str>,
     ) -> Result<()> {
-        // expires_at 覆盖、alias/note 保留
-        self.upsert_preserving(
+        let mut state = self.state.lock().unwrap();
+        // 首写裁决（同临界区读既有值，杜绝 check-then-write 竞态窗口）：
+        // 外层 None = 保留既有；Some(Some(cand)) = 首写候选
+        let existing_has_alias = state
+            .current
+            .active
+            .get(&(*fabric_id, *root))
+            .is_some_and(|meta| meta.alias.is_some());
+        let alias_write = if existing_has_alias {
+            None
+        } else {
+            alias_candidate.map(|cand| Some(cand.to_string()))
+        };
+        // expires_at 覆盖、alias 首写、note 保留
+        Self::upsert_locked(
+            &mut state,
             fabric_id,
             root,
             Some(expires_at),
+            alias_write,
             None,
-            None,
-            *via_code_hash,
+            Some(*via_code_hash),
+            self.path.as_path(),
         )
     }
 
@@ -368,31 +390,9 @@ impl OwnerRegistry {
         Ok(true)
     }
 
-    /// upsert 公共核（register_via_code 直连；renew/update_metadata 在
-    /// 预检后同锁进入）：None = 保留既有值，Some = 覆盖为终值。锁外不可
-    /// 调用（renew/update 的存在性预检与写入必须同临界区）。
-    fn upsert_preserving(
-        &self,
-        fabric_id: &[u8; 32],
-        root: &[u8; 32],
-        expires_at: Option<Option<u64>>,
-        alias: Option<Option<String>>,
-        note: Option<Option<String>>,
-        via_code_hash: [u8; 32],
-    ) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
-        Self::upsert_locked(
-            &mut state,
-            fabric_id,
-            root,
-            expires_at,
-            alias,
-            note,
-            Some(via_code_hash),
-            self.path.as_path(),
-        )
-    }
-
+    /// upsert 公共核（renew/update_metadata 在预检后同锁进入）：None =
+    /// 保留既有值，Some = 覆盖为终值。锁外不可调用（renew/update 的存在性
+    /// 预检与写入必须同临界区；register_via_code 的 alias 首写裁决同此纪律）。
     #[allow(clippy::too_many_arguments)]
     fn upsert_locked(
         state: &mut State,
@@ -950,7 +950,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("owners.jsonl");
         let reg = OwnerRegistry::load(&path).unwrap();
-        reg.register_via_code(&[0x11; 32], &[0x22; 32], Some(9_999), &[0x33; 32])
+        reg.register_via_code(&[0x11; 32], &[0x22; 32], Some(9_999), &[0x33; 32], None)
             .unwrap();
         let line = std::fs::read_to_string(&path).unwrap();
         let line = line.trim_end();
@@ -1026,7 +1026,7 @@ mod tests {
         .unwrap();
         let reg = OwnerRegistry::load(&path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        reg.register_via_code(&[0x66; 32], &[0x77; 32], Some(900), &[0x88; 32])
+        reg.register_via_code(&[0x66; 32], &[0x77; 32], Some(900), &[0x88; 32], None)
             .unwrap();
         let entries = reg.snapshot().entries();
         assert_eq!(entries.len(), 1, "续期不重复建条目");
@@ -1042,6 +1042,65 @@ mod tests {
         // 注销后孤儿事实仍在（崩溃恢复以事件为准，不以活跃集合为准）
         reg.unregister(&[0x66; 32], &[0x77; 32]).unwrap();
         assert_eq!(reg.snapshot().code_orphans().len(), 1);
+    }
+
+    /// home-hub [H6] 自报别名首写语义：无既有 alias 时候选首次写入；
+    /// 续期（同键再兑换）的自报候选**不覆盖**既有 alias（无论其来源是
+    /// 管理员命名还是先前自报）
+    #[test]
+    fn register_via_code_alias_first_write_only() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        let reg = OwnerRegistry::load(&path).unwrap();
+        // 首次兑换：自报候选落册
+        reg.register_via_code(
+            &[0x11; 32],
+            &[0x22; 32],
+            Some(900),
+            &[0x33; 32],
+            Some("kzf-MacBook"),
+        )
+        .unwrap();
+        let entries = reg.snapshot().entries();
+        assert_eq!(entries[0].alias.as_deref(), Some("kzf-MacBook"), "首写落册");
+        // 续期：新自报候选不覆盖既有 alias（管理员设或先前自报同此裁决）
+        reg.register_via_code(
+            &[0x11; 32],
+            &[0x22; 32],
+            Some(9_999),
+            &[0x44; 32],
+            Some("renamed"),
+        )
+        .unwrap();
+        let entries = reg.snapshot().entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].alias.as_deref(),
+            Some("kzf-MacBook"),
+            "续期自报不覆盖既有 alias"
+        );
+        assert_eq!(entries[0].expires_at, Some(9_999), "租期照常刷新");
+        // 事件行携带终态（磁盘=内存，重启归并不丢首写结果）
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().next_back().unwrap();
+        assert!(last.contains("\"alias\":\"kzf-MacBook\""), "{last}");
+        // 管理员显式清除（PATCH 空串 → merge 后终值 None）后：下一次自报
+        // 候选可再首写
+        reg.update_metadata(&[0x11; 32], &[0x22; 32], None, None)
+            .unwrap();
+        reg.register_via_code(
+            &[0x11; 32],
+            &[0x22; 32],
+            Some(12_345),
+            &[0x55; 32],
+            Some("fresh"),
+        )
+        .unwrap();
+        assert_eq!(
+            reg.snapshot().entries()[0].alias.as_deref(),
+            Some("fresh"),
+            "清除后自报可再首写"
+        );
     }
 
     /// task 3.1：entries() 暴露 registered_at（最后 register 事件 ts），

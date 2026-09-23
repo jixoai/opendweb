@@ -982,17 +982,22 @@ Usage:
   opendweb id
       Read-only device identity view: prints the endpoint_id (64 hex) of
       this machine's default device key, the anti-phishing short form
-      (abc***xyz) and the key storage path. One default key per device; it
-      is created on first "opendweb join". Private key material is never
-      printed and no state is modified (repeat runs print the same output).
+      (abc***xyz), this machine's hostname (the default self-reported
+      alias, .local suffix stripped) and the key storage path. One default
+      key per device; it is created on first "opendweb join". Private key
+      material is never printed and no state is modified (repeat runs
+      print the same output).
 
-  opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--allow-insecure]
+  opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--alias <name>] [--allow-insecure]
       Tenant self-service registration (invite-code redemption). Uses the
       default device key as the fabric root, generates a local fabric when
       none exists (reuses the existing one otherwise; --fabric selects
       explicitly - a second fabric is never silently created), signs the
       canonical register payload as proof of possession, and exchanges it
-      at POST /register. On success the receipt is verified against the
+      at POST /register. The request self-reports an alias (default: this
+      machine's hostname with the .local suffix stripped; --alias
+      overrides, values over 32 UTF-8 bytes are truncated at a character
+      boundary). On success the receipt is verified against the
       server's server_id (from /services.json) and the registration
       (server/fabric_id/root/expiry/receipt) is saved to
       <DWEB_HOME>/registration.json. The invite code and the private key

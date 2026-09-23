@@ -4,8 +4,11 @@
 // 与 key 存储路径。MUST NOT 输出私钥材料；MUST NOT 修改任何状态（幂等——
 // 无 key 时非零退出并指引 join，绝不顺手生成）。
 // 缩写规则与 webui [R6] `alias (abc***xyz)` 的 hex 首尾各 3 字符一致。
+// 意图（2026-09-23，home-hub [H6]）：增输出本机机器名一行（剥 .local 的
+// hostname——与 join 自报别名同一规范化；缩写是核验层，机器名是称呼层）。
 
-import { CliExit, asciiEscape } from "./util.mjs";
+import os from "node:os";
+import { CliExit, asciiEscape, machineName } from "./util.mjs";
 import { deviceKeyFile, loadDeviceSeed } from "./device-key.mjs";
 import { endpointIdHexFromSeed } from "./ed25519.mjs";
 
@@ -22,12 +25,12 @@ export function abbreviateHex(hex) {
 }
 
 /**
- * id 主流程（只读）：设备 key 存在 → 输出 endpoint_id/缩写/路径；缺失 →
- * 非零退出指引 join（生成属 join 的设备引导职责，id 零副作用）。
- * @param {{ home: string, stdout?: (line: string) => void }} ctx
+ * id 主流程（只读）：设备 key 存在 → 输出 endpoint_id/缩写/机器名/路径；
+ * 缺失 → 非零退出指引 join（生成属 join 的设备引导职责，id 零副作用）。
+ * @param {{ home: string, stdout?: (line: string) => void, hostname?: string }} ctx
  * @returns {Promise<number>} 退出码 0
  */
-export async function runId({ home, stdout = (line) => console.log(line) }) {
+export async function runId({ home, stdout = (line) => console.log(line), hostname = os.hostname() }) {
   const keyPath = deviceKeyFile(home);
   let seed;
   try {
@@ -44,6 +47,7 @@ export async function runId({ home, stdout = (line) => console.log(line) }) {
   const endpointId = endpointIdHexFromSeed(seed);
   stdout(`endpoint_id  ${endpointId}`);
   stdout(`short        ${abbreviateHex(endpointId)}`);
+  stdout(`hostname     ${asciiEscape(machineName(hostname))}`);
   stdout(`key          ${asciiEscape(keyPath)}`);
   return 0;
 }

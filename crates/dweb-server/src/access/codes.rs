@@ -658,12 +658,20 @@ impl CodeLedger {
     /// ③ deny-set 503 → ④ 码状态（invalid/expired/exhausted）→ ⑤ 新兑换
     /// （跨台账提交协议：pending 预留 → owners register fsync → consume
     /// fsync）。
+    ///
+    /// `alias` = 设备自报别名（home-hub [H6]；/register body 可选字段，上游
+    /// 已校验 ≤32 UTF-8 字节）。别名仅在 **⑤ 新兑换** 落 owners（回放/
+    /// pending 补写零新 owners 副作用，alias 天然不变）；优先级 =
+    /// body.alias > 码条目 alias_hint（裁决在此处——hint 只在台账锁内可
+    /// 见），首写语义（既有 alias 不被覆盖）由
+    /// [`OwnerRegistry::register_via_code`] 执行。
     pub fn redeem(
         &self,
         owners: &OwnerRegistry,
         code_hash: &[u8; 32],
         fabric_id: &[u8; 32],
         root: &[u8; 32],
+        alias: Option<&str>,
         now: u64,
     ) -> RedeemOutcome {
         let key = (*code_hash, *fabric_id, *root);
@@ -723,6 +731,11 @@ impl CodeLedger {
             Some(v) => v,
             None => return RedeemOutcome::Io(anyhow::anyhow!("expires_at overflow")),
         };
+        // H6 优先级裁决：设备自报 body.alias > 码签发时的 alias_hint > 无
+        // （首写语义在 register_via_code 内裁决——既有 alias 不被覆盖）
+        let alias_candidate = alias
+            .map(str::to_string)
+            .or_else(|| entry.alias_hint.clone());
         // pending 预留（台账锁内）；owners register 失败 = 无任何持久化
         // 副作用，回滚预留（500）
         state.pending.insert(
@@ -733,7 +746,13 @@ impl CodeLedger {
                 expires_at,
             },
         );
-        if let Err(e) = owners.register_via_code(fabric_id, root, Some(expires_at), code_hash) {
+        if let Err(e) = owners.register_via_code(
+            fabric_id,
+            root,
+            Some(expires_at),
+            code_hash,
+            alias_candidate.as_deref(),
+        ) {
             state.pending.remove(code_hash);
             return RedeemOutcome::Io(e.context("owners register append failed"));
         }
@@ -1412,7 +1431,7 @@ mod tests {
         // 兑换 fail-closed：503（Unavailable，而非 exhausted）
         let owners = OwnerRegistry::load(&dir.path().join("owners.jsonl")).unwrap();
         assert!(matches!(
-            denied.redeem(&owners, &hash, &key(1), &key(2), now_ms()),
+            denied.redeem(&owners, &hash, &key(1), &key(2), None, now_ms()),
             RedeemOutcome::Unavailable
         ));
         // 恢复可写 → 同批孤儿 reload 补写成功 → deny 移除、计数就位
@@ -1460,7 +1479,21 @@ mod tests {
             root: [u8; 32],
             now: u64,
         ) -> RedeemOutcome {
-            self.codes.redeem(&self.owners, hash, &fabric, &root, now)
+            self.codes
+                .redeem(&self.owners, hash, &fabric, &root, None, now)
+        }
+
+        /// 自报别名变体（home-hub [H6] 聚焦用）
+        fn redeem_alias(
+            &self,
+            hash: &[u8; 32],
+            fabric: [u8; 32],
+            root: [u8; 32],
+            alias: Option<&str>,
+            now: u64,
+        ) -> RedeemOutcome {
+            self.codes
+                .redeem(&self.owners, hash, &fabric, &root, alias, now)
         }
     }
 
@@ -1471,6 +1504,74 @@ mod tests {
             }
             other => panic!("expected success outcome, got {other:?}"),
         }
+    }
+
+    /// home-hub [H6] 自报别名（台账层）：优先级 body.alias > alias_hint >
+    /// 无；续期（持新码同键）自报不覆盖既有；同键回放零 owners 副作用
+    /// （alias 不变）
+    #[test]
+    fn redeem_alias_priority_first_write_and_replay() {
+        let (f, hash_plain) = RedeemFixture::new(1);
+        let now = now_ms();
+        // 带 hint 的码（独立签发，走台账实例）
+        let (_, hash_hint) = f
+            .codes
+            .issue(IssueParams {
+                alias_hint: Some("hint-name".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        // ① 无自报 + 有 hint → alias = hint（hint 兜底）
+        assert!(matches!(
+            f.redeem_alias(&hash_hint, key(1), key(2), None, now),
+            RedeemOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            f.owners.snapshot().entries()[0].alias.as_deref(),
+            Some("hint-name"),
+            "无自报时 alias_hint 落册"
+        );
+        // ② 自报直落（新键 + 无 hint 码；HTTP 层测试覆盖 body.alias > hint
+        //    的同拍组合）
+        assert!(matches!(
+            f.redeem_alias(&hash_plain, key(3), key(4), Some("kzf-MacBook"), now),
+            RedeemOutcome::Completed { .. }
+        ));
+        let entry = f
+            .owners
+            .snapshot()
+            .entries()
+            .into_iter()
+            .find(|e| e.fabric_id == key(3) && e.root == key(4))
+            .unwrap();
+        assert_eq!(entry.alias.as_deref(), Some("kzf-MacBook"), "自报落册");
+        // ③ 续期：新码同键 + 新自报 → alias 不覆盖（首写语义）
+        let (_, hash_renew) = f
+            .codes
+            .issue(IssueParams {
+                alias_hint: Some("hint-2".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(
+            f.redeem_alias(&hash_renew, key(1), key(2), Some("self-2"), now + 1),
+            RedeemOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            f.owners.snapshot().entries()[0].alias.as_deref(),
+            Some("hint-name"),
+            "续期自报/hint 均不覆盖既有 alias"
+        );
+        // ④ 同键回放：零 owners 副作用（alias 不变，即使 body.alias 不同）
+        assert!(matches!(
+            f.redeem_alias(&hash_hint, key(1), key(2), Some("replay-alias"), now + 2),
+            RedeemOutcome::Replay { .. }
+        ));
+        assert_eq!(
+            f.owners.snapshot().entries()[0].alias.as_deref(),
+            Some("hint-name"),
+            "幂等回放不改变 alias"
+        );
     }
 
     /// 正常兑换：双 fsync 后 Completed；owners 出现该键；used_count=1；
@@ -1558,14 +1659,14 @@ mod tests {
         let codes2 = CodeLedger::load(&path2, &[]).unwrap();
         assert!(
             matches!(
-                codes2.redeem(&owners2, &expired_hash, &key(1), &key(2), 999),
+                codes2.redeem(&owners2, &expired_hash, &key(1), &key(2), None, 999),
                 RedeemOutcome::Completed { .. }
             ),
             "到期前活跃"
         );
         assert!(
             matches!(
-                codes2.redeem(&owners2, &expired_hash, &key(3), &key(4), 1000),
+                codes2.redeem(&owners2, &expired_hash, &key(3), &key(4), None, 1000),
                 RedeemOutcome::Expired
             ),
             "等值 = 过期（过期判定先于耗尽——次序冻结）"
@@ -1759,7 +1860,7 @@ mod tests {
             "租户在册（完整兑换，无烧码无租户）"
         );
         // 重启后同键重试 = 幂等回放（不产生第二 consume/条目）
-        let e = completed_expires(codes.redeem(&owners, &hash, &key(1), &key(2), now_ms()));
+        let e = completed_expires(codes.redeem(&owners, &hash, &key(1), &key(2), None, now_ms()));
         assert_eq!(e, expires, "回放回落 owners 持久值（consume 行不带租期）");
         assert_eq!(codes.snapshot().used_count(&hash), 1);
         let oc = std::fs::read_to_string(&owners_path).unwrap();
@@ -1781,7 +1882,7 @@ mod tests {
         // 重启等价：磁盘归并（consume 无租期）→ 回放回落 owners 持久值
         let owners2 = OwnerRegistry::load(f.owners.path()).unwrap();
         let codes2 = CodeLedger::load(f.codes.path(), &[]).unwrap();
-        let e3 = completed_expires(codes2.redeem(&owners2, &hash, &key(1), &key(2), now));
+        let e3 = completed_expires(codes2.redeem(&owners2, &hash, &key(1), &key(2), None, now));
         assert_eq!(
             e3,
             u64::MAX,
@@ -1917,11 +2018,11 @@ mod tests {
         // 配额终态：新 register 已占满 max_uses=1——同键幂等回放 200，
         // 他键不可超兑（exhausted，而非复活可兑）
         assert!(matches!(
-            codes.redeem(&owners, &hash, &key(1), &key(2), now_ms()),
+            codes.redeem(&owners, &hash, &key(1), &key(2), None, now_ms()),
             RedeemOutcome::Replay { .. }
         ));
         assert!(matches!(
-            codes.redeem(&owners, &hash, &key(3), &key(4), now_ms()),
+            codes.redeem(&owners, &hash, &key(3), &key(4), None, now_ms()),
             RedeemOutcome::Exhausted
         ));
     }
