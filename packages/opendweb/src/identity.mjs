@@ -6,11 +6,14 @@
 // 缩写规则与 webui [R6] `alias (abc***xyz)` 的 hex 首尾各 3 字符一致。
 // 意图（2026-09-23，home-hub [H6]）：增输出本机机器名一行（剥 .local 的
 // hostname——与 join 自报别名同一规范化；缩写是核验层，机器名是称呼层）。
+// 意图（2026-09-24，home-hub Phase 1d [H7]）：增输出租约计数行（leases.json
+// 只读计数，不触发迁移——id 零副作用纪律）。
 
 import os from "node:os";
 import { CliExit, asciiEscape, machineName } from "./util.mjs";
 import { deviceKeyFile, loadDeviceSeed } from "./device-key.mjs";
 import { endpointIdHexFromSeed } from "./ed25519.mjs";
+import { loadLeases } from "./leases.mjs";
 
 /**
  * 防钓鱼缩写：hex 首 3 + `***` + 尾 3（[R6] 冻结；输入须为 ≥6 字符 hex）。
@@ -25,8 +28,9 @@ export function abbreviateHex(hex) {
 }
 
 /**
- * id 主流程（只读）：设备 key 存在 → 输出 endpoint_id/缩写/机器名/路径；
- * 缺失 → 非零退出指引 join（生成属 join 的设备引导职责，id 零副作用）。
+ * id 主流程（只读）：设备 key 存在 → 输出 endpoint_id/缩写/机器名/租约
+ * 计数/路径；缺失 → 非零退出指引 join（生成属 join 的设备引导职责，id
+ * 零副作用——leases.json 只读计数，损坏时以 errored 呈现且不修改文件）。
  * @param {{ home: string, stdout?: (line: string) => void, hostname?: string }} ctx
  * @returns {Promise<number>} 退出码 0
  */
@@ -45,9 +49,17 @@ export async function runId({ home, stdout = (line) => console.log(line), hostna
     );
   }
   const endpointId = endpointIdHexFromSeed(seed);
+  let leases = 0;
+  let leasesError = false;
+  try {
+    leases = (await loadLeases(home)).leases.length;
+  } catch {
+    leasesError = true; // 账本损坏：如实呈现，不修不改（id 零副作用）
+  }
   stdout(`endpoint_id  ${endpointId}`);
   stdout(`short        ${abbreviateHex(endpointId)}`);
   stdout(`hostname     ${asciiEscape(machineName(hostname))}`);
+  stdout(`leases       ${leasesError ? "(unreadable)" : leases}`);
   stdout(`key          ${asciiEscape(keyPath)}`);
   return 0;
 }

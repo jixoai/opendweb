@@ -660,24 +660,32 @@ Usage:
       material is never printed and no state is modified (repeat runs
       print the same output).
 
-  opendweb join --server <URL> --code <dwebc1 code> [--fabric <hex64>] [--alias <name>] [--allow-insecure]
-      Tenant self-service registration (invite-code redemption). Uses the
-      default device key as the fabric root, generates a local fabric when
-      none exists (reuses the existing one otherwise; --fabric selects
-      explicitly - a second fabric is never silently created), signs the
-      canonical register payload as proof of possession, and exchanges it
-      at POST /register. The request self-reports an alias (default: this
-      machine's hostname with the .local suffix stripped; --alias
-      overrides, values over 32 UTF-8 bytes are truncated at a character
-      boundary). On success the receipt is verified against the
-      server's server_id (from /services.json) and the registration
-      (server/fabric_id/root/expiry/receipt) is saved to
-      <DWEB_HOME>/registration.json. The invite code and the private key
-      never appear in any output. Failures exit non-zero and leave no
-      partial local state; retrying an already-redeemed code replays the
-      first result (idempotent - renewal requires a fresh valid code).
-      https is the default expectation; plaintext http is only allowed to
-      loopback addresses unless --allow-insecure is passed.
+  opendweb join --server <URL|dwebh1 code> --code <dwebc1 code> [--fabric <hex64>] [--alias <name>] [--allow-insecure]
+      Tenant self-service registration (invite-code redemption). --server
+      accepts a hub URL or a dwebh1. access short code (decoded offline).
+      Uses the default device key as the fabric root; a machine carries
+      exactly one fabric (reused across servers; --fabric must match any
+      existing fabric - a second fabric is never created, explicit
+      mismatches are refused before anything is sent). Before contacting
+      POST /register the CLI checks /services.json: the server_id and at
+      least one usable relay entry (name=relay, enabled, valid http(s)
+      url; the first legal entry in manifest order) - no usable relay
+      means the join is refused (a lease that cannot connect must not
+      exist). The admission window is guarded by <DWEB_HOME>/fabric.lock
+      and a pending-admission journal (fabric-admission.json) written
+      before the register call: if the process dies mid-join, the next
+      join with the SAME invite code replays the identical
+      (fabric_id, root) tuple idempotently and completes the ledger; a
+      different code never touches the journal. On success the receipt
+      is verified against the server's server_id and the lease is
+      merged into <DWEB_HOME>/leases.json (one entry per
+      server/fabric/root key; rejoining the same server with a fresh
+      code renews the lease without resetting its first-registered
+      time; joining another server adds a second lease on the same
+      fabric). The invite code and the private key never appear in any
+      output. Failures exit non-zero and leave no partial lease state.
+      https is the default expectation; plaintext http is only allowed
+      to loopback addresses unless --allow-insecure is passed.
 
   opendweb marketplace add|list|remove "npm:<glob>, ..."
       Manage plugin candidate globs. Default: npm:@jixo/opendweb-ext-*,
@@ -733,8 +741,10 @@ Environment:
                             DWEB_CALLBACK_URL + DWEB_CALLBACK_TOKEN)
   DWEB_HOME                 CLI state directory (default ~/.opendweb):
                             marketplace.json, plugins.json, the device
-                            identity.key and registration.json; hub state
-                            after "hub init" (hub.json, hub-token, hub.pid)
+                            identity.key and leases.json (multi-lease
+                            ledger; legacy registration.json is migrated
+                            on first join); hub state after "hub init"
+                            (hub.json, hub-token, hub.pid)
 
 Clients need a single config entry: pick any Network address from the startup
 banner (e.g. http://192.168.2.13:8787). The gateway exposes the

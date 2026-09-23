@@ -1,10 +1,11 @@
-// opendweb join 命令测试（server-access-roles Phase 3，cli/identity）。
+// opendweb join 命令测试（server-access-roles Phase 3 + home-hub Phase 1d）。
 // 单元（零网络，注入 fetch/dns/now/home）：参数解析、明文守卫矩阵（sidecar
-// 语义对齐）、fabric 选取（复用/生成/--fabric）、错误码映射（非零退出且无
-// 半提交）、回执验签 fail-closed、码与私钥零泄露。
-// e2e（真实 127.0.0.1 mock 服务 + 子进程 CLI）：完整兑换链（守卫放行→签名
-// 兑换→services.json 验签→registration.json 落盘 0600）、fabric 复用、
-// 失败码端到端。真实服务器的兑换 e2e 属验收阶段（内核 /register 未实现）。
+// 语义对齐）、fabric 决策（复用/生成/--fabric 等值采纳/异值 fail-closed）、
+// 错误码映射（非零退出、无租约半提交、journal 按协议保留）、回执验签
+// fail-closed、码与私钥零泄露。
+// e2e（真实 127.0.0.1 mock 服务 + 子进程 CLI）：完整兑换链（守卫放行→
+// preflight→签名兑换→验签复核→leases.json 落账 0600）、fabric 复用、失败码
+// 端到端。多租约/admission/journal/恢复状态机专测见 join-admission.test.mjs。
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -17,14 +18,15 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 
 import { CliExit, machineName, truncateUtf8Bytes, ALIAS_MAX_BYTES } from "../src/util.mjs";
-import { parseJoinArgs, validateServerUrl, selectFabricId, runJoin, loadRegistration, saveRegistration, resolveSelfAlias } from "../src/join.mjs";
+import { parseJoinArgs, validateServerUrl, selectFabricId, runJoin, resolveSelfAlias } from "../src/join.mjs";
+import { loadLeases, loadAdmissionJournal } from "../src/leases.mjs";
 import { endpointIdHexFromSeed, signDetached, verifyDetached } from "../src/ed25519.mjs";
-import { buildRegisterCanonical, buildRegisterReceiptCanonical, toBase64UrlNoPad } from "../src/register.mjs";
+import { buildRegisterCanonical, buildRegisterReceiptCanonical, toBase64UrlNoPad, inviteCodeHashHex } from "../src/register.mjs";
 import { ensureDeviceSeed, deviceKeyFile, loadDeviceSeed } from "../src/device-key.mjs";
 
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../bin/opendweb.mjs");
 const FABRIC = "aa".repeat(32);
-const CODE = "dwebc1.e2e0-unut-tilo-vest";
+const CODE = "dwebc1.e2e0-qrs7-tvxy-zhjk";
 const FIXED_TS = 1758612345678;
 
 /** @returns {Promise<string>} */
@@ -46,8 +48,8 @@ function runCli(cmd, args = [], opts = {}) {
 }
 
 /** 签名回执响应体（mock 服务端 fixture） */
-function signedReceipt(serverSeed, { ts = FIXED_TS, generation = 7, fabricId, root, expiresAt = FIXED_TS + 30 * 24 * 3600 * 1000 } = {}) {
-  const codeHash = "33".repeat(32);
+function signedReceipt(serverSeed, { ts = FIXED_TS, generation = 7, fabricId, root, expiresAt = FIXED_TS + 30 * 24 * 3600 * 1000, code = CODE } = {}) {
+  const codeHash = /** @type {string} */ (inviteCodeHashHex(code));
   const canonical = buildRegisterReceiptCanonical({ codeHashHex: codeHash, fabricIdHex: fabricId, rootHex: root, ts, generation });
   return {
     op: "register",
@@ -78,7 +80,16 @@ function mockFetch(impl) {
     }
     if (u.endsWith("/services.json")) {
       requests.push({ url: u, body: null });
-      return new Response(JSON.stringify({ server_id: impl.serverId, relay: "http://x" }), { status: 200 });
+      return new Response(
+        JSON.stringify({
+          server_id: impl.serverId,
+          services: [
+            { name: "rendezvous", enabled: true, url: `${u.replace("/services.json", "")}/rendezvous` },
+            { name: "relay", enabled: true, url: `http://127.0.0.1:3340` },
+          ],
+        }),
+        { status: 200 },
+      );
     }
     throw new Error(`unexpected fetch: ${u}`);
   };
@@ -177,7 +188,13 @@ test("runJoin [H6]: body.alias 自报（hostname 默认/剥 .local/--alias 覆�
         );
       }
       if (u.endsWith("/services.json")) {
-        return new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 });
+        return new Response(
+          JSON.stringify({
+            server_id: endpointIdHexFromSeed(serverSeed),
+            services: [{ name: "relay", enabled: true, url: "http://127.0.0.1:3340" }],
+          }),
+          { status: 200 },
+        );
       }
       throw new Error(`unexpected fetch: ${u}`);
     };
@@ -296,18 +313,29 @@ test("guard: URL 形态防线（scheme/userinfo/query/path/编码/点段/反斜�
 
 // ---- fabric 选取 -------------------------------------------------------------
 
-test("selectFabricId: --fabric 显式（大写归一）；本地复用；无则随机生成", async () => {
-  assert.deepEqual(selectFabricId({ fabric: FABRIC.toUpperCase(), registration: null }), {
+test("selectFabricId [1d]: --fabric 显式（大写归一）；既有复用；首设备随机；异值 fail-closed", async () => {
+  assert.deepEqual(selectFabricId({ fabric: FABRIC.toUpperCase(), existing: null }), {
     fabricId: FABRIC,
     origin: "flag",
   });
-  assert.throws(() => selectFabricId({ fabric: "zz", registration: null }), /64 hex/);
-  assert.deepEqual(selectFabricId({ fabric: undefined, registration: { fabric_id: FABRIC } }), {
+  assert.throws(() => selectFabricId({ fabric: "zz", existing: null }), /64 hex/);
+  assert.deepEqual(selectFabricId({ fabric: undefined, existing: FABRIC }), {
     fabricId: FABRIC,
     origin: "reused",
   });
-  const a = selectFabricId({ fabric: undefined, registration: null });
-  const b = selectFabricId({ fabric: undefined, registration: null });
+  // 显式值=既有值：采纳（显式确认语义）
+  assert.deepEqual(selectFabricId({ fabric: FABRIC, existing: FABRIC }), {
+    fabricId: FABRIC,
+    origin: "flag",
+  });
+  // 单 fabric 约束：显式异值=fail-closed（exit 1，非 usage 错误）
+  const other = "bb".repeat(32);
+  assert.throws(
+    () => selectFabricId({ fabric: other, existing: FABRIC }),
+    (e) => e instanceof CliExit && e.exitCode === 1 && /one fabric per machine/.test(e.message),
+  );
+  const a = selectFabricId({ fabric: undefined, existing: null });
+  const b = selectFabricId({ fabric: undefined, existing: null });
   assert.equal(a.origin, "new");
   assert.equal(b.origin, "new");
   assert.match(a.fabricId, /^[0-9a-f]{64}$/);
@@ -360,33 +388,44 @@ test("runJoin 成功: 新 fabric + 新设备 key → PoP 签名兑换 + 回执�
   });
   assert.equal(verifyDetached(capturedBody.root, canonical, Buffer.from(capturedBody.sig, "base64url")), true);
 
-  // 本地数据面：identity.key + registration.json（0600）
+  // 本地数据面：identity.key + leases.json（0600）
   const seed = await loadDeviceSeed(home);
   assert.ok(seed);
   assert.equal(endpointIdHexFromSeed(seed), capturedBody.root);
-  const regStat = await fsp.stat(path.join(home, "registration.json"));
-  assert.equal(regStat.mode & 0o777, 0o600);
-  const reg = await loadRegistration(home);
+  const ledgerStat = await fsp.stat(path.join(home, "leases.json"));
+  assert.equal(ledgerStat.mode & 0o777, 0o600);
+  const ledger = await loadLeases(home);
+  assert.equal(ledger.leases.length, 1);
+  const reg = ledger.leases[0];
   assert.equal(reg.server, "http://127.0.0.1:8787");
   assert.equal(reg.fabric_id, capturedBody.fabric_id);
   assert.equal(reg.root, capturedBody.root);
   assert.equal(reg.expires_at, FIXED_TS + 30 * 24 * 3600 * 1000);
   assert.equal(reg.server_id, serverId);
+  assert.equal(reg.relay_url, "http://127.0.0.1:3340");
+  assert.equal(reg.label, null);
+  assert.match(reg.id, /^[0-9a-z]{10}$/, "10 字符不透明 id");
   assert.equal(reg.receipt.generation, 7);
+  // 成功后 journal 清空
+  assert.equal((await loadAdmissionJournal(home)).journal, null);
 
-  // 输出：缩写 + 到期日 + 新 fabric 标注；码与私钥零泄露
+  // 输出：缩写 + 到期日 + 新 fabric 标注 + relay/lease 行；码与私钥零泄露
   const out = cap.lines.join("\n");
   assert.match(out, new RegExp(`${capturedBody.root.slice(0, 3)}\\*\\*\\*${capturedBody.root.slice(-3)}`));
   assert.match(out, /expires\s+\d{4}-\d{2}-\d{2}/);
   assert.match(out, /newly generated/);
   assert.match(out, /receipt\s+verified/);
+  assert.match(out, /relay\s+http:\/\/127\.0\.0\.1:3340/);
+  assert.match(out, /lease\s+[0-9a-z]{10} \(new entry, 1 in ledger\)/);
   assert.ok(!out.includes(CODE), "码不落输出");
   assert.ok(!out.includes(seed.toString("hex")), "私钥不落输出");
 });
 
-test("runJoin 成功: 既有 fabric 复用（持新码=续期语义），不生成第二个", async () => {
+test("runJoin 成功: 既有 fabric 复用（旧 registration.json 残留形态），不生成第二个", async () => {
   const home = await tmpHome();
-  await saveRegistration(home, { version: 1, fabric_id: FABRIC });
+  // 旧单条文件不完整（无 server/root）：迁移按损坏告警保留，fabric preflight
+  // 仍读其 fabric_id 复用
+  await fsp.writeFile(path.join(home, "registration.json"), JSON.stringify({ version: 1, fabric_id: FABRIC }));
   const serverSeed = crypto.randomBytes(32);
   /** @type {any} */
   let captured = null;
@@ -398,7 +437,13 @@ test("runJoin 成功: 既有 fabric 复用（持新码=续期语义），不生�
         status: 200,
       });
     }
-    return new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 });
+    return new Response(
+      JSON.stringify({
+        server_id: endpointIdHexFromSeed(serverSeed),
+        services: [{ name: "relay", enabled: true, url: "http://127.0.0.1:3340" }],
+      }),
+      { status: 200 },
+    );
   };
   const cap = capture();
   await runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
@@ -409,127 +454,169 @@ test("runJoin 成功: 既有 fabric 复用（持新码=续期语义），不生�
   });
   assert.equal(captured.fabric_id, FABRIC, "复用本地 fabric");
   assert.match(cap.lines.join("\n"), /reused local fabric/);
+  const ledger = await loadLeases(home);
+  assert.equal(ledger.leases.length, 1);
+  assert.equal(ledger.leases[0].fabric_id, FABRIC);
 });
 
-test("runJoin 成功: --fabric 显式指定（覆盖本地记录）", async () => {
+test("runJoin 失败: --fabric 异值于既有=fail-closed（单 fabric），零网络零落账", async () => {
   const home = await tmpHome();
-  await saveRegistration(home, { version: 1, fabric_id: FABRIC });
-  const other = "bb".repeat(32);
   const serverSeed = crypto.randomBytes(32);
-  /** @type {any} */
-  let captured = null;
-  const fetchImpl = async (url, init) => {
-    const u = String(url);
-    if (u.endsWith("/register")) {
-      captured = JSON.parse(String(init?.body));
-      return new Response(JSON.stringify(signedReceipt(serverSeed, { fabricId: captured.fabric_id, root: captured.root })), {
-        status: 200,
-      });
-    }
-    return new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 });
+  await fsp.writeFile(path.join(home, "registration.json"), JSON.stringify({ version: 1, fabric_id: FABRIC }));
+  let fetchCalls = 0;
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    throw new Error("must not be called");
   };
-  await runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE, "--fabric", other.toUpperCase()], {
-    home,
-    now: () => FIXED_TS,
-    fetchImpl,
-    stdout: () => {},
-  });
-  assert.equal(captured.fabric_id, other);
+  const info = await exitInfo(
+    runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE, "--fabric", "bb".repeat(32)], {
+      home,
+      now: () => FIXED_TS,
+      fetchImpl,
+      stdout: () => {},
+    }),
+  );
+  assert.equal(info.thrown?.exitCode, 1);
+  assert.match(info.thrown?.message ?? "", /one fabric per machine/);
+  assert.equal(fetchCalls, 0, "preflight/register 均未发出");
+  const ledger = await loadLeases(home);
+  assert.equal(ledger.leases.length, 0, "零租约落账");
+  assert.equal((await loadAdmissionJournal(home)).journal, null, "未写 journal");
 });
 
 // ---- runJoin：失败矩阵（非零退出 + 无半提交 + 码不泄露） -----------------------
 
 const FAIL_CODES = ["bad-signature", "stale-ts", "code-invalid", "code-exhausted", "code-expired", "code-pending", "code-unavailable", "rate-limited", "invalid-request"];
 
+const manifestOk = (serverId) =>
+  new Response(
+    JSON.stringify({
+      server_id: serverId,
+      services: [{ name: "relay", enabled: true, url: "http://127.0.0.1:3340" }],
+    }),
+    { status: 200 },
+  );
+
 for (const errCode of FAIL_CODES) {
-  test(`runJoin 失败映射: ${errCode} → 非零退出、人类可读、无半提交`, async () => {
+  test(`runJoin 失败映射: ${errCode} → 非零退出、人类可读、无租约半提交、journal 保留`, async () => {
     const home = await tmpHome();
-    const fetchImpl = async () =>
-      new Response(JSON.stringify({ error: { code: errCode, message: "server detail" } }), { status: 400 });
+    const serverId = endpointIdHexFromSeed(crypto.randomBytes(32));
+    let registerCalls = 0;
+    const fetchImpl = async (url) => {
+      if (String(url).endsWith("/register")) {
+        registerCalls += 1;
+        return new Response(JSON.stringify({ error: { code: errCode, message: "server detail" } }), { status: 400 });
+      }
+      return manifestOk(serverId);
+    };
     const info = await exitInfo(
       runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], { home, now: () => FIXED_TS, fetchImpl, stdout: () => {} }),
     );
     assert.equal(info.thrown?.exitCode, 1);
     assert.match(info.thrown?.message ?? "", new RegExp(errCode));
-    assert.equal(await loadRegistration(home), null, "无半提交：registration.json 不存在");
+    assert.equal(registerCalls, 1, "register 恰一次（journal 前置）");
+    assert.equal((await loadLeases(home)).leases.length, 0, "无租约半提交");
+    const j = await loadAdmissionJournal(home);
+    assert.ok(j.journal, "journal 按协议保留（重试经幂等回放恢复）");
+    if (errCode === "code-invalid" || errCode === "code-expired") {
+      assert.match(info.thrown?.message ?? "", /manual recovery/i, "不得判「明确未登记」");
+    }
   });
 }
 
-test("runJoin 失败: 非 envelope 错误体按 HTTP 状态归并；网络不可达独立文案", async () => {
+test("runJoin 失败: preflight 非 2xx/坏 JSON 明确归并；register 网络未知=journal 保留+回放提示", async () => {
   const home = await tmpHome();
+  // services.json 500 → preflight 失败（register 未发出）
+  let registerCalls = 0;
   const http500 = await exitInfo(
     runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
       home,
-      fetchImpl: async () => new Response("oops", { status: 500 }),
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/register")) {
+          registerCalls += 1;
+          return new Response("oops", { status: 500 });
+        }
+        return new Response("oops", { status: 500 });
+      },
       stdout: () => {},
     }),
   );
   assert.match(http500.thrown?.message ?? "", /HTTP 500/);
+  assert.match(http500.thrown?.message ?? "", /services preflight failed/);
+  assert.equal(registerCalls, 0, "preflight 失败时 register 未发出");
 
+  // register 网络不可达：结果未知 → journal 保留 + 幂等回放提示
   const unreachable = await exitInfo(
     runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
       home,
-      fetchImpl: async () => {
-        throw new Error("ECONNREFUSED");
+      fetchImpl: async (url) => {
+        if (String(url).endsWith("/register")) {
+          throw new Error("ECONNREFUSED");
+        }
+        return manifestOk(endpointIdHexFromSeed(crypto.randomBytes(32)));
       },
       stdout: () => {},
     }),
   );
   assert.match(unreachable.thrown?.message ?? "", /cannot reach/);
-  assert.equal(await loadRegistration(home), null);
+  assert.match(unreachable.thrown?.message ?? "", /idempotent replay/);
+  assert.equal((await loadLeases(home)).leases.length, 0);
+  const j = await loadAdmissionJournal(home);
+  assert.ok(j.journal, "journal 保留");
+  assert.match(j.journal?.last_error ?? "", /network/);
 });
 
-test("runJoin 失败: 畸形成功响应/服务端公钥不可得/回执验签不过 → 拒绝落盘", async () => {
+test("runJoin 失败: 畸形成功响应/preflight 公钥不可得/回执验签不过 → 拒绝落账+journal 保留", async () => {
   const home = await tmpHome();
   const serverSeed = crypto.randomBytes(32);
-  const goodSeed = crypto.randomBytes(32);
-  const goodRoot = endpointIdHexFromSeed(goodSeed);
+  const serverId = endpointIdHexFromSeed(serverSeed);
+  const goodRoot = endpointIdHexFromSeed(crypto.randomBytes(32));
 
-  // 畸形 200 体
+  // 畸形 200 体（register 成功形态非 JSON 契约）
   const malformed = await exitInfo(
     runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
       home,
-      fetchImpl: async (url) => (String(url).endsWith("/register") ? new Response(JSON.stringify({ what: 1 }), { status: 200 }) : new Response("{}", { status: 200 })),
+      fetchImpl: async (url) => (String(url).endsWith("/register") ? new Response(JSON.stringify({ what: 1 }), { status: 200 }) : manifestOk(serverId)),
       stdout: () => {},
     }),
   );
   assert.match(malformed.thrown?.message ?? "", /malformed success response/);
+  assert.ok((await loadAdmissionJournal(home)).journal, "journal 保留");
 
-  // services.json 不可得
+  // services.json 不可得 → preflight 失败（register 未发出、journal 未写）；
+  // 独立 home（malformed 案例留下的 journal 会把后续 join 切入恢复模式）
+  const noServicesHome = await tmpHome();
   const noServices = await exitInfo(
     runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
-      home,
-      fetchImpl: async (url) => {
-        if (String(url).endsWith("/register")) {
-          const receipt = signedReceipt(serverSeed, { fabricId: FABRIC, root: goodRoot });
-          return new Response(JSON.stringify(receipt), { status: 200 });
-        }
-        return new Response("down", { status: 503 });
-      },
+      home: noServicesHome,
+      fetchImpl: async () => new Response("down", { status: 503 }),
       stdout: () => {},
     }),
   );
-  assert.match(noServices.thrown?.message ?? "", /cannot obtain.*services\.json/);
+  assert.match(noServices.thrown?.message ?? "", /services preflight failed.*services\.json/);
+  assert.equal((await loadAdmissionJournal(noServicesHome)).journal, null, "preflight 失败不写 journal");
 
-  // 回执由另一把 key 签（伪造）→ 验签失败拒绝保存
+  // 回执由另一把 key 签（伪造）→ 验签失败拒绝保存（独立 home，同上）
+  const forgedHome = await tmpHome();
   const forged = await exitInfo(
     runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
-      home,
+      home: forgedHome,
       fetchImpl: async (url) => {
         if (String(url).endsWith("/register")) {
           const receipt = signedReceipt(crypto.randomBytes(32), { fabricId: FABRIC, root: goodRoot });
           return new Response(JSON.stringify(receipt), { status: 200 });
         }
-        return new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 });
+        return manifestOk(serverId);
       },
       stdout: () => {},
     }),
   );
   assert.match(forged.thrown?.message ?? "", /did not verify/);
-  assert.equal(await loadRegistration(home), null, "全部失败路径无半提交");
+  assert.equal((await loadLeases(home)).leases.length, 0, "全部失败路径无租约半提交");
 });
+// （forged 用独立 home；同 home 的 malformed 案例已各自断言）
 
-test("runJoin 失败: 回执 fabric/root 与本机不符 → 拒绝落盘（防错配）", async () => {
+test("runJoin 失败: 回执 fabric/root 与本 admission 不符 → 拒绝落账（防错配）", async () => {
   const home = await tmpHome();
   const serverSeed = crypto.randomBytes(32);
   const wrong = signedReceipt(serverSeed, { fabricId: FABRIC, root: "cc".repeat(32) });
@@ -539,12 +626,13 @@ test("runJoin 失败: 回执 fabric/root 与本机不符 → 拒绝落盘（防�
       fetchImpl: async (url) =>
         String(url).endsWith("/register")
           ? new Response(JSON.stringify(wrong), { status: 200 })
-          : new Response(JSON.stringify({ server_id: endpointIdHexFromSeed(serverSeed) }), { status: 200 }),
+          : manifestOk(endpointIdHexFromSeed(serverSeed)),
       stdout: () => {},
     }),
   );
-  assert.match(info.thrown?.message ?? "", /do not match this device/);
-  assert.equal(await loadRegistration(home), null);
+  assert.match(info.thrown?.message ?? "", /do not match this admission/);
+  assert.equal((await loadLeases(home)).leases.length, 0);
+  assert.ok((await loadAdmissionJournal(home)).journal, "journal 保留（远端已登记提示回放恢复）");
 });
 
 test("runJoin 失败: 守卫拒绝先于一切网络与落盘（无 fetch 调用）", async () => {
@@ -563,7 +651,7 @@ test("runJoin 失败: 守卫拒绝先于一切网络与落盘（无 fetch 调用
   assert.equal(info.thrown?.exitCode, 2);
   assert.match(info.thrown?.message ?? "", /--allow-insecure/);
   assert.equal(fetchCalled, false);
-  assert.equal(await loadRegistration(home), null);
+  assert.equal((await loadLeases(home)).leases.length, 0);
   assert.equal(await loadDeviceSeed(home), null, "守卫拒绝时不生成设备 key");
 });
 
@@ -577,6 +665,7 @@ function startMockRegisterServer() {
   const EXPIRED = "dwebc1.dddd-dddd-dddd-dddd";
   /** @type {{ path: string, body: any }[]} */
   const seen = [];
+  let mockPortBase = 0;
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
@@ -585,7 +674,16 @@ function startMockRegisterServer() {
       if (req.method === "GET" && req.url === "/services.json") {
         seen.push({ path: req.url, body: null });
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ server_id: serverId, gateway: "http://127.0.0.1" }));
+        res.end(
+          JSON.stringify({
+            server_id: serverId,
+            gateway: `http://127.0.0.1:${mockPortBase}`,
+            services: [
+              { name: "rendezvous", enabled: true, url: `http://127.0.0.1:${mockPortBase}/rendezvous` },
+              { name: "relay", enabled: true, url: "http://127.0.0.1:3340" },
+            ],
+          }),
+        );
         return;
       }
       if (req.method === "POST" && req.url === "/register") {
@@ -623,11 +721,14 @@ function startMockRegisterServer() {
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, seen, serverId }));
+    server.listen(0, "127.0.0.1", () => {
+      mockPortBase = /** @type {import("node:net").AddressInfo} */ (server.address()).port;
+      resolve({ server, port: mockPortBase, seen, serverId });
+    });
   });
 }
 
-test("e2e join: 持有效码完整兑换（loopback http 免 --allow-insecure）→ 落盘 + id 一致", async (t) => {
+test("e2e join: 持有效码完整兑换（loopback http 免 --allow-insecure）→ 落账 + id 一致", async (t) => {
   const mock = await startMockRegisterServer();
   t.after(() => new Promise((r) => mock.server.close(() => r(null))));
   const home = await tmpHome();
@@ -635,28 +736,32 @@ test("e2e join: 持有效码完整兑换（loopback http 免 --allow-insecure）
 
   const r = await runCli("join", ["--server", `http://127.0.0.1:${mock.port}`, "--code", CODE], { env });
   assert.equal(r.code, 0, r.stderr);
-  const reg = await loadRegistration(home);
-  assert.ok(reg, "registration.json 落盘");
+  const ledger = await loadLeases(home);
+  assert.equal(ledger.leases.length, 1, "leases.json 落账一条");
+  const reg = ledger.leases[0];
   assert.equal(reg.server, `http://127.0.0.1:${mock.port}`);
+  assert.equal(reg.relay_url, "http://127.0.0.1:3340", "relay_url 来自 services manifest");
   assert.match(String(reg.fabric_id), /^[0-9a-f]{64}$/);
   const seed = await loadDeviceSeed(home);
   assert.equal(reg.root, endpointIdHexFromSeed(seed));
   assert.equal(reg.server_id, mock.serverId);
-  const stat = await fsp.stat(path.join(home, "registration.json"));
+  const stat = await fsp.stat(path.join(home, "leases.json"));
   assert.equal(stat.mode & 0o777, 0o600);
   assert.match(r.stdout, new RegExp(`${reg.root.slice(0, 3)}\\*\\*\\*${reg.root.slice(-3)}`));
   assert.match(r.stdout, /expires\s+\d{4}-\d{2}-\d{2}/);
   assert.ok(!r.stdout.includes(CODE) && !r.stderr.includes(CODE), "码全文不落 stdout/stderr");
+  // join 成功不产生到访记录（租户路径只写 leases）
+  assert.equal(await fsp.stat(path.join(home, "visits.json")).then(() => true, () => false), false);
 
-  // 服务端收到了可验签的 PoP（mock 已验签）+ services.json 拉取序
+  // 服务端收到了可验签的 PoP（mock 已验签）+ services.json 拉取序（preflight+复核=2）
   assert.equal(mock.seen.filter((s) => s.path === "/register").length, 1);
-  assert.equal(mock.seen.filter((s) => s.path === "/services.json").length, 1);
+  assert.equal(mock.seen.filter((s) => s.path === "/services.json").length, 2);
   // [H6] 自报别名：子进程 CLI 以本机机器名（剥 .local）入 body + 输出呈现
   const regBody = /** @type {{ path: string, body: any }} */ (mock.seen.find((s) => s.path === "/register")).body;
   assert.equal(regBody.alias, machineName(os.hostname()), "body.alias = 本机机器名（剥 .local）");
   assert.match(r.stdout, /alias\s+\S+ \(self-reported\)/, "join 成功输出呈现自报别名");
 
-  // opendweb id 与 join 的 root 一致（同一设备身份）；[H6] 增机器名行
+  // opendweb id 与 join 的 root 一致（同一设备身份）；[H6] 机器名行 + [1d] 租约计数行
   const idr = await runCli("id", [], { env });
   assert.equal(idr.code, 0);
   assert.match(idr.stdout, new RegExp(reg.root));
@@ -664,17 +769,23 @@ test("e2e join: 持有效码完整兑换（loopback http 免 --allow-insecure）
     idr.stdout.includes(`hostname     ${machineName(os.hostname())}`),
     `id 输出本机机器名（实际：${idr.stdout}）`,
   );
+  assert.ok(idr.stdout.includes("leases       1"), `id 输出租约计数（实际：${idr.stdout}）`);
 
-  // 第二次 join（持新有效码=同码再兑）：fabric 复用、root 不变
+  // 第二次 join（同码再兑）：fabric 复用、root 不变、同键续期（不新增条目）
   const firstFabric = String(reg.fabric_id);
+  const firstRegisteredAt = reg.registered_at;
   const r2 = await runCli("join", ["--server", `http://127.0.0.1:${mock.port}`, "--code", CODE], { env });
   assert.equal(r2.code, 0, r2.stderr);
   assert.match(r2.stdout, /reused local fabric/);
-  const reg2 = await loadRegistration(home);
-  assert.equal(reg2.fabric_id, firstFabric, "不静默生成第二个 fabric");
+  const ledger2 = await loadLeases(home);
+  assert.equal(ledger2.leases.length, 1, "同键 upsert 不新增条目");
+  assert.equal(ledger2.leases[0].fabric_id, firstFabric, "不静默生成第二个 fabric");
+  assert.equal(ledger2.leases[0].registered_at, firstRegisteredAt, "registered_at 保持首条");
+  const idr2 = await runCli("id", [], { env });
+  assert.ok(idr2.stdout.includes("leases       1"), "同键续期后计数仍为 1");
 });
 
-test("e2e join: 失效码非零退出、人类可读、无 registration.json", async (t) => {
+test("e2e join: 失效码非零退出、人类可读、无租约落账（journal 保留+人工恢复文案）", async (t) => {
   const mock = await startMockRegisterServer();
   t.after(() => new Promise((r) => mock.server.close(() => r(null))));
   const home = await tmpHome();
@@ -682,11 +793,13 @@ test("e2e join: 失效码非零退出、人类可读、无 registration.json", a
   const r = await runCli("join", ["--server", `http://127.0.0.1:${mock.port}`, "--code", "dwebc1.dddd-dddd-dddd-dddd"], { env });
   assert.notEqual(r.code, 0);
   assert.match(r.stderr, /code-expired/);
-  assert.match(r.stderr, /no uses left|expired/, "人类可读错误");
-  assert.equal(await loadRegistration(home), null, "无半提交");
+  assert.match(r.stderr, /expired/, "人类可读错误");
+  assert.match(r.stderr, /manual recovery/i, "code-expired 不得判「明确未登记」");
+  assert.equal((await loadLeases(home)).leases.length, 0, "无租约半提交");
+  assert.ok((await loadAdmissionJournal(home)).journal, "journal 保留");
   // 设备 key 属设备级引导（首启生成、重试复用）——非注册半提交状态
   const seed = await loadDeviceSeed(home);
-  assert.ok(seed, "设备 key 已引导（join 职责）；注册状态未落盘");
+  assert.ok(seed, "设备 key 已引导（join 职责）；租约未落账");
 });
 
 test("e2e join: 非 loopback 明文 http → 守卫 exit 2，零本地状态", async () => {
@@ -695,6 +808,6 @@ test("e2e join: 非 loopback 明文 http → 守卫 exit 2，零本地状态", a
   assert.equal(r.code, 2);
   assert.match(r.stderr, /non-loopback/);
   assert.match(r.stderr, /--allow-insecure/);
-  assert.equal(await loadRegistration(home), null);
+  assert.equal((await loadLeases(home)).leases.length, 0);
   assert.equal(await loadDeviceSeed(home), null, "守卫拒绝时不生成设备 key");
 });
