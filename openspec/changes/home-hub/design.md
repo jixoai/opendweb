@@ -156,7 +156,16 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   （server-access-roles 冻结契约：capability 由 root 侧自签、server 只验票
   不签票；SDK `ensureRelayCapabilities` 既有实现）——租约条目已含
   server_id，消费材料齐备；capability 由 SDK 内存态自签/刷新，**不入
-  leases.json**（无新增凭证落盘面）。端到端断言：restricted 中枢注册后
+  leases.json**（无新增凭证落盘面）。
+- **签发时序冻结（r5-P1-1——CustomWithCaps 构造只读静态 token，own
+  capability 不自动签发）**：租约消费连接器 MUST 按以下顺序执行且不得
+  跳步：①构造 `FabricOptions.relay={mode:"custom",relays:[{url:relay_url,
+  serverId:server_id}]}` 并 `createRoot/open/attach`；②**显式 `await
+  ensureRelayCapabilities()`**；③断言其返回条目覆盖租约的
+  (relay_url, server_id) 且 token 已注入**同一 Fabric 实例**的 RelayMap；
+  ④此后才允许任何 join/connect（首次拨号前完成）。签发失败/非 root/
+  server_id 或 URL 与租约不匹配/token 未出现在 RelayMap=MUST fail-closed
+  （连接终止并明确报错，不得静默降级为无凭证、不得写租约）。端到端断言：restricted 中枢注册后
   实际 relay 握手成功、无票连接被拒 `dweb/no-capability`、跨 server
   capability 被拒、SDK relay mode=custom（非 N0Default）；malformed
   server_id/URL 在落租约前失败。
@@ -171,9 +180,10 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
 - **写者与锁协议（r1-P1-6 不变）**：写者=join CLI、label 编辑；每账本
   `<name>.lock`（O_EXCL+锁内重读+合并+rename+锁归属校验+陈锁打破+退避）。
 - **join 顺序冻结（r4-P2-1 preflight）**：**register 之前**完成 services
-  preflight——读 /services.json，要求恰一可用 relay（enabled 且 url 非空串
-  且为合法 http(s) URL：scheme/authority 校验+长度上限；多候选=按 manifest
-  顺序取第一条合法者）；register 成功后**复核** server_id 与 relay URL 与
+  preflight——读 /services.json，要求**至少一条可用 relay**（enabled 且
+  url 非空串且为合法 http(s) URL：scheme/authority 校验+长度上限；一条都
+  没有=失败；**多候选=按 manifest 顺序取第一条合法者**——「可用」的判定
+  唯一，不要求 manifest 全局恰一条）；register 成功后**复核** server_id 与 relay URL 与
   preflight 一致。任一步失败 MUST NOT 写本地账本，并明确报告远端登记状态
   （若 register 已发生：提示「服务端已登记、本地未落账，重试 join 经幂等
   回放可恢复」——server-access-roles 冻结的幂等回放语义即补偿路径）。
@@ -410,6 +420,7 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r4 | NOT-READY 7.5，P1×1+P2×4（十条基线 9 PASS+1 BLOCKED） | 全处置（v5，本版）：P1-1 消费契约改为 relays:[{url,serverId}]（CustomWithCaps，root 自签 capability，杜绝 no-capability 主路径阻断）+端到端 Scenario（§2.1）；P2-1 join preflight 顺序冻结（register 前恰一可用 relay+URL 校验+复核+幂等回放补偿路径）（§2.1）；P2-2 PM 头部裁决范围 [H0]-[H7]；P2-3 encode_canonical/decode_accepts 两集合拆分+测试表格（§3.1）；P2-4 batch golden 帧补样例（§6） |
+| r5 | NOT-READY 7.8，P1×1+P2×2（十条基线 8 PASS+2 CONDITIONAL） | 全处置（v6，本版）：P1-1 capability 签发时序冻结（构造→显式 ensureRelayCapabilities→断言覆盖与同实例注入→方可拨号；任何不符 fail-closed）（§2.1）；P2-1 preflight「恰一」与「第一条合法者」措辞冲突修正为「至少一条+多候选取第一条」（§2.1）；P2-2 PM 证据基线补 [H7] |
+| r4 | NOT-READY 7.5，P1×1+P2×4（十条基线 9 PASS+1 BLOCKED） | 全处置（v5）：P1-1 消费契约改为 relays:[{url,serverId}]（CustomWithCaps，root 自签 capability，杜绝 no-capability 主路径阻断）+端到端 Scenario（§2.1）；P2-1 join preflight 顺序冻结（register 前恰一可用 relay+URL 校验+复核+幂等回放补偿路径）（§2.1）；P2-2 PM 头部裁决范围 [H0]-[H7]；P2-3 encode_canonical/decode_accepts 两集合拆分+测试表格（§3.1）；P2-4 batch golden 帧补样例（§6） |
 | r3 | NOT-READY 7.3，P1×4+P2×4 | 全处置（v4）：P1-1 DWEB_ADMIN_TOKEN 链入口注入（覆盖继承 env）+readiness 双探断言（无 token 401≠404 + token 200）+失败停机清锁（§1.3）；P1-2 relay null/disabled=join fail-closed 不落租约+连接器从租约构造 custom（§2.1）；P1-3 短码严格 canonical（歧义字符拒绝不映射+连字符仅固定分组位置+大小写折叠）+IPv6 bracket URL 冻结 V2 断言（§3.1）；P1-4 全部 error 帧补 jsonrpc 字段+严格 validator 逐帧校验（§6）；P2-1 proposal/PM 旧词残留清理+rg 门禁；P2-2 G-3 acceptance 模板六字段+NOT-EXECUTABLE 客观条件（§7）；P2-3 生成物 quoting 冻结+特殊路径 Scenario（§1.4）；P2-4 capability v1 冻结（§5.1） |
 | r2 | NOT-READY 7.0，P1×9+P2×7 | 全处置（v3）：P1-1 入网闭环=join 落 relay_url（§2.1）+delta Scenario+G-3 验收义务（§7）；P1-2 hub open 命令+五行分流表 hub 本机行（§1.1/§4.2）；P1-3 DWEB_DATA_DIR 全宿主注入+启动后核实（§1.3）；P1-4 cwd 统一 DWEB_HOME+config_path 冻结+承诺面改为三宿主间一致（§1.3）；P1-5 expires_at=本地快照冻结+PM 文案同步（§2.1）；P1-6 pid 三元组（start_identity+argv 摘要）三重核验（§1.2）；P1-7 接管=尽力探测+强制人工确认+data_dir 唯一规则（§1.6）；P1-8 字节修正 9/21+CRC 覆盖范围+MSB/padding 位/非规范拒绝+设计级 golden vectors V1/V2（§3.1）；P1-9 urlFor+open=注入 opener+url 会话 capability 非 admin token（§5.1）；P2-1 PM/proposal 残留清理（已裁决记录化/平台同步）；P2-2 写路由 Origin 严格策略（存在且匹配，不沿用基线放行）（§4.2）；P2-3 visits 回归访客语义（join 不写）+五类映射（§2.2）；P2-4 label 用不透明 id+空串归一 null（§2.1/§4.2）；P2-5 RPC 完整 golden 帧+notification/batch 拒绝+服务验收分层（§1.4/§6）；P2-6 link-local 拒绝（§1.5/§3.1）；P2-7 默认不启动负向 Scenario（§1.1） |

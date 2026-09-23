@@ -13,7 +13,7 @@
 > server-access-roles §5.1（租户/访客/管理凭证/楼/敲门），本文新增术语首现处定义。
 >
 > 证据基线：
-> - 用户一手：Owner 裁决逐字存档 `requirements.md`（[H0] 初衷 + [H1]-[H6]）
+> - 用户一手：Owner 裁决逐字存档 `requirements.md`（[H0] 初衷 + [H1]-[H7]，含 [H7] 三项拍板）
 > - 范围契约：`proposal.md`（What Changes / 非 Goals）
 > - 风格与体验基准：`openspec/changes/server-access-roles/PRODUCT-DESIGN.md`（IA/成品
 >   文案/开放问题三段式）+ `docs/WALKTHROUGH-server-access-roles.md`（Owner 实走形态）
