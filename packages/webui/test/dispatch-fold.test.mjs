@@ -51,6 +51,14 @@ async function cliProjectEnv() {
   await fsp.mkdir(installed, { recursive: true });
   await fsp.copyFile(path.join(PKG_ROOT, "package.json"), path.join(installed, "package.json"));
   await fsp.cp(path.join(PKG_ROOT, "src"), path.join(installed, "src"), { recursive: true });
+  // home-hub 2b：webui 声明依赖 opendweb（workspace:*——真实安装必然并存），
+  // core/home.mjs 经深导入复用其 leases/锁协议/探测；临时项目镜像该依赖
+  // （--server 路径只需 stdlib-only 的 src，无需 zod 等运行时依赖）。
+  const OPENDBWEB_ROOT = path.resolve(PKG_ROOT, "..", "opendweb");
+  const dep = path.join(dir, "node_modules", "opendweb");
+  await fsp.mkdir(dep, { recursive: true });
+  await fsp.copyFile(path.join(OPENDBWEB_ROOT, "package.json"), path.join(dep, "package.json"));
+  await fsp.cp(path.join(OPENDBWEB_ROOT, "src"), path.join(dep, "src"), { recursive: true });
   return { dir, home };
 }
 
@@ -74,7 +82,7 @@ test("cli e2e: opendweb webui --help renders zero-exec usage through the fold-aw
   const env = await cliProjectEnv();
   const r = await runCli(["webui", "--help"], env);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /opendweb webui webui \[--server <string> --token <string> --port <number> --allow-insecure --no-open\]/);
+  assert.match(r.out, /opendweb webui webui \[--server <string> --token <string> --port <number> --allow-insecure --no-open --setup\]/);
   // --token OS 可见性提示由 help 渲染器原样呈现（spec「CLI 面接线」）
   assert.match(r.out, /--token or DWEB_ADMIN_TOKEN is visible to other local processes/);
   assert.match(r.out, ASCII, "help output must be all-ASCII");

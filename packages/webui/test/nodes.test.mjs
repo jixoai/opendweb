@@ -563,7 +563,8 @@ test("disclosure: node responses and logs never contain any token; state shape u
   }
   // state 形状不因节点簿改变（基座契约）
   const stateBody = JSON.parse(state.text);
-  assert.deepEqual(Object.keys(stateBody).sort(), ["insecure", "phase", "server_host_masked"]);
+  // home-hub 2b 增量：role/hub_local（加性字段——admin 姿态缺省值）
+  assert.deepEqual(Object.keys(stateBody).sort(), ["hub_local", "insecure", "phase", "role", "server_host_masked"]);
 });
 
 test("nodes disabled (no nodesFile): /sidecar/nodes* 404 and connect face unchanged", async (t) => {

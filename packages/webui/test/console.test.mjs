@@ -421,7 +421,7 @@ test("getSnapshot: synchronous {mode,node,hub} snapshot (hub slot frozen null in
 
   const before = con.getSnapshot();
   assert.ok(!(before instanceof Promise), "snapshot is synchronous (not a promise)");
-  assert.deepEqual(before, { mode: "ready", node: null, hub: null }, "--server target is not in the node book");
+  assert.deepEqual(before, { mode: "ready", node: null, hub: null, role: "admin" }, "--server target is not in the node book");
 
   await con.switchTarget(entryB.id);
   const after = con.getSnapshot();

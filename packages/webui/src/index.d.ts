@@ -91,6 +91,18 @@ export interface SidecarOptions {
   /** nodesFile 给出即启用节点簿；nodesStore 直接注入实例（优先于 nodesFile） */
   nodesFile?: string | null;
   nodesStore?: NodeStore | null;
+  /** home-hub 2b：member 姿态（不生成配对码；connect/nodes 403；/api/* 404 零出站） */
+  member?: boolean;
+  /** home-hub 2b：hub 本机自动形态标记（row 2——/sidecar/state.hub_local） */
+  hubLocal?: boolean;
+  /** home-hub 2b：DWEB_HOME（注入即启用 /sidecar 本机数据面） */
+  homeDir?: string | null;
+  /** hub 投影注入面（机器名/网卡/探测 fetch/锁 pid 存活；测试用） */
+  hostname?: string;
+  interfaces?: NodeJS.Dict<import("node:os").NetworkInterfaceInfo[]> | null;
+  homeFetch?: typeof fetch;
+  homeIsPidAlive?: (pid: number) => boolean;
+  homeProbeTimeoutMs?: number;
 }
 
 export interface Sidecar {
@@ -166,13 +178,140 @@ export function createCapabilities(opts?: {
   random?: (n: number) => Buffer;
 }): CapabilityRegistry;
 
+// ---- core/home.mjs + core/cardkit.mjs（home-hub 2b/2c 本机数据面与接入卡片） ----
+
+export type LaunchKind = "hub-local" | "member" | "setup";
+
+export interface LaunchDecision {
+  kind: LaunchKind;
+  hubState: Record<string, unknown> | null;
+  /** hub-local 且可读时非 null——只进调用方进程内存，绝不入 argv/URL/浏览器状态 */
+  hubToken: string | null;
+  hubBase: string | null;
+}
+
+/** 无参启动分流（design §4.2 五行表 row 2-5；row 1 显式 --server 由调用方先行）。 */
+export function resolveLaunch(input: {
+  home: string;
+  setup?: boolean;
+  readToken?: (home: string) => Promise<string>;
+}): Promise<LaunchDecision>;
+
+export interface LeaseProjectionEntry {
+  id: string;
+  server: string;
+  relay_url: string;
+  server_id: string | null;
+  fabric_id: string;
+  root: string;
+  alias: string | null;
+  label: string | null;
+  registered_at: number;
+  expires_at: number;
+  /** 毫秒（可负=已过期）；本地快照语义——管理端续期不回写本机 */
+  expires_in: number | null;
+  receipt: unknown;
+}
+
+export function leasesProjection(
+  home: string,
+  ctx?: { now?: () => number },
+): Promise<{ leases: LeaseProjectionEntry[] }>;
+
+export interface VisitProjectionEntry {
+  server: string;
+  server_id: string | null;
+  first_visit_at: number;
+  last_visit_at: number | null;
+  last_probe: { result: "reachable" | "unreachable"; detail?: string; at: number };
+  note: string | null;
+}
+
+export function visitsProjection(home: string): Promise<{ visits: VisitProjectionEntry[] }>;
+
+/** 五类映射探测 + visits.json 落账（锁写复用 opendweb leases.mjs）。 */
+export function probeVisit(
+  home: string,
+  server: string,
+  ctx?: {
+    fetchImpl?: typeof fetch;
+    timeoutMs?: number;
+    now?: () => number;
+    isPidAlive?: (pid: number) => boolean;
+  },
+): Promise<{
+  probe: { result: "reachable" | "unreachable"; detail: string | null; at: number };
+  entry: VisitProjectionEntry;
+}>;
+
+export const LABEL_MAX_BYTES: number;
+
+/** label 行内编辑写入口（leases.mjs 锁协议；空串归一 null；未知 id not-found）。 */
+export function setLeaseLabel(
+  home: string,
+  id: string,
+  label: string | null,
+  ctx?: { now?: () => number; isPidAlive?: (pid: number) => boolean },
+): Promise<
+  | { ok: true; lease: LeaseProjectionEntry }
+  | { ok: false; code: "too-long" | "not-found" | "lock" }
+>;
+
+export interface HubProjection {
+  version: number;
+  machine: string;
+  urls: string[];
+  primary_url: string;
+  short_code: string;
+  qr_svg: string;
+  gateway_bind: string;
+  running: boolean;
+}
+
+/** hub.json 投影 + 接入卡片模型（与 CLI hub card 同源）；无 hub.json → null。 */
+export function hubProjection(
+  home: string,
+  ctx?: { hostname?: string; interfaces?: object; fetchImpl?: typeof fetch },
+): Promise<HubProjection | null>;
+
+/** getSnapshot().hub 槽位数据（fs-only；running=null=未探测）。 */
+export function hubSnapshotSlot(
+  home: string,
+  ctx?: { hostname?: string; interfaces?: object },
+): Promise<{ present: true; machine: string; primary_url: string; short_code: string; running: null } | null>;
+
+/** 接入卡片数据模型（与 CLI printHubCard 同一推导；输出即 renderHubCard 入参形状）。 */
+export function hubCardModel(input: {
+  hostname?: string;
+  interfaces?: NodeJS.Dict<import("node:os").NetworkInterfaceInfo[]>;
+  gatewayBind?: string;
+}): { machine: string; urls: string[]; primaryUrl: string; shortCode: string; port: number };
+
+/** 二维码 SVG（与终端 ASCII 同一 qrMatrix 矩阵的 webui 渲染层）。 */
+export function qrSvg(text: string, opts?: { scale?: number }): string;
+
+/** CLI `hub card` 同一渲染函数（懒加载 re-export——hub.mjs 传递依赖重，按需加载）。 */
+export function loadRenderHubCard(): Promise<
+  (input: { machine: string; urls: string[]; primaryUrl: string; shortCode: string }) => string
+>;
+
 // ---- core/console.mjs（进程内宿主） ----
+
+export interface HubSlot {
+  present: true;
+  machine: string;
+  primary_url: string;
+  short_code: string;
+  running: boolean | null;
+}
 
 export interface ConsoleSnapshot {
   mode: "setup" | "ready";
   node: PublicNode | null;
-  /** home-hub 2b 槽位：hub.json 投影落地后填充（2a 冻结为 null） */
-  hub: null;
+  /** home-hub 2b：hub.json 投影槽位（homeDir 数据面启用时；无 hub.json=null） */
+  hub: HubSlot | null;
+  /** admin | member（member=本机数据面姿态，SPA 不进 setup） */
+  role: "admin" | "member";
 }
 
 export interface ConsoleHandle {

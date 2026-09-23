@@ -20,6 +20,7 @@ import { homedir } from "node:os";
 import readline from "node:readline";
 import { validateTarget } from "./core/target.mjs";
 import { startSidecar } from "./core/sidecar.mjs";
+import { resolveLaunch } from "./core/home.mjs";
 
 /** bin 直跑形态的参数声明（与 plugin.mjs 的 manifest args 同集） */
 const ARG_SPEC = {
@@ -28,6 +29,7 @@ const ARG_SPEC = {
   port: "number",
   "allow-insecure": "boolean",
   "no-open": "boolean",
+  setup: "boolean",
 };
 
 const TOKEN_VISIBILITY_NOTE = {
@@ -43,11 +45,18 @@ const INSECURE_BANNER =
 const USAGE = `opendweb-webui - local management console (sidecar + UI)
 
 Usage:
-  opendweb-webui [--server <string>] [--token <string>] [--port <number>] [--allow-insecure] [--no-open]
+  opendweb-webui [--server <string>] [--token <string>] [--port <number>] [--allow-insecure] [--no-open] [--setup]
       ${TOKEN_VISIBILITY_NOTE.argv}
 
-Default (no --server) starts in setup mode: open the printed URL and pair a
-server with the one-time pairing code using the browser connect form.`;
+Default (no --server) resolves the home-hub launch mode: a local hub.json
+connects this machine's hub as admin (hub-token stays in-process); leases or
+visits data opens the member console (leases/visits only); an empty device
+starts the setup wizard. --setup forces the setup wizard on any device.`;
+
+/** DWEB_HOME 解析（hub.mjs resolveHubCtx 同拍：env 优先，缺省 ~/.opendweb）。 */
+function homeRoot(env) {
+  return env.DWEB_HOME ?? path.join(homedir(), ".opendweb");
+}
 
 /**
  * bin 直跑参数解析（--key value / --key=value / boolean flag；语义与
@@ -93,7 +102,7 @@ function coerceArg(type, raw, name) {
 /**
  * CLI 主流程（plugin run envelope 与 bin 共用）。
  * @param {Record<string, unknown>} args
- * @param {{ log?: (line?: string) => void, cwd?: string, stdout?: { write(s: string): void }, stderr?: { write(s: string): void }, env?: Record<string, string | undefined>, stdin?: { isTTY?: boolean }, signal?: import("node:events").EventEmitter, dns?: object, openImpl?: (url: string) => void, platform?: NodeJS.Platform, nodesFile?: string }} [io]
+ * @param {{ log?: (line?: string) => void, cwd?: string, stdout?: { write(s: string): void }, stderr?: { write(s: string): void }, env?: Record<string, string | undefined>, stdin?: { isTTY?: boolean }, signal?: import("node:events").EventEmitter, dns?: object, openImpl?: (url: string) => void, platform?: NodeJS.Platform, nodesFile?: string, homeDir?: string }} [io]
  * @returns {Promise<{ exit: number }>}
  */
 export async function main(args, io = {}) {
@@ -169,18 +178,65 @@ export async function main(args, io = {}) {
   // ~/.opendweb/），0600 私有文件——仅节点 token 落盘；帮助文本/横幅披露 OS 可见性。
   const nodesFile =
     io.nodesFile ?? env.DWEB_WEBUI_NODES_FILE ?? path.join(env.DWEB_HOME ?? homedir(), ".opendweb", "nodes.json");
+
+  // home-hub 2b 无参分流（design §4.2 五行表；row 1 显式 --server 已在上方处理，
+  // 行为不变）：--setup 强制 setup（row 5，member 态设备重新配对的显式通道）；
+  // hub.json 存在→hub 本机自动 admin（row 2——hub-token 进程内读取注入内存，
+  // 绝不入 argv/URL/浏览器状态；服务未跑=中枢视角+中枢状态卡）；无 hub.json +
+  // 有 leases/visits→member（row 3——不生成配对码、admin 面封闭）；零数据→
+  // setup 基线（row 4）。数据面（/sidecar/leases|visits|hub）跟随本机 DWEB_HOME。
+  /** @type {boolean} */
+  let member = false;
+  /** @type {boolean} */
+  let hubLocal = false;
+  /** @type {string | null} */
+  let homeDir = null;
+  if (target === null) {
+    const home = io.homeDir ?? homeRoot(env);
+    const decision = await resolveLaunch({ home, setup: args.setup === true });
+    if (decision.kind === "hub-local") {
+      hubLocal = true;
+      if (decision.hubToken !== null) {
+        const v = await validateTarget(decision.hubBase, { allowInsecure: false, dns });
+        if (v.ok) {
+          target = v.value;
+          token = decision.hubToken;
+          tokenSource = null; // 进程内读取（0600 hub-token 文件）——非 argv/env/tty 面
+        }
+        // 目标守卫失败（异常 bind 形态）：保持 hub-local admin 姿态、无 target——
+        // UI 落中枢视角+中枢状态卡；不降级 member/setup
+      }
+    } else if (decision.kind === "member") {
+      member = true;
+    }
+    homeDir = home;
+  }
+
   try {
-    sidecar = await startSidecar({ target, token, port, log, allowInsecure, dns, nodesFile });
+    sidecar = await startSidecar({
+      target,
+      token,
+      port,
+      log,
+      allowInsecure,
+      dns,
+      nodesFile: member ? null : nodesFile,
+      member,
+      hubLocal,
+      homeDir,
+    });
   } catch (e) {
     stderr.write(`error: webui: cannot start sidecar (${ascii(String(e?.message ?? e))})\n`);
     return { exit: 1 };
   }
   log(`opendweb-webui listening on ${sidecar.origin}`);
-  if (target === null) {
+  if (member) {
+    log(`member console: this device has leases or visits; the admin console is closed (re-pair with --setup)`);
+  } else if (target === null) {
     log(`pairing code: ${sidecar.pairingCode}`);
     log(`open ${sidecar.origin} in a browser and use the pairing code to connect a server`);
   } else {
-    log(`proxying to ${target.scheme}://${target.hostHeader}`);
+    log(`proxying to ${target.scheme}://${target.hostHeader}${hubLocal ? " (local hub)" : ""}`);
     if (target.insecure) log(INSECURE_BANNER);
     if (tokenSource === "argv" || tokenSource === "env") log(TOKEN_VISIBILITY_NOTE[tokenSource]);
   }

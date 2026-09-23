@@ -8,6 +8,7 @@
 	import * as Table from "$lib/components/ui/table";
 	import { CircleX, LoaderCircle, WifiOff } from "@lucide/svelte";
 	import { DISCONNECT_PHASE_LABEL } from "$lib/terms";
+	import { linkLabel } from "$lib/member";
 	import { shortHex } from "$lib/hex";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
@@ -160,7 +161,11 @@
 	{:else if cs.connData !== null}
 		<Card.Root class="gap-4 py-5">
 			<Card.Header>
-				<Card.Title class="text-base">按端点</Card.Title>
+				<Card.Title class="text-base">
+					按端点
+					<!-- home-hub F2：本组只含租户票接入的端点（访客单列于「按访客」） -->
+					<span class="ml-1.5 text-sm font-normal text-muted-foreground">仅租户端点</span>
+				</Card.Title>
 			</Card.Header>
 			<Card.Content>
 				{#if perEndpointAll.length === 0}
@@ -183,7 +188,22 @@
 						<Table.Body>
 							{#each perEndpoint as e (e.endpoint_id + e.fabric_id)}
 								<Table.Row>
-									<Table.Cell><HexValue value={e.endpoint_id} kind="端点" /></Table.Cell>
+									<Table.Cell>
+										<div class="flex items-center gap-2">
+											<HexValue value={e.endpoint_id} kind="端点" />
+											{#if e.link === "direct" || e.link === "relay"}
+												{@const link = linkLabel(e.link)}
+												<!-- G-3：直连中/借道中（服务端携带 link 字段时标注；缺失不标） -->
+												<Badge
+													variant="outline"
+													class={link.label === "直连中" ? "border-success/30 bg-success/10 text-success" : ""}
+													title={link.title}
+												>
+													{link.label}
+												</Badge>
+											{/if}
+										</div>
+									</Table.Cell>
 									<Table.Cell><HexValue value={e.fabric_id} kind="Fabric" /></Table.Cell>
 									<Table.Cell class="text-right font-mono tabular-nums">{e.connections}</Table.Cell>
 									<Table.Cell>
@@ -273,7 +293,21 @@
 						<Table.Body>
 							{#each perVisitorAll as v (v.endpoint_id)}
 								<Table.Row>
-									<Table.Cell><HexValue value={v.endpoint_id} kind="端点" /></Table.Cell>
+									<Table.Cell>
+										<div class="flex items-center gap-2">
+											<HexValue value={v.endpoint_id} kind="端点" />
+											{#if v.link === "direct" || v.link === "relay"}
+												{@const link = linkLabel(v.link)}
+												<Badge
+													variant="outline"
+													class={link.label === "直连中" ? "border-success/30 bg-success/10 text-success" : ""}
+													title={link.title}
+												>
+													{link.label}
+												</Badge>
+											{/if}
+										</div>
+									</Table.Cell>
 									<Table.Cell class="text-right font-mono tabular-nums">{v.connections}</Table.Cell>
 									<Table.Cell>
 										<div class="flex justify-end">

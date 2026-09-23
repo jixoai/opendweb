@@ -1,21 +1,33 @@
 // 本地管理 sidecar——core 运行时（webui-console design §2 / specs/webui「本地管理 sidecar」）。
 // 意图（2026-09-22，webui-console Phase A；2026-09-23 server-access-roles Phase 2b 增节点簿；
-// 2026-09-25 home-hub Phase 2a 迁入 src/core/ 并增事件总线/会话 capability/进程内宿主面）：
+// 2026-09-25 home-hub Phase 2a 迁入 src/core/ 并增事件总线/会话 capability/进程内宿主面；
+// 2026-09-25 home-hub Phase 2b 增 member 姿态与本机数据面）：
 // 1. 127.0.0.1 + 随机端口绑定；静态面 dist/（缺失降级占位页）+ SPA fallback；
 // 2. /api/* 白名单反代：GET/POST/DELETE → /admin/*（Bearer 注入；入站 raw
 //    path 独立解析 + 拼接后二次 /admin/ 断言，越界 404 且零出站）——按请求
 //    开始时的 target/token 快照完成（节点切换不撕裂在途请求）；
+//    member 姿态（home-hub design §4.2 row 3）：/api/* 一律 404 且零上游出站；
 // 3. /sidecar/connect 配对面：一次性配对码（常时比较/10min/连败 5 次销毁）
 //    + Host === 127.0.0.1:port + Origin 同源或缺失；成功即目标冻结；
+//    member 姿态：不生成配对码、connect 403（member-closed）；
 // 3b. /sidecar/nodes* 节点簿本地控制面（server-access-roles 版本化例外）：
 //    nodesFile 注入时启用——列表/添加（独立配对码，终端打印）/切换
 //    （POST /sidecar/nodes/switch {node_id}——仅已存节点，任何 URL/host 字段
 //    400；进程内原子替换 target+token，无需重启）/删除（当前节点 409）。
 //    响应/日志零 token（publicNode 投影）；其余 /sidecar/* 重指向仍 target-frozen；
+//    member 姿态：nodes 面全部 403；
 // 3c. /sidecar/session 会话 capability 引导面（home-hub 2a，design §5.1 冻结）：
 //    capabilities 注册表注入即启用——GET /sidecar/session?dweb_console=<cap>
 //    为一次性引导（≥128-bit、TTL 120s、绑定本实例、单次消费）；重放/过期/
 //    跨实例/close 后使用=403（重放留记录行，值不入日志）；query 不落访问日志；
+// 3d. /sidecar 本机数据面（home-hub 2b，design §4.2「本机数据路由」；homeDir
+//    注入即启用，core/home.mjs 复用 opendweb leases.mjs 锁协议/探测）：
+//    GET /sidecar/leases（投影含 expires_in）· GET /sidecar/visits ·
+//    GET /sidecar/hub（hub.json 投影+接入卡片模型；无 hub.json=404）——读路由
+//    沿用基线 Host 守卫（Host 精确 + Origin 同源或缺失，400 族）；
+//    POST /sidecar/visits/probe · PATCH /sidecar/leases/{id}/label——写路由
+//    Origin 严格策略（四类冻结：same-origin 200 / 缺失 Origin 403 / 伪造 403 /
+//    坏 Host 403；基线 guard 的缺失放行不适用于新写路由）；
 // 4. stdlib http/https.request 按解析 IP + SNI + Host 逐请求连接（agent:false
 //    + 响应结束/abort 即 destroy socket）；body 界 64KiB/1MiB；10s 超时；
 // 5. 日志只记 method/path/status/耗时——token 不进任何日志/响应。
@@ -33,6 +45,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateTarget } from "./target.mjs";
 import { NodeStore, publicNode } from "./nodes.mjs";
+import {
+  hubProjection,
+  hubSnapshotSlot,
+  leasesProjection,
+  probeVisit,
+  setLeaseLabel,
+  visitsProjection,
+} from "./home.mjs";
 
 /** 资源界与配对面参数（design §2.3/§2.2 冻结值） */
 export const LIMITS = {
@@ -188,9 +208,16 @@ export async function startSidecar(opts = {}) {
 /**
  * sidecar 全量内部句柄（home-hub 2a）：createConsole 的进程内宿主消费——
  * controls.switchNode=进程内切换（不经 HTTP）、controls.snapshot=同步快照。
- * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null }} [opts]
+ * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null, member?: boolean, hubLocal?: boolean, homeDir?: string | null, hostname?: string, interfaces?: object | null, homeFetch?: typeof fetch, homeIsPidAlive?: (pid: number) => boolean }} [opts]
  *   - bus：事件总线注入（schema v1 帧派发；缺省 null=不发事件，既有行为不变）
  *   - capabilities：会话 capability 注册表注入（启用 /sidecar/session 引导面）
+ *   - member（home-hub 2b design §4.2 row 3）：member 姿态——不生成配对码、
+ *     connect/nodes 403、/api/* 404 零出站；仅服务租约/到访数据面与静态 SPA
+ *   - hubLocal：row 2 标记（/sidecar/state.hub_local 与快照；hub 本机自动形态）
+ *   - homeDir：DWEB_HOME（注入即启用 /sidecar 本机数据面——leases/visits/hub/
+ *     probe/label；core/home.mjs）
+ *   - hostname/interfaces/homeFetch/homeIsPidAlive/homeProbeTimeoutMs：hub 投影
+ *     与锁协议/探测注入面（测试）
  * @returns {Promise<SidecarHandle>}
  */
 export async function createSidecar(opts = {}) {
@@ -207,6 +234,14 @@ export async function createSidecar(opts = {}) {
     nodesStore = null,
     bus = null,
     capabilities = null,
+    member = false,
+    hubLocal = false,
+    homeDir = null,
+    hostname,
+    interfaces = null,
+    homeFetch,
+    homeIsPidAlive,
+    homeProbeTimeoutMs,
   } = opts;
   if (target && (typeof token !== "string" || token === "")) {
     throw new Error("startSidecar: target requires a token");
@@ -224,11 +259,19 @@ export async function createSidecar(opts = {}) {
     token,
     /** 当前目标对应的节点簿条目 id（null = 目标来自 --server/setup 配对，未入簿） */
     currentNodeId: null,
+    /** member 姿态下不生成 setup 配对码（MUST NOT 生成或打印配对码） */
     pairing:
-      target === null
+      target === null && !member
         ? { code: generatePairingCode(), expiresAt: now() + LIMITS.pairingTtlMs, failures: 0, dead: false }
         : null,
   };
+  /** hub 槽位快照缓存（homeDir 启用数据面时启动即载，/sidecar/hub 命中时刷新） */
+  let hubSlot = null;
+  if (homeDir !== null) {
+    hubSlot = await hubSnapshotSlot(path.resolve(homeDir), { hostname, interfaces: interfaces ?? undefined }).catch(
+      () => null,
+    );
+  }
   /**
    * 节点簿添加配对码（独立于 setup 配对面；每次成功添加或连败 5 次即轮换新码
    * 并打印终端——「每次新配对码」；措辞避开 "pairing code: " 前缀，防与 setup
@@ -276,6 +319,13 @@ export async function createSidecar(opts = {}) {
 
   async function handleApi(req, res) {
     const startedAt = now();
+    if (member) {
+      // member 姿态（design §4.2 row 3 负向矩阵）：/api/*（→ /admin/*）全部
+      // 404 且零上游出站——此 return 先于任何 target/proxy 动作，结构上无出站面
+      sendJson(res, 404, { error: { code: "not-found" } });
+      logAccess(req, 404, startedAt);
+      return;
+    }
     if (state.mode === "setup") {
       sendJson(res, 503, { error: { code: "no-target", message: "no target configured; open the sidecar URL and pair a server first" } });
       logAccess(req, 503, startedAt);
@@ -412,11 +462,15 @@ export async function createSidecar(opts = {}) {
     const startedAt = now();
     // GET /sidecar/state：SPA 启动期状态暴露面（design §4）——phase + 掩码
     // host + insecure 明文标志。MUST NOT 含 token/完整 URL/配对码。
+    // home-hub 2b 增量字段：role（admin|member——member 态 SPA 不进 setup）、
+    // hub_local（row 2 hub 本机自动形态标记——中枢视角/中枢状态卡的数据源）。
     if (req.method === "GET" && req.url === "/sidecar/state") {
       const body = {
         phase: state.mode,
         server_host_masked: state.target === null ? null : maskTarget(state.target),
         insecure: state.target?.insecure === true,
+        role: member ? "member" : "admin",
+        hub_local: hubLocal === true,
       };
       const buf = Buffer.from(JSON.stringify(body), "utf8");
       res.writeHead(200, {
@@ -428,10 +482,29 @@ export async function createSidecar(opts = {}) {
       logAccess(req, 200, startedAt);
       return;
     }
+    // 本机数据面（home-hub 2b /sidecar/leases|visits|hub + probe/label）：
+    // homeDir 注入即启用（member 与 admin 姿态都服务——三视角数据互不串扰，
+    // 数据面本身无 admin 概念）。
+    if (
+      homeDir !== null &&
+      (req.url === "/sidecar/leases" ||
+        req.url?.startsWith("/sidecar/leases/") ||
+        req.url === "/sidecar/visits" ||
+        req.url?.startsWith("/sidecar/visits/") ||
+        req.url === "/sidecar/hub")
+    ) {
+      await handleHomeData(req, res, startedAt);
+      return;
+    }
     // 节点簿本地控制面（/sidecar/nodes*）：ready 态仍可用——switch 是唯一被
     // 许可的运行时重指向通道（server-access-roles 版本化例外），先于
-    // target-frozen 门分流。
+    // target-frozen 门分流。member 姿态：403（admin 面全封闭）。
     if (req.url === "/sidecar/nodes" || req.url?.startsWith("/sidecar/nodes/")) {
+      if (member) {
+        sendJson(res, 403, { error: { code: "member-closed", message: "this sidecar runs in member mode; the admin console is closed" } });
+        logAccess(req, 403, startedAt);
+        return;
+      }
       await handleNodes(req, res, startedAt);
       return;
     }
@@ -446,6 +519,12 @@ export async function createSidecar(opts = {}) {
     if (req.method !== "POST") {
       sendJson(res, 404, { error: { code: "not-found" } });
       logAccess(req, 404, startedAt);
+      return;
+    }
+    if (member) {
+      // member 姿态负向矩阵：/sidecar/connect 403（不生成配对码、无重指向面）
+      sendJson(res, 403, { error: { code: "member-closed", message: "this sidecar runs in member mode; pairing is closed (run with --setup to re-pair)" } });
+      logAccess(req, 403, startedAt);
       return;
     }
     if (state.mode === "ready") {
@@ -578,6 +657,173 @@ export async function createSidecar(opts = {}) {
       insecure: state.target?.insecure === true,
     });
     logAccess(req, 200, startedAt);
+  }
+
+  // ---- /sidecar 本机数据面（home-hub 2b：leases/visits/hub + probe/label） ---------
+
+  /**
+   * 写路由严格守卫（probe/label；design §4.2 r2-P2-2 冻结四类）：
+   * same-origin→放行；缺失 Origin→403；不匹配/伪造→403；坏 Host→403。
+   * 与基线 guardLocalOrigin 的差异：Origin 必须存在且精确匹配（浏览器
+   * same-origin 写请求必带 Origin；裸 HTTP 客户端缺失即拒）。
+   */
+  function guardWriteOrigin(req, res, startedAt) {
+    if (req.headers.host !== `127.0.0.1:${actualPort}`) {
+      sendJson(res, 403, { error: { code: "bad-origin-host", message: "Host header must be the sidecar origin" } });
+      logAccess(req, 403, startedAt);
+      return false;
+    }
+    const originHeader = req.headers.origin;
+    if (typeof originHeader !== "string" || originHeader !== origin) {
+      sendJson(res, 403, { error: { code: "bad-origin-host", message: "writes require an exact same-origin Origin header" } });
+      logAccess(req, 403, startedAt);
+      return false;
+    }
+    return true;
+  }
+
+  /** 读路由（GET leases/visits/hub）：账本不可读=500 fail-closed，不静默伪造空簿。 */
+  async function handleHomeData(req, res, startedAt) {
+    const home = path.resolve(/** @type {string} */ (homeDir));
+    const url = req.url ?? "";
+
+    // GET /sidecar/leases：投影含 expires_in（本地快照）
+    if (req.method === "GET" && url === "/sidecar/leases") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      try {
+        sendJson(res, 200, await leasesProjection(home, { now }));
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 500, { error: { code: "ledger-unreadable", message: safeError(e) } });
+        logAccess(req, 500, startedAt);
+      }
+      return;
+    }
+
+    // GET /sidecar/visits：best-effort 到访簿投影
+    if (req.method === "GET" && url === "/sidecar/visits") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      try {
+        sendJson(res, 200, await visitsProjection(home));
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 500, { error: { code: "ledger-unreadable", message: safeError(e) } });
+        logAccess(req, 500, startedAt);
+      }
+      return;
+    }
+
+    // GET /sidecar/hub：hub.json 投影（接入卡片模型 + 运行探测）；无 hub.json=404
+    if (req.method === "GET" && url === "/sidecar/hub") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      /** @type {null | { machine: string, primary_url: string, short_code: string, running: boolean }} */
+      let proj = null;
+      try {
+        proj = await hubProjection(home, { hostname, interfaces: interfaces ?? undefined, fetchImpl: homeFetch });
+      } catch (e) {
+        sendJson(res, 500, { error: { code: "hub-state-unreadable", message: safeError(e) } });
+        logAccess(req, 500, startedAt);
+        return;
+      }
+      if (proj === null) {
+        sendJson(res, 404, { error: { code: "not-found", message: "no hub on this device" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      hubSlot = { present: true, machine: proj.machine, primary_url: proj.primary_url, short_code: proj.short_code, running: proj.running };
+      sendJson(res, 200, proj);
+      logAccess(req, 200, startedAt);
+      return;
+    }
+
+    // POST /sidecar/visits/probe {server}：五类映射探测 + visits 落账（锁写）
+    if (req.method === "POST" && url === "/sidecar/visits/probe") {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const body = await readBody(req, res);
+      if (body === null) {
+        logAccess(req, 413, startedAt);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body.toString("utf8"));
+      } catch {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be JSON" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const server = typeof parsed?.server === "string" ? parsed.server.trim() : "";
+      let originOk = false;
+      try {
+        const u = new URL(server);
+        originOk = (u.protocol === "http:" || u.protocol === "https:") && u.pathname === "/" && (u.search === "" && u.hash === "");
+      } catch {
+        originOk = false;
+      }
+      if (server === "" || !originOk) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "server must be an absolute http(s) origin like http://192.168.2.13:8787" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      try {
+        sendJson(res, 200, await probeVisit(home, server, { fetchImpl: homeFetch, timeoutMs: homeProbeTimeoutMs, now, isPidAlive: homeIsPidAlive }));
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 500, { error: { code: "probe-failed", message: safeError(e) } });
+        logAccess(req, 500, startedAt);
+      }
+      return;
+    }
+
+    // PATCH /sidecar/leases/{id}/label {label: string|null}
+    const labelMatch = /^\/sidecar\/leases\/([0-9a-zA-Z-]+)\/label$/.exec(url);
+    if (req.method === "PATCH" && labelMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const body = await readBody(req, res);
+      if (body === null) {
+        logAccess(req, 413, startedAt);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body.toString("utf8"));
+      } catch {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be JSON" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed) || !("label" in parsed)) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {label: string|null}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const label = parsed.label;
+      if (label !== null && typeof label !== "string") {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "label must be a string or null" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const r = await setLeaseLabel(home, labelMatch[1], label, { now, isPidAlive: homeIsPidAlive });
+      if (!r.ok) {
+        // 未知 id=404；超长=400（setLeaseLabel 复核，双保险）；锁获取失败=503
+        const status = r.code === "not-found" ? 404 : r.code === "too-long" ? 400 : 503;
+        const message =
+          r.code === "not-found"
+            ? "unknown lease id"
+            : r.code === "too-long"
+              ? `label exceeds 64 UTF-8 bytes`
+              : "cannot acquire the leases lock; try again";
+        sendJson(res, status, { error: { code: r.code, message } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, { lease: r.lease });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+
+    sendJson(res, 404, { error: { code: "not-found" } });
+    logAccess(req, 404, startedAt);
   }
 
   // ---- /sidecar/nodes* 节点簿（server-access-roles 版本化例外面） ---------------
@@ -948,7 +1194,8 @@ export async function createSidecar(opts = {}) {
 
   /**
    * 进程内控制面：switchNode=switchCore 直调（进程内原子替换+事件）；
-   * snapshot=调用时刻同步快照（三视角数据面 2b/2c 落地——hub 槽位已留）。
+   * snapshot=调用时刻同步快照（hub 槽位为最近一次投影缓存——启动即载、
+   * /sidecar/hub 命中时刷新；running=null=未探测）。
    */
   const controls = {
     switchNode: (/** @type {string} */ nodeId) => switchCore(nodeId),
@@ -957,8 +1204,8 @@ export async function createSidecar(opts = {}) {
       return {
         mode: state.mode,
         node: entry !== null ? publicNode(entry, true) : null,
-        // home-hub 2b：GET /sidecar/hub（hub.json 投影）落地后填充；2a 槽位冻结
-        hub: null,
+        hub: hubSlot,
+        role: member ? "member" : "admin",
       };
     },
   };
@@ -993,7 +1240,7 @@ export async function createSidecar(opts = {}) {
  * @property {() => "setup" | "ready"} mode
  * @property {string | null} pairingCode
  * @property {() => string | null} nodePairingCode
- * @property {{ switchNode: (nodeId: string) => Promise<{ ok: true, node: object } | { ok: false, status: number, code: string, message: string }>, snapshot: () => { mode: "setup" | "ready", node: { id: string, name: string, server_host: string, added_at: number, current: boolean } | null, hub: null } }} controls
+ * @property {{ switchNode: (nodeId: string) => Promise<{ ok: true, node: object } | { ok: false, status: number, code: string, message: string }>, snapshot: () => { mode: "setup" | "ready", node: { id: string, name: string, server_host: string, added_at: number, current: boolean } | null, hub: { present: true, machine: string, primary_url: string, short_code: string, running: boolean | null } | null, role: "admin" | "member" } }} controls
  * @property {import("./events.mjs").EventBus | null} bus
  * @property {import("./capability.mjs").CapabilityRegistry | null} capabilities
  * @property {() => Promise<void>} close

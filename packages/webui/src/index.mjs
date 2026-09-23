@@ -17,3 +17,16 @@ export { defaultDns, validateTarget } from "./core/target.mjs";
 export { createConsole, CAPABILITY_QUERY_PARAM } from "./core/console.mjs";
 export { EVENT_TYPES, EventBus, eventFrame } from "./core/events.mjs";
 export { createCapabilities, CAPABILITY_TTL_MS } from "./core/capability.mjs";
+// home-hub 2b/2c 本机数据面与接入卡片同源面（core/home.mjs + cardkit.mjs）：
+// 分流裁决 / leases·visits·hub 投影 / label 锁写 / probe / 卡片模型与 SVG。
+export {
+  LABEL_MAX_BYTES,
+  resolveLaunch,
+  leasesProjection,
+  visitsProjection,
+  probeVisit,
+  setLeaseLabel,
+  hubProjection,
+  hubSnapshotSlot,
+} from "./core/home.mjs";
+export { hubCardModel, qrSvg, loadRenderHubCard } from "./core/cardkit.mjs";

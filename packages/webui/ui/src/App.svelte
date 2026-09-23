@@ -1,6 +1,9 @@
 <script lang="ts">
-	// 应用壳：启动失败面 / setup 世界 / ready 世界（三角色管理台 IA）。
+	// 应用壳：启动失败面 / setup 世界 / 三视角应用世界（home-hub [H5]）。
 	// 副作用生命周期在此接线；状态与动作全部在 console store。
+	// 我的中枢视角 = 既有四页（server-access-roles 冻结面零回退）+ 接入卡片卡/
+	// 中枢状态卡（总览置顶）；我的租约 / 我的到访 = 单页台账（无侧栏导航）；
+	// member 态访问中枢页 → no-hub 诚实页。视角切换 = hash 驱动整页重渲。
 	import { Button } from "$lib/components/ui/button";
 	import { Skeleton } from "$lib/components/ui/skeleton";
 	import { Toaster } from "$lib/components/ui/sonner";
@@ -14,24 +17,31 @@
 	import TenantsView from "./components/TenantsView.svelte";
 	import VisitorsView from "./components/VisitorsView.svelte";
 	import OnlineView from "./components/OnlineView.svelte";
+	import LeaseView from "./components/LeaseView.svelte";
+	import VisitsView from "./components/VisitsView.svelte";
+	import NoHubView from "./components/NoHubView.svelte";
+	import HubAccessCard from "./components/HubAccessCard.svelte";
+	import HubStatusCard from "./components/HubStatusCard.svelte";
 
-	// store 生命周期（hash 监听（含旧路由收敛）+ sidecar state 首拉）
+	// store 生命周期（hash 监听（含旧路由收敛）+ sidecar state 首拉 + 默认视角裁决）
 	$effect(() => {
 		cs.start();
 		return () => cs.stop();
 	});
 
-	// ready 态常驻轮询（phase 翻转时重启；切页不消失，5s 驱动顶栏健康灯与待办徽章）
+	// 应用世界常驻轮询（admin=在线面 5s + 成员面 3s；member=仅成员面；phase/姿态
+	// 翻转时重启；切页不消失）
 	$effect(() => {
-		if (cs.phase === "ready") cs.$poll();
+		if (cs.appWorld) cs.$poll();
 	});
 
-	// 各页数据拉取：总览需要名册计数；租户页需要名册+邀请码；门禁页需要
-	// 敲门/访客/黑名单——进页即拉，动作后各自刷新。
+	// 各页数据拉取：中枢四页（admin）进页即拉，动作后各自刷新；租约/到访页由
+	// 3s 列表轮询覆盖（首拍在 $poll 内）。
 	$effect(() => {
-		if (cs.phase !== "ready") return;
+		if (!cs.appWorld || cs.role !== "admin") return;
 		const view = cs.route.view;
 		if (view === "overview" || view === "tenants") void cs.refreshOwners();
+		if (view === "overview") void cs.refreshHub();
 		if (view === "tenants") void cs.refreshCodes();
 		if (view === "visitors") {
 			void cs.refreshKnocks();
@@ -42,7 +52,9 @@
 
 	const bootLoading = $derived(cs.sidecar === null && cs.sidecarError === null);
 	const bootFailed = $derived(cs.sidecar === null && cs.sidecarError !== null);
-	const setupWorld = $derived(cs.phase === "setup" || cs.connectResult?.ok === true);
+	const setupWorld = $derived((cs.phase === "setup" && cs.role !== "member") || cs.connectResult?.ok === true);
+	// 中枢视角的首页数据条件（admin：四页；member：no-hub）
+	const hubPerspective = $derived(cs.perspective === "hub");
 </script>
 
 <Toaster position="bottom-right" richColors={false} />
@@ -74,26 +86,48 @@
 {:else if setupWorld}
 	<SetupWizard />
 {:else}
-	<div class="flex min-h-svh flex-col" data-phase="ready">
+	<div class="flex min-h-svh flex-col" data-phase="ready" data-role={cs.role} data-perspective={cs.perspective}>
 		<TopBar />
-		{#if cs.sidecar?.insecure === true}
+		{#if cs.sidecar?.insecure === true && hubPerspective && cs.role === "admin"}
 			<InsecureStrip />
 		{/if}
-		<div class="flex flex-1">
-			<SideNav />
-			<main class="flex-1 px-4 py-6 lg:px-8">
-				<div class="mx-auto flex w-full max-w-6xl flex-col">
-					{#if cs.route.view === "overview"}
-						<OverviewView />
-					{:else if cs.route.view === "tenants"}
-						<TenantsView />
-					{:else if cs.route.view === "visitors"}
-						<VisitorsView />
-					{:else}
-						<OnlineView />
-					{/if}
-				</div>
+		{#if hubPerspective && cs.role === "admin"}
+			<div class="flex flex-1">
+				<SideNav />
+				<main class="flex-1 px-4 py-6 lg:px-8">
+					<div class="mx-auto flex w-full max-w-6xl flex-col gap-6">
+						{#if cs.route.view === "overview"}
+							<!-- 中枢状态卡（hub 本机自动形态且服务未跑）与接入卡片卡（真源）置顶 -->
+							{#if cs.hubLocal && cs.hubData?.running === false}
+								<HubStatusCard />
+							{/if}
+							<HubAccessCard />
+							<OverviewView />
+						{:else if cs.route.view === "tenants"}
+							<TenantsView />
+						{:else if cs.route.view === "visitors"}
+							<VisitorsView />
+						{:else}
+							<OnlineView />
+						{/if}
+					</div>
+				</main>
+			</div>
+		{:else if cs.route.view === "lease"}
+			<!-- 我的租约：单页直给，不虚构层级 -->
+			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">
+				<LeaseView />
 			</main>
-		</div>
+		{:else if cs.route.view === "visits"}
+			<!-- 我的到访：单页直给 -->
+			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">
+				<VisitsView />
+			</main>
+		{:else}
+			<!-- member 态的中枢视角：诚实页（零 admin 概念） -->
+			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">
+				<NoHubView />
+			</main>
+		{/if}
 	</div>
 {/if}

@@ -106,6 +106,10 @@ export interface SidecarState {
   phase: "setup" | "ready";
   server_host_masked: string | null;
   insecure: boolean;
+  /** home-hub 2b 增量：姿态（member=本机数据面姿态，SPA 不进 setup）；缺省 admin */
+  role?: "admin" | "member";
+  /** home-hub 2b 增量：hub 本机自动形态（row 2——中枢视角/中枢状态卡数据源） */
+  hub_local?: boolean;
 }
 
 /** SidecarState 结构守卫（r8-P2-2 API 边界校验）：畸形 JSON 不进组件状态。 */
@@ -116,7 +120,15 @@ function parseSidecarState(v: unknown): SidecarState {
   if (o.phase !== "setup" && o.phase !== "ready") throw bad();
   if (o.server_host_masked !== null && typeof o.server_host_masked !== "string") throw bad();
   if (typeof o.insecure !== "boolean") throw bad();
-  return { phase: o.phase, server_host_masked: o.server_host_masked, insecure: o.insecure };
+  if (o.role !== undefined && o.role !== "admin" && o.role !== "member") throw bad();
+  if (o.hub_local !== undefined && typeof o.hub_local !== "boolean") throw bad();
+  return {
+    phase: o.phase,
+    server_host_masked: o.server_host_masked,
+    insecure: o.insecure,
+    ...(o.role !== undefined ? { role: o.role } : {}),
+    ...(o.hub_local !== undefined ? { hub_local: o.hub_local } : {}),
+  };
 }
 
 /** GET /sidecar/state → {phase, server_host_masked, insecure}（经边界结构校验）。 */
@@ -181,6 +193,79 @@ export function postConnect(payload: { pairing_code: string; server: string; tok
   });
 }
 
+// ---- /sidecar 本机数据面（home-hub 2b：leases/visits/hub/probe/label） ----------
+
+/** 租约条目投影（GET /sidecar/leases；expires_in=本地快照倒计时毫秒）。 */
+export interface LeaseEntry {
+  id: string;
+  server: string;
+  relay_url: string;
+  server_id: string | null;
+  fabric_id: string;
+  root: string;
+  alias: string | null;
+  label: string | null;
+  registered_at: number;
+  expires_at: number;
+  expires_in: number | null;
+  receipt: { ts: number; generation: number; code_hash: string; receipt_sig: string } | null;
+}
+
+/** GET /sidecar/leases → {leases:[…]}。 */
+export function fetchSidecarLeases(): Promise<{ leases: LeaseEntry[] }> {
+  return jsonFetch("/sidecar/leases") as Promise<{ leases: LeaseEntry[] }>;
+}
+
+/** 到访条目投影（GET /sidecar/visits；best-effort 账本）。 */
+export interface VisitEntry {
+  server: string;
+  server_id: string | null;
+  first_visit_at: number;
+  last_visit_at: number | null;
+  last_probe: { result: "reachable" | "unreachable"; detail?: string; at: number };
+  note: string | null;
+}
+
+/** GET /sidecar/visits → {visits:[…]}。 */
+export function fetchSidecarVisits(): Promise<{ visits: VisitEntry[] }> {
+  return jsonFetch("/sidecar/visits") as Promise<{ visits: VisitEntry[] }>;
+}
+
+/** POST /sidecar/visits/probe {server} → {probe, entry}（五类映射 + 落账）。 */
+export function probeSidecarVisit(server: string): Promise<{ probe: { result: "reachable" | "unreachable"; detail: string | null; at: number }; entry: VisitEntry }> {
+  return jsonFetch("/sidecar/visits/probe", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ server }),
+  }) as Promise<{ probe: { result: "reachable" | "unreachable"; detail: string | null; at: number }; entry: VisitEntry }>;
+}
+
+/** PATCH /sidecar/leases/{id}/label {label: string|null}（空串语义在客户端先行归一为 null）。 */
+export function patchSidecarLeaseLabel(id: string, label: string | null): Promise<{ lease: LeaseEntry }> {
+  return jsonFetch(`/sidecar/leases/${encodeURIComponent(id)}/label`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ label }),
+  }) as Promise<{ lease: LeaseEntry }>;
+}
+
+/** hub.json 投影 + 接入卡片模型（GET /sidecar/hub；无 hub.json=404 → AdminError）。 */
+export interface HubData {
+  version: number;
+  machine: string;
+  urls: string[];
+  primary_url: string;
+  short_code: string;
+  qr_svg: string;
+  gateway_bind: string;
+  running: boolean;
+}
+
+/** GET /sidecar/hub（调用方以 404 判定「这台设备没有中枢身份」）。 */
+export function fetchSidecarHub(): Promise<HubData> {
+  return jsonFetch("/sidecar/hub") as Promise<HubData>;
+}
+
 // ---- /api/* 业务代理面（wire 冻结于 sdk-mgmt-surface specs/server） -----------
 
 /** GET /api/status → {mode, policy, generation, active_connections[], …} */
@@ -216,10 +301,15 @@ export interface ConnectionsData {
   policy?: string;
   relay_enabled: boolean;
   quota: { configured?: boolean; max_connections_per_owner?: number };
-  per_endpoint: { endpoint_id: string; fabric_id: string; connections: number }[];
+  /**
+   * 每端点在线投影。home-hub G-3 增量位 `link`：服务端将来携带 "direct"|"relay"
+   * 时 UI 标「直连中/借道中」；当前服务端 wire 无此字段——缺失即不标（如实
+   * 呈现，不虚构链路状态）。
+   */
+  per_endpoint: { endpoint_id: string; fabric_id: string; connections: number; link?: string }[];
   per_owner: { fabric_id: string; connections: number }[];
   /** 三角色增量：访客在线投影（fabric=None 的连接；endpoint_id 字典序） */
-  per_visitor?: { endpoint_id: string; connections: number }[];
+  per_visitor?: { endpoint_id: string; connections: number; link?: string }[];
 }
 
 /** GET /api/connections → {mode, relay_enabled, quota{}, per_endpoint[], per_owner[], per_visitor?[]} */

@@ -20,8 +20,11 @@ import {
 	disconnectByEndpoint,
 	disconnectByFabric,
 	dismissKnock,
+	fetchSidecarHub,
+	fetchSidecarLeases,
 	fetchSidecarNodes,
 	fetchSidecarState,
+	fetchSidecarVisits,
 	grantVisitor,
 	grantVisitorFromKnock,
 	issueCode,
@@ -33,8 +36,10 @@ import {
 	loadStatus,
 	loadVisitors,
 	patchOwnerMeta,
+	patchSidecarLeaseLabel,
 	patchVisitorMeta,
 	postConnect,
+	probeSidecarVisit,
 	registerOwner,
 	renewOwner,
 	revokeCode,
@@ -47,19 +52,36 @@ import {
 	type BlocklistData,
 	type CodeEntry,
 	type ConnectionsData,
+	type HubData,
 	type KnockEntry,
+	type LeaseEntry,
 	type OwnersData,
 	type Receipt,
 	type SidecarNode,
 	type SidecarState,
 	type StatusData,
+	type VisitEntry,
 	type VisitorEntry,
 } from "./api";
-import { routeFor, canonicalHashFor, type Route } from "./route";
+import {
+	PERSPECTIVE_HASH,
+	canonicalHashFor,
+	defaultPerspective,
+	rememberedPerspective,
+	rememberPerspective,
+	routeFor,
+	perspectiveFor,
+	type Perspective,
+	type Route,
+} from "./route";
 import { validateHex64 } from "./hex";
 import { aliasEditError, aliasEditSubmit, type DisconnectPhase } from "./terms";
+import { labelEditError, labelEditSubmit } from "./member";
+import { leaseState } from "./format";
 
 export const POLL_MS = 5_000;
+/** 成员面列表轮询（home-hub F1：3s——与在线面同拍节奏、同一可见性门控机制）。 */
+export const LIST_POLL_MS = 3_000;
 export const CONVERGE_POLL_MS = 1_000;
 /** 断连收敛观测上界 ~15s（design §4 有界轮询） */
 export const CONVERGE_MAX_POLLS = 15;
@@ -139,8 +161,13 @@ export interface AddNodeForm {
 
 /** 在线表快照里目标是否仍在（断连收敛观测）。 */
 function snapshotHasTarget(data: ConnectionsData | null, kind: "endpoint" | "fabric", id: string): boolean {
-	const rows = Array.isArray(data?.per_endpoint) ? data.per_endpoint : [];
-	return rows.some((e) => (kind === "endpoint" ? e.endpoint_id === id : e.fabric_id === id));
+  const rows = Array.isArray(data?.per_endpoint) ? data.per_endpoint : [];
+  return rows.some((e) => (kind === "endpoint" ? e.endpoint_id === id : e.fabric_id === id));
+}
+
+/** 租约条目 → 状态（本地快照边界与名册侧 leaseState 同源）。 */
+function leaseStateOf(l: { expires_at?: number | null }) {
+  return leaseState(typeof l.expires_at === "number" ? l.expires_at : null);
 }
 
 const visible = () => document.visibilityState === "visible";
@@ -222,6 +249,25 @@ class ConsoleStore {
 	connConfirm = $state<ConnConfirm | null>(null);
 	disconnect = $state<DisconnectState | null>(null);
 
+	// ---- 三视角成员面（home-hub 2b：本机租约/到访/hub 数据面） -----------------------
+
+	leasesData = $state<{ leases: LeaseEntry[] } | null>(null);
+	leasesError = $state<AdminError | null>(null);
+	visitsData = $state<{ visits: VisitEntry[] } | null>(null);
+	visitsError = $state<AdminError | null>(null);
+	hubData = $state<HubData | null>(null);
+	hubError = $state<AdminError | null>(null);
+	/** GET /sidecar/hub 404 = 这台设备没有中枢身份（正常态呈现，不是错误）。 */
+	hubAbsent = $state(false);
+	/** 行内展开的租约 id（一次至多一条）。 */
+	leaseExpanded = $state<string | null>(null);
+	/** label 行内编辑会话（id 定位；prev/value trim 前）。 */
+	leaseLabelEdit = $state<{ id: string; server: string; prev: string; value: string } | null>(null);
+	leaseLabelEditError = $state<string | null>(null);
+	leaseLabelBusy = $state(false);
+	/** 「测一下」进行中的目标 origin（按钮 Loading 锁，防重复触发）。 */
+	probeBusy = $state<string | null>(null);
+
 	detailsOpen = $state(false);
 	onlineFilter = $state<string | null>(null);
 
@@ -230,8 +276,41 @@ class ConsoleStore {
 	get phase(): "setup" | "ready" {
 		return this.sidecar !== null && this.sidecar.phase === "ready" ? "ready" : "setup";
 	}
+	/** home-hub 2b：sidecar 姿态（member=本机数据面——SPA 不进 setup 世界）。 */
+	get role(): "admin" | "member" {
+		return this.sidecar?.role === "member" ? "member" : "admin";
+	}
+	/** hub 本机自动形态（row 2）——中枢视角/中枢状态卡的数据源。 */
+	get hubLocal(): boolean {
+		return this.sidecar?.hub_local === true;
+	}
+	/** 应用世界：ready(admin) 或 member——setup 引导只在 admin 姿态无目标时出现。 */
+	get appWorld(): boolean {
+		return this.phase === "ready" || this.role === "member";
+	}
 	get route(): Route {
-		return routeFor(this.hash, this.phase);
+		return routeFor(this.hash, this.appWorld ? "ready" : "setup", this.role);
+	}
+	/** 当前视角（切换器高亮与外壳分派）。 */
+	get perspective(): Perspective {
+		return perspectiveFor(this.route.view);
+	}
+	/** 租约临期计数（切换器徽章与租约页同源；≤7 天未到期）。 */
+	get leaseExpiringCount(): number {
+		const leases = Array.isArray(this.leasesData?.leases) ? this.leasesData!.leases : [];
+		return leases.filter((l) => {
+			const state = leaseStateOf(l);
+			return state.state === "expiring";
+		}).length;
+	}
+	/** 最近一条临期租约（首屏黄条呈现对象；null=无临期）。 */
+	get soonestExpiring(): LeaseEntry | null {
+		const leases = Array.isArray(this.leasesData?.leases) ? this.leasesData!.leases : [];
+		return (
+			leases
+				.filter((l) => leaseStateOf(l).state === "expiring")
+				.sort((a, b) => (a.expires_at ?? 0) - (b.expires_at ?? 0))[0] ?? null
+		);
 	}
 	/** 名册行「在用」状态源：per_owner 的 fabric 集合（快照快）。 */
 	get onlineFabricSet(): Set<string> {
@@ -255,12 +334,15 @@ class ConsoleStore {
 	};
 	#statusTimer: ReturnType<typeof setInterval> | null = null;
 	#connTimer: ReturnType<typeof setInterval> | null = null;
+	#listTimer: ReturnType<typeof setInterval> | null = null;
 	#visHandler: (() => void) | null = null;
+	/** boot 默认视角只裁决一次（deep link 优先；此后记忆最近使用）。 */
+	#initialRouteSettled = false;
 
 	start(): void {
 		window.addEventListener("hashchange", this.#hashHandler);
 		this.applyHash(location.hash);
-		void this.refreshSidecar();
+		void this.refreshSidecar().then(() => this.#settleInitialRoute());
 	}
 	/** 旧路由 301 式收敛（应用内重定向，不 404）：非规范 hash 就地 replace 为规范形态。 */
 	applyHash(raw: string): void {
@@ -274,9 +356,52 @@ class ConsoleStore {
 				location.hash = canonical; // 无 history 权限的环境退化为赋值
 			}
 			this.hash = canonical;
+			this.#rememberCurrent();
 			return;
 		}
 		this.hash = raw;
+		this.#rememberCurrent();
+	}
+	/** 视角记忆：进入应用世界后的每次 hash 变化记住所属视角（spec「此后记忆最近使用」）。 */
+	#rememberCurrent(): void {
+		if (!this.appWorld) return;
+		rememberPerspective(window.localStorage, this.perspective);
+	}
+	/**
+	 * boot 默认视角（home-hub spec：hub.json 存在→中枢；有租约→租约；有到访→
+	 * 到访；全空→中枢引导态；记忆最近使用优先于自动选择；显式深链最优先——
+	 * 托盘/`hub open` 的落点不被覆盖）。
+	 */
+	async #settleInitialRoute(): Promise<void> {
+		if (this.#initialRouteSettled) return;
+		this.#initialRouteSettled = true;
+		const raw = location.hash;
+		if (raw !== "" && raw !== "#" && raw !== "#/") {
+			this.#rememberCurrent();
+			return;
+		}
+		const hubPresent = await this.refreshHub().then(
+			() => !this.hubAbsent,
+			() => false,
+		);
+		const leases = await this.refreshLeases().then(
+			() => (Array.isArray(this.leasesData?.leases) ? this.leasesData!.leases.length : 0),
+			() => 0,
+		);
+		const visits = await this.refreshVisits().then(
+			() => (Array.isArray(this.visitsData?.visits) ? this.visitsData!.visits.length : 0),
+			() => 0,
+		);
+		const auto = defaultPerspective({ role: this.role, hubLocal: this.hubLocal, hubPresent, leases, visits });
+		const target = rememberedPerspective(window.localStorage) ?? auto;
+		const hash = PERSPECTIVE_HASH[target];
+		try {
+			history.replaceState(null, "", hash);
+		} catch {
+			location.hash = hash;
+		}
+		this.hash = hash;
+		this.#rememberCurrent();
 	}
 	stop(): void {
 		window.removeEventListener("hashchange", this.#hashHandler);
@@ -285,8 +410,9 @@ class ConsoleStore {
 	#stopPolling(): void {
 		if (this.#statusTimer !== null) clearInterval(this.#statusTimer);
 		if (this.#connTimer !== null) clearInterval(this.#connTimer);
+		if (this.#listTimer !== null) clearInterval(this.#listTimer);
 		if (this.#visHandler !== null) document.removeEventListener("visibilitychange", this.#visHandler);
-		this.#statusTimer = this.#connTimer = null;
+		this.#statusTimer = this.#connTimer = this.#listTimer = null;
 		this.#visHandler = null;
 	}
 
@@ -299,28 +425,43 @@ class ConsoleStore {
 		}
 	}
 
-	/** ready 态常驻轮询（App 壳挂载后启动；phase 非 ready 时只抓 sidecar state）。 */
+	/** 应用世界轮询（App 壳挂载后启动；admin=在线面 5s + 成员面 3s，member=仅成员面）。 */
 	$poll(): void {
 		this.#stopPolling();
-		if (this.phase !== "ready") return;
-		const tickStatus = () => {
-			if (!visible()) return;
+		if (!this.appWorld) return;
+		if (this.phase === "ready") {
+			const tickStatus = () => {
+				if (!visible()) return;
+				void this.refreshStatus();
+				if (this.route.view === "visitors") void this.refreshKnocks(); // 敲门=待办，门禁页同拍刷新
+			};
+			const tickConn = () => {
+				if (visible()) void this.refreshConnections();
+			};
 			void this.refreshStatus();
-			if (this.route.view === "visitors") void this.refreshKnocks(); // 敲门=待办，门禁页同拍刷新
+			void this.refreshConnections();
+			if (this.route.view === "visitors") void this.refreshKnocks();
+			this.#statusTimer = setInterval(tickStatus, POLL_MS);
+			this.#connTimer = setInterval(tickConn, POLL_MS);
+		}
+		// 成员面列表（home-hub F1：3s；徽章/首屏两问的数据源；到访页与租约页的
+		// last_probe 呈现同拍）
+		const tickLists = () => {
+			if (!visible()) return;
+			void this.refreshLeases();
+			if (this.route.view === "visits" || this.route.view === "lease") void this.refreshVisits();
 		};
-		const tickConn = () => {
-			if (visible()) void this.refreshConnections();
-		};
-		void this.refreshStatus();
-		void this.refreshConnections();
-		if (this.route.view === "visitors") void this.refreshKnocks();
-		this.#statusTimer = setInterval(tickStatus, POLL_MS);
-		this.#connTimer = setInterval(tickConn, POLL_MS);
+		void this.refreshLeases();
+		if (this.route.view === "visits" || this.route.view === "lease") void this.refreshVisits();
+		this.#listTimer = setInterval(tickLists, LIST_POLL_MS);
 		this.#visHandler = () => {
-			if (visible()) {
+			if (!visible()) return;
+			if (this.phase === "ready") {
 				void this.refreshStatus();
 				void this.refreshConnections();
 			}
+			void this.refreshLeases();
+			if (this.route.view === "visits" || this.route.view === "lease") void this.refreshVisits();
 		};
 		document.addEventListener("visibilitychange", this.#visHandler);
 	}
@@ -388,6 +529,120 @@ class ConsoleStore {
 			this.nodesError = null;
 		} catch (e) {
 			this.nodesError = toAdminError(e);
+		}
+	}
+	async refreshLeases(): Promise<void> {
+		try {
+			this.leasesData = await fetchSidecarLeases();
+			this.leasesError = null;
+		} catch (e) {
+			this.leasesError = toAdminError(e);
+		}
+	}
+	async refreshVisits(): Promise<void> {
+		try {
+			this.visitsData = await fetchSidecarVisits();
+			this.visitsError = null;
+		} catch (e) {
+			this.visitsError = toAdminError(e);
+		}
+	}
+	/** hub 投影（404=无中枢身份——hubAbsent 常态位，不进错误面）。 */
+	async refreshHub(): Promise<void> {
+		try {
+			this.hubData = await fetchSidecarHub();
+			this.hubError = null;
+			this.hubAbsent = false;
+		} catch (e) {
+			const err = toAdminError(e);
+			if (err.status === 404) {
+				this.hubAbsent = true;
+				this.hubError = null;
+				this.hubData = null;
+			} else {
+				this.hubError = err;
+			}
+		}
+	}
+
+	// ---- 三视角成员面动作（label 编辑 / 探测 / 行内展开） ---------------------------
+
+	/** 切换器一击切换（整页重渲、无确认——hash 变更驱动视角分派）。 */
+	switchPerspective(p: Perspective): void {
+		location.hash = PERSPECTIVE_HASH[p];
+	}
+
+	toggleLeaseExpanded(id: string): void {
+		this.leaseExpanded = this.leaseExpanded === id ? null : id;
+	}
+
+	beginLeaseLabelEdit(lease: LeaseEntry): void {
+		this.leaseLabelEdit = {
+			id: lease.id,
+			server: lease.server,
+			prev: typeof lease.label === "string" ? lease.label : "",
+			value: typeof lease.label === "string" ? lease.label : "",
+		};
+		this.leaseLabelEditError = null;
+	}
+
+	onLeaseLabelInput(value: string): void {
+		if (this.leaseLabelEdit === null) return;
+		this.leaseLabelEdit = { ...this.leaseLabelEdit, value };
+		this.leaseLabelEditError = labelEditError(value);
+	}
+
+	cancelLeaseLabelEdit(): void {
+		this.leaseLabelEdit = null;
+		this.leaseLabelEditError = null;
+	}
+
+	/**
+	 * 提交 label：裁决在纯函数 labelEditSubmit（node --test 直测）——save→PATCH
+	 * （空串先行归一 null=清除）；cancel/error 不发请求。返回 {ok} 供 toast。
+	 */
+	async submitLeaseLabelEdit(): Promise<{ ok: boolean } | null> {
+		const edit = this.leaseLabelEdit;
+		if (edit === null) return null;
+		const decision = labelEditSubmit(edit.value, edit.prev);
+		if (decision.action === "error") {
+			this.leaseLabelEditError = decision.message;
+			return { ok: false };
+		}
+		if (decision.action === "cancel") {
+			this.cancelLeaseLabelEdit();
+			return null;
+		}
+		// 空串=清除——body 归一 {label: null}
+		const label = decision.value === "" ? null : decision.value;
+		this.leaseLabelBusy = true;
+		try {
+			await patchSidecarLeaseLabel(edit.id, label);
+			this.leaseLabelEdit = null;
+			this.leaseLabelEditError = null;
+			await this.refreshLeases();
+			return { ok: true };
+		} catch (e) {
+			this.leasesError = toAdminError(e);
+			return { ok: false };
+		} finally {
+			this.leaseLabelBusy = false;
+		}
+	}
+
+	/** 「测一下」：主动探测（写 visits；按钮 Loading 锁）。返回 {ok} 供行内结果呈现。 */
+	async probeServerTarget(server: string): Promise<boolean> {
+		if (this.probeBusy !== null) return false;
+		this.probeBusy = server;
+		try {
+			await probeSidecarVisit(server);
+			await this.refreshVisits();
+			return true;
+		} catch (e) {
+			this.visitsError = toAdminError(e);
+			return false;
+		} finally {
+			this.probeBusy = null;
 		}
 	}
 

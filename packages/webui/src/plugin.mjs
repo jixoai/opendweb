@@ -27,6 +27,7 @@ const manifest = {
           port: { type: "number" },
           "allow-insecure": { type: "boolean" },
           "no-open": { type: "boolean" },
+          setup: { type: "boolean" },
         },
         required: [],
       },

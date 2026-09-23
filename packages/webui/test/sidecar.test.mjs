@@ -469,7 +469,8 @@ test("sidecar state: setup phase exposes phase/null host/insecure=false, never t
   assert.equal(res.headers["content-type"], "application/json");
   assert.equal(res.headers["cache-control"], "no-store");
   const body = JSON.parse(res.text);
-  assert.deepEqual(body, { phase: "setup", server_host_masked: null, insecure: false });
+  // home-hub 2b 增量字段：role/hub_local（加性——旧消费者忽略未知字段）
+  assert.deepEqual(body, { phase: "setup", server_host_masked: null, insecure: false, role: "admin", hub_local: false });
   assert.ok(!res.text.includes(sc.pairingCode ?? ""), "pairing code must not leak to HTTP");
 });
 
