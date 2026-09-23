@@ -483,6 +483,24 @@ test("write-route Origin four classes (probe and label): 200 / 403 / 403 / 403; 
     assert.deepEqual(JSON.parse(denied.text).error.code, "forbidden");
   }
 
+  // label 写面无角色收敛（r19 P1-NEW 契约冻结）：label 是本机租约簿的显示命名
+  // （本机用户的数据，非成员事实簿）——admin 姿态 same-origin 可写且持久；
+  // 与 probe 的「成员事实簿」分层，各叫各的
+  const adminSc = await homeSidecar(t, home, { homeFetch: reachable });
+  const adminLabel = await request(adminSc.port, {
+    method: "PATCH",
+    path: `/sidecar/leases/${entry.id}/label`,
+    headers: { ...sameOriginHeaders(adminSc), ...jsonHeaders },
+    body: JSON.stringify({ label: "中枢机自看" }),
+  });
+  assert.equal(adminLabel.status, 200, "label=本机租约簿显示命名，admin 姿态可写（与 probe 成员事实簿分层）");
+  const adminRead = await request(adminSc.port, { path: "/sidecar/leases" });
+  assert.equal(
+    JSON.parse(adminRead.text).leases.find((l) => l.id === entry.id)?.label,
+    "中枢机自看",
+    "admin 姿态 label 写入须持久到本机账本",
+  );
+
   // member 姿态：probe 四类 Origin 矩阵（same-origin 200 / 缺失 403 / 伪造 403 / 坏 Host 403）
   const sc = await homeSidecar(t, home, { member: true, homeFetch: reachable });
   const ok = await postJson(sc.port, "/sidecar/visits/probe", { server }, sameOriginHeaders(sc));
