@@ -163,6 +163,33 @@ export function aliasTargetKey(target: {
 }
 
 /**
+ * 同名警示（PM §4.5 步 3 成品文案；不阻止保存——真身份是缩写）。
+ * 输入 trim 后与名册**其他行**（others 须已排除当前编辑行）的别名相同 →
+ * 返回警示文案；否则 null。abbr = 当前编辑行自身的缩写（防别名钓鱼：
+ * 请核对的是「你正在编辑谁」的缩写）。
+ */
+export function aliasDuplicateWarning(
+  value: string,
+  others: (string | null | undefined)[],
+  abbr: string,
+): string | null {
+  const name = value.trim();
+  if (name === "") return null;
+  const dup = others.some((a) => typeof a === "string" && a.trim() === name);
+  if (!dup) return null;
+  return `名册里已有同名「${name}」——别名可以重复，身份以缩写为准，请核对 (${abbr})。`;
+}
+
+/**
+ * 名册行 note 次要文本（PM §3.4 名册对象树：别名与 note 都是名册行元数据）。
+ * trim 后为空（含 null/undefined）= null——该行不渲染 note。
+ */
+export function rosterNote(note: string | null | undefined): string | null {
+  const t = typeof note === "string" ? note.trim() : "";
+  return t !== "" ? t : null;
+}
+
+/**
  * 同 fabric 多 root 集合（钓鱼警示标记源——fabric_id 是自声明标签，身份键
  * = 二元组 (fabric, root)；同 fabric 多 root 合法并存但须警示核对缩写）。
  */

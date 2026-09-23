@@ -9,7 +9,7 @@
 	import { Input } from "$lib/components/ui/input";
 	import { Check, LoaderCircle, PencilLine, X } from "@lucide/svelte";
 	import { toast } from "svelte-sonner";
-	import { aliasTargetKey } from "$lib/terms";
+	import { aliasDuplicateWarning, aliasTargetKey } from "$lib/terms";
 	import { consoleStore as cs } from "$lib/console.svelte";
 
 	let {
@@ -18,6 +18,8 @@
 		root = "",
 		endpointId = "",
 		current = null,
+		abbr = "",
+		otherAliases = [],
 	}: {
 		kind: "owner" | "visitor";
 		/** owner 行定位（二元组，防 fabric 单显钓鱼）；visitor 行为 endpoint_id。 */
@@ -25,12 +27,18 @@
 		root?: string;
 		endpointId?: string;
 		current?: string | null;
+		/** 当前行自身缩写（同名警示的核对锚点——PM §4.5 步 3）。 */
+		abbr?: string;
+		/** 同名册其他行的别名（当前行已排除；同名输入 → 警示文案，不阻止保存）。 */
+		otherAliases?: (string | null | undefined)[];
 	} = $props();
 
 	const key = $derived(aliasTargetKey({ kind, fabricId, root, endpointId }));
 	const editing = $derived(cs.aliasEdit !== null && aliasTargetKey(cs.aliasEdit) === key);
 	const value = $derived(editing && cs.aliasEdit !== null ? cs.aliasEdit.value : "");
 	const shown = $derived(typeof current === "string" ? current.trim() : "");
+	/** 同名警示（PM §4.5 步 3：成品文案；不阻止——真身份是缩写，保存不禁用）。 */
+	const dupWarning = $derived(editing ? aliasDuplicateWarning(value, otherAliases, abbr) : null);
 
 	let inputEl: HTMLElement | null = $state(null);
 
@@ -93,6 +101,8 @@
 	</form>
 	{#if cs.aliasEditError !== null}
 		<p class="text-xs text-destructive" role="alert" data-alias-error>{cs.aliasEditError}</p>
+	{:else if dupWarning !== null}
+		<p class="text-xs text-warning" role="status" data-alias-dup>{dupWarning}</p>
 	{/if}
 {:else}
 	<!-- 静态态：别名（无别名时 hover 显占位）+ 行 hover 显编辑铅笔 -->

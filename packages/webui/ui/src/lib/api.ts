@@ -415,9 +415,15 @@ export interface BlockEntry {
   ts: number;
 }
 
-/** GET /api/blocklist → {blocklist:[{kind,id,reason,ts}]}。 */
-export function loadBlocklist(): Promise<{ blocklist: BlockEntry[] }> {
-  return jsonFetch("/api/blocklist") as Promise<{ blocklist: BlockEntry[] }>;
+/** GET /api/blocklist 响应（wire 与 roles.rs BlocklistList 同拍：容器键 = entries）。 */
+export interface BlocklistData {
+  generation: number;
+  entries: BlockEntry[];
+}
+
+/** GET /api/blocklist → {generation, entries:[{kind,id,reason,ts}]}。 */
+export function loadBlocklist(): Promise<BlocklistData> {
+  return jsonFetch("/api/blocklist") as Promise<BlocklistData>;
 }
 
 /** POST /api/blocklist（拉黑：kind=endpoint|fabric；先于一切准入判定生效）。 */

@@ -43,6 +43,7 @@ import {
 	undismissKnock,
 	unregisterOwner,
 	type BlockEntry,
+	type BlocklistData,
 	type CodeEntry,
 	type ConnectionsData,
 	type KnockEntry,
@@ -192,7 +193,7 @@ class ConsoleStore {
 	visitorBusy = $state(false);
 	visitorConfirm = $state<{ endpointId: string; alias: string | null } | null>(null);
 
-	blocklistData = $state<{ blocklist: BlockEntry[] } | null>(null);
+	blocklistData = $state<BlocklistData | null>(null);
 	blocklistError = $state<AdminError | null>(null);
 	blockConfirm = $state<{ kind: "endpoint" | "fabric"; id: string } | null>(null);
 

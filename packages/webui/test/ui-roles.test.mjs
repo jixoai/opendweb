@@ -11,6 +11,9 @@
 // 7. apiFetch 注入矩阵扩展：新端点的 envelope 透传 / http 兜底 / network / timeout。
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { routeFor, canonicalHashFor } from "../ui/src/lib/route.ts";
 import { AdminError } from "../ui/src/lib/api.ts";
 import { displayKey, shortHex } from "../ui/src/lib/hex.ts";
@@ -25,6 +28,7 @@ import {
 	loadBlocklist,
 	loadCodes,
 	loadKnocks,
+	loadOwners,
 	loadVisitors,
 	patchOwnerMeta,
 	patchVisitorMeta,
@@ -44,6 +48,7 @@ import {
 import { fmtDate, groupInviteCode, leaseState } from "../ui/src/lib/format.ts";
 import {
 	aliasByteLength,
+	aliasDuplicateWarning,
 	aliasEditError,
 	aliasEditSubmit,
 	aliasTargetKey,
@@ -52,6 +57,7 @@ import {
 	knockReasonLabel,
 	maskNodeUrl,
 	multiRootFabrics,
+	rosterNote,
 } from "../ui/src/lib/terms.ts";
 
 test.afterEach(() => resetApiFetch());
@@ -422,4 +428,122 @@ test("codeDeniedBadge: deny-set ops projection renders 「暂不可兑」 withou
 		status: "revoked",
 		label: "已吊销",
 	});
+});
+
+// ---- 视觉走查修复（P0/P1/P2）：blocklist wire 键 / note 呈现 / 同名警示 / 源级宽度断言 ------
+
+test("blocklist wire: UI reads the server's entries key (roles.rs BlocklistList), not blocklist (P0)", async () => {
+	// 与 roles.rs BlocklistList 同拍的真实 wire 形态（generation + entries）
+	const wire = {
+		generation: 25,
+		entries: [
+			{ kind: "endpoint", id: "ab".repeat(32), reason: "恶意扫描", ts: 1_750_000_000_000 },
+			{ kind: "fabric", id: "cd".repeat(32), ts: 1_750_000_100_000 },
+		],
+	};
+	setApiFetch(async () => new Response(JSON.stringify(wire), { status: 200 }));
+	const data = await loadBlocklist();
+	assert.ok(Array.isArray(data.entries), "loadBlocklist 必须读服务端实际返回的 entries 键");
+	assert.equal(data.entries.length, 2);
+	assert.equal(data.entries[0].kind, "endpoint");
+	assert.equal(data.entries[0].reason, "恶意扫描");
+	assert.equal(data.entries[1].kind, "fabric");
+	assert.equal(data.entries[1].reason, undefined, "reason 缺省不落（serde skip_serializing_if）");
+	assert.equal(data.generation, 25);
+	assert.equal("blocklist" in data, false, "wire 上不存在 blocklist 键——旧读取面已死");
+});
+
+test("list wire cross-check: every roster/list endpoint reads the key the server actually sends", async () => {
+	// 五个列表端点的容器键逐一与 server handler 对拍（owners/visitors/knocks/codes=同名；
+	// blocklist=entries——防同类键名漂移）。fixture 刻意携带诱饵旧键。
+	const fabric = "11".repeat(32);
+	const root = "22".repeat(32);
+	const endpoint = "33".repeat(32);
+	const fixtures = {
+		"/api/owners": { generation: 3, owners: [{ fabric_id: fabric, root, registered_at: 1 }] },
+		"/api/visitors": { generation: 4, visitors: [{ endpoint_id: endpoint, granted_at: 1 }] },
+		"/api/knocks": { knocks: [{ endpoint_id: endpoint, seq: 1, first_at: 1, last_at: 1, count: 1, last_reason: "x" }], pending_count: 1 },
+		"/api/codes": { generation: 5, codes: [{ code_hash: "cd".repeat(32), max_uses: 1, used_count: 0, expires_at: 9e15, revoked: false }] },
+		"/api/blocklist": { generation: 6, entries: [{ kind: "endpoint", id: endpoint, ts: 1 }] },
+	};
+	setApiFetch(async (p) => new Response(JSON.stringify(fixtures[p]), { status: 200 }));
+	const owners = await loadOwners();
+	const visitors = await loadVisitors();
+	const knocks = await loadKnocks();
+	const codes = await loadCodes();
+	const blocks = await loadBlocklist();
+	assert.equal(owners.owners.length, 1, "owners 键");
+	assert.equal(visitors.visitors.length, 1, "visitors 键");
+	assert.equal(knocks.knocks.length, 1, "knocks 键");
+	assert.equal(knocks.pending_count, 1);
+	assert.equal(codes.codes.length, 1, "codes 键");
+	assert.equal(blocks.entries.length, 1, "blocklist=entries 键");
+});
+
+test("rosterNote: trimmed note or null——空白/null 不渲染名册行 note（P1 note 呈现）", () => {
+	assert.equal(rosterNote("长期合作伙伴"), "长期合作伙伴");
+	assert.equal(rosterNote("  临时访客  "), "临时访客");
+	assert.equal(rosterNote(""), null);
+	assert.equal(rosterNote("   "), null);
+	assert.equal(rosterNote(null), null);
+	assert.equal(rosterNote(undefined), null);
+});
+
+test("aliasDuplicateWarning: PM §4.5 步 3 成品文案；空值/唯一/空白别名不警示；不阻止保存", () => {
+	// 命中：名册其他行已有同名（trim 对齐）
+	const msg = aliasDuplicateWarning(" 李四团队 ", ["王五", "李四团队"], "ab12***cd34");
+	assert.match(msg, /名册里已有同名「李四团队」——别名可以重复，身份以缩写为准，请核对 \(ab12\*\*\*cd34\)。/);
+	// 不命中：唯一名 / 空输入 / 空白输入 / 其他行别名为空或空白
+	assert.equal(aliasDuplicateWarning("王五", ["李四团队"], "ab12***cd34"), null);
+	assert.equal(aliasDuplicateWarning("", ["李四团队"], "ab12***cd34"), null);
+	assert.equal(aliasDuplicateWarning("   ", ["李四团队"], "ab12***cd34"), null);
+	assert.equal(aliasDuplicateWarning("李四团队", [null, undefined, "  "], "ab12***cd34"), null);
+	// 同名判定 trim 对齐（其他行别名带首尾空白也算同名）
+	assert.notEqual(aliasDuplicateWarning("李四团队", ["  李四团队  "], "ab12***cd34"), null);
+	// 警示非错误：不参与提交禁用（aliasEditSubmit 不受其影响——同值/常规保存语义不变）
+	assert.deepEqual(aliasEditSubmit("李四团队", ""), { action: "save", value: "李四团队" });
+	assert.equal(aliasEditError("李四团队"), null);
+});
+
+// 源级回归断言（视觉走查 P1/P2：组件无 DOM 测试面，冻结关键类/结构防回归）
+
+const UI_SRC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "ui", "src");
+
+test("source regression: roster table width convergence + sticky action column (P1)", () => {
+	const src = readFileSync(path.join(UI_SRC, "components", "TenantsView.svelte"), "utf8");
+	// 动作列 sticky 常显——溢出时「续期/注销」仍可见且不参与滚动
+	assert.ok(src.includes('class="sticky right-0 z-10 bg-card transition-colors group-hover/row:bg-muted/50"'), "动作列须 sticky 常显并同步 hover 底色");
+	assert.ok(src.includes('class="sticky right-0 z-10 bg-card"'), "动作列表头须 sticky 常显");
+	// 身份/时间列解除 nowrap 继承——窄屏降级换行而非横向溢出
+	assert.ok(src.includes('<Table.Cell class="whitespace-normal">'), "身份/状态列须 whitespace-normal");
+	assert.ok(src.includes('<Table.Cell class="whitespace-normal text-muted-foreground">'), "注册时间列须 whitespace-normal");
+	// 双格式仍为两段各自 nowrap（日期段 + 相对时段），只是段间可换行
+	assert.ok(src.includes("{fmtLocal(o.registered_at)}"));
+	assert.ok(src.includes("（{relativeTime(o.registered_at)}）"));
+	// note 次要文本：title 全文 + truncate 截断
+	assert.ok(src.includes("rosterNote(o.note)"), "租户行须消费 note");
+	assert.ok(/class="max-w-md truncate text-xs text-muted-foreground" title=\{note\}/.test(src), "note 呈现须 title 全文+截断");
+	// 侧栏表单并排栅格推至 2xl——1280–1535 档名册占满整行不再被挤到 ~600px
+	assert.ok(src.includes("2xl:grid-cols-[minmax(0,1fr)_360px]"));
+});
+
+test("source regression: visitors note render / single-alias render / online header / nodebook casing (P0/P2)", () => {
+	const visitors = readFileSync(path.join(UI_SRC, "components", "VisitorsView.svelte"), "utf8");
+	// 黑名单读 entries（P0 修复面）
+	assert.ok(visitors.includes("cs.blocklistData?.entries"), "黑名单必须读 wire 的 entries 键");
+	// 访客行 note 呈现 + 别名单一呈现（HexValue 不再重复渲染别名）
+	assert.ok(visitors.includes("rosterNote(v.note)"), "访客行须消费 note");
+	assert.ok(/<HexValue value=\{v\.endpoint_id\} kind="端点" \/>/.test(visitors), "HexValue 不带 alias——别名只由 AliasInlineEdit 呈现一次");
+	assert.ok(/<AliasInlineEdit[\s\S]*?abbr=\{shortHex\(v\.endpoint_id\)\}/.test(visitors), "访客行内编辑须携带缩写（同名警示锚点）");
+
+	const online = readFileSync(path.join(UI_SRC, "components", "OnlineView.svelte"), "utf8");
+	assert.ok(online.includes("<h2"), "#/online 须有页头");
+	assert.ok(/<p class="py-6 text-sm text-muted-foreground" data-empty="endpoints">/.test(online), "按端点空态为左对齐纯文本（与另两组一致）");
+
+	const nodebook = readFileSync(path.join(UI_SRC, "components", "NodeBook.svelte"), "utf8");
+	assert.ok(!nodebook.includes("uppercase"), "节点簿输入不做 CSS 大写化（终端命令大小写敏感）");
+
+	const alias = readFileSync(path.join(UI_SRC, "components", "AliasInlineEdit.svelte"), "utf8");
+	assert.ok(alias.includes("data-alias-dup"), "行内编辑须呈现同名警示");
+	assert.ok(alias.includes('role="status"'), "警示为非阻断 status（不阻止保存）");
 });

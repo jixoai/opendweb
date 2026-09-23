@@ -15,8 +15,8 @@
 	import { Copy, DoorOpen, KeyRound, LoaderCircle, TriangleAlert, UserRoundPlus, Users } from "@lucide/svelte";
 	import { toast } from "svelte-sonner";
 	import { validateHex64, shortHex } from "$lib/hex";
-	import { fmtDate, formatTime, groupInviteCode, leaseState } from "$lib/format";
-	import { codeDeniedBadge, codeStatus, multiRootFabrics } from "$lib/terms";
+	import { fmtDate, fmtLocal, groupInviteCode, leaseState, relativeTime } from "$lib/format";
+	import { codeDeniedBadge, codeStatus, multiRootFabrics, rosterNote } from "$lib/terms";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
@@ -103,7 +103,7 @@
 		<ErrorBanner error={cs.ownersError} onRetry={() => void cs.refreshOwners()} />
 	{/if}
 
-	<div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+	<div class="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_360px]">
 		<!-- 租户名册表（主角） -->
 		<Card.Root class="gap-4 py-5">
 			<Card.Header class="flex flex-row flex-wrap items-center gap-2">
@@ -139,88 +139,108 @@
 							</Button>
 						</Empty.Content>
 					</Empty.Root>
-				{:else}
-					<Table.Root>
-						<Table.Header>
-							<Table.Row>
-								<Table.Head>租户（Fabric · 根端点）</Table.Head>
-								<Table.Head>状态 / 租期</Table.Head>
-								<Table.Head>注册时间</Table.Head>
-								<Table.Head class="w-2"></Table.Head>
-							</Table.Row>
-						</Table.Header>
-						<Table.Body>
-							{#each owners as o (o.fabric_id + o.root)}
-								{@const lease = leaseState(typeof o.expires_at === "number" ? o.expires_at : null)}
-								<Table.Row class="group/row">
-									<Table.Cell>
-										<div class="flex flex-col gap-1">
-											<AliasInlineEdit kind="owner" fabricId={o.fabric_id} root={o.root} current={o.alias ?? null} />
-											<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-												<span class="text-xs text-muted-foreground">
-													Fabric <span class="font-mono text-[13px] text-foreground" title={o.fabric_id}>{shortHex(o.fabric_id)}</span>
-													· 根端点 <span class="font-mono text-[13px] text-foreground" title={o.root}>{shortHex(o.root)}</span>
-												</span>
-												{#if multiRoot.has(o.fabric_id)}
-													<Badge variant="outline" class="h-5 gap-1 border-warning/40 bg-warning/10 px-1.5 text-[11px] text-warning" title="同 Fabric 有多个根端点——别名可以仿名，仿不了缩写；请核对根端点缩写再操作">
-														<TriangleAlert class="size-3" />
-														同 Fabric 多根端点
-													</Badge>
+					{:else}
+						<!-- 宽度收敛（视觉走查 P1）：身份/时间列 whitespace-normal 允许窄屏降级换行；
+						    「在用」互链并入状态列；动作列 sticky 常显——溢出时续期/注销始终可达 -->
+						<Table.Root>
+							<Table.Header>
+								<Table.Row>
+									<Table.Head>租户（Fabric · 根端点）</Table.Head>
+									<Table.Head>状态 / 租期</Table.Head>
+									<Table.Head>注册时间</Table.Head>
+									<Table.Head class="sticky right-0 z-10 bg-card"></Table.Head>
+								</Table.Row>
+							</Table.Header>
+							<Table.Body>
+								{#each owners as o (o.fabric_id + o.root)}
+									{@const lease = leaseState(typeof o.expires_at === "number" ? o.expires_at : null)}
+									{@const note = rosterNote(o.note)}
+									<Table.Row class="group/row">
+										<Table.Cell class="whitespace-normal">
+											<div class="flex flex-col gap-1">
+												<AliasInlineEdit
+													kind="owner"
+													fabricId={o.fabric_id}
+													root={o.root}
+													current={o.alias ?? null}
+													abbr={shortHex(o.root)}
+													otherAliases={owners
+														.filter((x) => x.fabric_id !== o.fabric_id || x.root !== o.root)
+														.map((x) => x.alias)}
+												/>
+												<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+													<span class="text-xs text-muted-foreground">
+														Fabric <span class="font-mono text-[13px] text-foreground" title={o.fabric_id}>{shortHex(o.fabric_id)}</span>
+														· 根端点 <span class="font-mono text-[13px] text-foreground" title={o.root}>{shortHex(o.root)}</span>
+													</span>
+													{#if multiRoot.has(o.fabric_id)}
+														<Badge variant="outline" class="h-5 gap-1 border-warning/40 bg-warning/10 px-1.5 text-[11px] text-warning" title="同 Fabric 有多个根端点——别名可以仿名，仿不了缩写；请核对根端点缩写再操作">
+															<TriangleAlert class="size-3" />
+															同 Fabric 多根端点
+														</Badge>
+													{/if}
+												</div>
+												{#if note !== null}
+													<!-- 名册行 note 次要文本（PM §3.4 名册对象树；title 全文 + 截断） -->
+													<span class="max-w-md truncate text-xs text-muted-foreground" title={note}>{note}</span>
+												{/if}
+												{#if lease.state === "expired"}
+													<span class="text-xs text-destructive">新连接正被拒绝；续期后立即恢复。</span>
 												{/if}
 											</div>
-											{#if lease.state === "expired"}
-												<span class="text-xs text-destructive">新连接正被拒绝；续期后立即恢复。</span>
-											{/if}
-										</div>
-									</Table.Cell>
-									<Table.Cell>
-										<Badge variant="outline" class={leaseBadgeClass(lease.state)}>{lease.label}</Badge>
-									</Table.Cell>
-									<Table.Cell class="whitespace-nowrap text-muted-foreground">
-										{formatTime(o.registered_at)}
-									</Table.Cell>
-									<Table.Cell>
-										<div class="flex items-center justify-end gap-1.5">
-											<Button
-												variant="outline"
-												size="sm"
-												class="h-6 gap-1.5 rounded-full px-2.5 text-xs"
-												title={onlineFabrics.has(o.fabric_id)
-													? "该租户有活跃连接——点击查看在线连接明细"
-													: "该租户当前没有活跃连接——点击查看在线视角"}
-												onclick={() => cs.goOnline(o.fabric_id)}
-											>
-												<span
-													aria-hidden="true"
-													class="size-1.5 rounded-full {onlineFabrics.has(o.fabric_id)
-														? 'bg-success'
-														: 'bg-muted-foreground/40'}"
-												></span>
-												{onlineFabrics.has(o.fabric_id) ? "在用" : "未在用"}
-											</Button>
-											<Button
-												variant="ghost"
-												size="sm"
-												class="h-7"
-												onclick={() => cs.askRenew(o)}
-											>
-												续期
-											</Button>
-											<Button
-												variant="ghost"
-												size="sm"
-												class="h-7 text-destructive hover:text-destructive"
-												onclick={() => cs.askUnregister(o)}
-											>
-												注销
-											</Button>
-										</div>
-									</Table.Cell>
-								</Table.Row>
-							{/each}
-						</Table.Body>
-					</Table.Root>
-				{/if}
+										</Table.Cell>
+										<Table.Cell class="whitespace-normal">
+											<div class="flex flex-col items-start gap-1.5">
+												<Badge variant="outline" class={leaseBadgeClass(lease.state)}>{lease.label}</Badge>
+												<Button
+													variant="outline"
+													size="sm"
+													class="h-6 gap-1.5 rounded-full px-2.5 text-xs"
+													title={onlineFabrics.has(o.fabric_id)
+														? "该租户有活跃连接——点击查看在线连接明细"
+														: "该租户当前没有活跃连接——点击查看在线视角"}
+													onclick={() => cs.goOnline(o.fabric_id)}
+												>
+													<span
+														aria-hidden="true"
+														class="size-1.5 rounded-full {onlineFabrics.has(o.fabric_id)
+															? 'bg-success'
+															: 'bg-muted-foreground/40'}"
+													></span>
+													{onlineFabrics.has(o.fabric_id) ? "在用" : "未在用"}
+												</Button>
+											</div>
+										</Table.Cell>
+										<Table.Cell class="whitespace-normal text-muted-foreground">
+											<!-- 双格式两段各自 nowrap、段间可换行——窄屏降级不破相 -->
+											<span class="whitespace-nowrap">{fmtLocal(o.registered_at)}</span>
+											<span class="whitespace-nowrap text-xs text-muted-foreground/80">（{relativeTime(o.registered_at)}）</span>
+										</Table.Cell>
+										<Table.Cell class="sticky right-0 z-10 bg-card transition-colors group-hover/row:bg-muted/50">
+											<div class="flex items-center justify-end gap-1.5">
+												<Button
+													variant="ghost"
+													size="sm"
+													class="h-7"
+													onclick={() => cs.askRenew(o)}
+												>
+													续期
+												</Button>
+												<Button
+													variant="ghost"
+													size="sm"
+													class="h-7 text-destructive hover:text-destructive"
+													onclick={() => cs.askUnregister(o)}
+												>
+													注销
+												</Button>
+											</div>
+										</Table.Cell>
+									</Table.Row>
+								{/each}
+							</Table.Body>
+						</Table.Root>
+					{/if}
 			</Card.Content>
 		</Card.Root>
 

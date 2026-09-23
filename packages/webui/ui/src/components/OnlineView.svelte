@@ -39,7 +39,15 @@
 	);
 </script>
 
-<section class="flex flex-col gap-4" data-section="online">
+<section class="flex flex-col gap-5" data-section="online">
+	<!-- 页头（视觉走查 P2：与其余三页「题 + 副注」模式对齐） -->
+	<div class="flex flex-col gap-1">
+		<h2 class="text-lg font-semibold tracking-tight">在线连接</h2>
+		<p class="text-sm text-muted-foreground">
+			谁正在用——按端点、按租户、按访客三组投影；断开是异步指令，发出后在这里观察收敛。
+		</p>
+	</div>
+
 	{#if cs.connError !== null && cs.connError !== undefined}
 		<ErrorBanner error={cs.connError} onRetry={() => void cs.refreshConnections()} />
 	{/if}
@@ -156,13 +164,10 @@
 			</Card.Header>
 			<Card.Content>
 				{#if perEndpointAll.length === 0}
-						<Empty.Root class="py-6">
-							<Empty.Header>
-								<Empty.Media variant="icon"><WifiOff /></Empty.Media>
-								<Empty.Title>当前没有在线连接。</Empty.Title>
-								<Empty.Description>已注册的租户建立组网后，连接会实时出现在这里。</Empty.Description>
-							</Empty.Header>
-						</Empty.Root>
+						<!-- 空态风格统一（视觉走查 P2）：左对齐纯文本，与按租户/按访客两组一致 -->
+						<p class="py-6 text-sm text-muted-foreground" data-empty="endpoints">
+							当前没有在线连接。已注册的租户建立组网后，连接会实时出现在这里。
+						</p>
 					{:else if perEndpoint.length === 0}
 						<p class="text-sm text-muted-foreground">该租户当前没有在线连接。</p>
 				{:else}

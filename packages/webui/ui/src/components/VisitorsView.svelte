@@ -21,7 +21,7 @@
 	import { toast } from "svelte-sonner";
 	import { validateHex64, shortHex } from "$lib/hex";
 	import { formatTime } from "$lib/format";
-	import { aliasTargetKey, blockKindLabel, knockReasonLabel } from "$lib/terms";
+	import { blockKindLabel, knockReasonLabel, rosterNote } from "$lib/terms";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
@@ -33,11 +33,9 @@
 	const knocksLoading = $derived(cs.knocksData === null && cs.knocksError === null);
 	const visitors = $derived(Array.isArray(cs.visitorsData?.visitors) ? cs.visitorsData!.visitors : []);
 	const visitorsLoading = $derived(cs.visitorsData === null && cs.visitorsError === null);
-	const blocklist = $derived(Array.isArray(cs.blocklistData?.blocklist) ? cs.blocklistData!.blocklist : []);
+	const blocklist = $derived(Array.isArray(cs.blocklistData?.entries) ? cs.blocklistData!.entries : []);
 	const blocklistLoading = $derived(cs.blocklistData === null && cs.blocklistError === null);
 	const action = $derived(cs.knockAction);
-	/** 正在编辑别名的行（编辑期间该行 HexValue 不再重复显示别名）。 */
-	const editingKey = $derived(cs.aliasEdit !== null ? aliasTargetKey(cs.aliasEdit) : null);
 	/** 清除别名确认的目标行（弹窗内双展示：别名 + 缩写）。 */
 	const clearVisitor = $derived(
 		cs.aliasClearConfirm?.kind === "visitor"
@@ -216,16 +214,25 @@
 						</Table.Header>
 						<Table.Body>
 							{#each visitors as v (v.endpoint_id)}
+								{@const note = rosterNote(v.note)}
 								<Table.Row class="group/row">
-									<Table.Cell>
-										<!-- 编辑期间 HexValue 只显示缩写（别名由行内输入承载，避免双呈现打架） -->
-										<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-											<HexValue
-												value={v.endpoint_id}
-												alias={editingKey === v.endpoint_id ? null : (v.alias ?? null)}
-												kind="端点"
-											/>
-											<AliasInlineEdit kind="visitor" endpointId={v.endpoint_id} current={v.alias ?? null} />
+									<Table.Cell class="whitespace-normal">
+										<!-- 别名单一呈现：AliasInlineEdit（别名 + 铅笔）+ HexValue（缩写）拼成
+										    规范形态「别名 (abc***xyz)」，不再各自重复渲染别名 -->
+										<div class="flex flex-col gap-1">
+											<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+												<AliasInlineEdit
+													kind="visitor"
+													endpointId={v.endpoint_id}
+													current={v.alias ?? null}
+													abbr={shortHex(v.endpoint_id)}
+													otherAliases={visitors.filter((x) => x.endpoint_id !== v.endpoint_id).map((x) => x.alias)}
+												/>
+												<HexValue value={v.endpoint_id} kind="端点" />
+											</div>
+											{#if note !== null}
+												<span class="truncate text-xs text-muted-foreground" title={note}>{note}</span>
+											{/if}
 										</div>
 									</Table.Cell>
 									<Table.Cell class="whitespace-nowrap text-muted-foreground">{formatTime(v.granted_at)}</Table.Cell>

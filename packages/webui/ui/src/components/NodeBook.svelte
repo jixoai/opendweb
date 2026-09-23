@@ -155,10 +155,11 @@
 					</Field.Field>
 					<Field.Field>
 						<Field.Label for="node-code" class="text-xs">③ 配对码（终端打印，10 分钟内有效）</Field.Label>
+						<!-- 不做 CSS 大写化：占位符含终端命令「node book add code:」，命令大小写敏感 -->
 						<Input
 							id="node-code"
 							placeholder="终端「node book add code:」一行"
-							class="h-8 font-mono uppercase"
+							class="h-8 font-mono"
 							value={cs.addNodeForm.code}
 							oninput={(e) => cs.onAddNodeInput("code", e.currentTarget.value)}
 							autocomplete="off"
