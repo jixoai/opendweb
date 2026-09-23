@@ -522,8 +522,10 @@ impl OwnerRegistry {
 
     /// reload 并返回孤儿集合（codes 台账热重载看护的原子事实源，Phase 1b）：
     /// 孤儿与快照出自**同一次**磁盘归并——消除「codes 看护先于 owners 看护
-    /// reload」读到旧快照（孤儿缺失）的竞态窗口。失败保留旧快照并上抛，
-    /// 由调用方回落上一轮孤儿集合（保守）。
+    /// reload」读到旧快照（孤儿缺失）的竞态窗口。失败保留旧快照并上抛；
+    /// 调用方（codes 看护）fail-closed——本轮不 reload codes、不推进指纹，
+    /// 挂待重试标志直至成功（r11-P1-1：不回落旧孤儿集，避免失败窗口内
+    /// 新增的外部 via_code_hash register 被发布中的 codes reload 漏过）。
     pub fn reload_for_orphans(&self) -> Result<Vec<super::codes::RedeemKey>> {
         self.reload()?;
         Ok(self.snapshot().code_orphans())

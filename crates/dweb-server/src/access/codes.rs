@@ -923,10 +923,16 @@ fn stat_of(path: &Path) -> Option<(SystemTime, u64)> {
 /// 在下次 reload 归并时补齐，spec Scenario「热重载触发孤儿补齐」）。
 /// 任一指纹变化即 reload（归并 + reconciliation 同锁）。**孤儿事实源 =
 /// 同轮 `owners.reload_for_orphans()`**（owners 磁盘与快照原子归并——
-/// 不依赖 owners 自身看护的时序，消除跨看护竞态）；owners reload 失败时
-/// 回落上一轮孤儿集合（保守）。codes reload 失败保留旧快照且**不推进
-/// 指纹**（下轮重试——自进程追加与本看护并发时的撕裂读窗口靠重试收敛；
-/// 持久坏行则周期性告警，由 admin 修复磁盘）。
+/// 不依赖 owners 自身看护的时序，消除跨看护竞态）。**owners reload
+/// 失败 = 本轮 fail-closed：不调 codes.reload、不推进指纹，挂起待重试
+/// 标志**（r11-P1-1：旧实现回落旧孤儿集继续 reload codes 并在成功后
+/// 推进指纹——失败窗口内新增的外部 via_code_hash register 不在旧孤儿
+/// 集，被发布中的 codes reload 漏过；临时读权限故障恢复不改变
+/// (mtime,len)，指纹相等即永久跳过，该码 used_count 永久漏计、max_uses
+/// 可绕过。待重试标志直到 owners reload 成功**且**同轮孤儿集合完成
+/// codes reload 才清除——期间即使指纹不变也每轮重试）。codes reload
+/// 失败保留旧快照且**不推进指纹**（下轮重试——自进程追加与本看护并发
+/// 时的撕裂读窗口靠重试收敛；持久坏行则周期性告警，由 admin 修复磁盘）。
 pub fn spawn_codes_ledger_watcher(
     codes: Arc<CodeLedger>,
     owners: Arc<OwnerRegistry>,
@@ -944,7 +950,10 @@ pub fn spawn_codes_ledger_watcher_every(
     let owners_path = owners.path().to_path_buf();
     tokio::spawn(async move {
         let mut last = (stat_of(&codes_path), stat_of(&owners_path));
-        let mut last_orphans = owners.snapshot().code_orphans();
+        // 待重试标志（r11-P1-1）：owners reload 失败挂起的未完成
+        // reconciliation 轮次——存在时即使 (mtime,len) 指纹未变也每轮
+        // 重试（权限修复不改变指纹，不能只靠指纹变化触发）
+        let mut owners_reload_retry = false;
         loop {
             tokio::time::sleep(interval).await;
             let current = (stat_of(&codes_path), stat_of(&owners_path));
@@ -952,19 +961,24 @@ pub fn spawn_codes_ledger_watcher_every(
             // 每轮重试 reload（磁盘恢复后自愈——「补写成功即从 deny-set 移除」
             // 的重试通道；权限修复不改变 mtime/len，指纹不变也需可触发）
             let deny_pending = codes.deny_count() > 0;
-            if current == last && !deny_pending {
+            if current == last && !deny_pending && !owners_reload_retry {
                 continue;
             }
-            match owners.reload_for_orphans() {
-                Ok(orphans) => last_orphans = orphans,
+            // 同轮孤儿事实源：失败则本轮不调 codes.reload、不推进 last
+            //（宁可滞后发布也不带旧孤儿集发布——见函数级注释）
+            let orphans = match owners.reload_for_orphans() {
+                Ok(orphans) => orphans,
                 Err(e) => {
+                    owners_reload_retry = true;
                     tracing::warn!(
-                        "owners reload for code reconciliation failed (using previous orphans): {e:#}"
+                        "owners reload for code reconciliation failed (codes reload deferred, will retry): {e:#}"
                     );
+                    continue;
                 }
-            }
-            match codes.reload(&last_orphans) {
+            };
+            match codes.reload(&orphans) {
                 Ok(()) => {
+                    owners_reload_retry = false;
                     last = current;
                     tracing::info!(
                         generation = codes.snapshot().generation(),
@@ -1817,6 +1831,99 @@ mod tests {
         }
         handle.abort();
         panic!("热重载未在 2s 内补齐孤儿 consume");
+    }
+
+    /// r11-P1-1：owner 指纹变化后 owners 读取失败（注入 0o000）→ 本轮
+    /// codes reload 必须不发布不推进（旧实现用旧孤儿集继续 reload 并推进
+    /// 指纹）；恢复读权限（chmod 不改 mtime/len——指纹不变）后必须重试并
+    /// 补齐孤儿，终态 used_count/deny/配额正确（新 register 占用的码不可
+    /// 超兑 max_uses）。注入确定性：先取 append 句柄再 chmod——已打开 fd
+    /// 保留写权，写入落地时文件已不可读，无「成功窗口」竞态。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn watcher_owners_read_failure_defers_codes_reload_then_backfills() {
+        if nix::unistd::Uid::effective().is_root() {
+            // root 绕过 0o000 读权限，注入不成立（CI root 环境跳过）
+            return;
+        }
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let dir = TempDir::new().unwrap();
+        let codes_path = dir.path().join("codes.jsonl");
+        let owners_path = dir.path().join("owners.jsonl");
+        // 先建空 owners 文件（load 对缺失文件不落盘）：看护启动时指纹即
+        // 稳定为 (mtime, 0)，后续「摘权限→写入」不存在建文件窗口
+        std::fs::write(&owners_path, b"").unwrap();
+        let owners = Arc::new(OwnerRegistry::load(&owners_path).unwrap());
+        let codes = Arc::new(CodeLedger::load(&codes_path, &[]).unwrap());
+        let (_, hash) = codes
+            .issue(IssueParams {
+                max_uses: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
+        let handle = spawn_codes_ledger_watcher_every(
+            Arc::clone(&codes),
+            Arc::clone(&owners),
+            Duration::from_millis(30),
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let gen_before = codes.snapshot().generation();
+        // 先摘读权限，再经预先打开的 append 句柄写入外部孤儿 register：
+        // 写入落地即指纹已变且不可读——失败窗口内每个 tick 都必然失败
+        let mut owners_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&owners_path)
+            .unwrap();
+        std::fs::set_permissions(&owners_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        writeln!(
+            owners_file,
+            "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":1,\"via_code_hash\":\"{}\"}}",
+            hex::encode(key(1)),
+            hex::encode(key(2)),
+            hex::encode(hash)
+        )
+        .unwrap();
+        owners_file.sync_all().unwrap();
+        // 失败窗口：多轮 tick 后 codes reload 未发布（generation 不变——
+        // 旧实现此处每轮以旧孤儿集发布 generation+1）、未补齐、无 deny
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            codes.snapshot().generation(),
+            gen_before,
+            "owners 读取失败期间不得发布 codes reload（旧实现以旧孤儿集发布）"
+        );
+        assert_eq!(codes.snapshot().used_count(&hash), 0, "失败窗口不补齐");
+        assert_eq!(codes.deny_count(), 0);
+        // 恢复读权限：chmod 只改 ctime——mtime/len 与失败窗口一致（指纹
+        // 不变），待重试路径仍必须触发并补齐孤儿
+        std::fs::set_permissions(&owners_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && codes.snapshot().used_count(&hash) == 0 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        handle.abort();
+        assert_eq!(
+            codes.snapshot().used_count(&hash),
+            1,
+            "权限恢复（指纹不变）后必须重试并补齐孤儿 consume"
+        );
+        assert!(
+            codes.snapshot().is_consumed(&(hash, key(1), key(2))),
+            "完整三元组补齐"
+        );
+        assert_eq!(codes.deny_count(), 0, "整轮成功终态无 deny");
+        // 配额终态：新 register 已占满 max_uses=1——同键幂等回放 200，
+        // 他键不可超兑（exhausted，而非复活可兑）
+        assert!(matches!(
+            codes.redeem(&owners, &hash, &key(1), &key(2), now_ms()),
+            RedeemOutcome::Replay { .. }
+        ));
+        assert!(matches!(
+            codes.redeem(&owners, &hash, &key(3), &key(4), now_ms()),
+            RedeemOutcome::Exhausted
+        ));
     }
 
     // ---- r8 验收：P0-1 写序列化协议 / P1-1 pending 释放 ----
