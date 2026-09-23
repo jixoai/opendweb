@@ -8,6 +8,7 @@
 	import { Skeleton } from "$lib/components/ui/skeleton";
 	import { Toaster } from "$lib/components/ui/sonner";
 	import { RefreshCw } from "@lucide/svelte";
+	import { untrack } from "svelte";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import SetupWizard from "./components/SetupWizard.svelte";
 	import TopBar from "./components/TopBar.svelte";
@@ -24,15 +25,19 @@
 	import HubStatusCard from "./components/HubStatusCard.svelte";
 
 	// store 生命周期（hash 监听（含旧路由收敛）+ sidecar state 首拉 + 默认视角裁决）
+	// D2 风暴修复：start/$poll 的同步段会读 sidecar/hash 等响应式源——若被本
+	// effect 追踪，refreshSidecar 每次赋新对象都会重入 start() → 再拉 state →
+	// 无限循环（走查实测 ~800 req/s）。untrack 钉死：挂载期一次性接线，零依赖。
 	$effect(() => {
-		cs.start();
+		untrack(() => cs.start());
 		return () => cs.stop();
 	});
 
 	// 应用世界常驻轮询（admin=在线面 5s + 成员面 3s；member=仅成员面；phase/姿态
-	// 翻转时重启；切页不消失）
+	// 翻转时重启；切页不消失）。依赖面只留 appWorld（phase/role 投影）——$poll
+	// 同步段对 route/hash 的读取一律 untrack（D2：防 hash/对象引用翻转重入轮询）。
 	$effect(() => {
-		if (cs.appWorld) cs.$poll();
+		if (cs.appWorld) untrack(() => cs.$poll());
 	});
 
 	// 各页数据拉取：中枢四页（admin）进页即拉，动作后各自刷新；租约/到访页由

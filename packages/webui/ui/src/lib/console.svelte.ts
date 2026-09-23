@@ -338,8 +338,16 @@ class ConsoleStore {
 	#visHandler: (() => void) | null = null;
 	/** boot 默认视角只裁决一次（deep link 优先；此后记忆最近使用）。 */
 	#initialRouteSettled = false;
+	/**
+	 * 页面载入时的原始 hash（start() 首行捕获，先于任何规范化改写）。settle 用
+	 * 它区分「用户/启动器显式深链」与「空 hash 需自动裁决」——不能读当时的
+	 * location.hash：applyHash 已把空 hash 规范化为 #/overview（D3 竞态根因，
+	 * 程序性落点被误判为显式深链，压过 member 的 auto="lease" 裁决）。
+	 */
+	#bootHash = "";
 
 	start(): void {
+		this.#bootHash = location.hash;
 		window.addEventListener("hashchange", this.#hashHandler);
 		this.applyHash(location.hash);
 		void this.refreshSidecar().then(() => this.#settleInitialRoute());
@@ -362,21 +370,26 @@ class ConsoleStore {
 		this.hash = raw;
 		this.#rememberCurrent();
 	}
-	/** 视角记忆：进入应用世界后的每次 hash 变化记住所属视角（spec「此后记忆最近使用」）。 */
+	/**
+	 * 视角记忆（spec「此后记忆最近使用」；D3 收紧）：只记录用户显式切换——
+	 * settle 完成前一切程序性落点（boot 规范化 / settle 自动裁决）不写键，
+	 * 防启动竞态把 auto 结果钉进记忆压过下次启动的自动选择。
+	 */
 	#rememberCurrent(): void {
-		if (!this.appWorld) return;
+		if (!this.#initialRouteSettled || !this.appWorld) return;
 		rememberPerspective(window.localStorage, this.perspective);
 	}
 	/**
 	 * boot 默认视角（home-hub spec：hub.json 存在→中枢；有租约→租约；有到访→
 	 * 到访；全空→中枢引导态；记忆最近使用优先于自动选择；显式深链最优先——
-	 * 托盘/`hub open` 的落点不被覆盖）。
+	 * 托盘/`hub open` 的落点不被覆盖）。深链判定用 #bootHash（载入时的原始
+	 * hash）：空 hash 一律走自动裁决——boot 规范化写下的 #/overview 不算深链
+	 * （D3：member 干净首启必须落 auto 视角，且自动落点不写记忆键）。
 	 */
 	async #settleInitialRoute(): Promise<void> {
 		if (this.#initialRouteSettled) return;
 		this.#initialRouteSettled = true;
-		const raw = location.hash;
-		if (raw !== "" && raw !== "#" && raw !== "#/") {
+		if (this.#bootHash !== "" && this.#bootHash !== "#" && this.#bootHash !== "#/") {
 			this.#rememberCurrent();
 			return;
 		}
@@ -401,7 +414,8 @@ class ConsoleStore {
 			location.hash = hash;
 		}
 		this.hash = hash;
-		this.#rememberCurrent();
+		// 程序性自动落点不写记忆键（D3）——记忆只来自用户显式切换（#rememberCurrent
+		// 经 hashchange/切换器触发；本行刻意的落点若被记忆，会压过下次启动的 auto）。
 	}
 	stop(): void {
 		window.removeEventListener("hashchange", this.#hashHandler);
@@ -418,8 +432,23 @@ class ConsoleStore {
 
 	async refreshSidecar(): Promise<void> {
 		try {
-			this.sidecar = await fetchSidecarState();
+			const next = await fetchSidecarState();
 			this.sidecarError = null;
+			// D2 防线（引用稳定）：投影字段全部等值时复用既有对象——$state 引用不
+			// 翻转，依赖 sidecar 的任何 $effect 都不重入。风暴根因之一是本方法每次
+			// 赋新对象；即便上游 effect 接线回归，此门也把重入收敛到「真变化」。
+			const prev = this.sidecar;
+			if (
+				prev !== null &&
+				prev.phase === next.phase &&
+				prev.role === next.role &&
+				prev.server_host_masked === next.server_host_masked &&
+				prev.insecure === next.insecure &&
+				prev.hub_local === next.hub_local
+			) {
+				return;
+			}
+			this.sidecar = next;
 		} catch (e) {
 			this.sidecarError = toAdminError(e);
 		}

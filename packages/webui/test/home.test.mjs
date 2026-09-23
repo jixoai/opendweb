@@ -116,7 +116,7 @@ async function writeOneLease(home, { server = "http://192.168.2.13:8787", expire
 }
 
 /** CLI main() 的受控 io（信号驱动退出；不自动开浏览器）。 */
-async function runMain(args, { home, env = {} }) {
+async function runMain(args, { home, env = {} }, { injectHomeDir = true } = {}) {
   const lines = [];
   const signal = new EventEmitter();
   const p = main(args, {
@@ -124,7 +124,9 @@ async function runMain(args, { home, env = {} }) {
     log: (l) => lines.push(l),
     signal,
     openImpl: () => {},
-    homeDir: home,
+    // injectHomeDir=false 复刻 `hub open` 的 spawn 形态：DWEB_HOME 只经 env 注入，
+    // CLI 必须自行 homeRoot(env) 解析（走查 D1：显式 --server 路径数据面恒注入）
+    ...(injectHomeDir ? { homeDir: home } : {}),
     stdin: {},
   });
   const settle = (ms) =>
@@ -246,6 +248,65 @@ test("dispatch row 2: hub service not running -> admin stance + hub projection r
   const body = JSON.parse(hub.text);
   assert.equal(body.running, false);
   assert.equal(body.machine, "Mac-mini-书房");
+});
+
+test("dispatch row 1 + `hub open` shape: explicit --server with local hub.json serves /sidecar/hub 200 (D1 access-card data plane)", async (t) => {
+  // 走查 D1：`hub open`（hub.mjs hubOpen）spawn webui CLI 的精确形态——显式
+  // --server 指向本机中枢 bind base、DWEB_HOME 只经 env、token 经 env。本机
+  // hub.json 存在 → /sidecar/hub 200（接入卡片模型字段齐备）——与无参 row-2
+  // 路径的数据面行为一致；hub_local 标记仍仅 row-2 自动形态触发（显式目标
+  // 不标——远端/本机中枢由调用方声明，CLI 不擅自升格）。
+  const { home, cleanup } = await tmpHome();
+  t.after(() => cleanup());
+  const upstream = await fakeHub(); // /healthz 200 → 接入卡片 running=true
+  t.after(() => upstream.close());
+  await writeHubState(home, { gatewayBind: `0.0.0.0:${upstream.port}` });
+  const run = await runMain(
+    { server: `http://127.0.0.1:${upstream.port}`, token: "T".repeat(43) },
+    { home },
+    { injectHomeDir: false },
+  );
+  t.after(() => run.finish());
+  const state = JSON.parse((await request(run.port, { path: "/sidecar/state" })).text);
+  assert.equal(state.phase, "ready");
+  assert.equal(state.role, "admin");
+  assert.equal(state.hub_local, false, "显式 --server 不是 row-2 hub 本机自动形态");
+  const hub = await request(run.port, { path: "/sidecar/hub", headers: { host: `127.0.0.1:${run.port}` } });
+  assert.equal(hub.status, 200, "hub open 路径接入卡片数据面可达（走查 D1）");
+  const body = JSON.parse(hub.text);
+  assert.equal(typeof body.machine, "string", "卡片模型字段：machine（中枢名）");
+  assert.match(body.primary_url, /^http:\/\//, "卡片模型字段：primary_url（家里人怎么连）");
+  assert.ok(typeof body.short_code === "string" && body.short_code.length > 0, "卡片模型字段：short_code");
+  assert.ok(typeof body.qr_svg === "string" && body.qr_svg.includes("<svg"), "卡片模型字段：qr_svg");
+  assert.equal(body.running, true, "/healthz 运行探测接通假上游");
+  const r = await run.finish();
+  assert.equal(r.exit, 0);
+});
+
+test("dispatch row 1 baseline: explicit --server on a machine WITHOUT hub.json keeps /sidecar/hub 404", async (t) => {
+  // D1 语义的另一侧：homeDir 恒注入只打开数据面通道；hub.json 存在性门控不变
+  //（无中枢身份的机器 = 404 本来就对，卡片不渲染）。
+  const { home, cleanup } = await tmpHome();
+  t.after(() => cleanup());
+  const upstream = await fakeUpstream({
+    handler: (req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{}");
+    },
+  });
+  t.after(() => upstream.close());
+  const run = await runMain(
+    { server: `http://127.0.0.1:${upstream.port}`, token: "T".repeat(43) },
+    { home },
+    { injectHomeDir: false },
+  );
+  t.after(() => run.finish());
+  const hub = await request(run.port, { path: "/sidecar/hub", headers: { host: `127.0.0.1:${run.port}` } });
+  assert.equal(hub.status, 404);
+  const leases = await request(run.port, { path: "/sidecar/leases", headers: { host: `127.0.0.1:${run.port}` } });
+  assert.equal(leases.status, 200, "空租约簿照常投影（数据面通道开，账本为空）");
+  const r = await run.finish();
+  assert.equal(r.exit, 0);
 });
 
 test("dispatch row 3 + Scenario「成员设备不进 setup」: leases data, no hub.json -> member console", async (t) => {

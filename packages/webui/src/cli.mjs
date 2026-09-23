@@ -189,10 +189,14 @@ export async function main(args, io = {}) {
   let member = false;
   /** @type {boolean} */
   let hubLocal = false;
-  /** @type {string | null} */
-  let homeDir = null;
+  // homeDir 恒注入（home-hub 走查 D1）：本机数据面（/sidecar/hub|leases|visits）
+  // 跟随本机 DWEB_HOME——显式 --server（含 `hub open` 的本机中枢 admin 入口）与
+  // 无参 row 2-5 同权。它只是路径注入，无副作用；无 hub.json 的机器数据面照旧
+  // 404（core 侧 hub.json 存在性门控不变）。hubLocal 标记仍仅由 row 2 自动形态
+  // 触发——显式 --server（远端或本机中枢）不是 hub 本机自动形态。
+  const homeDir = io.homeDir ?? homeRoot(env);
   if (target === null) {
-    const home = io.homeDir ?? homeRoot(env);
+    const home = homeDir;
     const decision = await resolveLaunch({ home, setup: args.setup === true });
     if (decision.kind === "hub-local") {
       hubLocal = true;
@@ -209,7 +213,6 @@ export async function main(args, io = {}) {
     } else if (decision.kind === "member") {
       member = true;
     }
-    homeDir = home;
   }
 
   try {
