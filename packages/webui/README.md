@@ -67,14 +67,48 @@ Ed25519 签名的审计辅助，验签公钥见 server 的 services.json `server
 仍可读 sidecar 内存或注入；配对码防线的成立依赖终端与浏览器不同时被攻击
 者控制。
 
+## SDK 分层与 createConsole（home-hub 2a）
+
+包分层为**核心 SDK + 薄壳**（`src/core/` 运行时；`src/cli.mjs`/`src/plugin.mjs`
+壳层——信号/开浏览器/退出留在壳，core 零浏览器 spawn、零进程语义）：
+
+```js
+import { startSidecar, createConsole, NodeStore, validateTarget } from "opendweb-webui";
+// startSidecar：既有入口，签名与返回形状零破坏（HTTP 面/CLI 壳继续用它）
+// createConsole：进程内宿主（托盘/嵌入式壳消费）
+const con = await createConsole({
+  opener: (url) => myShellOpens(url), // 必填：打开行为注入（core 不自带浏览器）
+  target, token,                      // 其余 opts 透传 startSidecar
+});
+con.urlFor("#/lease");                // 纯函数：http://127.0.0.1:<p>/?dweb_console=<cap>#/lease
+con.open("#/lease");                  // 经注入 opener 打开
+con.mode();                           // "setup" | "ready"
+con.getSnapshot();                    // 同步快照 {mode, node, hub}（hub 槽位 2b 填充）
+con.onEvent("node-switch", fn);       // 事件 schema v1 整帧 {v:1,type,payload,ts} → disposer
+await con.switchTarget(nodeId);       // 进程内直调（不经 HTTP）
+await con.close();                    // capability 即失效；事件静默；再订阅抛错
+```
+
+**会话 capability v1**（`urlFor` 产物中的 `dweb_console` query）：≥128-bit
+CSPRNG、绑定本 sidecar 实例（跨实例无效）、**单次消费**（`GET /sidecar/session`
+引导；重放=403+记录行）、TTL 120s、close 即失效。属一次性会话凭证（配对码
+族的强化）——**非 hub-token/admin token**：后者永不入 URL/浏览器可见状态/
+IPC。query 不落 sidecar 访问日志；SPA 页面施加 `no-referrer`。
+
+类型：手写 `src/index.d.ts`（"." 导出面）。接入卡片算法（短码/QR）经
+workspace 依赖复用 CLI 单源（`src/core/cardkit.mjs` re-export，2c 卡片消费）。
+
 ## 开发
 
 ```sh
 pnpm install            # 安装构建期依赖（vite / preact / htm —— 均为 devDependencies）
-pnpm test               # node:test 全套（sidecar/CLI/契约/UI 失败态矩阵/dist 冒烟）
+pnpm test               # node:test 全套（sidecar/CLI/契约/UI/createConsole/dist 冒烟）
 pnpm run build          # ui/ → dist/（构建产物提交入库：dist 随 npm 包分发）
 ```
 
-包结构：`src/` 运行时（零依赖 sidecar + CLI + plugin 清单）；`ui/` 构建期
-SPA 源码（Preact + htm + 手写 CSS，不发布）；`dist/` 预构建静态资源
-（发布产物，入库）。
+包结构：`src/core/` 核心 SDK（sidecar 运行时 / NodeStore / 目标守卫 / 事件
+总线 / 会话 capability / 卡片算法复用面）；`src/cli.mjs`+`src/plugin.mjs`
+薄壳（bin 与 `opendweb webui` 插件形态，分发体感不变）；`src/index.mjs`
+SDK 入口（`src/sidecar.mjs` 等旧深导入路径保留兼容 re-export）；`ui/`
+构建期 SPA 源码（Preact + htm + 手写 CSS，不发布）；`dist/` 预构建静态
+资源（发布产物，入库）。

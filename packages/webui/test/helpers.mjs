@@ -66,7 +66,8 @@ export async function fakeUpstream(opts = {}) {
 export function request(port, opts = {}) {
   const { method = "GET", path = "/", headers = {}, body, agent } = opts;
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, method, path, headers, ...(agent ? { agent } : {}) }, (res) => {
+    // agent 仅在显式给出时下发（含 false=逐请求一次性连接——close 后拒连探测用）
+    const req = http.request({ host: "127.0.0.1", port, method, path, headers, ...(agent !== undefined ? { agent } : {}) }, (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () =>

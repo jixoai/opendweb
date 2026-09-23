@@ -4,6 +4,7 @@
 // OS 可见性提示（ASCII）——help 渲染器原样呈现，golden fixture 钉住。
 // server-access-roles 节点簿例外披露：节点 token 持久化于 0600 的
 // <DWEB_HOME>/nodes.json（与 --token flag/env 的 OS 可见性同级披露）。
+// home-hub 2a 分层：envelope 零变化（薄壳经 cli.mjs → src/core/ 运行时）。
 
 const TOKEN_NOTE =
   "[note: --token or DWEB_ADMIN_TOKEN is visible to other local processes (shell history, ps, env); prefer the hidden terminal prompt or the browser pairing flow]";

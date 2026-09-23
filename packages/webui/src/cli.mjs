@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// CLI 入口（webui-console design §2.2/§3 / spec「CLI 面接线」）。
+// CLI 薄壳（webui-console design §2.2/§3 / spec「CLI 面接线」；home-hub 2a 起
+// 壳层化——运行时在 src/core/，本文件只留壳职责）。
 // 意图（2026-09-22，webui-console Phase A）：
 // 1. URL/port 校验自担（契约不扩展 schema 能力）；
 // 2. token 获取链 --token > DWEB_ADMIN_TOKEN > TTY 交互（回显关闭）；
@@ -9,14 +10,16 @@
 // 4. SIGINT/SIGTERM 清理退出；token 值不进任何 log/错误字符串。
 // 双入口：bin（opendweb-webui，本文件 shebang 直跑）与 plugin envelope
 // （run({command,args,log,cwd,stdout,stderr}) → main(args, io)）。
+// 壳层职责冻结（design §5.1）：信号/开浏览器（openImpl 形态）/退出留在本层——
+// core 零浏览器 spawn、零进程语义。
 
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { homedir } from "node:os";
 import readline from "node:readline";
-import { validateTarget } from "./target.mjs";
-import { startSidecar } from "./sidecar.mjs";
+import { validateTarget } from "./core/target.mjs";
+import { startSidecar } from "./core/sidecar.mjs";
 
 /** bin 直跑形态的参数声明（与 plugin.mjs 的 manifest args 同集） */
 const ARG_SPEC = {
@@ -160,7 +163,7 @@ export async function main(args, io = {}) {
     }
   }
 
-  /** @type {import("./sidecar.mjs").Awaited<ReturnType<typeof startSidecar>>} */
+  /** @type {import("./core/sidecar.mjs").Awaited<ReturnType<typeof startSidecar>>} */
   let sidecar;
   // 节点簿存储（server-access-roles 版本化例外）：<DWEB_HOME>/nodes.json（缺省
   // ~/.opendweb/），0600 私有文件——仅节点 token 落盘；帮助文本/横幅披露 OS 可见性。
