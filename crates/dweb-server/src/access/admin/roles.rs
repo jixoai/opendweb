@@ -231,15 +231,17 @@ fn validate_opt_len(value: &Option<String>, max: usize, label: &str) -> Result<(
     Ok(())
 }
 
-/// `expires_in_days` → expires_at（checked 链防溢出；0 非法）
-fn expires_at_from_days(days: u64, now: u64) -> Result<u64, AdminError> {
+/// `expires_in_days` → expires_at（checked 链防溢出；0 非法）。`base` =
+/// 起算基准：visitor grant 传 now；owner renew 传 **max(now, 当前
+/// expires_at)**（「顺延」语义——spec 实现期增补，三角色走查 r2）
+fn expires_at_from_days(days: u64, base: u64) -> Result<u64, AdminError> {
     if days < 1 {
         return Err(AdminError::InvalidRequest(
             "expires_in_days must be >= 1 (0 is invalid)".into(),
         ));
     }
     days.checked_mul(DAY_MS)
-        .and_then(|ms| now.checked_add(ms))
+        .and_then(|ms| base.checked_add(ms))
         .ok_or_else(|| AdminError::InvalidRequest("expires_at overflow".into()))
 }
 
@@ -938,9 +940,12 @@ pub(super) struct RenewBody {
 }
 
 /// 续期（op=0x04）：`expires_in_days` 或 `permanent:true` **恰好其一**（spec
-/// 冻结）；permanent → expires_at=None（回执 wire 恒数字，回落 u64::MAX）；
-/// 保留既有 alias/note（registry::renew 冻结语义）。键不在册（过期条目
-/// 仍在册可续期——spec「续期恢复准入」）→ 404 no-match。
+/// 冻结）；**顺延基准 = max(now, 当前 expires_at)**（spec 实现期增补，三
+/// 角色走查 r2：「顺延」语义——未到期从当前到期日起算，剩 N 天 +M 天 =
+/// 旧到期 + M 天；过期条目从 now 起算恢复准入；permanent（无既有租期）→
+/// days 以 now 起算）；permanent → expires_at=None（回执 wire 恒数字，
+/// 回落 u64::MAX）；保留既有 alias/note（registry::renew 冻结语义）。键
+/// 不在册（过期条目仍在册可续期——spec「续期恢复准入」）→ 404 no-match。
 pub(super) async fn renew_owner(
     State(state): State<AdminState>,
     Path((fabric_hex, root_hex)): Path<(String, String)>,
@@ -957,8 +962,20 @@ pub(super) async fn renew_owner(
     }
     let fabric_id = parse_hex_id(&fabric_hex, "fabric_id")?;
     let root = parse_hex_id(&root_hex, "root")?;
+    // 顺延基准：当前条目未到期 → 从当前 expires_at 起（webui「顺延 N 天」
+    // 文案的产品语义）；过期 / permanent / 理论竞态缺失 → 从 now 起算。
+    // 只读快照取基准 + renew 同锁写入（admin 低频单人操作面，快照与写入
+    // 之间的窗口不构成可观察的语义漂移）
+    let now = now_ms();
+    let base = state
+        .registry
+        .snapshot()
+        .active_entry(&fabric_id, &root)
+        .and_then(|entry| entry.expires_at)
+        .filter(|expires| *expires > now)
+        .unwrap_or(now);
     let expires_at = match body.expires_in_days {
-        Some(days) => Some(expires_at_from_days(days, now_ms())?),
+        Some(days) => Some(expires_at_from_days(days, base)?),
         None => None, // permanent
     };
     state
@@ -1912,6 +1929,141 @@ mod tests {
         .await;
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "no-match");
+    }
+
+    /// 三角色走查 r2（2026-09-23）：renew 顺延基准 = max(now, 当前
+    /// expires_at)——未到期（剩 20 天）renew 30 → 新到期 = 旧到期 + 30 天
+    /// （回执/列表数值精确断言，非 now+30）；permanent→days 从 now 起算；
+    /// 过期条目从 now 起算恢复准入；renew 不改写 registered_at
+    #[tokio::test]
+    async fn owner_renew_extends_from_current_expiry_not_now() {
+        let f = F::new();
+        let app = f.app();
+        let (unexpired, permanent, expired) = (hex32(0xF3), hex32(0xF5), hex32(0xF7));
+        let old_expires = now_ms() + 20 * DAY_MS;
+        // 三形态条目（文件入口；ts=100 = 固定首次注册时刻）
+        std::fs::write(
+            f.registry.path(),
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":{}}}\n{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100}}\n{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":{}}}\n",
+                hex::encode(unexpired),
+                hex::encode(hex32(0xF4)),
+                old_expires,
+                hex::encode(permanent),
+                hex::encode(hex32(0xF6)),
+                hex::encode(expired),
+                hex::encode(hex32(0xF8)),
+                now_ms() - 1
+            ),
+        )
+        .unwrap();
+        f.registry.reload().unwrap();
+        let renew = |fabric: [u8; 32], root: [u8; 32], body: serde_json::Value| {
+            req_with_body(
+                "POST",
+                &format!(
+                    "/admin/owners/{}/{}/renew",
+                    hex::encode(fabric),
+                    hex::encode(root)
+                ),
+                body,
+            )
+        };
+
+        // ① 未到期（剩 20 天）renew 30：新到期 = 旧到期 + 30 天（精确）
+        let (status, body) = send(
+            &app,
+            renew(
+                unexpired,
+                hex32(0xF4),
+                serde_json::json!({"expires_in_days": 30}),
+            ),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body["expires_at"].as_u64().unwrap(),
+            old_expires + 30 * DAY_MS,
+            "回执 expires_at = 旧到期 + 30 天（顺延，非 now+30）"
+        );
+        let (_, list) = send(&app, get("/admin/owners")).await;
+        let e = &list["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["fabric_id"] == hex::encode(unexpired))
+            .unwrap();
+        assert_eq!(e["expires_at"].as_u64().unwrap(), old_expires + 30 * DAY_MS);
+        assert!(
+            e["expires_in"].as_u64().unwrap() > 49 * DAY_MS,
+            "剩余 ≈ 50 天（20 + 30），未损失既有租期"
+        );
+        assert_eq!(e["registered_at"], 100, "renew 不改写注册时间");
+        // 磁盘归并一致
+        f.registry.reload().unwrap();
+        assert_eq!(
+            f.registry
+                .snapshot()
+                .active_entry(&unexpired, &hex32(0xF4))
+                .unwrap()
+                .expires_at,
+            Some(old_expires + 30 * DAY_MS)
+        );
+        assert_eq!(
+            f.registry
+                .snapshot()
+                .active_entry(&unexpired, &hex32(0xF4))
+                .unwrap()
+                .registered_at,
+            100
+        );
+
+        // ② permanent→days：无既有租期 → 从 now 起算（窗口断言）
+        let before = now_ms();
+        let (status, body) = send(
+            &app,
+            renew(
+                permanent,
+                hex32(0xF6),
+                serde_json::json!({"expires_in_days": 7}),
+            ),
+        )
+        .await;
+        let after = now_ms();
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let expires = body["expires_at"].as_u64().unwrap();
+        assert!(
+            expires >= before + 7 * DAY_MS && expires <= after + 7 * DAY_MS,
+            "permanent→days 从 now 起算：{expires}"
+        );
+
+        // ③ 过期条目：从 now 起算恢复准入（非从旧到期顺延——已无可顺延）
+        let before = now_ms();
+        let (status, body) = send(
+            &app,
+            renew(
+                expired,
+                hex32(0xF8),
+                serde_json::json!({"expires_in_days": 1}),
+            ),
+        )
+        .await;
+        let after = now_ms();
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let expires = body["expires_at"].as_u64().unwrap();
+        assert!(
+            expires >= before + DAY_MS && expires <= after + DAY_MS,
+            "过期条目 renew 从 now 起算：{expires}"
+        );
+        let (_, list) = send(&app, get("/admin/owners")).await;
+        let e = &list["owners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["fabric_id"] == hex::encode(expired))
+            .unwrap();
+        assert_eq!(e["status"], "active", "过期条目续期后恢复准入");
+        assert_eq!(e["registered_at"], 100, "过期条目续期同样不改写注册时间");
     }
 
     /// owner 元数据 PATCH：设置/清除/保留 + 404 + 回执 0x0D

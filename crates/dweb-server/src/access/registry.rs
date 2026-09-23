@@ -59,6 +59,13 @@ struct Record {
     /// `serde(default)` 兼容旧行——无此字段的行解析为非兑换注册）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     via_code_hash: Option<String>,
+    /// 该键**首次注册**时刻（三角色走查 r2，2026-09-23：`registered_at`
+    /// 审计语义冻结——续期/元数据编辑/同键再兑换不得改写「注册时间」）。
+    /// 仅 upsert 路径遇**已在册**键时携带（= 既有 registered_at）；新键与
+    /// CLI mutate 行不落该字段（行形状与旧行逐字节一致）。旧行无此字段
+    /// 回退 `ts` 老语义（`serde(default)` 兼容）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_registered_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -77,9 +84,9 @@ struct EntryMeta {
     note: Option<String>,
 }
 
-/// 活跃 Owner 条目（admin API 列表用，task 3.1；registered_at = 该键最后
-/// 一次 register 事件的 ts——重复注册刷新时间戳，append-only 日志保留
-/// 全部历史事件）
+/// 活跃 Owner 条目（admin API 列表用，task 3.1；registered_at = **首次
+/// 注册时刻**——续期/元数据编辑/同键再兑换不变（三角色走查 r2 冻结）；
+/// append-only 日志保留全部历史事件，CLI 重复 register 是唯一的刷新入口）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerEntry {
     pub fabric_id: [u8; 32],
@@ -153,6 +160,23 @@ impl RegistrySnapshot {
             .active
             .get(&(*fabric_id, *root))
             .and_then(|meta| meta.expires_at)
+    }
+
+    /// 单键只读投影（三角色走查 r2：admin renew「顺延」基准的事实源——
+    /// 未到期条目从当前 expires_at 起算）。键在册返回完整条目，否则 None
+    /// （含过期条目——在册可续期）；不物化整个 entries() 列表
+    pub fn active_entry(&self, fabric_id: &[u8; 32], root: &[u8; 32]) -> Option<OwnerEntry> {
+        self.inner
+            .active
+            .get(&(*fabric_id, *root))
+            .map(|meta| OwnerEntry {
+                fabric_id: *fabric_id,
+                root: *root,
+                registered_at: meta.registered_at,
+                expires_at: meta.expires_at,
+                alias: meta.alias.clone(),
+                note: meta.note.clone(),
+            })
     }
 
     /// 是否为空（restricted+static+空 registry 启动告警，task 1.3）
@@ -246,7 +270,9 @@ impl OwnerRegistry {
                     active.insert(
                         (fabric_id, root),
                         EntryMeta {
-                            registered_at: record.ts,
+                            // 事件行携带首次注册时刻则保持；旧行（无该字段）
+                            // 回退 ts 老语义（磁盘归并路径的向后兼容）
+                            registered_at: record.first_registered_at.unwrap_or(record.ts),
                             expires_at: record.expires_at,
                             alias: record.alias,
                             note: record.note,
@@ -285,6 +311,9 @@ impl OwnerRegistry {
                 alias: None,
                 note: None,
                 via_code_hash: None,
+                // CLI/admin 直加不带首次注册时刻（重复 register 刷新语义的
+                // 唯一保留入口，见 OwnerEntry.registered_at 注释）
+                first_registered_at: None,
             },
             *fabric_id,
             *root,
@@ -294,8 +323,8 @@ impl OwnerRegistry {
     /// 邀请码兑换注册（server-access-roles Phase 1b 跨台账提交协议 ①：
     /// 唯一调用方 = codes::CodeLedger::redeem，codes 锁内执行）。事件携带
     /// `via_code_hash` + 兑换租期；**同键已活跃 = 续期语义**——刷新
-    /// expires_at 与 registered_at、**保留既有 alias/note**（spec 冻结，
-    /// 与 mutate 的覆盖语义有意不同）、不重复建条目。
+    /// expires_at、**保留既有 alias/note 与首次 registered_at**（spec
+    /// 冻结，与 mutate 的覆盖语义有意不同）、不重复建条目。
     ///
     /// `alias_candidate` = 设备自报别名（home-hub [H6]，调用方已完成
     /// body.alias > alias_hint 优先级裁决）的**首写语义**：既有 alias
@@ -410,15 +439,15 @@ impl OwnerRegistry {
         // 合并规则：外层 Some=覆盖终值（内层 None=清除/永久）、外层 None=
         // 保留既有——**不得**用 flatten().or() 回落（会把「清除」误判为
         // 「未提供」而复活旧值）
-        let existing = state
-            .current
-            .active
-            .get(&(*fabric_id, *root))
-            .cloned()
-            .unwrap_or_default();
+        let existing_entry = state.current.active.get(&(*fabric_id, *root)).cloned();
+        let existing = existing_entry.clone().unwrap_or_default();
         let final_expires = expires_at.unwrap_or(existing.expires_at);
         let final_alias = alias.unwrap_or(existing.alias);
         let final_note = note.unwrap_or(existing.note);
+        // 键已在册：事件行携带首次注册时刻（registered_at 审计语义冻结，
+        // 三角色走查 r2——续期/元数据编辑/同键再兑换不刷「注册时间」）；
+        // 新键不落该字段（行形状与旧行逐字节一致）
+        let first_registered_at = existing_entry.map(|meta| meta.registered_at);
         let record = Record {
             op: Op::Register,
             fabric_id: encode_key(&hex::encode(fabric_id)),
@@ -428,6 +457,7 @@ impl OwnerRegistry {
             alias: final_alias,
             note: final_note,
             via_code_hash: via_code_hash.map(hex::encode),
+            first_registered_at,
         };
         let line = ledger::record_line(&record).context("serialize owners record")?;
         ledger::append_line(path, "owners", &line)?;
@@ -435,7 +465,7 @@ impl OwnerRegistry {
         active.insert(
             (*fabric_id, *root),
             EntryMeta {
-                registered_at: record.ts,
+                registered_at: record.first_registered_at.unwrap_or(record.ts),
                 expires_at: record.expires_at,
                 alias: record.alias,
                 note: record.note,
@@ -466,7 +496,9 @@ impl OwnerRegistry {
                 active.insert(
                     (fabric_id, root),
                     EntryMeta {
-                        registered_at: record.ts,
+                        // 事件行携带首次注册时刻则保持；无该字段（mutate 行/
+                        // 旧行）回退 ts（apply 路径 = CLI register 刷新语义）
+                        registered_at: record.first_registered_at.unwrap_or(record.ts),
                         expires_at: record.expires_at,
                         alias: record.alias,
                         note: record.note,
@@ -769,7 +801,7 @@ mod tests {
         reg.register(&key(1), &key(2)).unwrap();
         reg.unregister(&key(1), &key(2)).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        for keyword in ["expires_at", "alias", "note"] {
+        for keyword in ["expires_at", "alias", "note", "first_registered_at"] {
             assert!(
                 !content.contains(keyword),
                 "无元数据写入不得落 {keyword} 键：{content}"
@@ -962,6 +994,10 @@ mod tests {
         assert!(line.contains("\"expires_at\":9999"));
         assert!(line.contains(&format!("\"via_code_hash\":\"{}\"", "33".repeat(32))));
         assert!(!line.contains("alias") && !line.contains("note"));
+        assert!(
+            !line.contains("first_registered_at"),
+            "新键行不落首次注册时刻（旧行形状冻结）"
+        );
         // 重启 load：via_code 孤儿集合 + 快照租期恢复
         let reloaded = OwnerRegistry::load(&path).unwrap();
         assert_eq!(
@@ -1007,9 +1043,10 @@ mod tests {
         assert!(OwnerRegistry::load(&path).is_err());
     }
 
-    /// 兑换注册的续期合并语义：同键再兑换刷新租期/registered_at、保留
-    /// 既有 alias/note、不重复建条目；unregister 后 via_code 孤儿仍保留
-    /// （append-only 事实，reconciliation 不因注销而漏补）
+    /// 兑换注册的续期合并语义：同键再兑换刷新租期、保留既有 alias/note
+    /// 与**首次 registered_at**（三角色走查 r2 的有意语义修正——「注册
+    /// 时间」不再被续期改写）、不重复建条目；unregister 后 via_code 孤儿
+    /// 仍保留（append-only 事实，reconciliation 不因注销而漏补）
     #[test]
     fn register_via_code_renewal_preserves_metadata() {
         let dir = TempDir::new().unwrap();
@@ -1033,7 +1070,17 @@ mod tests {
         assert_eq!(entries[0].expires_at, Some(900));
         assert_eq!(entries[0].alias.as_deref(), Some("a"), "续期保留 alias");
         assert_eq!(entries[0].note.as_deref(), Some("n"), "续期保留 note");
-        assert!(entries[0].registered_at > 100, "registered_at 刷新");
+        assert_eq!(entries[0].registered_at, 100, "首次注册时刻保持（r2 修正）");
+        // 续期行携带 first_registered_at（磁盘=内存，重启归并语义一致）
+        let text = std::fs::read_to_string(&path).unwrap();
+        let last = text.lines().next_back().unwrap();
+        assert!(last.contains("\"first_registered_at\":100"), "{last}");
+        let reloaded = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(
+            reloaded.snapshot().entries()[0].registered_at,
+            100,
+            "重启归并保持首次注册时刻"
+        );
         assert_eq!(
             reg.snapshot().code_orphans(),
             vec![([0x88; 32], [0x66; 32], [0x77; 32])],
@@ -1042,6 +1089,106 @@ mod tests {
         // 注销后孤儿事实仍在（崩溃恢复以事件为准，不以活跃集合为准）
         reg.unregister(&[0x66; 32], &[0x77; 32]).unwrap();
         assert_eq!(reg.snapshot().code_orphans().len(), 1);
+    }
+
+    /// 三角色走查 r2（2026-09-23）：registered_at 审计语义冻结——改名
+    /// （update_metadata）/renew/同键再兑换均不改写「注册时间」；新键
+    /// = 事件 ts；全程含重启归并复核
+    #[test]
+    fn registered_at_first_registration_survives_all_owner_mutations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        // 首次注册（文件入口，ts=100）
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"alias\":\"old\"}}\n",
+                "81".repeat(32),
+                "82".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        // 改名：registered_at 不变
+        reg.update_metadata(&[0x81; 32], &[0x82; 32], Some("renamed".into()), None)
+            .unwrap();
+        assert_eq!(
+            reg.snapshot().entries()[0].registered_at,
+            100,
+            "改名不改注册时间"
+        );
+        // renew（绝对时间戳入参）：不变
+        reg.renew(&[0x81; 32], &[0x82; 32], Some(9_000)).unwrap();
+        assert_eq!(
+            reg.snapshot().entries()[0].registered_at,
+            100,
+            "续期不改注册时间"
+        );
+        // 同键再兑换：不变（租期照常刷新、alias 保留）
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        reg.register_via_code(&[0x81; 32], &[0x82; 32], Some(12_000), &[0x83; 32], None)
+            .unwrap();
+        let entry = &reg.snapshot().entries()[0];
+        assert_eq!(entry.registered_at, 100, "同键再兑换不改注册时间");
+        assert_eq!(entry.expires_at, Some(12_000), "租期照常刷新");
+        assert_eq!(entry.alias.as_deref(), Some("renamed"));
+        // 重启归并：first_registered_at 已落行 → 语义持久
+        let reloaded = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(
+            reloaded.snapshot().entries()[0].registered_at,
+            100,
+            "重启归并保持首次注册时刻"
+        );
+        // 新键（兑换路径首次落册）：registered_at = 事件 ts（≈ now）
+        let before = now_ms();
+        reg.register_via_code(&[0x91; 32], &[0x92; 32], Some(9_000), &[0x93; 32], None)
+            .unwrap();
+        let after = now_ms();
+        let all_entries = reg.snapshot().entries();
+        let fresh = all_entries
+            .iter()
+            .find(|e| e.fabric_id == [0x91; 32])
+            .unwrap();
+        assert!(
+            fresh.registered_at >= before && fresh.registered_at <= after,
+            "新键 registered_at = 事件 ts"
+        );
+        // 新键行不落 first_registered_at（行形状与旧行逐字节一致）
+        let text = std::fs::read_to_string(&path).unwrap();
+        let new_key_line = text
+            .lines()
+            .rev()
+            .find(|l| l.contains(&"91".repeat(32)))
+            .unwrap();
+        assert!(
+            !new_key_line.contains("first_registered_at"),
+            "{new_key_line}"
+        );
+    }
+
+    /// 旧格式行（无 first_registered_at 字段）reload 后回退 ts 老语义：
+    /// registered_at = 最后一条 register 行的 ts（向后兼容冻结）
+    #[test]
+    fn old_format_rows_without_first_registered_at_fall_back_to_ts() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owners.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":100,\"expires_at\":200}}\n{{\"op\":\"register\",\"fabric_id\":\"{}\",\"root\":\"{}\",\"ts\":5000,\"expires_at\":9000}}\n",
+                "86".repeat(32),
+                "87".repeat(32),
+                "86".repeat(32),
+                "87".repeat(32)
+            ),
+        )
+        .unwrap();
+        let reg = OwnerRegistry::load(&path).unwrap();
+        assert_eq!(
+            reg.snapshot().entries()[0].registered_at,
+            5000,
+            "旧行无字段 → 回退最后 register 行 ts 老语义"
+        );
     }
 
     /// home-hub [H6] 自报别名首写语义：无既有 alias 时候选首次写入；
@@ -1103,8 +1250,9 @@ mod tests {
         );
     }
 
-    /// task 3.1：entries() 暴露 registered_at（最后 register 事件 ts），
-    /// 确定性排序；磁盘重载保留 ts；重复 register 刷新 ts
+    /// task 3.1：entries() 暴露 registered_at（CLI mutate 行 = 最后 register
+    /// 事件 ts——upsert 路径则保持首次注册时刻，见 first_registered_at），
+    /// 确定性排序；磁盘重载保留 ts；CLI 重复 register 刷新 ts
     #[test]
     fn entries_track_registered_at_sorted_and_survive_reload() {
         let dir = TempDir::new().unwrap();
