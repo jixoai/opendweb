@@ -27,7 +27,8 @@
 //    沿用基线 Host 守卫（Host 精确 + Origin 同源或缺失，400 族）；
 //    POST /sidecar/visits/probe · PATCH /sidecar/leases/{id}/label——写路由
 //    Origin 严格策略（四类冻结：same-origin 200 / 缺失 Origin 403 / 伪造 403 /
-//    坏 Host 403；基线 guard 的缺失放行不适用于新写路由）；
+//    坏 Host 403；基线 guard 的缺失放行不适用于新写路由）；probe 另有角色
+//    守卫（r18 P1-1/裁决 #14：到访簿仅成员侧写入——非 member 姿态 403）；
 // 4. stdlib http/https.request 按解析 IP + SNI + Host 逐请求连接（agent:false
 //    + 响应结束/abort 即 destroy socket）；body 界 64KiB/1MiB；10s 超时；
 // 5. 日志只记 method/path/status/耗时——token 不进任何日志/响应。
@@ -483,8 +484,8 @@ export async function createSidecar(opts = {}) {
       return;
     }
     // 本机数据面（home-hub 2b /sidecar/leases|visits|hub + probe/label）：
-    // homeDir 注入即启用（member 与 admin 姿态都服务——三视角数据互不串扰，
-    // 数据面本身无 admin 概念）。
+    // homeDir 注入即启用（读面 member 与 admin 姿态都服务——三视角数据互不
+    // 串扰；probe 写面仅 member 姿态，见 handleHomeData 角色守卫）。
     if (
       homeDir !== null &&
       (req.url === "/sidecar/leases" ||
@@ -736,8 +737,17 @@ export async function createSidecar(opts = {}) {
       return;
     }
 
-    // POST /sidecar/visits/probe {server}：五类映射探测 + visits 落账（锁写）
+    // POST /sidecar/visits/probe {server}：五类映射探测 + visits 落账（锁写）。
+    // 角色守卫（r18 P1-1 / 裁决 #14）：到访簿仅成员侧写入——非 member 姿态
+    // （admin/默认/hub-local 同族）一律 403，先于 Origin/入参守卫（授权优先）。
     if (req.method === "POST" && url === "/sidecar/visits/probe") {
+      if (!member) {
+        sendJson(res, 403, {
+          error: { code: "forbidden", message: "visit probes write the member-side visits ledger; only a member-stance sidecar may probe" },
+        });
+        logAccess(req, 403, startedAt);
+        return;
+      }
       if (!guardWriteOrigin(req, res, startedAt)) return;
       const body = await readBody(req, res);
       if (body === null) {

@@ -47,7 +47,7 @@
 5. **heartbeat pid 核验降级**：pid 校验失败不致命，降级为「未核实」状态继续心跳。
 6. **opened 帧序**：hub 侧 opened 事件先于首个 heartbeat 帧发出。
 7. **envelope 未冻结注记**：JSON-RPC golden 帧只冻结语义字段；envelope 外额外字段不纳入冻结面（README 注记）。
-8. **默认模式 EOF**：stdout 模式下宿主关闭 stdout（EOF）→ 插件自行退出，不挂死。
+8. **默认模式断管退出（双信号；r18 P1-2 改写）**：stdout 模式下「stdout 写错（EPIPE）**或**宿主关闭 stdin（EOF）」任一发生 → 幂等 stop() 退出（exit 0，心跳 mtime 冻结），不挂死；宿主干净关管无写错时 stdin EOF 是可靠即时的宿主消失信号，故默认模式宿主 MUST 保持 stdin 打开（`stdio: ignore` 形态立即触发退出，不再适用——初版「stdin EOF 不退出防秒退」裁决作废）。停机时释放 stdin 读柄（流动态 EOF 探测的 ref'd handle 不释放则 SIGTERM 路径无法退出）。
 
 ### Phase 1d（leases/join）×8
 

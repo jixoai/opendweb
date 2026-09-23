@@ -351,10 +351,74 @@ export async function readLegacyRegistration(home) {
 }
 
 /**
+ * leases.json 存在性（迁移触发条件的只读探测——与 migrateLegacyRegistration
+ * 的触发判定共用同一事实源；join 的一致性预检亦用）。
+ * @param {string} home
+ * @returns {Promise<boolean>}
+ */
+export async function leasesFileExists(home) {
+  return readFile(path.join(home, LEASES_FILE), "utf8").then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
+ * @param {unknown} v
+ * @returns {v is LeaseEntry["receipt"]}
+ */
+function isReceipt(v) {
+  if (v === null || typeof v !== "object") return false;
+  const r = /** @type {Record<string, unknown>} */ (v);
+  return (
+    typeof r.ts === "number" && typeof r.generation === "number" &&
+    typeof r.code_hash === "string" && typeof r.receipt_sig === "string"
+  );
+}
+
+/**
+ * 纯函数（r18 P2-1）：旧 registration 状态 → 租约条目构建——不落盘、不加锁、
+ * 不探测网络（relay_url/serverId 由调用方探测后注入；缺省 relay_url=""、
+ * server_id 取旧文件自带值）。迁移提交（migrateLegacyRegistration）与 join
+ * 的一致性预检（join.freshAdmission 只读预演「迁移后条目」）共用同一构建
+ * 语义，两者对「legacy 是否可迁移」的判定恒一致。
+ * @param {Record<string, unknown>} state 旧 registration.json 解析对象
+ * @param {{ rootFallback?: string, serverId?: string | null, relayUrl?: string, now?: () => number, random?: () => Uint8Array }} [ctx]
+ * @returns {{ ok: true, entry: LeaseEntry } | { ok: false }} ok=false=必需字段缺失/非法（server/fabric_id/root）
+ */
+export function buildLegacyLeaseEntry(state, ctx = {}) {
+  const { rootFallback, serverId = null, relayUrl = "", now = Date.now, random } = ctx;
+  const server = state.server;
+  const fabricId = state.fabric_id;
+  const root = typeof state.root === "string" && HEX64_RE.test(state.root)
+    ? state.root
+    : (typeof rootFallback === "string" && HEX64_RE.test(rootFallback) ? rootFallback : null);
+  if (typeof server !== "string" || server === "" || typeof fabricId !== "string" || !HEX64_RE.test(fabricId) || root === null) {
+    return { ok: false };
+  }
+  /** @type {LeaseEntry} */
+  const entry = {
+    id: randomLeaseId(random),
+    server,
+    relay_url: relayUrl,
+    server_id: typeof state.server_id === "string" && HEX64_RE.test(state.server_id) ? state.server_id : serverId,
+    fabric_id: fabricId,
+    root,
+    alias: null,
+    label: typeof state.label === "string" ? state.label : null,
+    registered_at: typeof state.registered_at === "number" ? state.registered_at : now(),
+    expires_at: typeof state.expires_at === "number" ? state.expires_at : 0,
+    receipt: isReceipt(state.receipt) ? state.receipt : null,
+  };
+  return { ok: true, entry };
+}
+
+/**
  * 触发式迁移：旧 registration.json 存在且 leases.json 缺失时，在 leases
  * 写锁内并入首条（relay_url 由对 server 发 /services.json 探测补全，任何
  * 不可达=留空待下次 join 补）；旧文件改名 registration.json.migrated；
  * 损坏=警告保留不阻塞。仅在 admission 锁内调用（锁序 admission→ledger）。
+ * 条目构建=buildLegacyLeaseEntry（纯函数，与 join 一致性预检共用）。
  * @param {string} home
  * @param {{ server?: string, rootFallback?: string, fetchImpl?: typeof fetch, probeTimeoutMs?: number, now?: () => number, isPidAlive?: (pid: number) => boolean, random?: () => Uint8Array, warn?: (line: string) => void }} [ctx]
  * @returns {Promise<MigrationResult>}
@@ -368,11 +432,7 @@ export async function migrateLegacyRegistration(home, ctx = {}) {
     random,
     warn = () => {},
   } = ctx;
-  const leasesPath = path.join(home, LEASES_FILE);
-  const leasesExists = await readFile(leasesPath, "utf8").then(
-    () => true,
-    () => false,
-  );
+  const leasesExists = await leasesFileExists(home);
   const legacy = await readLegacyRegistration(home);
   if (legacy.state === null && !legacy.corrupt) return { migrated: false, warning: null, entry: null };
   if (leasesExists) return { migrated: false, warning: null, entry: null };
@@ -396,33 +456,14 @@ export async function migrateLegacyRegistration(home, ctx = {}) {
     }
   }
 
-  // 必需字段校验：server（string）+ fabric_id（hex64）缺失/非法=按损坏处理
-  const server = legacy.state.server;
-  const fabricId = legacy.state.fabric_id;
-  const root = typeof legacy.state.root === "string" && HEX64_RE.test(legacy.state.root)
-    ? legacy.state.root
-    : (typeof ctx.rootFallback === "string" && HEX64_RE.test(ctx.rootFallback) ? ctx.rootFallback : null);
-  if (typeof server !== "string" || server === "" || typeof fabricId !== "string" || !HEX64_RE.test(fabricId) || root === null) {
+  const built = buildLegacyLeaseEntry(legacy.state, { rootFallback: ctx.rootFallback, serverId, relayUrl, now, random });
+  if (!built.ok) {
     warn(
       `warning: legacy ${LEGACY_REGISTRATION_FILE} is incomplete or damaged; keeping it in place (join continues with a fresh ledger)`,
     );
     return { migrated: false, warning: "legacy registration incomplete or damaged; kept in place", entry: null };
   }
-
-  /** @type {LeaseEntry} */
-  const entry = {
-    id: randomLeaseId(random),
-    server,
-    relay_url: relayUrl,
-    server_id: typeof legacy.state.server_id === "string" && HEX64_RE.test(legacy.state.server_id) ? legacy.state.server_id : serverId,
-    fabric_id: fabricId,
-    root,
-    alias: null,
-    label: typeof legacy.state.label === "string" ? legacy.state.label : null,
-    registered_at: typeof legacy.state.registered_at === "number" ? legacy.state.registered_at : now(),
-    expires_at: typeof legacy.state.expires_at === "number" ? legacy.state.expires_at : 0,
-    receipt: isReceipt(legacy.state.receipt) ? legacy.state.receipt : null,
-  };
+  const entry = built.entry;
 
   const lock = await acquireFileLock(path.join(home, "leases.lock"), { now, isPidAlive });
   if (!lock.ok) {
@@ -432,7 +473,7 @@ export async function migrateLegacyRegistration(home, ctx = {}) {
   }
   try {
     // 锁内再核（并发迁移者可能已落账）
-    const again = await readFile(leasesPath, "utf8").then(() => true, () => false);
+    const again = await readFile(path.join(home, LEASES_FILE), "utf8").then(() => true, () => false);
     if (again) return { migrated: false, warning: null, entry: null };
     await saveLeases(home, { version: 1, leases: [entry] });
     await rename(path.join(home, LEGACY_REGISTRATION_FILE), path.join(home, `${LEGACY_REGISTRATION_FILE}.migrated`));
@@ -440,19 +481,6 @@ export async function migrateLegacyRegistration(home, ctx = {}) {
   } finally {
     await lock.release();
   }
-}
-
-/**
- * @param {unknown} v
- * @returns {v is LeaseEntry["receipt"]}
- */
-function isReceipt(v) {
-  if (v === null || typeof v !== "object") return false;
-  const r = /** @type {Record<string, unknown>} */ (v);
-  return (
-    typeof r.ts === "number" && typeof r.generation === "number" &&
-    typeof r.code_hash === "string" && typeof r.receipt_sig === "string"
-  );
 }
 
 // ---- 既有 fabric 源读取（单 fabric 约束 preflight） ------------------------------

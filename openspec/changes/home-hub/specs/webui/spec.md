@@ -30,7 +30,7 @@ webui SHALL 升级为右上角身份切换器驱动的三视角控制台，命�
 
 ### Requirement: sidecar 本机数据面（租约/到访/中枢状态）
 
-sidecar SHALL 新增仅本机回环的数据路由：`GET /sidecar/leases`（投影含 expires_in）、`GET /sidecar/visits`、`POST /sidecar/visits/probe`（按 leases delta 冻结的五类映射落 last_probe）、`GET /sidecar/hub`（hub.json 投影；无 hub.json=404）、`PATCH /sidecar/leases/{id}/label`（**id=条目不透明键**；body `{label: string|null}`，≤64 UTF-8 字节，**空串归一为 null=清除**；未知 id=404；走 leases delta 锁协议）。**Host 守卫沿用基线；写路由（probe/label）Origin 策略严于基线**：MUST 要求 Origin 存在且匹配（基线 guard 的缺失 Origin 放行仅适用旧读/配对面，新写路由不沿用）；四类状态冻结：same-origin→200、缺失 Origin→403、不匹配/伪造 Origin→403、坏 Host→403。接入卡片卡（中枢视角·总览）与 CLI `hub card` 同源同文案（同一生成函数），二维码 SVG 与终端 ASCII 同算法；卡片不含凭证（实现默认，依 [H1] 精神，O-8 未显式拍板可回退）。
+sidecar SHALL 新增仅本机回环的数据路由：`GET /sidecar/leases`（投影含 expires_in）、`GET /sidecar/visits`、`POST /sidecar/visits/probe`（按 leases delta 冻结的五类映射落 last_probe；**写面仅 member 姿态可用——到访簿仅成员侧写入，admin/默认/hub-local 姿态一律 403（含 same-origin 合法写形态），授权守卫先于 Origin/入参守卫**）、`GET /sidecar/hub`（hub.json 投影；无 hub.json=404）、`PATCH /sidecar/leases/{id}/label`（**id=条目不透明键**；body `{label: string|null}`，≤64 UTF-8 字节，**空串归一为 null=清除**；未知 id=404；走 leases delta 锁协议）。**Host 守卫沿用基线；写路由（probe/label）Origin 策略严于基线**：MUST 要求 Origin 存在且匹配（基线 guard 的缺失 Origin 放行仅适用旧读/配对面，新写路由不沿用）；四类状态冻结：same-origin→200、缺失 Origin→403、不匹配/伪造 Origin→403、坏 Host→403。接入卡片卡（中枢视角·总览）与 CLI `hub card` 同源同文案（同一生成函数），二维码 SVG 与终端 ASCII 同算法；卡片不含凭证（实现默认，依 [H1] 精神，O-8 未显式拍板可回退）。
 
 #### Scenario: label 行内编辑（id 路由+并发+归一）
 
@@ -39,8 +39,13 @@ sidecar SHALL 新增仅本机回环的数据路由：`GET /sidecar/leases`（投
 
 #### Scenario: 写路由 Origin 四类
 
-- **WHEN** 对 probe/label 分别以 same-origin 浏览器请求、无 Origin 的裸 HTTP 客户端、伪造 Origin、坏 Host 请求
+- **WHEN** 对 probe/label 分别以 same-origin 浏览器请求、无 Origin 的裸 HTTP 客户端、伪造 Origin、坏 Host 请求（probe 在 member 姿态）
 - **THEN** 依次 200 / 403 / 403 / 403；读路由（GET leases/visits/hub）行为不受影响（沿用基线 Host 守卫）
+
+#### Scenario: 到访探测仅成员视角（负向矩阵）
+
+- **WHEN** admin/默认/hub-local 姿态的 sidecar 收到 `POST /sidecar/visits/probe`（含 same-origin 合法写形态）
+- **THEN** 一律 403（`forbidden`——到访簿仅成员侧写入）；member 姿态按写路由 Origin 四类照常服务
 
 #### Scenario: 接入卡片三形态同源
 

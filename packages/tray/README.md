@@ -104,8 +104,12 @@ opendweb-tray --ipc      # 等价 bin 直跑形态
    `{"v":1,"type":"opened","payload":{"url":"http://127.0.0.1:<port>/?dweb_console=<cap>#/lease"},"ts":…}`
 
 生命周期：SIGINT/SIGTERM → 优雅退出（心跳冻结、console 关闭、capability 失效）。
-stdout 断管（壳先死）同样触发退出（防孤儿）。**stdin 不被消费、EOF 不退出**
-（防 `stdio: ignore` 形态秒退）。
+默认模式为**双断管信号**（r18）：**stdout 写错（EPIPE）或宿主关闭 stdin（EOF）
+任一发生 → 幂等停机退出（exit 0）**——宿主干净关闭管道且无写错时，stdin EOF
+是可靠即时的宿主消失信号，插件不驻留成孤儿。因此默认模式宿主 MUST 以管道接
+stdin 并在整个生命周期保持打开（stdin 数据无协议语义，仅 EOF 有意义；
+`stdio: ignore` 形态会立即触发退出，不再适用）。ipc 模式 stdin EOF 同为
+优雅退出（既有语义，由会话层承接）。
 
 ## --ipc 模式：JSON-RPC 2.0（帧级冻结）
 

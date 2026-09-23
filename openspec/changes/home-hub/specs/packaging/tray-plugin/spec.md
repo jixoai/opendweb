@@ -6,7 +6,7 @@
 
 1. **进程内消费 webui SDK**（[H4]）：`opendweb tray` 经 createConsole 拉起本机控制台（`open(deepLink)` 为 tray open-console 的落点）；
 2. **状态面**：`<DWEB_HOME>/tray-status.json` 心跳文件（≤1s 级 mtime 刷新，原子写）承载**版本化快照 schema v1**：`{v:1, state:"error"|"knock"|"running"|"unconfigured", knocks_pending:number, ts}`——优先级 异常>敲门角标 n>运行>未配置（PRODUCT-DESIGN §3.6 冻结表；「未配置」为 v1 可选呈现，纯成员机托盘不在 v1 承诺内——O-5）；数据源=hub.json/hub.pid+hub-token 调 /admin/status（3s 轮询）+console 事件；
-3. **控制面（两种互斥模式，帧级冻结）**：默认模式=stdout **JSON-lines 事件流**（仅推送 webui SDK 同款 schema v1 事件，无请求语义）；`--ipc` 模式=stdin/stdout **JSON-RPC 2.0**（newline 分帧；request id 透传；错误 envelope `{code,message}`；**不支持 notification 与 batch**（收到即 `-32600` error 响应）；单帧上限 64KB——超限返回 error 帧（id 取帧前缀可解析值，否则 null）不断流；坏 JSON=error 帧继续服务；stdin EOF=优雅退出；stderr 仅归日志，事件与 RPC 不混流）。**golden 帧样例（契约测试冻结）**：
+3. **控制面（两种互斥模式，帧级冻结）**：默认模式=stdout **JSON-lines 事件流**（仅推送 webui SDK 同款 schema v1 事件，无请求语义；生命周期=双断管信号——**stdout 写错（EPIPE）或宿主关闭 stdin（EOF）任一发生→幂等停机退出（exit 0）**，宿主 MUST 保持 stdin 打开：`stdio: ignore` 形态不再适用）；`--ipc` 模式=stdin/stdout **JSON-RPC 2.0**（newline 分帧；request id 透传；错误 envelope `{code,message}`；**不支持 notification 与 batch**（收到即 `-32600` error 响应）；单帧上限 64KB——超限返回 error 帧（id 取帧前缀可解析值，否则 null）不断流；坏 JSON=error 帧继续服务；stdin EOF=优雅退出；stderr 仅归日志，事件与 RPC 不混流）。**golden 帧样例（契约测试冻结）**：
 
 ```jsonl
 → {"jsonrpc":"2.0","id":1,"method":"open-console","params":{"deepLink":"#/lease"}}
@@ -33,6 +33,11 @@
 
 - **WHEN** 中枢运行且有 1 台设备待敲门时启动 `opendweb tray`
 - **THEN** tray-status.json 快照 `{v:1,state:"knock",knocks_pending:1,...}`（优先级高于运行态）；stdout 事件流正常推送；进程退出后心跳 mtime 不再前进
+
+#### Scenario: 默认模式断管退出（双信号）
+
+- **WHEN** 默认模式运行中宿主关闭其 stdin 端（干净关管、无写错），或 stdout 断管触发写错（EPIPE）
+- **THEN** 两种信号任一发生即幂等停机退出（exit 0）：退出前心跳已写盘、退出后 mtime 冻结；宿主因此必须在默认模式保持 stdin 打开
 
 #### Scenario: IPC golden 帧与异常帧
 

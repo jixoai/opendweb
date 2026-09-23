@@ -4,8 +4,10 @@
 // 2. member 安全负向矩阵：/admin/*（含编码变体/未知子路径）404 且上游 mock 零
 //    收包、connect/nodes 403、不生成配对码；
 // 3. 本机数据面：leases 投影 expires_in / visits / hub 投影（无=404）/
-//    probe 五类经路由 / label（id 路由/空串清除/超长拒/未知 id 404/并发经锁）；
-//    写路由 Origin 四类（same-origin 200 / 缺失 403 / 伪造 403 / 坏 Host 403）；
+//    probe 五类经路由（member 姿态——r18 P1-1：probe 写面仅成员侧，admin/
+//    hub-local 同族 403 forbidden）/ label（id 路由/空串清除/超长拒/未知 id
+//    404/并发经锁）；写路由 Origin 四类（same-origin 200 / 缺失 403 / 伪造
+//    403 / 坏 Host 403）；
 // 4. 接入卡片三形态同源：webui 模型与 CLI runHub(["card"]) 对拍同地址同短码；
 //    golden V1；qrSvg 同矩阵；卡片无凭证；
 // 5. 路由/视角纯函数：#/lease、#/visits、member 收敛 no-hub、默认视角顺序、
@@ -465,15 +467,24 @@ test("GET /sidecar/hub: projection = card model + running probe; no credentials"
   assert.ok(!res.text.includes(token), "hub-token never in hub projection");
 });
 
-test("write-route Origin four classes (probe and label): 200 / 403 / 403 / 403; reads unaffected", async (t) => {
+test("write-route Origin four classes (probe and label): 200 / 403 / 403 / 403; probe is member-only (r18 P1-1)", async (t) => {
   const { home, cleanup } = await tmpHome();
   t.after(() => cleanup());
   const entry = await writeOneLease(home, { expiresAt: Date.now() + 86_400_000 });
-  const sc = await homeSidecar(t, home, {
-    homeFetch: () => new Response(JSON.stringify({ server_id: "a".repeat(64), services: [] }), { status: 200 }),
-  });
+  const reachable = () => new Response(JSON.stringify({ server_id: "a".repeat(64), services: [] }), { status: 200 });
   const server = "http://192.168.2.13:8787";
-  // same-origin（浏览器写请求形态：Origin 存在且匹配）
+
+  // 非 member 姿态负向（裁决 #14：到访簿仅成员侧写入）：默认（admin）与
+  // hub-local 同族——即使 same-origin 合法写形态也一律 403 forbidden
+  for (const stance of [{}, { hubLocal: true }]) {
+    const nonMember = await homeSidecar(t, home, { homeFetch: reachable, ...stance });
+    const denied = await postJson(nonMember.port, "/sidecar/visits/probe", { server }, sameOriginHeaders(nonMember));
+    assert.equal(denied.status, 403, `non-member stance ${JSON.stringify(stance)} must refuse probe writes`);
+    assert.deepEqual(JSON.parse(denied.text).error.code, "forbidden");
+  }
+
+  // member 姿态：probe 四类 Origin 矩阵（same-origin 200 / 缺失 403 / 伪造 403 / 坏 Host 403）
+  const sc = await homeSidecar(t, home, { member: true, homeFetch: reachable });
   const ok = await postJson(sc.port, "/sidecar/visits/probe", { server }, sameOriginHeaders(sc));
   assert.equal(ok.status, 200);
   assert.deepEqual(JSON.parse(ok.text).probe.result, "reachable");
@@ -492,7 +503,7 @@ test("write-route Origin four classes (probe and label): 200 / 403 / 403 / 403; 
     origin: sc.origin,
   });
   assert.equal(badHost.status, 403);
-  // label 同款四类（PATCH）
+  // label 同款四类（PATCH；label 无 member 收敛——admin 态照常）
   const labelOk = await request(sc.port, {
     method: "PATCH",
     path: `/sidecar/leases/${entry.id}/label`,
@@ -635,7 +646,8 @@ test("probe five-class mapping through the route (last_probe lands in visits.jso
   ];
 
   for (const c of cases) {
-    const sc = await homeSidecar(t, home, { homeFetch: c.fetchImpl, homeProbeTimeoutMs: c.timeoutMs });
+    // r18 P1-1 后 probe 仅 member 姿态可写——五类映射经路由的断言在 member 形态下打
+    const sc = await homeSidecar(t, home, { member: true, homeFetch: c.fetchImpl, homeProbeTimeoutMs: c.timeoutMs });
     const server = `http://192.168.2.13:8787`;
     const res = await postJson(sc.port, "/sidecar/visits/probe", { server }, sameOriginHeaders(sc));
     assert.equal(res.status, 200, c.name);

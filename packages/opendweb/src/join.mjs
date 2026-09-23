@@ -15,7 +15,8 @@
 //   - --server 直收接入短码（dwebh1. 前缀离线 decode，util.resolveServerArg）
 //   - 多租约簿 leases.json 取代单条 registration.json（旧文件触发式迁移）
 //   - join 顺序冻结：services preflight（server_id + relay 选择，无可用
-//     relay=fail-closed「中枢未启用中转」）先于 register；成功后复核
+//     relay=fail-closed「中枢未启用中转」先于 register；成功后复核；
+//     fabric 一致性闸门先于迁移提交（r18 P2-1：冲突=零迁移副作用）
 //   - fabric-admission 锁（<DWEB_HOME>/fabric.lock）封 TOCTOU：锁序恒
 //     admission→ledger；pending journal 在 register 发出前落账，崩溃/响应
 //     丢失经幂等回放状态机恢复（异码零副作用，绝不产生第二 fabric）
@@ -48,8 +49,10 @@ import {
   FABRIC_LOCK_FILE,
   PROBE_TIMEOUT_MS,
   acquireFileLock,
+  buildLegacyLeaseEntry,
   clearAdmissionJournal,
   fabricLockFile,
+  leasesFileExists,
   loadAdmissionJournal,
   loadLeases,
   migrateLegacyRegistration,
@@ -480,7 +483,36 @@ async function freshAdmission({ args, origin, codeHash, ctx }) {
   const { seed, created } = await ensureDeviceSeed(home);
   const rootHex = endpointIdHexFromSeed(seed);
 
-  // 触发式迁移：旧 registration.json（leases.json 缺失时）并入首条
+  // 一致性预检前置（r18 P2-1）：先只读汇总 leases/legacy/roster——leases.json
+  // 缺失且 legacy 可迁移时，以纯函数 buildLegacyLeaseEntry 预演「迁移后条目」
+  // 参与 resolveExistingFabricId（与提交路径共用构建语义，两者对可迁移性的
+  // 判定恒一致）；冲突在此 CliExit，零迁移副作用（registration.json 原名
+  // 原字节、leases.json 仍不存在）——旧序「先迁移后闸门」会把 fail-closed
+  // 的机器留在半迁移状态。
+  const preLeases = await loadLeases(home);
+  const preLegacy = await readLegacyRegistration(home);
+  const preRoster = await readRosterFabricId(home);
+  /** @type {import("./leases.mjs").LeaseEntry[]} */
+  let preLeasesView = preLeases.leases;
+  /** @type {Record<string, unknown> | null} */
+  let preLegacyView = preLegacy.corrupt ? null : preLegacy.state;
+  if (preLegacyView !== null && !(await leasesFileExists(home))) {
+    const built = buildLegacyLeaseEntry(preLegacyView, { now });
+    if (built.ok) {
+      preLeasesView = [built.entry];
+      preLegacyView = null;
+    }
+  }
+  const precheck = resolveExistingFabricId({ leases: preLeasesView, legacy: preLegacyView, rosterFabricId: preRoster });
+  if (precheck.ok === false) {
+    throw new CliExit(
+      `local fabric state is inconsistent (ledger/legacy/roster disagree: ${precheck.conflict.map((f) => f.slice(0, 8) + "…").join(" vs ")}); refusing to join; resolve the mismatch manually - no lease was written and the legacy registration was left untouched`,
+      1,
+    );
+  }
+
+  // 一致性通过 → 触发式迁移提交：旧 registration.json（leases.json 缺失时）
+  // 并入首条（其锁内再核逻辑保留；relay_url 探测补全）
   const migration = await migrateLegacyRegistration(home, {
     fetchImpl,
     probeTimeoutMs,
@@ -489,7 +521,8 @@ async function freshAdmission({ args, origin, codeHash, ctx }) {
     warn: (line) => stdout(line),
   });
 
-  // fabric preflight：既有 roster/租约 fabric_id（单 fabric 约束）
+  // fabric preflight：既有 roster/租约 fabric_id（单 fabric 约束；admission
+  // 锁内文件状态与预检一致——此处复核为防御性等价路径）
   const leases = await loadLeases(home);
   const legacy = migration.migrated ? null : (await readLegacyRegistration(home)).state;
   const rosterFabricId = await readRosterFabricId(home);

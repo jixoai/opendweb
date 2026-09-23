@@ -7,14 +7,17 @@
 // 2. 心跳接线：createHeartbeat（tray-status.json ≤1s 刷新）+ console
 //    knock-pending 事件注入（后到者覆盖）；
 // 3. 双模式互斥：默认=stdout JSON-lines 事件流（webui schema v1 帧转发 +
-//    tray-status 状态变化通知 + opened 事件；无请求语义，stdin 不消费——
-//    不做 EOF 退出，防 stdio:ignore 形态秒退）；--ipc=JSON-RPC 2.0
-//    （ipc.mjs；opened 以 server 通知帧透出）；
+//    tray-status 状态变化通知 + opened 事件；无请求语义，stdin 数据不消费
+//    ——协议面无 stdin 语义，但接其 'end'/'close' 作宿主消失信号，见 5）；
+//    --ipc=JSON-RPC 2.0（ipc.mjs；opened 以 server 通知帧透出）；
 // 4. 方法集：open-console(deepLink?)/start/stop/set-autostart——hub 动作经
 //    子进程 `node <opendweb bin> hub …`（绝对路径解析，DWEB_HOME 注入）；
 //    未 init hub=业务 error -32000 "hub not initialized"（golden 冻结）；
-// 5. 生命周期：SIGINT/SIGTERM/stdin EOF(ipc)/stdout EPIPE → stop()（幂等）：
-//    停心跳（mtime 冻结）→ 关 console（capability 即失效）。
+// 5. 生命周期（r18 P1-2 双断管信号）：SIGINT/SIGTERM/stdout 写错（EPIPE）/
+//    宿主关闭 stdin（EOF——默认模式）任一 → stop()（幂等）：停心跳（mtime
+//    冻结）→ 关 console（capability 即失效）。默认模式宿主 MUST 保持 stdin
+//    打开（stdio:ignore 形态 EOF 立即触发退出，不再适用）；ipc 模式 stdin
+//    EOF 由 createIpcSession 承接（既有语义）。
 // stderr 只归日志；stdout 恒为当前模式的帧通道（事件与 RPC 不混流）。
 
 import os from "node:os";
@@ -220,7 +223,9 @@ export async function createTrayController(opts = {}) {
   const shutdownPromise = new Promise((resolve) => {
     resolveShutdown = resolve;
   });
-  /** 幂等停机：停心跳（mtime 冻结）→ 关 console（capability 失效） */
+  /** 幂等停机：停心跳（mtime 冻结）→ 关 console（capability 失效）→ 释放
+   * stdin 读柄（流动态 EOF 探测的代价是一个 ref'd 读柄——不释放则宿主仍
+   * 持管时（如 SIGTERM 路径）进程无法退出；替身无 destroy 时静默跳过）。 */
   const stop = async () => {
     if (stopped) return;
     stopped = true;
@@ -230,6 +235,9 @@ export async function createTrayController(opts = {}) {
         d();
       } catch { /* close 后再 dispose 的幂等面 */ }
     }
+    try {
+      stdin?.destroy?.();
+    } catch { /* 已销毁/替身无 destroy */ }
     try {
       await consoleHandle.close();
     } catch (e) {
@@ -243,12 +251,20 @@ export async function createTrayController(opts = {}) {
   };
   signal.once?.("SIGINT", onSignal);
   signal.once?.("SIGTERM", onSignal);
-  // stdout 断管（壳先死）→ 退出防孤儿
+  // stdout 断管（壳先死）→ 退出防孤儿（信号 1：写错 EPIPE）
   if (typeof stdout.on === "function") {
     stdout.on("error", () => void stop());
   }
-  // 默认模式 stdin 不消费（见文件头注 3）；ipc 模式由 runTray 接 EOF
-  void stdin;
+  // 默认模式信号 2（r18 P1-2）：宿主干净关闭管道且无写错时，stdout 'error'
+  // 永不触发——宿主关闭其 stdin 端（EOF）是可靠即时的宿主消失信号。仅接
+  // 'end'/'close' 事件、不消费协议数据：resume 使流进入流动态丢弃数据（暂停
+  // 态流不读到底不会发 'end'，EOF 将不可观察）；双信号可能同时到——stop 幂等。
+  // ipc 模式不接（stdin 由 createIpcSession 消费并承接 EOF，行为不变）。
+  if (!ipc && typeof stdin?.on === "function") {
+    if (typeof stdin.resume === "function") stdin.resume();
+    stdin.on("end", () => void stop());
+    stdin.on("close", () => void stop());
+  }
 
   return {
     mode: ipc ? "ipc" : "stream",

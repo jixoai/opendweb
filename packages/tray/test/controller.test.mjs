@@ -52,6 +52,7 @@ test("controller (stream mode): frame sequence tray-status → knock → opened;
     stdout: out,
     stderr: errMem,
     signal: signals,
+    stdin: new EventEmitter(), // r18 后默认模式接 stdin EOF——注入替身保持测试封闭
     heartbeatIntervalMs: 100,
     pollIntervalMs: 100,
   });
@@ -99,6 +100,7 @@ test("controller: hub action method matrix via fake spawn (argv/env/success/busi
     stdout: out,
     stderr: memWriter(),
     signal: new EventEmitter(),
+    stdin: new EventEmitter(),
     heartbeatIntervalMs: 10_000,
     pollIntervalMs: 10_000,
     opendwebBinPath: "/opt/fake/opendweb.mjs",
@@ -133,6 +135,7 @@ test("controller: hub action method matrix via fake spawn (argv/env/success/busi
     stdout: memWriter(),
     stderr: memWriter(),
     signal: new EventEmitter(),
+    stdin: new EventEmitter(),
     heartbeatIntervalMs: 10_000,
     pollIntervalMs: 10_000,
     opendwebBinPath: "/opt/fake/opendweb.mjs",
@@ -160,6 +163,7 @@ test("controller: stop() is idempotent and closes the console (mode/setup degene
     stdout: memWriter(),
     stderr: memWriter(),
     signal: new EventEmitter(),
+    stdin: new EventEmitter(),
     heartbeatIntervalMs: 10_000,
     pollIntervalMs: 10_000,
   });

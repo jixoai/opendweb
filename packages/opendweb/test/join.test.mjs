@@ -484,6 +484,109 @@ test("runJoin 失败: --fabric 异值于既有=fail-closed（单 fabric），零
   assert.equal((await loadAdmissionJournal(home)).journal, null, "未写 journal");
 });
 
+test("runJoin 失败: legacy registration 与 roster fabric 冲突 → 一致性闸门先于迁移（零迁移副作用不变性）", async () => {
+  // r18 P2-1：旧序先提交迁移再查一致性——冲突机器被留在半迁移状态（leases
+  // 已写、registration.json 已改名）。新序只读预检（预演迁移条目）→ 冲突
+  // CliExit 时零写入：registration.json 原名原字节、无 .migrated、leases.json
+  // 不存在、零网络。
+  const home = await tmpHome();
+  const legacyBytes = `${JSON.stringify(
+    {
+      version: 1,
+      server: "http://192.168.2.13:8787",
+      fabric_id: FABRIC,
+      root: "cc".repeat(32),
+      registered_at: 1757000000000,
+      expires_at: 1757900000000,
+    },
+    null,
+    2,
+  )}\n`;
+  await fsp.writeFile(path.join(home, "registration.json"), legacyBytes);
+  // roster.facts 头部 fabric 与 legacy 冲突（DWEBRST1 + 32B fabric）
+  await fsp.writeFile(
+    path.join(home, "roster.facts"),
+    Buffer.concat([Buffer.from("DWEBRST1"), Buffer.from("bb".repeat(32), "hex"), Buffer.alloc(64)]),
+  );
+  let fetchCalls = 0;
+  const fetchImpl = async () => {
+    fetchCalls += 1;
+    throw new Error("must not be called");
+  };
+  const info = await exitInfo(
+    runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
+      home,
+      now: () => FIXED_TS,
+      fetchImpl,
+      stdout: () => {},
+    }),
+  );
+  assert.equal(info.thrown?.exitCode, 1);
+  assert.match(info.thrown?.message ?? "", /local fabric state is inconsistent/);
+  assert.match(info.thrown?.message ?? "", /left untouched/, "文案明示 legacy 未被触碰");
+  assert.equal(fetchCalls, 0, "一致性闸门先于一切网络（含迁移 relay 探测）");
+  // 零迁移副作用三断言：字节不变 / 文件名不变 / 租约簿仍不存在
+  assert.equal(await fsp.readFile(path.join(home, "registration.json"), "utf8"), legacyBytes, "registration.json 原字节");
+  assert.equal(await fsp.stat(path.join(home, "registration.json.migrated")).then(() => true, () => false), false, "无 .migrated 改名");
+  assert.equal(await fsp.stat(path.join(home, "leases.json")).then(() => true, () => false), false, "leases.json 仍不存在");
+  assert.equal((await loadLeases(home)).leases.length, 0);
+  assert.equal((await loadAdmissionJournal(home)).journal, null, "未写 journal");
+});
+
+test("runJoin 成功: legacy 与 roster 一致 → 一致性预检过后迁移正常发生（构建语义等价）", async () => {
+  // 同一 fixture 族但 roster fabric 与 legacy 一致：预检以「迁移后条目」参与
+  // 裁决通过 → 提交路径照常迁移（.migrated 改名 + 首条并入）+ join 落账。
+  const home = await tmpHome();
+  await fsp.writeFile(
+    path.join(home, "registration.json"),
+    JSON.stringify({
+      version: 1,
+      server: "http://127.0.0.1:8787",
+      fabric_id: FABRIC,
+      root: "cc".repeat(32),
+      registered_at: 1757000000000,
+      expires_at: 1757900000000,
+    }),
+  );
+  await fsp.writeFile(
+    path.join(home, "roster.facts"),
+    Buffer.concat([Buffer.from("DWEBRST1"), Buffer.from(FABRIC, "hex"), Buffer.alloc(64)]),
+  );
+  const serverSeed = crypto.randomBytes(32);
+  /** @type {any} */
+  let captured = null;
+  const fetchImpl = async (url, init) => {
+    const u = String(url);
+    if (u.endsWith("/register")) {
+      captured = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify(signedReceipt(serverSeed, { fabricId: captured.fabric_id, root: captured.root })), {
+        status: 200,
+      });
+    }
+    return new Response(
+      JSON.stringify({
+        server_id: endpointIdHexFromSeed(serverSeed),
+        services: [{ name: "relay", enabled: true, url: "http://127.0.0.1:3340" }],
+      }),
+      { status: 200 },
+    );
+  };
+  const cap = capture();
+  await runJoin(["--server", "http://127.0.0.1:8787", "--code", CODE], {
+    home,
+    now: () => FIXED_TS,
+    fetchImpl,
+    stdout: cap.stdout,
+  });
+  assert.equal(captured.fabric_id, FABRIC, "复用 legacy/roster 一致的本地 fabric");
+  // 迁移正常发生：改名 + 迁移首条在簿（root=legacy root），join 新条随后并入
+  assert.equal(await fsp.stat(path.join(home, "registration.json.migrated")).then(() => true, () => false), true);
+  const ledger = await loadLeases(home);
+  assert.equal(ledger.leases.length, 2, "迁移首条 + join 新条");
+  assert.ok(ledger.leases.some((e) => e.root === "cc".repeat(32) && e.registered_at === 1757000000000), "迁移条目保留 legacy root/registered_at");
+  assert.ok(ledger.leases.every((e) => e.fabric_id === FABRIC), "单 fabric 约束");
+});
+
 // ---- runJoin：失败矩阵（非零退出 + 无半提交 + 码不泄露） -----------------------
 
 const FAIL_CODES = ["bad-signature", "stale-ts", "code-invalid", "code-exhausted", "code-expired", "code-pending", "code-unavailable", "rate-limited", "invalid-request"];

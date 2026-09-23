@@ -19,6 +19,8 @@ import { blake3Hex } from "../src/blake3.mjs";
 import { normalizeInviteCode, inviteCodeHashHex } from "../src/register.mjs";
 import {
   acquireFileLock,
+  buildLegacyLeaseEntry,
+  leasesFileExists,
   loadLeases,
   upsertLease,
   migrateLegacyRegistration,
@@ -346,6 +348,40 @@ test("迁移: 损坏旧文件 → 警告保留不阻塞；缺失 → 无动作�
 });
 
 // ---- 既有 fabric 汇裁 + roster 头读取 --------------------------------------------
+
+test("buildLegacyLeaseEntry (纯函数): 必需字段矩阵 + 探测注入位（r18 P2-1 迁移/预检共用构建语义）", () => {
+  const base = { version: 1, server: "http://127.0.0.1:8787", fabric_id: FABRIC, root: ROOT };
+  // 合法：relay_url/serverId 注入、server_id 旧文件自带优先、时刻字段缺省
+  const ok = buildLegacyLeaseEntry(base, { serverId: "dd".repeat(32), relayUrl: "http://127.0.0.1:3340", now: () => 42 });
+  assert.equal(ok.ok, true);
+  const e = /** @type {{ok: true, entry: any}} */ (ok).entry;
+  assert.equal(e.server, "http://127.0.0.1:8787");
+  assert.equal(e.fabric_id, FABRIC);
+  assert.equal(e.root, ROOT);
+  assert.equal(e.relay_url, "http://127.0.0.1:3340");
+  assert.equal(e.registered_at, 42, "registered_at 缺省=now()");
+  assert.equal(e.expires_at, 0);
+  // server_id：旧文件自带（hex64）优先于探测值；非法形态回退探测值
+  assert.equal(
+    buildLegacyLeaseEntry({ ...base, server_id: "ee".repeat(32) }, { serverId: "dd".repeat(32) }).entry?.server_id,
+    "ee".repeat(32),
+  );
+  assert.equal(buildLegacyLeaseEntry({ ...base, server_id: "nothex" }, { serverId: "dd".repeat(32) }).entry?.server_id, "dd".repeat(32));
+  // root 缺失 → rootFallback 合法值补；两者皆无 → ok:false
+  assert.equal(buildLegacyLeaseEntry({ ...base, root: "zz" }, { rootFallback: ROOT }).entry?.root, ROOT);
+  assert.equal(buildLegacyLeaseEntry({ ...base, root: "zz" }, {}).ok, false);
+  // 必需字段缺失/非法矩阵：无 server / 空 server / fabric 非 hex64
+  assert.equal(buildLegacyLeaseEntry({ ...base, server: undefined }).ok, false);
+  assert.equal(buildLegacyLeaseEntry({ ...base, server: "" }).ok, false);
+  assert.equal(buildLegacyLeaseEntry({ ...base, fabric_id: "nothex" }).ok, false);
+});
+
+test("leasesFileExists: 迁移触发条件的只读探测", async () => {
+  const home = await tmpHome();
+  assert.equal(await leasesFileExists(home), false);
+  await fsp.writeFile(path.join(home, "leases.json"), JSON.stringify({ version: 1, leases: [] }));
+  assert.equal(await leasesFileExists(home), true, "空簿文件存在也算存在（不迁移）");
+});
 
 test("resolveExistingFabricId: 优先级（leases>旧文件>roster）+ 多源冲突 fail-closed", () => {
   assert.deepEqual(resolveExistingFabricId({ leases: [], legacy: null, rosterFabricId: null }), { ok: true, fabricId: null });
