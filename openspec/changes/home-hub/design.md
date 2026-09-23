@@ -1,3 +1,17 @@
+<!--
+intent:
+  - id: home-hub-hub-lifecycle
+    why: 把常开机器一键变为家庭中枢（[H0]/[H3]：hub 命令族/守护/自启）
+  - id: home-hub-three-perspective-console
+    why: 三视角控制台与 webui SDK 分层（[H4]/[H5]/[H7]-O-1）
+  - id: home-hub-multi-lease-and-access
+    why: 多租约簿+入网闭环+短码+托盘契约（[H1]/[H2]/[H7]-G-1）
+不可拆分声明：三项意图共享同一身份 tuple/relay 凭证链与 DWEB_HOME 布局
+（§2.1），拆分任一都会使另两项 Scenario 失去数据前提，故作单一 change
+交付。原始输入：requirements.md [H0]-[H8]（2026-09-23/24 Owner 裁决）；
+评审史 docs/codex-review-hh-r1..r13.md。
+-->
+
 # Design: home-hub（家庭中枢与三视角控制台）
 
 > 依据：requirements.md 裁决 [H0]-[H8] + PRODUCT-DESIGN.md v1.2。Rust 边界
@@ -28,7 +42,8 @@
 | [H5] 三视角控制台 | 切换器+member 态分流（五行表，含 hub 本机自动 admin）；租约/到访单页 | §4 |
 | [H6] 机器名默认别名 | 已落地（2dacb56）；本 change 仅消费显示，不写回服务端 | §2 |
 | [H7] G-1/O-1/O-2 | leases.json 0..N（锁协议）；组 B 命名；hub 命令族 | §1/§2/§4 |
-| [H8] deferStart 最小 SDK 扩展 | dweb-fabric 生命周期 API（Deferred 状态机）+ client-sdk NAPI/d.ts 桥接 + 集成测试；CLI 不引入 NAPI；server 零改动 | §2.1/§9 |
+| [H8]-a deferStart 生命周期扩展 | dweb-fabric Deferred 状态机+client-sdk NAPI `deferStart`/`start()`+d.ts+表驱动测试；缺省 eager 零回归 | §2.1/Phase 0/Node delta |
+| [H8]-b Roster fabricId 采纳（二次拍板） | `FabricOptions.fabricId` 仅 createRoot/持久化采纳/冲突拒绝+集成测试；CLI 仍零 NAPI；server 零改动 | §2.1/Phase 0/Node delta |
 
 ## 1. 中枢命令族与守护（CLI builtin）
 
@@ -181,7 +196,15 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
 | 当前态 \ 操作 | start() | ensureRelayCapabilities() | shutdown() |
 |---|---|---|---|
 | Deferred | →Starting | 允许（零网络） | →Closed（清理资源，无网络面） |
-| Starting | single-flight 复用同一 Future | 允许 | 取消启动→Closed（**shutdown 返回后不得有晚到 bind/网络事件**） |
+| Starting | single-flight 复用同一 Future | 允许 | 取消启动→Closed（shutdown 返回后无晚到 bind/网络事件） |
+
+  **取消三分法（r13-P2-3）**：①shutdown 主动取消——在途 start Promise
+  resolve 为「已取消」（非错误；状态=Closed，资源已清理，**不可重试**——
+  再 start=Closed 态明确错误）；②底层启动失败——Promise reject（错误
+  载荷含原因；状态=Failed，可重试）；③调用方放弃 Future（不 await）——
+  状态机不感知、启动照常完成或失败（Promise 结果由运行时丢弃；single-
+  flight 语义保证后续 start 仍得同一结果）。三分支各有 Rust+Node 表驱动
+  Scenario。
 | Started | 幂等 no-op | 允许 | →Closed（正常停机语义=既有 shutdown） |
 | Failed | →Starting（重试） | 允许 | →Closed |
 | Closed | 明确错误 | 明确错误 | 幂等 no-op |
@@ -217,9 +240,18 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   一致性验证载体=两侧测试合并：join 侧（纯 JS）register body==租约
   落盘值；连接器侧（集成测试）createRoot(fabricId=租约值,
   dataDir=DWEB_HOME) 读回 fabric_id==租约值 且 endpointId()==lease.root。
-  全链顺序：**CLI join/register → SDK createRoot(fabricId,
-  dataDir=DWEB_HOME, deferStart)/open → endpointId 断言 →
-  ensure/start/connect**。**首次 relay 拨号前断言三元组连续性**：`Fabric.fabric_id_hex()
+- **单 fabric 约束（r13-P1-1，选项 1——与 join「既有 fabric MUST 复用」
+  冻结语义一致）**：每个 DWEB_HOME 承载**恰好一个 fabric**。join
+  preflight 在 register 前**读取既有 roster/租约的 fabric_id**：
+  `--fabric` 显式值或将要生成的值与既有值不等=**fail-closed**（明确
+  错误、不 register、不写 leases）；同 fabric 跨 server 加入=必须成功
+  （H7 多租约的形态由此冻结为**多 server/同 fabric 子集**——0..N 的
+  N 是 server 维度，fabric 维度恒 1）。第二 fabric 的负向 Scenario
+  与「两个 server 同 fabric 两条租约」正向 Scenario 见 leases delta。
+  全链顺序（r13-P2-1 统一）：**CLI join/register → SDK createRoot
+  (fabricId=租约值, dataDir=DWEB_HOME, deferStart)/open →
+  fabricId+endpointId 断言 → ensure/start/connect**；负向（错 fabric/
+  错目录/损坏 roster）一律首拨前拒绝。**首次 relay 拨号前断言三元组连续性**：`Fabric.fabric_id_hex()
   == lease.fabric_id`、`Fabric.endpoint_id() == lease.root`、capability 的
   (fabric_id, issuer, server_id) 覆盖租约——任一不符/旧 roster/不同
   seed/server 或 URL 不匹配=fail-closed（首拨前拒绝，不写不更新
@@ -527,7 +559,8 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r12 | NOT-READY 7.8，P1×1 | 全处置（v13，本版）：同 seed 供给改为**目录供给方案（零新 API）**——消费路径 Fabric dataDir 固定=DWEB_HOME，SDK 既有默认身份解析天然读 join 的 identity.key（同文件同源）；dataDir≠DWEB_HOME 构造禁止；seed 缺失/损坏=构造前明确错误；单设备单 roster 与 join fabric 复用裁决一致；无需再扩 [H8]（§2.1） |
+| r13 | NOT-READY 7.8，P1×1+P2×4 | 全处置（v14，本版）：P1-1 单 fabric 约束（选项 1：join preflight 读既有 fabric，不等=fail-closed 不 register；H7 多租约冻结为多 server/同 fabric 子集；正负 Scenario）（§2.1）；P2-1 tuple Scenario 顺序统一为 CLI join→SDK 消费；P2-2 createRoot 既有 roster 一律 AlreadyExists、open 负责复用+tuple 校验（Node delta 修订）；P2-3 取消三分法（shutdown 取消=resolve 已取消不可重试/启动失败=reject 可重试/调用方放弃=状态机不感知）；P2-4 三文档意图元数据头+[H8] 映射拆 a/b 两项 |
+| r12 | NOT-READY 7.8，P1×1 | 全处置（v13）：同 seed 供给改为**目录供给方案（零新 API）**——消费路径 Fabric dataDir 固定=DWEB_HOME，SDK 既有默认身份解析天然读 join 的 identity.key（同文件同源）；dataDir≠DWEB_HOME 构造禁止；seed 缺失/损坏=构造前明确错误；单设备单 roster 与 join fabric 复用裁决一致；无需再扩 [H8]（§2.1） |
 | r11 | NOT-READY 7.7，P1×2 | 全处置（v12）：P1-1 root 同 seed 供给冻结（SDK 身份 seed=DWEB_HOME/identity.key，dataDir 不决定身份；register.root==lease.root==SDK endpointId 断言；Scenario 顺序重写为 CLI join→SDK createRoot(同 seed)→断言→ensure/start/connect；leases 陈旧 createRoot→register 顺序修正）（§2.1）；P1-2 [H8] Owner 二次拍板扩充（roster fabricId 采纳明文授权，CLI 仍零 NAPI）（requirements [H8]） |
 | r10 | NOT-READY 7.8，P1×1+P2×2 | 全处置（v11）：P1-1 tuple 供给路径反转（CLI=唯一生成点保持纯 JS；roster 显式 fabricId 采纳=[H8] 最小扩展；首拨断言保留为防御层；两侧测试合并构成全链一致性）（§2.1）；P2-1 新增 specs/sdk/node delta（deferStart/start 的 Node 可观察契约+d.ts fixture+NAPI 集成测试）；P2-2 状态机操作转移表（start/ensure/shutdown × 五态全集+并发取消语义+晚到网络禁令+表驱动测试） |
 | r9 | NOT-READY 7.6，P1×2+P2×4 | 全处置（v10）：P1-1 缓存票据合并优先级冻结（ensured>tuple 校验缓存票；构造期非网络预检；四类旧票 Scenario+首触带票观测）（§2.1）；P1-2 Node 桥接冻结（NAPI deferStart/start+d.ts+集成测试；CLI 不引入 NAPI；连接器命令留未来 change）（§2.1）；P2-1 v9 引入的 fence 未闭合修复；P2-2 流程图纯 ASCII 化；P2-3 Deferred 状态机冻结（并发/失败/关闭语义+双层测试）；P2-4 §0/§9 增 [H8] 映射与 Phase 0 |
