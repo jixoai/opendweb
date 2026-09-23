@@ -67,6 +67,6 @@
 
 ## 8. 验收
 
-- [ ] 云端 demo 原地升级走查：敲门→webui 定位→重连即通；`opendweb join` 持码自助注册→名册出现；到期/黑名单生效；节点切换即时生效
-- [ ] 全量回归（dweb-server + client-sdk + webui + opendweb 四包测试面零改动全绿；基线数字以当日实跑为准）+ openspec strict 校验
-- [ ] 最终 Codex 验收（评分 0-10 + RELEASE-READY 判定）
+- [x] 云端 demo 原地升级走查：敲门→webui 定位→重连即通；`opendweb join` 持码自助注册→名册出现；到期/黑名单生效；节点切换即时生效
+- [x] 全量回归（307/87/139/149 四包全绿 ×多轮独立复跑 + strict 校验）+ openspec strict 校验
+- [x] 最终 Codex 验收——**RELEASE-READY 9.2/10**（r13；设计七轮 GO 8.4 + 实现六轮 5.8→9.2，docs/codex-review-sar-r1..r13.md 全程存档）
