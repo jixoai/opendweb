@@ -283,7 +283,11 @@ P1×12、P2×4 均已落入 spec/design/tasks。
   整服务 fail-fast/seq 唯一排序/同键回放不刷新（续期=持新码）/基座
   场景排除 switch——九条实现验收基线见 codex-review-sar-r7.md §4。
 - 实现期增补：元数据 PATCH 0x0D/0x0E（d999ae7）；1b 六项接口冻结
-  回写（ce3cf0b）；1c 四项 wire/加载/404 语义回写。
+  回写（ce3cf0b）；1c 四项 wire/加载/404 语义回写；home-hub [H6]
+  register body 可选 `alias`（优先级 自报>alias_hint>无、首写语义、
+  ≤32 UTF-8 字节越界 400；CLI join 默认自报机器名（剥 `.local`+
+  字符边界截断），`opendweb id` 增机器名行——详见 spec 邀请码
+  requirement「[H6] 实现期增补」段）。
 遗留（非阻塞、实现期观察）：
 - fabric_id 自声明残余：UI 钓鱼警示 + 二元组呈现已冻结；genesis 绑定
   proof（FabricId 可验派生）列 Phase 2 候选
