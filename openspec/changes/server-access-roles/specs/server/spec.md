@@ -312,7 +312,7 @@
 - **敲门**：`GET /admin/knocks`（排序冻结：dismissed 在前与否分组——未处置在前、组内 seq 降序（last_at 仅展示）、endpoint_id 升序 tie-break；`?include_dismissed=true` 含已处置；响应 `{"knocks":[…聚合条目…],"pending_count":N}`）；`POST /admin/knocks/{endpoint_id}/dismiss` 与 `POST /admin/knocks/{endpoint_id}/undismiss`（均幂等，回执 op=knock-dismiss/knock-undismiss）。
 - **访客名册**：`GET /admin/visitors`（活跃列表：endpoint_id/alias/note/granted_at/expires_at）；`POST /admin/visitors`（body：endpoint_id 必填、alias/note/expires_in_days 可选，缺省=永久；回执 op=visitor-grant）；`DELETE /admin/visitors/{endpoint_id}`（revoke；回执 op=visitor-revoke）。语义糖路由 `POST /admin/visitors/from-knock`（body 含 endpoint_id，等同 POST，供敲门台一键定位）。
 - **邀请码**：`GET /admin/codes`（列表只含 code_hash/max_uses/used_count/expires_at/alias_hint/revoked/default_ttl_days，**绝不含码全文**）；`POST /admin/codes`（body：alias_hint/max_uses/expires_in_days/default_ttl_days 可选，缺省 1/7/30；**响应含 `code` 全文——仅此一次**；回执 op=code-issue）；`DELETE /admin/codes/{code_hash}`（吊销；回执 op=code-revoke）。
-- **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。**元数据编辑（实现期增补，2a 集成发现）**：`PATCH /admin/owners/{fabric_id}/{root}`（body：`alias`/`note` 至少其一，空串=清除；长度上限同签发；回执 op=owner-meta）与 `PATCH /admin/visitors/{endpoint_id}`（同构；回执 op=visitor-meta）——PM 别名行内编辑的承载面。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略。
+- **租户续期**：`POST /admin/owners/{fabric_id}/{root}/renew`（body：`expires_in_days` 或 `permanent:true` 恰好其一；回执 op=renew）。**实现期增补（三角色走查 r2，2026-09-23）**：`expires_in_days` 基准冻结 = **max(now, 当前 expires_at)**（「顺延」语义：未到期从当前到期日起算；过期条目从 now 起算恢复准入；permanent→days 以 now 起算）。**元数据编辑（实现期增补，2a 集成发现）**：`PATCH /admin/owners/{fabric_id}/{root}`（body：`alias`/`note` 至少其一，空串=清除；长度上限同签发；回执 op=owner-meta）与 `PATCH /admin/visitors/{endpoint_id}`（同构；回执 op=visitor-meta）——PM 别名行内编辑的承载面。`GET /admin/owners` 列表条目增量携带 alias/note/expires_at/expires_in（剩余毫秒）/状态（active|expired）——增量字段，旧消费者忽略；`registered_at` = **首次注册时刻**——续期/元数据编辑/同键再兑换不刷新（事件行增量字段 `first_registered_at` 携带，旧事件行回退 `ts`；三角色走查发现改写问题后冻结）。
 - **黑名单**：`GET /admin/blocklist`（当前集合：kind/id/reason/ts）；`POST /admin/blocklist`（body：kind(endpoint|fabric)/id/reason?；回执 op=block-add）；`DELETE /admin/blocklist/{kind}/{id}`（回执 op=block-remove）。
 - **状态增量**：`GET /admin/status` 响应增量字段 `knocks_pending`/`visitors_active`/`codes_active`/`visitors_online`（既有 wire 冻结不变，新字段为纯增量）。
 
@@ -335,6 +335,11 @@
 
 - **WHEN** 租户条目已过期（连接被拒 `dweb/owner-expired`），`POST /admin/owners/{fabric}/{root}/renew` body `{"expires_in_days":30}`
 - **THEN** 回执 op=renew；该租户的有效 capability 随后接入成功
+
+#### Scenario: 未到期租户续期顺延
+
+- **WHEN** 租户条目剩余 20 天有效期（未到期），`POST /admin/owners/{fabric}/{root}/renew` body `{"expires_in_days":30}`
+- **THEN** 新到期时刻 = 旧到期时刻 + 30 天（顺延基准 = max(now, 当前 expires_at)，非 now + 30 天）；名册 `registered_at` 保持首次注册时刻不变
 
 #### Scenario: status 增量字段不破坏旧消费者
 

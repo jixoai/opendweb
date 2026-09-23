@@ -288,6 +288,18 @@ P1×12、P2×4 均已落入 spec/design/tasks。
   ≤32 UTF-8 字节越界 400；CLI join 默认自报机器名（剥 `.local`+
   字符边界截断），`opendweb id` 增机器名行——详见 spec 邀请码
   requirement「[H6] 实现期增补」段）。
+- 三角色走查 r2-a（2026-09-23）：admin renew 顺延基准 = **max(now,
+  当前 expires_at)**——未到期租户 renew N 天得「旧到期 + N」（对齐
+  webui「顺延 N 天」文案；修复前以 now 为基准，剩 20 天租户损失
+  20 天）；过期条目/permanent→days 仍从 now 起算，「续期恢复准入」
+  场景语义不变；join 兑换路径的 now+TTL（spec 冻结）不动。
+- 三角色走查 r2-b（2026-09-23）：`registered_at` 冻结为**首次注册
+  时刻**——修复前一切 owner 变更（改名/续期/同键再兑换）经 upsert
+  追加 Register 事件并以 record.ts 重建 registered_at，名册「注册
+  时间」漂移（走查实测 17:19→17:21→17:24）；事件行增量字段
+  `first_registered_at`（仅已在册键的 upsert 行携带）承载，旧事件行
+  `serde(default)` 回退 `ts` 老语义；CLI 重复 register（mutate 路径）
+  保持刷新语义不变。
 遗留（非阻塞、实现期观察）：
 - fabric_id 自声明残余：UI 钓鱼警示 + 二元组呈现已冻结；genesis 绑定
   proof（FabricId 可验派生）列 Phase 2 候选
