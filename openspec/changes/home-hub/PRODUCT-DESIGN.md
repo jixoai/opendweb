@@ -4,7 +4,7 @@
 > O-2 命令=`opendweb hub` 族（重看卡片=`hub card`）；G-1 多租约进本 change 范围。
 > 其余开放问题（O-3..O-10、G-2..G-5）维持默认建议，实现期按需回 Owner。
 > 边界：本文档只做产品设计，不含存储格式、API 形态、守护进程与 launchd/systemd 实现；
-> 一切产品决策以 `openspec/changes/home-hub/requirements.md` 的 Owner 裁决（[H0]-[H6]）
+> 一切产品决策以 `openspec/changes/home-hub/requirements.md` 的 Owner 裁决（[H0]-[H7]）
 > 为准，不得偏离。
 >
 > 与前一 change 的关系：叠在 server-access-roles 之上，不是推翻。已验收资产原样继承：
@@ -493,7 +493,7 @@ deny 话术映射（owner-expired / blocked / 敲门语境）全部沿用 server
 
 ---
 
-## 附：裁决覆盖对照（[H0]-[H6] → 章节）
+## 附：裁决覆盖对照（[H0]-[H7] → 章节）
 
 | 裁决 | 覆盖处 |
 |---|---|

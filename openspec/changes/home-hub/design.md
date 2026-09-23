@@ -147,11 +147,19 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   → relay_url=该值；**relay disabled 或 url=null → join fail-closed**
   （明确报错「中枢未启用中转，无法完成家庭接入」，不落租约条目——不产生
   「宣称已加入却不可连接」的租约；G-3 家庭链前提由此保证）。**成员连接
-  该 server 时 MUST 经此 relay**：连接器从租约构造
-  `FabricOptions.relay={mode:"custom",urls:[relay_url]}`（SDK 默认
-  N0Default 不适用；knock.mjs 即此形态示范）；leases 消费者以此为唯一
-  relay 真源。实现期端到端断言：join→读 lease→SDK relay mode=custom 且
-  url=relay_url（非 N0Default）。
+  该 server 时 MUST 经此 relay（r4-P1-1 凭证装配冻结）**：连接器从租约构造
+  `FabricOptions.relay={mode:"custom",relays:[{url:relay_url,serverId:server_id}]}`
+  ——**不是无凭证的 `urls:[...]` 形态**（该形态在 restricted 中枢会被 relay
+  capability 校验以 `dweb/no-capability` 拒绝，relay.rs:134-155→AccessGate
+  事实）。`relays` 条目形态=SDK `CustomWithCaps`：root 据 serverId（=租约
+  条目的 server_id）**本地自签** own/bootstrap/member capability
+  （server-access-roles 冻结契约：capability 由 root 侧自签、server 只验票
+  不签票；SDK `ensureRelayCapabilities` 既有实现）——租约条目已含
+  server_id，消费材料齐备；capability 由 SDK 内存态自签/刷新，**不入
+  leases.json**（无新增凭证落盘面）。端到端断言：restricted 中枢注册后
+  实际 relay 握手成功、无票连接被拒 `dweb/no-capability`、跨 server
+  capability 被拒、SDK relay mode=custom（非 N0Default）；malformed
+  server_id/URL 在落租约前失败。
 - **expires_at=本机最后一次成功兑换的租期快照（r2-P1-5 冻结）**：管理端
   renew 只改服务端 owners，**不回写本机**（无成员侧查询协议——Phase 2
   候选，超出本 change 的 Rust 零改动边界）；租约页以「本地快照」呈现，
@@ -162,6 +170,15 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   server=新条目。
 - **写者与锁协议（r1-P1-6 不变）**：写者=join CLI、label 编辑；每账本
   `<name>.lock`（O_EXCL+锁内重读+合并+rename+锁归属校验+陈锁打破+退避）。
+- **join 顺序冻结（r4-P2-1 preflight）**：**register 之前**完成 services
+  preflight——读 /services.json，要求恰一可用 relay（enabled 且 url 非空串
+  且为合法 http(s) URL：scheme/authority 校验+长度上限；多候选=按 manifest
+  顺序取第一条合法者）；register 成功后**复核** server_id 与 relay URL 与
+  preflight 一致。任一步失败 MUST NOT 写本地账本，并明确报告远端登记状态
+  （若 register 已发生：提示「服务端已登记、本地未落账，重试 join 经幂等
+  回放可恢复」——server-access-roles 冻结的幂等回放语义即补偿路径）。
+  现状 join 是 register 后才读 services.json（join.mjs:395-405 事实），
+  本条为有意顺序修正。
 - **迁移**：旧 registration.json 在 leases 写锁内并入首条（relay_url 由
   server 探测补全——对 server origin 发 /services.json 读取，不可达=留空
   待下次 join 补）；旧文件改名 `.migrated`；损坏=警告不阻塞。
@@ -192,16 +209,19 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   false/xorout=0x0000（校验向量 "123456789"→0x29B1）。
 - **编码**：crockford-base32 **MSB-first**（自最高位每 5 bit 一字符），
   小写无 padding；**末尾不足 5 bit 右侧补零**。
-- **解码 canonical 规则（r3-P1-3 修订，消除歧义映射 vs 非规范拒绝的矛盾）**：
-  **严格 canonical 模式**——①仅接受 crockford 32 字符集（`0-9` +
-  `abcdefghjkmnpqrstvwxyz`）；**歧义字符 o/i/l/u 出现即拒绝**（错误提示
-  「o→0、i/l→1、u→v」但不自动映射）；②大小写折叠（全大写输入归一为小写
-  后比对，混合大小写接受）；③连字符**仅允许出现在固定分组位置**且整组
-  可省略（canonical 串=无连字符形态；IPv4 分组 5-5-5、IPv6 4×8+2；其他
-  位置连字符=拒绝）；④前缀 `dwebh1.` 大小写不敏感；⑤非零 padding 位=
-  拒绝、多余/缺失字符=拒绝（非规范等价串一律不接受）。测试变体清单：
-  逐位篡改/歧义字符（o、i、l、u 各一）/错误位置连字符/末字符零位变体/
-  超长/缺字符。
+- **canonical 规则（r4-P2-3 拆为两个集合）**：
+  - **`encode_canonical`（编码输出唯一形态）**：小写 crockford 32 字符集
+    （`0-9`+`abcdefghjkmnpqrstvwxyz`）+无连字符（`dwebh1.` 小写前缀+连续
+    字符）。
+  - **`decode_accepts`（解码接受集=canonical 的超集）**：①字符集同上，
+    歧义字符 o/i/l/u 出现即拒绝（提示 o→0、i/l→1、u→v，不自动映射）；
+    ②大小写折叠（任意大小写混合接受）；③连字符**每个分组位置独立可选**
+    （接受：全无/完整/部分分组连字符三种形态；错位或重复=拒绝）；④前缀
+    大小写不敏感；⑤非零 padding 位/多余/缺失字符=拒绝。「非规范等价串
+    不接受」的准确语义=decode_accepts 之外的一切变体拒绝；接受集内的
+    形态差异（大小写/连字符）归一后比对载荷。测试表格——正例：混合
+    大小写/全无连字符/完整连字符/部分连字符；负例：逐位篡改/歧义字符
+    （o、i、l、u 各一）/错位或重复连字符/末字符零位变体/超长/缺字符。
 - **IPv6 URL 冻结**：解码结果 URL 形态 `http://[<ip>]:<port>`（字面量带
   方括号）；V2 断言=`http://[fd00::13]:8787`。
 - **长度**：IPv4=15 字符（5-5-5 分组）、IPv6=34 字符（4×8+2）。
@@ -310,9 +330,13 @@ packages/webui/src/
 ← {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"notifications not supported"}}
 → [超长帧 >64KB]
 ← {"jsonrpc":"2.0","id":<前缀可解析则透传，否则 null>,"error":{"code":-32601,"message":"frame too large"}}
+→ [{"jsonrpc":"2.0","id":9,"method":"stop"}]      ← batch：整帧拒绝
+← {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batch not supported"}}
 → {坏 JSON}
 ← {"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}
 ```
+
+（batch=单帧整体拒绝、不逐元素响应；拒绝后连接继续处理下一帧。）
 
 **所有响应帧（含全部 error）都携带 `"jsonrpc":"2.0"` 字段（r3-P1-4）**——
 契约测试以严格 JSON-RPC 2.0 validator 逐帧校验；错误帧的 id 提取=语法解析
@@ -386,5 +410,6 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r3 | NOT-READY 7.3，P1×4+P2×4 | 全处置（v4，本版）：P1-1 DWEB_ADMIN_TOKEN 链入口注入（覆盖继承 env）+readiness 双探断言（无 token 401≠404 + token 200）+失败停机清锁（§1.3）；P1-2 relay null/disabled=join fail-closed 不落租约+连接器从租约构造 custom（§2.1）；P1-3 短码严格 canonical（歧义字符拒绝不映射+连字符仅固定分组位置+大小写折叠）+IPv6 bracket URL 冻结 V2 断言（§3.1）；P1-4 全部 error 帧补 jsonrpc 字段+严格 validator 逐帧校验（§6）；P2-1 proposal/PM 旧词残留清理+rg 门禁；P2-2 G-3 acceptance 模板六字段+NOT-EXECUTABLE 客观条件（§7）；P2-3 生成物 quoting 冻结+特殊路径 Scenario（§1.4）；P2-4 capability v1 冻结（§5.1） |
+| r4 | NOT-READY 7.5，P1×1+P2×4（十条基线 9 PASS+1 BLOCKED） | 全处置（v5，本版）：P1-1 消费契约改为 relays:[{url,serverId}]（CustomWithCaps，root 自签 capability，杜绝 no-capability 主路径阻断）+端到端 Scenario（§2.1）；P2-1 join preflight 顺序冻结（register 前恰一可用 relay+URL 校验+复核+幂等回放补偿路径）（§2.1）；P2-2 PM 头部裁决范围 [H0]-[H7]；P2-3 encode_canonical/decode_accepts 两集合拆分+测试表格（§3.1）；P2-4 batch golden 帧补样例（§6） |
+| r3 | NOT-READY 7.3，P1×4+P2×4 | 全处置（v4）：P1-1 DWEB_ADMIN_TOKEN 链入口注入（覆盖继承 env）+readiness 双探断言（无 token 401≠404 + token 200）+失败停机清锁（§1.3）；P1-2 relay null/disabled=join fail-closed 不落租约+连接器从租约构造 custom（§2.1）；P1-3 短码严格 canonical（歧义字符拒绝不映射+连字符仅固定分组位置+大小写折叠）+IPv6 bracket URL 冻结 V2 断言（§3.1）；P1-4 全部 error 帧补 jsonrpc 字段+严格 validator 逐帧校验（§6）；P2-1 proposal/PM 旧词残留清理+rg 门禁；P2-2 G-3 acceptance 模板六字段+NOT-EXECUTABLE 客观条件（§7）；P2-3 生成物 quoting 冻结+特殊路径 Scenario（§1.4）；P2-4 capability v1 冻结（§5.1） |
 | r2 | NOT-READY 7.0，P1×9+P2×7 | 全处置（v3）：P1-1 入网闭环=join 落 relay_url（§2.1）+delta Scenario+G-3 验收义务（§7）；P1-2 hub open 命令+五行分流表 hub 本机行（§1.1/§4.2）；P1-3 DWEB_DATA_DIR 全宿主注入+启动后核实（§1.3）；P1-4 cwd 统一 DWEB_HOME+config_path 冻结+承诺面改为三宿主间一致（§1.3）；P1-5 expires_at=本地快照冻结+PM 文案同步（§2.1）；P1-6 pid 三元组（start_identity+argv 摘要）三重核验（§1.2）；P1-7 接管=尽力探测+强制人工确认+data_dir 唯一规则（§1.6）；P1-8 字节修正 9/21+CRC 覆盖范围+MSB/padding 位/非规范拒绝+设计级 golden vectors V1/V2（§3.1）；P1-9 urlFor+open=注入 opener+url 会话 capability 非 admin token（§5.1）；P2-1 PM/proposal 残留清理（已裁决记录化/平台同步）；P2-2 写路由 Origin 严格策略（存在且匹配，不沿用基线放行）（§4.2）；P2-3 visits 回归访客语义（join 不写）+五类映射（§2.2）；P2-4 label 用不透明 id+空串归一 null（§2.1/§4.2）；P2-5 RPC 完整 golden 帧+notification/batch 拒绝+服务验收分层（§1.4/§6）；P2-6 link-local 拒绝（§1.5/§3.1）；P2-7 默认不启动负向 Scenario（§1.1） |

@@ -4,16 +4,21 @@
 
 本机租约 SHALL 从单条 `registration.json` 演进为 `<DWEB_HOME>/leases.json`（`{version, leases:[]}`），条目 = `{id, server(归一化 origin), relay_url, server_id, fabric_id, root, alias(自报机器名快照), label(本地备注，缺省 null), registered_at, expires_at, receipt}`；键 = `(server, fabric_id, root)`；**id** = 创建时随机 10 字符不透明键（UI 引用与 label 路由的稳定句柄）。写入 MUST 沿用 SecretStore 原子纪律（0600+tmp+fsync+rename；失败无半提交）。同键持新码 join = 续期 upsert：更新 expires_at/receipt/relay_url，**registered_at 保持首条**（镜像服务端 first_registered_at 裁决）；alias 更新为当前自报；同设备换 server = 新条目（0..N）。
 
-**relay_url（入网闭环，null/disabled 语义冻结）**：join 已访问 `/services.json` 校验 server_id——relay 选择规则：取 `services[]` 中 `name=="relay" && enabled==true && url` 非 null 的条目 → relay_url=该值；**relay disabled 或 url=null → join fail-closed**（明确报错「中枢未启用中转，无法完成家庭接入」，**不落租约条目**——不产生宣称已加入却不可连接的租约；G-3 家庭链前提由此保证）。**成员连接该 server 时 MUST 经此 relay**：连接器从租约构造 `FabricOptions.relay={mode:"custom",urls:[relay_url]}`（SDK 默认 N0Default 不适用）；leases 消费者以此为唯一 relay 真源。
+**relay_url（入网闭环，null/disabled 语义冻结）**：join 已访问 `/services.json` 校验 server_id——relay 选择规则：取 `services[]` 中 `name=="relay" && enabled==true && url` 非 null 的条目 → relay_url=该值；**relay disabled 或 url=null → join fail-closed**（明确报错「中枢未启用中转，无法完成家庭接入」，**不落租约条目**——不产生宣称已加入却不可连接的租约；G-3 家庭链前提由此保证）。**成员连接该 server 时 MUST 经此 relay（凭证装配冻结）**：连接器从租约构造 `FabricOptions.relay={mode:"custom",relays:[{url:relay_url,serverId:server_id}]}`——SDK `CustomWithCaps` 形态，root 据 serverId 本地自签 own/bootstrap/member capability（server-access-roles 冻结契约：capability 由 root 自签、server 只验票；SDK 既有 `ensureRelayCapabilities` 实现）；capability 为 SDK 内存态、不入 leases.json。**不是无凭证 `urls:[...]` 形态**（restricted 中枢会以 `dweb/no-capability` 拒绝）。**join 顺序冻结**：register **之前**完成 services preflight（恰一可用 relay：enabled+url 非空串+合法 http(s) URL；多候选按 manifest 顺序取第一条合法者），register 成功后复核 server_id 与 relay URL；任一步失败 MUST NOT 写本地账本并明确报告远端登记状态（已 register 时提示重试经幂等回放恢复）。
 
 **expires_at=本机最后一次成功兑换的租期快照**：管理端 renew 只改服务端 owners，MUST NOT 假设回写本机（无成员侧查询协议，Phase 2 候选）；租约呈现面 MUST 以「本地快照」语义展示（临期文案指引：若管理者已续期，数字在下次持新码加入时刷新；能否连上以实际连接为准）。
 
 **跨进程写协议**：写者=join CLI 与 label 编辑（sidecar 面）；每账本文件配 `<name>.lock`（O_EXCL 创建，内容 pid+ts）：获取锁→锁内重读→合并→tmp+fsync+rename→校验锁仍属本进程→释放；陈锁（>10s 且 pid 已死）可打破；锁获取失败=短退避重试（≤3）后报错，MUST NOT 静默丢写。**迁移**：读取器发现旧 `registration.json` 且 leases.json 缺失时，在 leases 写锁内解析并入首条（relay_url 由对 server 发 /services.json 探测补全，不可达=留空待下次 join 补）并将旧文件改名 `registration.json.migrated`（不删）；解析失败不阻塞（警告+保留原文件）。join 的 fabric 复用语义改为按 server 维度查租约簿。
 
-#### Scenario: join 落盘 relay_url（端到端）
+#### Scenario: join 落盘 relay_url 与凭证装配（端到端）
 
-- **WHEN** 对某中枢执行 `opendweb join` 成功，随后读取该租约构造 SDK 连接配置
-- **THEN** 新租约条目的 relay_url = /services.json 发布的 relay URL；SDK relay mode=custom 且 urls=[relay_url]（非 N0Default）
+- **WHEN** 对 restricted 中枢执行 `opendweb join` 成功，随后读取该租约构造 SDK 连接配置并实际连接
+- **THEN** relay_url = /services.json 的 relay URL；SDK 配置为 relays=[{url:relay_url,serverId:server_id}]（mode=custom，非 N0Default 非 urls 无凭证形态）；成员实际 relay 握手成功；无票连接被拒 `dweb/no-capability`；跨 server capability 被拒；malformed server_id/URL 在落租约前失败
+
+#### Scenario: preflight 失败无远端 register（顺序冻结）
+
+- **WHEN** /services.json 为 relay disabled / url:null / 空串 / 非 http(s) scheme / 重复条目时执行 `opendweb join`
+- **THEN** disabled/null/空串/错 scheme=preflight 失败、**未发出 register**、无本地条目；重复条目=取 manifest 顺序第一条合法者继续
 
 #### Scenario: relay 未启用则拒绝加入（fail-closed）
 

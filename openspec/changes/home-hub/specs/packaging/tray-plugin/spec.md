@@ -16,6 +16,8 @@
 → {"jsonrpc":"2.0","method":"open-console"}
 ← {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"notifications not supported"}}
 ← （注：所有 error 帧同成功帧一样 MUST 携带 "jsonrpc":"2.0" 字段——严格 JSON-RPC 2.0 validator 逐帧校验；错误帧 id 提取=语法解析前的受限前缀扫描）
+→ [{"jsonrpc":"2.0","id":9,"method":"stop"}]     ← batch：整帧拒绝
+← {"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"batch not supported"}}
 → [超长帧 >64KB]
 ← {"jsonrpc":"2.0","id":<前缀可解析则透传，否则 null>,"error":{"code":-32601,"message":"frame too large"}}
 → {坏 JSON}
