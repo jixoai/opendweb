@@ -159,21 +159,25 @@
 								<span class="text-xs text-muted-foreground" title={lastProbe.title}>最近探测：{lastProbe.text}</span>
 							{/if}
 							<div class="ml-auto flex items-center gap-1.5">
-								<Button
-									variant="ghost"
-									size="sm"
-									class="h-7"
-									disabled={cs.probeBusy !== null}
-									onclick={() => void cs.probeServerTarget(l.server)}
-									title="无凭证探测这台服务器现在是否可达"
-								>
-									{#if cs.probeBusy === l.server}
-										<LoaderCircle class="animate-spin" data-icon="inline-start" />
-									{:else}
-										<Radar data-icon="inline-start" />
-									{/if}
-									测一下
-								</Button>
+								<!-- 探测动作仅成员视角（服务端 /sidecar/visits/probe 对非 member 一律
+								     403——到访簿是成员侧事实簿；admin 落本页只读，不给必然 403 的按钮） -->
+								{#if cs.role === "member"}
+									<Button
+										variant="ghost"
+										size="sm"
+										class="h-7"
+										disabled={cs.probeBusy !== null}
+										onclick={() => void cs.probeServerTarget(l.server)}
+										title="无凭证探测这台服务器现在是否可达"
+									>
+										{#if cs.probeBusy === l.server}
+											<LoaderCircle class="animate-spin" data-icon="inline-start" />
+										{:else}
+											<Radar data-icon="inline-start" />
+										{/if}
+										测一下
+									</Button>
+								{/if}
 								<Button
 									variant="ghost"
 									size="sm"

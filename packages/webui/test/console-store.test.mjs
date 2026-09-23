@@ -311,3 +311,15 @@ test("D2: App.svelte lifecycle/poll effects must untrack store calls (storm wiri
   assert.match(src, /untrack\(\(\) => cs\.start\(\)\)/, "start() 一经 effect 追踪即成重入环（走查 D2 根因）");
   assert.match(src, /untrack\(\(\) => cs\.\$poll\(\)\)/, "$poll() 同步段读取必须 untrack");
 });
+
+// ---- r18 P1-1 收敛：探测按钮仅成员视角渲染（服务端 403 的 UI 对偶面） ---------------
+
+test("r18-P1-1: probe buttons gated by cs.role member in Lease/Visits views (source guard)", () => {
+  for (const comp of ["LeaseView.svelte", "VisitsView.svelte"]) {
+    const src = readFileSync(path.join(PKG_ROOT, "ui", "src", "components", comp), "utf8");
+    const m = /\{#if cs\.role === "member"\}([\s\S]*?)\{\/if\}/.exec(src);
+    assert.ok(m !== null, `${comp} 缺少 cs.role === "member" 门控块`);
+    assert.match(m[1], /cs\.probeServerTarget\(/, `${comp} 的探测按钮必须在 member 门控内（非 member 姿态服务端一律 403）`);
+    assert.equal(m[1].split("cs.probeServerTarget(").length - 1, 1, `${comp} member 块内只应有一个探测动作`);
+  }
+});

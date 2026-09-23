@@ -56,7 +56,7 @@
 11. **roster wire 格式自源读取**：fabric_id/identity 直接读 roster 文件实际值（单一事实源），不做第二份手抄。
 12. **journal 陈旧性未定义**：journal 不设时间戳过期（保留=安全侧）；陈旧 journal 由人工恢复路径承接，不做自动判死。
 13. **10s 崩溃窗**：admission 陈锁阈值 >10s 可打破（与 hub.lock 陈锁规则同值；join-admission L577/L618 覆盖）。
-14. **visits 写面**：到访簿仅成员侧（join/SDK 路径）写入；hub/服务端不写 visits。
+14. **visits 写面**：到访簿仅成员侧（join/SDK 路径）写入；hub/服务端不写 visits。r18 P1-1 修复后补：sidecar `/sidecar/visits/probe` 对非 member 姿态（admin/默认/hub-local）一律 403（授权先于 Origin）；UI 对偶面——Lease/Visits 视图的「测一下」按钮仅成员视角渲染（admin 落这两页为只读，不给必然 403 的按钮；源断言测试钉住）。
 15. **迁移触发点**：租约簿 v0→v1 迁移在读路径首次打开时触发（含备份），不设显式迁移命令。
 16. **id 零租约显示**：opendweb id 零租约时显示计数 0，不隐藏行（join-admission L481 有租约计数断言）。
 
