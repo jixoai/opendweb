@@ -203,9 +203,15 @@ export async function startSidecar(opts = {}) {
   const nodePairing =
     nodes === null ? null : { code: generatePairingCode(), expiresAt: now() + LIMITS.pairingTtlMs, failures: 0 };
   if (nodePairing !== null) log(nodeAddCodeLine(nodePairing.code));
-  /** 节点添加/切换的单飞锁（并发第二次请求 409；r8-P1-2 起覆盖提交段全程） */
+  /** 节点添加的单飞锁（并发第二次请求 409；r8-P1-2 起覆盖提交段全程） */
   let nodePairingInFlight = false;
-  let nodeSwitchInFlight = false;
+  /**
+   * 节点变更互斥锁（r9-P1-2）：switch 与 delete 共用同一把——覆盖「读取条目
+   * → DNS/目标验证 await → 提交（重指向 currentNodeId / 落盘删除）」全程。
+   * 旧实现两 handler 各自为政：switch 的验证 await 窗口内 DELETE 可删掉其
+   * 目标，提交后 currentNodeId 指向已删节点（违反 spec「切换仅接受已存节点」）。
+   */
+  let nodeMutationInFlight = false;
 
   /** 在途上游请求（close 时全量销毁，不留半开连接） */
   const inflight = new Set();
@@ -653,8 +659,8 @@ export async function startSidecar(opts = {}) {
       logAccess(req, 400, startedAt);
       return;
     }
-    if (nodeSwitchInFlight) {
-      sendJson(res, 409, { error: { code: "pairing-in-progress", message: "another switch is in flight" } });
+    if (nodeMutationInFlight) {
+      sendJson(res, 409, { error: { code: "node-change-in-progress", message: "another node switch or delete is in flight" } });
       logAccess(req, 409, startedAt);
       return;
     }
@@ -664,15 +670,23 @@ export async function startSidecar(opts = {}) {
       logAccess(req, 404, startedAt);
       return;
     }
-    // 单飞锁覆盖提交段全程（r8-P1-2 同纪律）：校验→自动入簿→进程内原子替换→
-    // 响应——旧实现的自动入簿 nodes.add 在锁外，并发切换可重复入簿当前目标。
-    nodeSwitchInFlight = true;
+    // 变更互斥锁覆盖提交段全程（r8-P1-2 单飞纪律 → r9-P1-2 起与 delete 共用）：
+    // 校验→自动入簿→进程内原子替换→响应——旧实现的自动入簿 nodes.add 在锁外，
+    // 并发切换可重复入簿当前目标；现在 await 让出窗口内并发的 delete 也直接 409。
+    nodeMutationInFlight = true;
     try {
       // 切换前全量重校验目标（DNS 守卫同配对面）——失败不切换（原子性）
       const v = await validateTarget(entry.server_host, { allowInsecure, dns });
       if (!v.ok) {
         sendJson(res, 400, { error: { code: "bad-target", message: v.error } });
         logAccess(req, 400, startedAt);
+        return;
+      }
+      // 提交前重查目标仍在簿（r9-P1-2）：互斥锁下正常不可达的防御性断言——
+      // 目标一旦消失即明确 409 冲突，绝不把 currentNodeId 指向不存在的条目
+      if (nodes?.get(entry.id) == null) {
+        sendJson(res, 409, { error: { code: "node-vanished", message: "target node disappeared during the switch" } });
+        logAccess(req, 409, startedAt);
         return;
       }
       // 当前目标未入簿（来自 --server/setup 配对）→ 切走前自动入簿（可切回）
@@ -693,28 +707,46 @@ export async function startSidecar(opts = {}) {
       log(`sidecar: switched to node ${entry.id.slice(0, 8)} (${v.value.scheme}://${v.value.hostHeader})`);
       logAccess(req, 200, startedAt);
     } finally {
-      nodeSwitchInFlight = false;
+      nodeMutationInFlight = false;
     }
   }
 
   /** DELETE /sidecar/nodes/{id}：当前连接节点不可删（409，先切走）。 */
   async function handleNodeDelete(req, res, startedAt, id) {
     if (!guardLocalOrigin(req, res, startedAt)) return;
-    const entry = nodes?.get(id) ?? null;
-    if (entry === null) {
-      sendJson(res, 404, { error: { code: "no-match", message: "unknown node_id" } });
-      logAccess(req, 404, startedAt);
-      return;
-    }
-    if (id === state.currentNodeId) {
-      sendJson(res, 409, { error: { code: "node-current", message: "switch to another node before deleting the current one" } });
+    // 与 switch 同一把节点变更互斥锁（r9-P1-2）：「是否当前」检查与落盘删除
+    // 必须在锁内原子完成——否则 switch 提交 currentNodeId 的窗口内可删掉其目标
+    if (nodeMutationInFlight) {
+      sendJson(res, 409, { error: { code: "node-change-in-progress", message: "another node switch or delete is in flight" } });
       logAccess(req, 409, startedAt);
       return;
     }
-    await nodes.remove(id);
-    sendJson(res, 200, { ok: true });
-    log(`sidecar: node removed (${id.slice(0, 8)})`);
-    logAccess(req, 200, startedAt);
+    nodeMutationInFlight = true;
+    try {
+      const entry = nodes?.get(id) ?? null;
+      if (entry === null) {
+        sendJson(res, 404, { error: { code: "no-match", message: "unknown node_id" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      if (id === state.currentNodeId) {
+        sendJson(res, 409, { error: { code: "node-current", message: "switch to another node before deleting the current one" } });
+        logAccess(req, 409, startedAt);
+        return;
+      }
+      const removed = await nodes.remove(id);
+      if (removed === null) {
+        // 互斥锁下不可达的并发双删兜底：仍按 unknown 语义应答
+        sendJson(res, 404, { error: { code: "no-match", message: "unknown node_id" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      sendJson(res, 200, { ok: true });
+      log(`sidecar: node removed (${id.slice(0, 8)})`);
+      logAccess(req, 200, startedAt);
+    } finally {
+      nodeMutationInFlight = false;
+    }
   }
 
   // ---- 静态面 ----

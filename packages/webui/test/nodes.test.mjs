@@ -22,7 +22,7 @@ import { NodeStore, NodeStoreError, publicNode } from "../src/nodes.mjs";
 import { delay, fakeUpstream, postJson, request } from "./helpers.mjs";
 
 /** ready 态 sidecar + 假上游 + 注入 nodesFile（或 nodesStore 慢存储替身） */
-async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", logs = [], nodesStore = null } = {}) {
+async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", logs = [], nodesStore = null, dns } = {}) {
   const sc = await startSidecar({
     target: {
       scheme: "http",
@@ -35,6 +35,7 @@ async function sidecarWithNodes(upstream, nodesFile, { token = "node-token-a", l
     },
     token,
     ...(nodesStore !== null ? { nodesStore } : { nodesFile }),
+    ...(dns !== undefined ? { dns } : {}),
     log: (line) => logs.push(line),
   });
   return { sc, logs };
@@ -407,6 +408,135 @@ test("delete: current node is 409 (switch away first); other nodes removed from 
   assert.equal(persisted.nodes.some((n) => n.id === nodeA.id), false, "deleted node gone from disk");
   const delUnknown = await request(sc.port, { method: "DELETE", path: "/sidecar/nodes/ffffffffffffffff" });
   assert.equal(delUnknown.status, 404);
+});
+
+// ---- switch/delete 并发互斥（r9-P1-2） ---------------------------------------------------
+// spec 冻结语义：「当前节点不可删除 / 切换仅接受已存节点」——并发交错下终态
+// currentNodeId 必须恒对应 durable 存在的节点，竞争一方明确 409。
+
+test("race: DELETE during switch's DNS window -> 409 node-change-in-progress; B stays current AND durable (r9-P1-2)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-race-sd-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const upstreamA = await fakeUpstream({ handler: (req, res) => { res.writeHead(200); res.end("{}"); } });
+  const upstreamB = await fakeUpstream({ handler: (req, res) => { res.writeHead(200); res.end("{}"); } });
+  t.after(() => Promise.all([upstreamA.close(), upstreamB.close()]));
+  // 延迟 DNS barrier（r5 慢 DNS 手法）：hostname 形式的 B 走 lookup 全记录
+  // 校验路径（字面 IP 会跳过 DNS 无竞态窗口）——switch 的验证 await 即窗口
+  const slowDns = {
+    lookup: async (hostname) => {
+      await delay(150);
+      return [{ address: "127.0.0.1", family: 4 }];
+    },
+  };
+  const file = path.join(dir, "nodes.json");
+  const { sc } = await sidecarWithNodes(upstreamA, file, { dns: slowDns });
+  t.after(() => sc.close());
+  // 添加 B（hostname 形态；add 的校验同样吃 150ms 延迟——串行完成即可）
+  const add = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, `http://localhost:${upstreamB.port}`, { token: "node-token-b" }));
+  assert.equal(add.status, 200, add.text);
+  const nodeB = JSON.parse(add.text).node;
+
+  // 确定性交错（review P1-2 原始时序）：switch(B) 先出发进入 DNS 窗口（互斥锁
+  // 持有中）→ DELETE(B) 到达（B 当时非当前——旧实现会放行并删掉 B）
+  const sw = postJson(sc.port, "/sidecar/nodes/switch", { node_id: nodeB.id });
+  await delay(40); // << 150ms：switch 仍在验证中
+  const del = request(sc.port, { method: "DELETE", path: `/sidecar/nodes/${nodeB.id}` });
+  const [swRes, delRes] = await Promise.all([sw, del]);
+  assert.equal(swRes.status, 200, swRes.text);
+  assert.equal(delRes.status, 409, `delete must conflict during switch: ${delRes.text}`);
+  assert.equal(JSON.parse(delRes.text).error.code, "node-change-in-progress");
+
+  // 终态不变量：currentNodeId 恒对应 durable 存在的节点（B current 且在盘上）
+  const persisted = JSON.parse(await readFile(file, "utf8"));
+  assert.ok(persisted.nodes.some((n) => n.id === nodeB.id), "current node B is durable on disk");
+  const list = JSON.parse((await request(sc.port, { path: "/sidecar/nodes" })).text);
+  const current = list.nodes.find((n) => n.current === true);
+  assert.equal(current?.id, nodeB.id, "switch committed: B is current");
+  assert.ok(persisted.nodes.some((n) => n.id === current?.id), "current id always refers to a durable entry");
+  // 切换真实生效：/api 即刻走 B
+  await request(sc.port, { path: "/api/status" });
+  assert.equal(upstreamB.hits.length, 1, "proxy re-pointed to B after the race");
+});
+
+test("race: switch during DELETE's store window -> 409 node-change-in-progress; B gone and current untouched (r9-P1-2)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-race-ds-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const upstreamA = await fakeUpstream({ handler: (req, res) => { res.writeHead(200); res.end("{}"); } });
+  t.after(() => upstreamA.close());
+  const file = path.join(dir, "nodes.json");
+  // 慢存储注入（remove 延迟——r8 慢存储手法的删除侧对偶）：DELETE 的
+  // nodes.remove fsync/rename await 即互斥锁持有窗口
+  class SlowRemoveStore extends NodeStore {
+    async remove(id) {
+      await delay(150);
+      return super.remove(id);
+    }
+  }
+  const { sc } = await sidecarWithNodes(upstreamA, file, { nodesStore: new SlowRemoveStore(file) });
+  t.after(() => sc.close());
+  const add = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstreamA.url, { token: "node-token-b" }));
+  assert.equal(add.status, 200, add.text);
+  const nodeB = JSON.parse(add.text).node;
+
+  // 反向确定性交错：DELETE(B) 先出发进入 remove 落盘窗口 → switch(B) 到达
+  const del = request(sc.port, { method: "DELETE", path: `/sidecar/nodes/${nodeB.id}` });
+  await delay(40); // << 150ms：delete 仍在落盘中
+  const sw = postJson(sc.port, "/sidecar/nodes/switch", { node_id: nodeB.id });
+  const [delRes, swRes] = await Promise.all([del, sw]);
+  assert.equal(delRes.status, 200, delRes.text);
+  assert.equal(swRes.status, 409, `switch must conflict during delete: ${swRes.text}`);
+  assert.equal(JSON.parse(swRes.text).error.code, "node-change-in-progress");
+
+  // 终态不变量：B 已从内存与磁盘消失；currentNodeId 仍为启动目标（null——未指向已删 B）
+  const persisted = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(persisted.nodes.some((n) => n.id === nodeB.id), false, "B removed durably");
+  const list = JSON.parse((await request(sc.port, { path: "/sidecar/nodes" })).text);
+  assert.equal(list.nodes.some((n) => n.id === nodeB.id), false, "in-memory roster matches disk");
+  assert.equal(list.nodes.some((n) => n.current === true), false, "no current node points at the deleted B");
+  // /api 仍指向启动目标 A（切换被拒后目标零漂移）
+  await request(sc.port, { path: "/api/status" });
+  assert.equal(upstreamA.hits.length, 1, "proxy still points at A");
+});
+
+test("race: switch commit re-check finds target gone -> 409 node-vanished, state untouched (r9-P1-2)", async (t) => {
+  const dir = await mkdtemp(path.join(tmpdir(), "webui-nodes-race-van-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const upstreamA = await fakeUpstream({ handler: (req, res) => { res.writeHead(200); res.end("{}"); } });
+  t.after(() => upstreamA.close());
+  const file = path.join(dir, "nodes.json");
+  // 互斥锁使 sidecar 内的 delete 无法与 switch 交错；用「第二次 get 即消失」
+  // 的存储替身直接钉提交前重查分支（防御性断言）的错误语义
+  class VanishingStore extends NodeStore {
+    #polled = new Set();
+    get(id) {
+      const hit = super.get(id);
+      if (hit !== null && this.#polled.has(id)) {
+        this.#polled.delete(id); // 一次性消失：恰好钉住提交前重查那一次 get
+        return null;
+      }
+      this.#polled.add(id);
+      return hit;
+    }
+  }
+  const { sc } = await sidecarWithNodes(upstreamA, file, { nodesStore: new VanishingStore(file) });
+  t.after(() => sc.close());
+  const add = await postJson(sc.port, "/sidecar/nodes", nodeBody(sc, upstreamA.url, { token: "node-token-b" }));
+  assert.equal(add.status, 200, add.text);
+  const nodeB = JSON.parse(add.text).node;
+
+  const sw = await postJson(sc.port, "/sidecar/nodes/switch", { node_id: nodeB.id });
+  assert.equal(sw.status, 409, sw.text);
+  assert.equal(JSON.parse(sw.text).error.code, "node-vanished");
+  // 状态零变更：/api 仍走 A、B 仍在簿、current 不指向 B
+  const api = await request(sc.port, { path: "/api/status" });
+  assert.equal(api.status, 200);
+  assert.equal(upstreamA.hits.length, 1, "target did not drift");
+  const list = JSON.parse((await request(sc.port, { path: "/sidecar/nodes" })).text);
+  assert.ok(list.nodes.some((n) => n.id === nodeB.id), "B untouched in the book");
+  assert.equal(list.nodes.some((n) => n.current === true), false, "no current node after the refused switch");
+  // 互斥锁已被 finally 释放：后续正常 delete 照常工作
+  const del = await request(sc.port, { method: "DELETE", path: `/sidecar/nodes/${nodeB.id}` });
+  assert.equal(del.status, 200, del.text);
 });
 
 // ---- 披露与基线面不变 ----------------------------------------------------------------------

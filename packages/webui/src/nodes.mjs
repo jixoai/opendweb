@@ -46,13 +46,24 @@ function validEntry(e) {
   );
 }
 
+/**
+ * fs 错误码窄化读取（r9-P2-1：any 断言 → unknown 守卫——零行为变化）。
+ * @param {unknown} e
+ * @returns {string | null}
+ */
+function errorCode(e) {
+  if (e === null || typeof e !== "object" || !("code" in e)) return null;
+  const code = /** @type {{ code?: unknown }} */ (e).code;
+  return typeof code === "string" ? code : null;
+}
+
 /** lstat 拒 symlink（读与写共用；不存在 = 无事）。 */
 async function assertNotSymlink(file) {
   let st;
   try {
     st = await lstat(file);
   } catch (e) {
-    if (e !== null && typeof e === "object" && /** @type {any} */ (e).code === "ENOENT") return;
+    if (errorCode(e) === "ENOENT") return;
     throw e;
   }
   if (st.isSymbolicLink()) throw new NodeStoreError(`refusing to follow symlink nodes file: ${file}`);
@@ -78,26 +89,34 @@ export class NodeStore {
     try {
       raw = await readFile(this.file, "utf8");
     } catch (e) {
-      if (e !== null && typeof e === "object" && /** @type {any} */ (e).code === "ENOENT") {
+      if (errorCode(e) === "ENOENT") {
         this.nodes = [];
         return;
       }
       throw e;
     }
-    let parsed;
+    /** @type {unknown} */ let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch {
       throw new NodeStoreError(`nodes file is not valid JSON: ${this.file}`);
     }
-    if (parsed === null || typeof parsed !== "object" || !Array.isArray(/** @type {any} */ (parsed).nodes)) {
+    // unknown 窄化（r9-P2-1）：先证明 nodes 是数组，再逐条经 validEntry 守卫
+    // 收窄为条目类型——不经 any 断言直接读取
+    const rawNodes =
+      parsed !== null && typeof parsed === "object" && "nodes" in parsed && Array.isArray(parsed.nodes)
+        ? parsed.nodes
+        : null;
+    if (rawNodes === null) {
       throw new NodeStoreError(`nodes file malformed (missing nodes array): ${this.file}`);
     }
-    const nodes = /** @type {any} */ (parsed).nodes;
-    for (const n of nodes) {
+    /** @type {Array<{ id: string, name: string, server_host: string, token: string, added_at: number }>} */
+    const entries = [];
+    for (const n of rawNodes) {
       if (!validEntry(n)) throw new NodeStoreError(`nodes file contains a malformed entry: ${this.file}`);
+      entries.push(n);
     }
-    this.nodes = nodes;
+    this.nodes = entries;
   }
 
   /**
