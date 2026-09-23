@@ -1,6 +1,8 @@
 # home-hub 产品设计（家庭中枢与三视角控制台）
 
-> 状态：待 Owner 拍板（§1.6 三视角命名终稿 + §8 开放问题）。
+> 状态：v1.1——[H7] 三项已拍板（2026-09-23）：O-1 命名=组 B「我的中枢/我的租约/我的到访」；
+> O-2 命令=`opendweb hub` 族（重看卡片=`hub card`）；G-1 多租约进本 change 范围。
+> 其余开放问题（O-3..O-10、G-2..G-5）维持默认建议，实现期按需回 Owner。
 > 边界：本文档只做产品设计，不含存储格式、API 形态、守护进程与 launchd/systemd 实现；
 > 一切产品决策以 `openspec/changes/home-hub/requirements.md` 的 Owner 裁决（[H0]-[H6]）
 > 为准，不得偏离。
