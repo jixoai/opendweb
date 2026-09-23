@@ -35,6 +35,22 @@ marketplace 安装，未安装不影响核心功能）。
 不硬依赖 opentray 主产品；中枢核心（守护/生命周期/契约）不依赖插件
 存在——插件是体验层，核心面 CLI 直达。
 
+### [H4] webui 双形态：既是 plugin，也是可复用 SDK（2026-09-23，Owner）
+
+> 所以 tray 插件本身依赖了 webui 插件，那么意味着 webui 本身既要是
+> 一个 plugin，也要是一个可复用的 SDK。
+
+**解读**：`packages/webui` 分层为——
+- **核心 = 可嵌入 SDK**：sidecar 运行时（node:http 零依赖，进程内可
+  起停）、节点簿/状态逻辑、SPA 资源解析、类型化事件与配置面——
+  具备编程消费入口（`startSidecar` 一族），供 tray 插件等宿主进程内
+  复用（避免插件套子进程的双层进程树与 nodes.json 并发宿主）；
+- **壳 = plugin 适配器与 CLI**：`opendweb webui` 走 marketplace 插件
+  分发（既有形态不变），CLI 直达——两者都是 SDK 之上的薄壳。
+
+托盘唤起 webui（含深链到敲门台等页面）经 SDK 进程内完成；独立使用
+webui 的用户体感不变。SDK 面（配置/事件/生命周期/资源）冻结进 spec。
+
 ### [H3] 架构共识（对话确认，作为设计前提）
 
 - **中枢 ≠ 流量瓶颈**：数据面点对点直连（局域网内现成；IPv6 直连为

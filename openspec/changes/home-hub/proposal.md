@@ -30,6 +30,12 @@
 - 守护生命周期：`--daemon` / `status` / `stop` + launchd/systemd
   用户级服务安装助手（跨平台包装，家庭设备重启后中枢自动回来）。
 
+### webui SDK 分层（[H4]，本 change 的前置工作项）
+
+- `packages/webui` 重分层：核心 SDK（sidecar 运行时/节点簿逻辑/SPA
+  资源/类型化事件）+ 薄壳（plugin 适配器、CLI）——独立使用体感不变，
+  `opendweb webui` 分发形态不变；新增 SDK 编程入口与契约测试。
+
 ### 托盘插件（`opendweb tray`）
 
 - 托盘做成 opendweb 插件（与 `opendweb webui` 同模式：插件包经
