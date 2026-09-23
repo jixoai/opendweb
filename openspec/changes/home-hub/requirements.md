@@ -112,6 +112,12 @@ join 自报 hostname 为 alias（register 增量字段，自声明标签，管�
 > 启动 Endpoint）。此前的「Rust 零产品改动」边界为编排方自定而非 Owner
 > 裁决，本条修订为：**允许 dweb-fabric 最小生命周期扩展（含其配套测试）；
 > dweb-server 仍零改动；G-3 用例仍 test-only**。
+>
+> **Owner 二次拍板（2026-09-23，r11 复审后）：[H8] 扩充**——除生命周期
+> API 外，同时授权 **Roster 显式 fabricId 采纳**（`FabricOptions.fabricId`
+> 仅 createRoot 生效：64hex 校验、roster 持久化采纳该值、既有随机行为
+> 缺省不变、既有 roster 冲突=明确错误不静默改写）。身份语义改动的授权
+> 范围以此为限；CLI 仍不引入 NAPI 依赖。
 
 ## 走查发现（2026-09-23 三角色 ego-browser 亲测，非裁决——设计吸收项）
 
