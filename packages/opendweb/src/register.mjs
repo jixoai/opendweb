@@ -12,6 +12,7 @@
 // 忽略、错误 envelope {"error":{"code","message"}}、签名 base64url-nopad。
 
 import { endpointIdHexFromSeed, signDetached, verifyDetached } from "./ed25519.mjs";
+import { blake3Hex } from "./blake3.mjs";
 
 /** PoP 域分隔符（17 字节域 + NUL = 18B） */
 export const REGISTER_DOMAIN = Buffer.from("dweb/register/v1\0", "utf8");
@@ -224,6 +225,57 @@ export function verifyRegisterReceipt(receipt, serverPublicKeyHex) {
   }
   const canonical = buildRegisterReceiptCanonical(receipt);
   return verifyDetached(serverPublicKeyHex, canonical, sig);
+}
+
+// ---- 邀请码规范化 + 哈希（home-hub Phase 1d；语义冻结对拍 dweb-server
+// access/codes.rs normalize_code_body/code_hash，frozen 向量在
+// test/leases.test.mjs） -----------------------------------------------------
+
+/** 邀请码前缀（与 Rust CODE_PREFIX 同拍） */
+export const INVITE_CODE_PREFIX = "dwebc1.";
+
+/** 规范化本体长度（16 字符小写 crockford） */
+const INVITE_CODE_BODY_LEN = 16;
+
+/** crockford 小写字符集（排除 i/l/o/u） */
+const CROCKFORD_LOWER = "0123456789abcdefghjkmnpqrstvwxyz";
+
+/**
+ * 邀请码规范化（Rust normalize_code_body 逐语义移植）：首尾空白容忍、
+ * `dwebc1.` 前缀大小写不敏感剥除、连字符剔除、ASCII 大写折叠；最终必须
+ * 恰 16 字符且全部属 crockford 小写集。歧义字符（i/l/o/u）与其他非法
+ * 字符同样拒绝（不自动映射）。返回 null = 拒绝。
+ * @param {string} raw
+ * @returns {string | null} 规范化 16 字符本体（null = 非法形态）
+ */
+export function normalizeInviteCode(raw) {
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  const head = s.slice(0, INVITE_CODE_PREFIX.length).toLowerCase();
+  const body = head === INVITE_CODE_PREFIX ? s.slice(INVITE_CODE_PREFIX.length) : s;
+  let normalized = "";
+  for (const c of body) {
+    if (c === "-") continue;
+    // 仅 ASCII A-Z 折叠（Rust to_ascii_lowercase 语义；非 ASCII 原样进集合校验被拒）
+    const code = c.charCodeAt(0);
+    normalized += code >= 65 && code <= 90 ? String.fromCharCode(code + 32) : c;
+  }
+  if (normalized.length !== INVITE_CODE_BODY_LEN) return null;
+  for (const c of normalized) {
+    if (!CROCKFORD_LOWER.includes(c)) return null;
+  }
+  return normalized;
+}
+
+/**
+ * 码哈希（Rust code_hash 语义：blake3(规范化本体字节) → 64 hex）。
+ * 输入为原始用户输入；非法形态返回 null（调用方 fail-fast）。
+ * @param {string} raw
+ * @returns {string | null}
+ */
+export function inviteCodeHashHex(raw) {
+  const normalized = normalizeInviteCode(raw);
+  return normalized === null ? null : blake3Hex(Buffer.from(normalized, "ascii"));
 }
 
 // ---- 便捷再导出（join 命令直接组包） ----------------------------------------
