@@ -28,6 +28,7 @@
 | [H5] 三视角控制台 | 切换器+member 态分流（五行表，含 hub 本机自动 admin）；租约/到访单页 | §4 |
 | [H6] 机器名默认别名 | 已落地（2dacb56）；本 change 仅消费显示，不写回服务端 | §2 |
 | [H7] G-1/O-1/O-2 | leases.json 0..N（锁协议）；组 B 命名；hub 命令族 | §1/§2/§4 |
+| [H8] deferStart 最小 SDK 扩展 | dweb-fabric 生命周期 API（Deferred 状态机）+ client-sdk NAPI/d.ts 桥接 + 集成测试；CLI 不引入 NAPI；server 零改动 | §2.1/§9 |
 
 ## 1. 中枢命令族与守护（CLI builtin）
 
@@ -173,9 +174,13 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   bind+online；票据已就绪，首次 relay 接触即带有效 capability）；
   ⑤此后才允许任何 join/connect。②③任一不符（签发失败/非 root/server_id
   或 URL 与租约不匹配/token 未注入）=MUST fail-closed（不调 start、明确
-  报错、不得静默降级为无凭证、不得写租约）。**SDK 扩展契约**：deferStart
-  形态构造 MUST NOT 产生任何网络出站；start() 幂等；扩展附配套单测；
-  dweb-server 零改动。端到端 Scenario MUST 断言：deferred 构造期零出站、
+  报错、不得静默降级为无凭证、不得写租约）。**SDK 扩展契约与状态机（r9-P2-3）**：deferStart 形态构造 MUST NOT
+  产生任何网络出站；最小状态机
+  `Deferred -> Starting -> Started | Failed -> Closed`：并发 start()
+  single-flight 同结果；Starting/Started 失败进入 Failed（资源清理、可
+  重试=再次 start 从 Failed 重入 Starting）；deferred 态 shutdown()=
+  清理 roster/RelMap 资源（未 bind 无网络面）；Closed 后 start/ensure=
+  明确错误。每条转换 Rust+Node 双层测试；dweb-server 零改动。端到端 Scenario MUST 断言：deferred 构造期零出站、
   首次 relay 接触晚于 ensure、root 身份前提。
 - **身份 tuple 同源冻结（r7-P1-1——杜绝 register 与票据消费的 fabric
   分叉）**：register body 与 lease 条目的 `(fabric_id, root)` 的**唯一
@@ -196,19 +201,44 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   且账本不变——不得把「实际握手失败」当唯一发现手段。
 
 ```text
-租约消费连接时序（[H8] deferStart 五步）
-──────────────────────────────────────────────
- createRoot/open(deferStart)   ← 零网络（不 bind/不 online/不连 relay）
-        │
- ensureRelayCapabilities()     ← root 自签（deferred 态）
-        │
+租约消费连接时序（[H8] deferStart 五步 + r9 缓存预检）
+------------------------------------------------------
+ createRoot/open(deferStart)
+   |   零网络出站；本地读 relay.caps.json 预检：
+   |   逐条 decode 校验 tuple (relay_url, fabric_id, issuer/root,
+   |   server_id) 且未过期 -> 匹配=留待注入 / 不匹配=忽略+诊断记录
+   v
+ ensureRelayCapabilities()  <- root 自签（deferred 态）
+   v
  断言 (relay_url, server_id) 覆盖租约 + token 注入同实例
-        │  ├─ 不符 → fail-closed（不 start / 不写租约）
- fabric.start()                ← 加载缓存票据+注入+bind+online
-        │                        （首次 relay 接触已带有效 capability）
+   |   不符 -> fail-closed（不 start / 不写租约）
+   v
+ fabric.start()
+   |   注入合并优先级：本次 ensure 且断言过的票 > tuple 校验通过的
+   |   缓存票（同 URL 冲突 ensured 胜；start 不得覆盖 ensured 票）
+   |   -> bind + online（首次 relay 接触已带有效 capability）
+   v
  join / connect（首次拨号）
-──────────────────────────────────────────────
-```端到端断言：restricted 中枢注册后
+------------------------------------------------------
+```
+
+**缓存票据合并优先级（r9-P1-1 冻结）**：`start()` 阶段的注入 MUST 遵循
+「本次 ensure 且断言过的票最高优先」——同 URL 缓存旧票不得覆盖 ensured
+票；缓存票参与注入的前置=tuple 完整校验通过（fabric/issuer/server/URL
+与租约一致且未过期），不匹配=忽略并留可诊断结果。Scenario：目标 URL
+缓存旧票分别属错误 server/错误 fabric/错误 issuer、以及同 tuple 的过期/
+有效票——start 后 RelayMap 仍持租约匹配票，且 relay 侧观测首次连接携带
+该票；负向路径不先拨号、不写租约。
+
+**Node 桥接冻结（r9-P1-2）**：deferStart 的可调用面=client-sdk NAPI——
+`FabricOptions.deferStart?: boolean`（仅对 `createRoot/open` 生效；缺省
+false=既有 eager-start 行为不变）与 `Fabric.start(): Promise<void>`
+（幂等）；`.d.ts` 同步（dts 契约纪律）+配套单测。**CLI 不引入 NAPI 依赖**
+（device-key.mjs 既有纪律保留：冷启动/体积）；五步时序的端到端验证载体
+=client-sdk 集成测试（CustomWithCaps+deferStart 全链，含首触带票观测）；
+CLI 连接器命令=未来 change（届时再议 NAPI 引入）。
+
+端到端断言：restricted 中枢注册后
   实际 relay 握手成功、无票连接被拒 `dweb/no-capability`、跨 server
   capability 被拒、SDK relay mode=custom（非 N0Default）；malformed
   server_id/URL 在落租约前失败。
@@ -449,6 +479,10 @@ n0 公共 relay 的用户）不在本结论内。
 
 ## 9. 任务分解
 
+- **Phase 0（SDK 扩展，[H8]）**：0a dweb-fabric deferStart 生命周期
+  （Deferred 状态机+缓存预检+合并优先级+单测）；0b client-sdk NAPI
+  `deferStart`/`start()` + d.ts + 集成测试（CustomWithCaps 全链含首触
+  带票观测）。
 - **Phase 1（CLI）**：1a 状态模型+init（接管/自检/零残留/config_path 冻结）；
   1b 统一进程模型（DWEB_DATA_DIR 注入核实/三宿主/pid 三元组）+stop/status；
   1c autostart 两平台+联动+acceptance 记录；1d leases（id/relay_url/快照
@@ -463,7 +497,8 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r8 | NOT-READY 7.9，P1×1（SDK 构造期 bind/online 先于 ensure——[H8] Owner 拍板选项 A） | 全处置（v9，本版）：deferStart 五步时序（deferred 构造零网络→ensure→断言→start→拨号）；Rust 边界修订（dweb-fabric 最小生命周期扩展+配套测试；server 零改动）；P2-1 open 重开正向 Scenario（§2.1 Scenario 集补充）；P2-2 身份/拨号链 ASCII 流程图（§2.1 末） |
+| r9 | NOT-READY 7.6，P1×2+P2×4 | 全处置（v10，本版）：P1-1 缓存票据合并优先级冻结（ensured>tuple 校验缓存票；构造期非网络预检；四类旧票 Scenario+首触带票观测）（§2.1）；P1-2 Node 桥接冻结（NAPI deferStart/start+d.ts+集成测试；CLI 不引入 NAPI；连接器命令留未来 change）（§2.1）；P2-1 v9 引入的 fence 未闭合修复；P2-2 流程图纯 ASCII 化；P2-3 Deferred 状态机冻结（并发/失败/关闭语义+双层测试）；P2-4 §0/§9 增 [H8] 映射与 Phase 0 |
+| r8 | NOT-READY 7.9，P1×1（SDK 构造期 bind/online 先于 ensure——[H8] Owner 拍板选项 A） | 全处置（v9）：deferStart 五步时序（deferred 构造零网络→ensure→断言→start→拨号）；Rust 边界修订（dweb-fabric 最小生命周期扩展+配套测试；server 零改动）；P2-1 open 重开正向 Scenario（§2.1 Scenario 集补充）；P2-2 身份/拨号链 ASCII 流程图（§2.1 末） |
 | r7 | NOT-READY 7.8，P1×1（租约 tuple 与 SDK roster 不同源可 unknown-owner） | 全处置（v8）：身份 tuple 唯一数据源=SDK roster 实际值（join 独立选 fabric_id 的现状被改造；roster 只 open 不另建/seed 不另生）+首拨前三元组连续性断言（fabric/root/capability 覆盖）+正负 Scenario（§2.1） |
 | r6 | NOT-READY 7.8，P1×1（attach 非 root 必败） | 全处置（v7）：采纳选项 A——构造器限定 createRoot/open 既有 root（租约消费=join 注册形态=root 身份）；attach/invite 成员路径排除出本时序（SDK 既有机制另行使用）；Scenario 断言 root 前提（§2.1） |
 | r5 | NOT-READY 7.8，P1×1+P2×2（十条基线 8 PASS+2 CONDITIONAL） | 全处置（v6）：P1-1 capability 签发时序冻结（构造→显式 ensureRelayCapabilities→断言覆盖与同实例注入→方可拨号；任何不符 fail-closed）（§2.1）；P2-1 preflight「恰一」与「第一条合法者」措辞冲突修正为「至少一条+多候选取第一条」（§2.1）；P2-2 PM 证据基线补 [H7] |
