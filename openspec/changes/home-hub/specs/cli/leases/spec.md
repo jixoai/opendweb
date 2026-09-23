@@ -2,40 +2,49 @@
 
 ### Requirement: 多租约簿（leases，[H7]-G1）
 
-本机租约 SHALL 从单条 `registration.json` 演进为 `<DWEB_HOME>/leases.json`（`{version, leases:[]}`），条目 = `{server(归一化 origin), server_id, fabric_id, root, alias(自报机器名快照), label(本地备注，缺省 null), registered_at, expires_at, receipt}`；键 = `(server, fabric_id, root)`。写入 MUST 沿用 SecretStore 原子纪律（0600+tmp+fsync+rename；失败无半提交）。同键持新码 join = 续期 upsert：更新 expires_at/receipt，**registered_at 保持首条**（镜像服务端 first_registered_at 裁决）；alias 更新为当前自报；同设备换 server = 新条目（0..N）。
+本机租约 SHALL 从单条 `registration.json` 演进为 `<DWEB_HOME>/leases.json`（`{version, leases:[]}`），条目 = `{id, server(归一化 origin), relay_url, server_id, fabric_id, root, alias(自报机器名快照), label(本地备注，缺省 null), registered_at, expires_at, receipt}`；键 = `(server, fabric_id, root)`；**id** = 创建时随机 10 字符不透明键（UI 引用与 label 路由的稳定句柄）。写入 MUST 沿用 SecretStore 原子纪律（0600+tmp+fsync+rename；失败无半提交）。同键持新码 join = 续期 upsert：更新 expires_at/receipt/relay_url，**registered_at 保持首条**（镜像服务端 first_registered_at 裁决）；alias 更新为当前自报；同设备换 server = 新条目（0..N）。
 
-**跨进程写协议（防丢更新）**：写者=join CLI 与 label 编辑（sidecar 面）两个进程面；每个账本文件配 `<name>.lock`（O_EXCL 创建，内容 pid+ts）：获取锁→**锁内重读**→合并→tmp+fsync+rename→校验锁仍属本进程→释放；陈锁（>10s 且 pid 已死）可打破；锁获取失败=短退避重试（≤3）后报错，MUST NOT 静默丢写。**迁移**：读取器发现旧 `registration.json` 且 leases.json 缺失时，在 leases 写锁内解析并入为首条并将旧文件改名 `registration.json.migrated`（不删）；解析失败不阻塞（警告+保留原文件）；迁移与 join 并发相撞由同一把锁串行。join 的 fabric 复用语义改为按 server 维度查租约簿。
+**relay_url（入网闭环）**：join 已访问 `/services.json` 校验 server_id——同时读取其 relay URL 并随租约落盘；**成员连接该 server 时 MUST 经此 relay**（Custom 模式指向中枢，G-3 承诺的入网前提）；leases 消费者以此为唯一 relay 真源，不回落 N0Default。
+
+**expires_at=本机最后一次成功兑换的租期快照**：管理端 renew 只改服务端 owners，MUST NOT 假设回写本机（无成员侧查询协议，Phase 2 候选）；租约呈现面 MUST 以「本地快照」语义展示（临期文案指引：若管理者已续期，数字在下次持新码加入时刷新；能否连上以实际连接为准）。
+
+**跨进程写协议**：写者=join CLI 与 label 编辑（sidecar 面）；每账本文件配 `<name>.lock`（O_EXCL 创建，内容 pid+ts）：获取锁→锁内重读→合并→tmp+fsync+rename→校验锁仍属本进程→释放；陈锁（>10s 且 pid 已死）可打破；锁获取失败=短退避重试（≤3）后报错，MUST NOT 静默丢写。**迁移**：读取器发现旧 `registration.json` 且 leases.json 缺失时，在 leases 写锁内解析并入首条（relay_url 由对 server 发 /services.json 探测补全，不可达=留空待下次 join 补）并将旧文件改名 `registration.json.migrated`（不删）；解析失败不阻塞（警告+保留原文件）。join 的 fabric 复用语义改为按 server 维度查租约簿。
+
+#### Scenario: join 落盘 relay_url
+
+- **WHEN** 对某中枢执行 `opendweb join` 成功
+- **THEN** 新租约条目的 relay_url = 该中枢 /services.json 发布的 relay URL
 
 #### Scenario: 并发双写不丢更新
 
 - **WHEN** 两个进程同时对不同 server 完成有效 join（或一 join 一 label 编辑）
-- **THEN** leases.json 最终包含全部两条更新（锁内重读合并）；任一进程的更新不因另一进程的 rename 而丢失
+- **THEN** leases.json 最终包含全部两条更新（锁内重读合并），无静默丢失
 
-#### Scenario: 换服务器得到两条租约
+#### Scenario: 换服务器得到两条租约 / 同服务器新码续期不重置注册时刻
 
-- **WHEN** 同一设备先后 join 服务器 A 与服务器 B（各持有效码）
-- **THEN** leases.json 含两条租约（键不同），各自独立倒计时
+- **WHEN** 先后 join A、B / 持新码再 join A（registered_at=T0）
+- **THEN** 两条独立租约各自倒计时 / 同键 upsert：expires_at 刷新、registered_at 保持 T0、relay_url/receipt 更新
 
-#### Scenario: 同服务器新码续期不重置注册时刻
+#### Scenario: 管理端续期不回写本机快照（诚实呈现）
 
-- **WHEN** 已有服务器 A 的租约（registered_at=T0），到期前持新码再次 join A
-- **THEN** 同键 upsert：expires_at 刷新，registered_at 保持 T0，receipt 更新
+- **WHEN** 管理员在服务端为租户续期后，租户本机打开租约视角
+- **THEN** 本机倒计时仍按最后兑换快照显示（标注本地快照语义）；临期文案含「若管理者已为你续期，数字在下次持新码加入时刷新」指引；实际连接可用性以探测/实际连接为准
 
 #### Scenario: 旧 registration.json 迁移（三形态）
 
-- **WHEN** 分别以完好/损坏/缺失的旧 registration.json 首次触发读取
-- **THEN** 完好→并入首条且旧文件改名 .migrated 保留；损坏→警告不阻塞、原文件原样；缺失→无迁移动作
+- **WHEN** 分别以完好/损坏/缺失的旧文件首次触发读取
+- **THEN** 完好→并入首条（relay_url 探测补全或留空）且旧文件改名 .migrated；损坏→警告不阻塞、原文件原样；缺失→无迁移动作
 
 ### Requirement: 到访簿与连通探测（visits，G-2 best-effort）
 
-本机 SHALL 维护 `<DWEB_HOME>/visits.json`（`{version, visits:[{server, server_id?, first_visit_at, last_visit_at, last_probe:{result, detail?, at}, note}]}`，键=server；同款原子写+锁协议；写者=join CLI 与 sidecar probe）。写入触发（v1 诚实范围）：join 成功（同源记录）、webui「测一下」探测动作、既有连接类命令成功时；**不承诺**自动捕获每次放行连接（呈现面 MUST 常驻 best-effort 声明；client-sdk 连接成功事件钩子=Phase 2 候选，非本 change 承诺）。**探测结果枚举冻结**：`result ∈ {reachable, unreachable}`（不使用「refused」作用户面词，避免与准入被拒歧义）；`detail` 为内部归类字段 ∈ {`http-status:<n>`, timeout, dns, bad-body, conn-refused}。映射：HTTP 2xx 且 services.json 可解析→reachable；非 2xx→unreachable/http-status；连接拒绝→unreachable/conn-refused；DNS 失败或超时（5s）→unreachable/dns|timeout。探测=无凭证 `GET <origin>/services.json`；「连不上」话术 MUST NOT 表述为「被拒」。
+本机 SHALL 维护 `<DWEB_HOME>/visits.json`（`{version, visits:[{server, server_id?, first_visit_at, last_visit_at, last_probe:{result, detail?, at}, note}]}`，键=server origin；同款原子写+锁协议；写者=sidecar probe 与既有访客连接类命令）。**业务定义=本机作为访客被放行后的记录：join 成功（租户路径）MUST NOT 写 visits**（租户只写 leases）。写入触发（v1）：①「测一下」探测动作；②既有访客连接类命令成功时；③未来访客连接器（Phase 2 候选，非本 change 承诺）。first_visit_at=条目创建；last_visit_at=最近一次 reachable 探测时刻。不承诺自动捕获每次放行连接（呈现面常驻 best-effort 声明）。**探测枚举冻结（五类确定映射）**：`result ∈ {reachable, unreachable}`（不使用「refused」作用户面词）；detail∈{`http-status:<n>`, timeout, dns, bad-body, conn-refused}；映射：2xx 且 services.json 可解析→reachable；非 2xx→unreachable/http-status；连接拒绝→conn-refused；DNS 失败→dns；超时（5s）→timeout；**2xx 但 JSON 不可解析→bad-body**。探测=无凭证 `GET <origin>/services.json`；「连不上」话术 MUST NOT 含「被拒」语义。
 
-#### Scenario: 探测结果落账（分类映射）
+#### Scenario: 探测结果落账（五类确定映射）
 
-- **WHEN** 分别对可达服务器、返回 500 的地址、连接被拒的端口、不可解析域名执行「测一下」
-- **THEN** 四种情况分别落 reachable / unreachable(http-status:500) / unreachable(conn-refused) / unreachable(dns)，UI 呈现均为二值话术且连不上文案不含「被拒」语义
+- **WHEN** 分别对可达服务器、返回 500 的地址、连接被拒的端口、不可解析域名、返回 2xx 但 body 非 JSON 的地址执行「测一下」
+- **THEN** 分别落 reachable / unreachable(http-status:500) / unreachable(conn-refused) / unreachable(dns) / unreachable(bad-body)；UI 均为二值话术且连不上文案不含「被拒」语义
 
-#### Scenario: 不虚造记录
+#### Scenario: 租户加入不产生到访记录
 
-- **WHEN** 本机从未成功连接过某服务器
-- **THEN** visits.json 无该条目；空态文案如实引导
+- **WHEN** join 成功（租户路径）
+- **THEN** visits.json 无该 server 条目；到访簿空态文案如实引导

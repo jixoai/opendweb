@@ -35,8 +35,9 @@
   中枢——restricted + 本地生成并安全保存 admin token + 固定家庭端口
   + 首次防火墙/端口可达性自检 + 接入引导（含二维码/短码承载的地址与
   凭证引导信息）。
-- 守护生命周期：`--daemon` / `status` / `stop` + launchd/systemd
-  用户级服务安装助手（跨平台包装，家庭设备重启后中枢自动回来）。
+- 守护生命周期：`start --foreground` / `status` / `stop` + 用户级系统服务
+  （macOS LaunchAgent / Windows 启动文件夹；Linux systemd 待 CLI 支持 Linux
+  分发后另立 change）——家庭设备重启后中枢自动回来。
 
 ### webui SDK 分层（[H4]，本 change 的前置工作项）
 
