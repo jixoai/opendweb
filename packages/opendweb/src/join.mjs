@@ -338,11 +338,13 @@ export async function runJoin(argv, ctx = {}) {
     let code = "";
     let message = "";
     try {
-      const errBody = await res.json();
-      const envelope = /** @type {any} */ (errBody)?.error;
-      if (envelope && typeof envelope === "object") {
+      const errBody = /** @type {unknown} */ (await res.json());
+      // unknown 窄化守卫（r9-P2-1）：逐键证明形态，不经 any 断言读取
+      const envelope =
+        errBody !== null && typeof errBody === "object" && "error" in errBody ? errBody.error : null;
+      if (envelope !== null && typeof envelope === "object" && "code" in envelope) {
         if (typeof envelope.code === "string") code = envelope.code;
-        if (typeof envelope.message === "string") message = envelope.message;
+        if ("message" in envelope && typeof envelope.message === "string") message = envelope.message;
       }
     } catch { /* 非 JSON 错误体：按状态归并 */ }
     const human = REGISTER_ERROR_TEXT[/** @type {keyof typeof REGISTER_ERROR_TEXT} */ (code)];
