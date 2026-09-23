@@ -1561,9 +1561,9 @@ async fn session_replaced_canonical_not_resurrected_by_inflight_resume() {
     // 放行 R1：install 因 S1 已 Dead 被拒——无 RESUME_OK、S1 不复活
     shared.resume_gate.release();
     let r1_resp = tokio::time::timeout(Duration::from_secs(10), t1.recv()).await;
-    match r1_resp {
-        Ok(Ok(f)) => panic!("R1 不得收到成功帧（得到 {:?}）", f.frame_type),
-        Ok(Err(_)) | Err(_) => {} // 半关候选：连接终结/无帧
+    // 半关候选：连接终结/无帧均静默放行
+    if let Ok(Ok(f)) = r1_resp {
+        panic!("R1 不得收到成功帧（得到 {:?}）", f.frame_type);
     }
     // 终态：S1 保持 Dead（不因 R1 的任何后续步骤复活）
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1666,9 +1666,8 @@ async fn session_close_gates_inflight_resume_from_reactivating() {
     // 放行 R1：Dead 拒绝安装——无成功帧、Dead 不被拉回 Active
     shared.resume_gate.release();
     let r1 = tokio::time::timeout(Duration::from_secs(10), t1.recv()).await;
-    match r1 {
-        Ok(Ok(f)) => panic!("Dead 会话的迟到恢复不得收到成功帧（{:?}）", f.frame_type),
-        Ok(Err(_)) | Err(_) => {}
+    if let Ok(Ok(f)) = r1 {
+        panic!("Dead 会话的迟到恢复不得收到成功帧（{:?}）", f.frame_type);
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
