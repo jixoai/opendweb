@@ -439,11 +439,22 @@ test("opendweb help is all-ASCII and mentions server usage", async () => {
       else resolve(stdout + stderr);
     });
   });
-  assert.match(out, ASCII, "help output must be all-ASCII");
+  // home-hub：hub 命令族首行与 PRODUCT-DESIGN §4.1 逐字对齐（PM 冻结中文
+  // 文案）——ASCII 纪律适用于 hub 段之外的全部输出（动态值仍全 ASCII）
+  const hubStart = out.indexOf("  opendweb hub init");
+  const hubEnd = out.indexOf("  opendweb id", hubStart);
+  const nonHub = hubStart === -1 ? out : out.slice(0, hubStart) + out.slice(hubEnd);
+  assert.notEqual(hubStart, -1, "help documents the hub command family");
+  assert.match(nonHub, ASCII, "help output (outside the PM-frozen hub section) must be all-ASCII");
   assert.ok(out.includes("opendweb server"), "help mentions server command");
   assert.ok(out.includes("--gateway"), "help documents --gateway");
   assert.ok(out.includes("DWEB_GATEWAY_BIND"), "help documents env vars");
   assert.ok(out.includes("opendweb-example"), "help mentions example flow");
+  // hub 首行 = PM §4.1 用户语言（逐字）
+  assert.match(out, /把这台机器变成家里的中枢（一次性：预设\+自检\+接入卡片）。/);
+  assert.match(out, /中枢现在怎么样：运行状态、地址、成员、敲门、自启、排障提示。/);
+  assert.match(out, /重新出示接入卡片（家里人怎么连）。/);
+  assert.match(out, /开机自动把中枢带回来 \/ 关掉。/);
 });
 
 test("opendweb server e2e: ASCII banner + /services.json + GET / (random ports)", async () => {
@@ -957,11 +968,16 @@ test("help mentions new commands (marketplace/plugin/setup)", async () => {
       else resolve(stdout + stderr);
     });
   });
-  assert.match(out, ASCII, "help must be all-ASCII");
+  // ASCII 纪律同上：豁免 PM 冻结中文的 hub 段（home-hub §4.1 逐字对齐）
+  const hubStart = out.indexOf("  opendweb hub init");
+  const hubEnd = out.indexOf("  opendweb id", hubStart);
+  const nonHub = hubStart === -1 ? out : out.slice(0, hubStart) + out.slice(hubEnd);
+  assert.match(nonHub, ASCII, "help must be all-ASCII outside the PM-frozen hub section");
   assert.match(out, /opendweb marketplace/);
   assert.match(out, /opendweb plugin/);
   assert.match(out, /opendweb setup/);
   assert.match(out, /opendweb <plugin-name>/);
+  assert.match(out, /opendweb hub open \[deep-link\]/);
 });
 
 // ---------------------------------------------------------------------------
