@@ -96,6 +96,15 @@ importers:
         specifier: ^3.0.0
         version: 3.2.7(@types/node@26.4.0)(jiti@2.7.0)(lightningcss@1.33.0)
 
+  packages/tray:
+    dependencies:
+      opendweb:
+        specifier: workspace:*
+        version: link:../opendweb
+      opendweb-webui:
+        specifier: workspace:*
+        version: link:../webui
+
   packages/website:
     devDependencies:
       '@fontsource-variable/jetbrains-mono':

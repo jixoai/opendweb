@@ -1,0 +1,32 @@
+{
+  "name": "opendweb-tray",
+  "version": "0.1.0",
+  "description": "opendweb tray - headless hub tray controller plugin: tray-status.json heartbeat + stdout event stream / --ipc JSON-RPC 2.0 for shell hosts (opentray)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "bin": {
+    "opendweb-tray": "./src/bin.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./opendweb-plugin": "./src/plugin.mjs"
+  },
+  "dependencies": {
+    "opendweb": "workspace:*",
+    "opendweb-webui": "workspace:*"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/opendweb.git"
+  }
+}
