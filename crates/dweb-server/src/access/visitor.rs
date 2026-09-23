@@ -313,11 +313,15 @@ impl VisitorRegistry {
         &self.path
     }
 
-    /// 从磁盘重载活跃集合：成功原子替换快照 + generation+1；失败（坏行/IO）
-    /// 保留旧快照并上抛。文件缺失 = 空集合（fail-closed，与 owners 同语义）。
+    /// 从磁盘重载活跃集合：**写序列化协议（r8-P0-1 四台账统一）**：读盘
+    /// 归并与发布同持本台账锁——与 grant/revoke/update_metadata 的「锁内
+    /// append+fsync+快照推进」构成同一互斥临界区，reload 不可能发布缺失
+    /// 任一已完成写入的旧快照。成功原子替换快照 + generation+1；失败（坏
+    /// 行/IO）保留旧快照并上抛。文件缺失 = 空集合（fail-closed，与 owners
+    /// 同语义）。
     pub fn reload(&self) -> Result<()> {
-        let fresh = Self::load_active(&self.path)?;
         let mut state = self.state.lock().unwrap();
+        let fresh = Self::load_active(&self.path)?;
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             active: fresh,
@@ -562,5 +566,39 @@ mod tests {
         assert!(reg.snapshot().len() == 0);
         assert!(reg.snapshot().generation() >= 1);
         assert!(!reg.snapshot().is_active(&key(1), now_ms()));
+    }
+
+    /// ③a（r8-P0-1 同构回归，visitors 侧）：并发 grant 与 reload 交错——
+    /// 写序列化协议下 reload 不可能发布缺失任一已完成 grant 的旧快照
+    /// （每轮 join 后立即断言内存快照；终态经 reload 从磁盘复核）
+    #[test]
+    fn concurrent_grant_and_reload_active_never_regresses() {
+        let dir = TempDir::new().unwrap();
+        let reg =
+            std::sync::Arc::new(VisitorRegistry::load(&dir.path().join("visitors.jsonl")).unwrap());
+        const ITERS: u8 = 24;
+        for i in 0..ITERS {
+            let grant = {
+                let reg = std::sync::Arc::clone(&reg);
+                std::thread::spawn(move || reg.grant(&key(i), None, None, None).unwrap())
+            };
+            let reload = {
+                let reg = std::sync::Arc::clone(&reg);
+                std::thread::spawn(move || reg.reload().unwrap())
+            };
+            grant.join().unwrap();
+            reload.join().unwrap();
+            assert!(
+                reg.snapshot().is_active(&key(i), now_ms()),
+                "第 {i} 轮：grant 完成后活跃集合不得被 reload 旧快照回退"
+            );
+        }
+        // 终态：静默后一次 reload（磁盘事实）+ 全量复核
+        reg.reload().unwrap();
+        let snap = reg.snapshot();
+        for i in 0..ITERS {
+            assert!(snap.is_active(&key(i), now_ms()), "终态第 {i} 键活跃");
+        }
+        assert_eq!(snap.len(), ITERS as usize);
     }
 }

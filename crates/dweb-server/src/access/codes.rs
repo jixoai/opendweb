@@ -20,8 +20,9 @@
 //! ① owners register（带 `via_code_hash`）先 fsync → ② codes consume 后
 //! fsync → ③ 双成功才允许 200/回执。崩溃窗口恒收敛为「完整兑换」或「码
 //! 完好」：**reconciliation（孤儿 consume 补齐）是每次加载（启动 + mtime
-//! 热重载）的同锁步骤**（r3-P0-2），孤儿匹配按完整三元组（旧行/管理员
-//! 直加行无 via_code_hash 永不补写）。
+//! 热重载）的同锁步骤**（r3-P0-2；r8-P0-1 起热重载整段——读盘/归并/
+//! 补写/发布——与全部写入共享同一台账锁，单一写序列化协议），孤儿匹配
+//! 按完整三元组（旧行/管理员直加行无 via_code_hash 永不补写）。
 //!
 //! 失败分级（r4-P1-3）：(a) 台账加载/归并失败（含首启）= 调用方（main）
 //! fail-fast 拒绝启动；(b) 加载成功后的补写 append 失败 = 保留快照 + 受
@@ -33,8 +34,10 @@
 //! pending 期间他键 409 `code-pending`、同键重试 = 幂等完成（按首次已
 //! 持久化 register 结果补写 consume，**不重新计算租期**）；consume 已
 //! durable 的同键请求 = 200 幂等回放（expires_at 不刷新，续期唯一入口
-//! 是持新有效码——r4-P1-2）。兑换判定与 consume 追加在同一临界区（codes
-//! Mutex）按 code_hash 串行：max_uses=1 并发双兑恰一成功（r1-P0-2）。
+//! 是持新有效码——r4-P1-2）。pending 的释放通道有二：同键重试补写完成，
+//! 或 reload 归并/reconciliation 发现该键 consume 已 durable（r8-P1-1）。
+//! 兑换判定与 consume 追加在同一临界区（codes Mutex）按 code_hash 串行：
+//! max_uses=1 并发双兑恰一成功（r1-P0-2）。
 
 use super::ledger;
 use super::registry::OwnerRegistry;
@@ -421,15 +424,31 @@ impl CodeLedger {
         ))
     }
 
-    /// 从磁盘重载 + reconciliation（mtime 热重载路径，r3-P0-2：与 pending
-    /// 预留同一台账锁协调）。失败（坏行/IO）保留旧快照并上抛；成功原子
-    /// 替换快照 + generation+1。deny-set 以本次归并结果重建（此前失败且
-    /// 本次补写成功的码自然移除——「补写成功即从 deny-set 移除」）。
-    /// pending 为进程内运行时状态，reload 不清空（兑换临界区与 reload 同
-    /// 锁互斥，不会观察中间态）。
+    /// 从磁盘重载 + reconciliation（mtime 热重载路径）。**写序列化协议
+    /// （r8-P0-1）**：磁盘读取、归并、孤儿补写与发布**全段持台账锁**——
+    /// 与本台账全部写入（redeem/issue/revoke 的「锁内 append+fsync+快照
+    /// 推进」）构成同一互斥临界区，reload 不可能发布落后于任一已完成写入
+    /// 的快照（旧实现锁外读盘后加锁替换：watcher 读旧文件期间完成的兑换
+    /// 会被旧快照覆盖，consume 计数丢失 → max_uses 绕过窗口）。锁序：本
+    /// 方法只持 codes 锁（orphans 由调用方先行从 owners 台账取得，看护中
+    /// owners/codes 两步顺序调用不嵌套持锁），与 redeem 的 codes→owners
+    /// 单向序无环，不构成死锁。孤儿补写（reconciliation append）本身是写
+    /// 操作，同样在该协议内。
+    /// 失败（坏行/IO）保留旧快照并上抛；成功原子替换快照 + generation+1。
+    /// deny-set 以本次归并结果重建（此前失败且本次补写成功的码自然移除
+    /// ——「补写成功即从 deny-set 移除」）。**pending 释放（r8-P1-1）**：
+    /// 快照 consumed 键集合 = 本轮 durable 三元组全集（磁盘既有行 + 本轮
+    /// 补写），预留键命中即清除——同码他键不再滞留 409 code-pending。
     pub fn reload(&self, orphans: &[RedeemKey]) -> Result<()> {
-        let (snapshot, deny) = Self::load_inner(&self.path, orphans)?;
         let mut state = self.state.lock().unwrap();
+        let (snapshot, deny) = Self::load_inner(&self.path, orphans)?;
+        #[cfg(test)]
+        test_hooks::fire_reload_read_hook();
+        state.pending.retain(|hash, p| {
+            !snapshot
+                .consumed
+                .contains_key(&(*hash, p.fabric_id, p.root))
+        });
         state.current = snapshot;
         state.deny = deny;
         Ok(())
@@ -802,6 +821,35 @@ pub fn spawn_codes_ledger_watcher_every(
             }
         }
     })
+}
+
+/// barrier 测试钩子（r8-P0-1 回归专用）：armed 时 reload 在「读盘完成、
+/// 发布前」（**持有台账锁**）触发一次并阻塞至释放——用于并发回归钉死
+/// 「读盘与发布同临界区」的写序列化协议。
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender};
+
+    struct Hook {
+        fired: Sender<()>,
+        release: Receiver<()>,
+    }
+
+    static RELOAD_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// 安装屏障（单次生效：fire 后自动卸载）
+    pub fn arm(fired: Sender<()>, release: Receiver<()>) {
+        *RELOAD_HOOK.lock().unwrap() = Some(Hook { fired, release });
+    }
+
+    pub(super) fn fire_reload_read_hook() {
+        let mut guard = RELOAD_HOOK.lock().unwrap();
+        if let Some(hook) = guard.take() {
+            let _ = hook.fired.send(());
+            let _ = hook.release.recv();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1594,5 +1642,218 @@ mod tests {
         }
         handle.abort();
         panic!("热重载未在 2s 内补齐孤儿 consume");
+    }
+
+    // ---- r8 验收：P0-1 写序列化协议 / P1-1 pending 释放 ----
+
+    /// ①（r8-P0-1，barrier）：reload 读盘完成后、发布前暂停（持锁），期间
+    /// 发起 max_uses=1 兑换并恢复 reload——写序列化协议下兑换与发布互斥
+    /// 排序，consume 计数不得丢失：同码他键必须仍 code-exhausted（旧实现
+    /// 读盘在锁外，暂停期间完成的兑换会被旧快照覆盖 → 计数复活 → 绕过
+    /// max_uses）
+    #[test]
+    fn reload_barrier_read_pause_then_redeem_keeps_exhausted() {
+        let (f, hash) = RedeemFixture::new(1);
+        let f = std::sync::Arc::new(f);
+        let now = now_ms();
+        let (fired_tx, fired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        test_hooks::arm(fired_tx, release_rx);
+        let reloader = {
+            let f = std::sync::Arc::clone(&f);
+            std::thread::spawn(move || f.codes.reload(&[]).unwrap())
+        };
+        fired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reload 已完成读盘（发布前、持锁暂停）");
+        // 暂停窗口内发起兑换：协议下与 reload 的发布互斥（阻塞至其完成）
+        let redeemer = {
+            let f = std::sync::Arc::clone(&f);
+            std::thread::spawn(move || {
+                matches!(
+                    f.redeem(&hash, key(1), key(2), now),
+                    RedeemOutcome::Completed { .. }
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(50)); // 确保兑换线程已竞争锁
+        release_tx.send(()).expect("恢复 reload");
+        reloader.join().unwrap();
+        assert!(redeemer.join().unwrap(), "K1 兑换完成");
+        // 兑换事实无损：快照计数 / 磁盘 consume 行 / durable 键命中
+        assert_eq!(f.codes.snapshot().used_count(&hash), 1);
+        assert!(f.codes.snapshot().is_consumed(&(hash, key(1), key(2))));
+        let content = std::fs::read_to_string(f.codes.path()).unwrap();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|l| l.contains("\"op\":\"consume\""))
+                .count(),
+            1,
+            "恰一条 consume 事件"
+        );
+        // 同码他键：必须仍 exhausted（旧实现此处复活为可兑——P0 安全语义）
+        assert!(matches!(
+            f.redeem(&hash, key(3), key(4), now),
+            RedeemOutcome::Exhausted
+        ));
+    }
+
+    /// ⑤（r8-P1-1，max_uses=2）：consume append 失败 → pending+deny-set →
+    /// 恢复可写 → **同一 ledger** reload 补齐孤儿 → pending 释放 → 同码
+    /// 他键 K2 成功（旧实现 pending 永不清 → K2 滞留 409 code-pending；
+    /// 现有恢复测试用新 load，不覆盖同 ledger 路径）
+    #[test]
+    #[cfg(unix)]
+    fn reload_reconciliation_releases_pending_k2_succeeds_same_ledger() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (f, hash) = RedeemFixture::new(2);
+        let now = now_ms();
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(matches!(
+            f.redeem(&hash, key(1), key(2), now),
+            RedeemOutcome::Io(_)
+        ));
+        assert_eq!(f.codes.deny_count(), 1, "consume 失败入 deny-set");
+        // 恢复可写 → 同一 ledger reload（orphans = owners 侧事实源）补齐
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let orphans = f.owners.snapshot().code_orphans();
+        assert_eq!(orphans, vec![(hash, key(1), key(2))]);
+        f.codes.reload(&orphans).unwrap();
+        assert_eq!(f.codes.deny_count(), 0, "补写成功清 deny-set");
+        assert_eq!(f.codes.snapshot().used_count(&hash), 1);
+        // 同码他键 K2：pending 已释放（不再 409）且计数 1 < 2 → 成功
+        assert!(
+            matches!(
+                f.redeem(&hash, key(3), key(4), now + 1),
+                RedeemOutcome::Completed { .. }
+            ),
+            "K2 必须成功（旧实现此处为 PendingOtherKey 409）"
+        );
+        assert_eq!(f.codes.snapshot().used_count(&hash), 2);
+    }
+
+    /// ⑥（r8-P1-1，max_uses=1）：同场景 reload 补齐后 pending 已清且计数
+    /// 正确 → K2 = code-exhausted（而非 409 code-pending / 复活可兑）
+    #[test]
+    #[cfg(unix)]
+    fn reload_reconciliation_releases_pending_k2_exhausted_max1() {
+        if nix::unistd::Uid::effective().is_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (f, hash) = RedeemFixture::new(1);
+        let now = now_ms();
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(matches!(
+            f.redeem(&hash, key(1), key(2), now),
+            RedeemOutcome::Io(_)
+        ));
+        assert_eq!(f.codes.deny_count(), 1);
+        std::fs::set_permissions(f.codes.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
+        let orphans = f.owners.snapshot().code_orphans();
+        assert_eq!(orphans, vec![(hash, key(1), key(2))]);
+        f.codes.reload(&orphans).unwrap();
+        assert_eq!(f.codes.deny_count(), 0);
+        assert_eq!(f.codes.snapshot().used_count(&hash), 1, "补齐后计数就位");
+        // 同码他键 K2：pending 已清、按码状态裁决 → exhausted
+        assert!(
+            matches!(
+                f.redeem(&hash, key(3), key(4), now + 1),
+                RedeemOutcome::Exhausted
+            ),
+            "K2 必须 code-exhausted（不得 409 pending，也不得复活可兑）"
+        );
+        assert_eq!(f.codes.snapshot().used_count(&hash), 1);
+    }
+
+    /// ④（r8-P0-1，锁序压力）：并发 redeem（codes→owners 单向锁序）与
+    /// owners/codes 各自 reload（单锁、看护同序两步不嵌套）持续交错——
+    /// 锁图无环不得死锁（有界超时断言）；终态一致：每码 used_count = 完成
+    /// 兑换数（内存与 reload 自磁盘复核同值）、owners 全部在册
+    #[test]
+    fn concurrent_redeem_and_dual_ledger_reload_no_deadlock() {
+        const WORKERS: usize = 3;
+        const PER_WORKER: u8 = 40;
+        let (f, _) = RedeemFixture::new(1);
+        // 每个兑换线程独占一个码（避免同码他键 pending 窗口的 409 噪声）
+        let hashes: Vec<[u8; 32]> = (0..WORKERS)
+            .map(|_| {
+                f.codes
+                    .issue(IssueParams {
+                        max_uses: Some(1000),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .1
+            })
+            .collect();
+        let f = std::sync::Arc::new(f);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<&'static str>();
+        let mut handles = Vec::new();
+        for (worker, hash) in hashes.iter().copied().enumerate() {
+            let f = std::sync::Arc::clone(&f);
+            let done_tx = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                let fabric = [(worker + 1) as u8; 32];
+                for i in 0..PER_WORKER {
+                    let root = [i + 1; 32];
+                    assert!(
+                        matches!(
+                            f.redeem(&hash, fabric, root, now_ms()),
+                            RedeemOutcome::Completed { .. }
+                        ),
+                        "worker {worker} 第 {i} 次兑换必须成功"
+                    );
+                }
+                done_tx.send("redeem").unwrap();
+            }));
+        }
+        for _ in 0..2 {
+            let f = std::sync::Arc::clone(&f);
+            let done_tx = done_tx.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    // 与生产看护同序：owners 先 reload 取孤儿，codes 后 reload
+                    let orphans = f.owners.reload_for_orphans().unwrap();
+                    f.codes.reload(&orphans).unwrap();
+                }
+                done_tx.send("reload").unwrap();
+            }));
+        }
+        drop(done_tx);
+        let expected = WORKERS + 2;
+        for _ in 0..expected {
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("疑似死锁：工作线程 30s 未完成（codes→owners 与 reload 锁序不得成环）");
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 终态一致：owners 全在册、每码 used_count = 完成兑换数（内存）；
+        // 静默后自磁盘 reload 复核同值（reload 不回退已完成写入）
+        for (worker, hash) in hashes.iter().enumerate() {
+            let fabric = [(worker + 1) as u8; 32];
+            for i in 0..PER_WORKER {
+                assert!(
+                    f.owners.snapshot().contains(&fabric, &[i + 1; 32]),
+                    "worker {worker} root {i} 未在册"
+                );
+            }
+            assert_eq!(f.codes.snapshot().used_count(hash), PER_WORKER as usize);
+        }
+        let orphans = f.owners.reload_for_orphans().unwrap();
+        f.codes.reload(&orphans).unwrap();
+        for (worker, hash) in hashes.iter().enumerate() {
+            assert_eq!(
+                f.codes.snapshot().used_count(hash),
+                PER_WORKER as usize,
+                "worker {worker}：磁盘事实复核（reload 后不回退）"
+            );
+        }
     }
 }

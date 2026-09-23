@@ -258,11 +258,15 @@ impl Blocklist {
         &self.path
     }
 
-    /// 从磁盘重载：成功原子替换快照 + generation+1；失败保留旧快照并上抛。
-    /// 文件缺失 = 空名单（fail-closed，与 owners/visitors 同语义）。
+    /// 从磁盘重载：**写序列化协议（r8-P0-1 四台账统一）**：读盘归并与发布
+    /// 同持本台账锁——与 add/remove 的「锁内 append+fsync+快照推进」构成
+    /// 同一互斥临界区，reload 不可能发布缺失任一已完成写入的旧快照（deny
+    /// 名单不得被旧快照回退）。成功原子替换快照 + generation+1；失败保留
+    /// 旧快照并上抛。文件缺失 = 空名单（fail-closed，与 owners/visitors
+    /// 同语义）。
     pub fn reload(&self) -> Result<()> {
-        let fresh = Self::load_entries(&self.path)?;
         let mut state = self.state.lock().unwrap();
+        let fresh = Self::load_entries(&self.path)?;
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             entries: fresh,
@@ -423,5 +427,45 @@ mod tests {
         assert!(bl.snapshot().len() == 0);
         assert!(bl.snapshot().generation() >= 1);
         assert!(!bl.snapshot().is_blocked(BlockKind::Endpoint, &key(1)));
+    }
+
+    /// ③b（r8-P0-1 同构回归，blocklist 侧）：并发 add 与 reload 交错——
+    /// 写序列化协议下 reload 不可能发布缺失任一已完成 add 的旧快照（deny
+    /// 名单不得被回退；每轮 join 后立即断言内存快照；终态经 reload 从磁盘
+    /// 复核）
+    #[test]
+    fn concurrent_add_and_reload_blocklist_never_regresses() {
+        let dir = TempDir::new().unwrap();
+        let bl = std::sync::Arc::new(Blocklist::load(&dir.path().join("blocklist.jsonl")).unwrap());
+        const ITERS: u8 = 24;
+        for i in 0..ITERS {
+            let add = {
+                let bl = std::sync::Arc::clone(&bl);
+                std::thread::spawn(move || {
+                    bl.add(BlockKind::Endpoint, &key(i), Some("r8".into()))
+                        .unwrap()
+                })
+            };
+            let reload = {
+                let bl = std::sync::Arc::clone(&bl);
+                std::thread::spawn(move || bl.reload().unwrap())
+            };
+            add.join().unwrap();
+            reload.join().unwrap();
+            assert!(
+                bl.snapshot().is_blocked(BlockKind::Endpoint, &key(i)),
+                "第 {i} 轮：add 完成后名单不得被 reload 旧快照回退"
+            );
+        }
+        // 终态：静默后一次 reload（磁盘事实）+ 全量复核
+        bl.reload().unwrap();
+        let snap = bl.snapshot();
+        for i in 0..ITERS {
+            assert!(
+                snap.is_blocked(BlockKind::Endpoint, &key(i)),
+                "终态第 {i} 键在名单"
+            );
+        }
+        assert_eq!(snap.len(), ITERS as usize);
     }
 }

@@ -498,14 +498,20 @@ impl OwnerRegistry {
     }
 
     /// 从磁盘重载活跃集合（mtime 轮询/SIGHUP 热重载接线，task 1.5）：
+    /// **写序列化协议（r8-P0-1 四台账统一）**：读盘归并与发布同持本台账
+    /// 锁——与本台账全部写入（register/unregister/renew/update_metadata/
+    /// register_via_code 的「锁内 append+fsync+快照推进」）构成同一互斥
+    /// 临界区，reload 不可能发布缺失任一已完成写入的旧快照（旧实现锁外
+    /// 读盘后加锁替换，刚写入的 owner 会被旧快照短暂回退）。锁序不变：
+    /// 本方法只持 owners 锁（redeem 方向为 codes→owners 单向，无环）。
     /// 成功则原子替换内存快照并 generation+1（全局单调不回退——外部进程
     /// 经 CLI 追加事件与本进程 register 走同一计数器）；失败（坏行/IO）
     /// 保留旧快照并上抛错误，由调用方决定重试节奏。
     /// 文件缺失 = 空集合（与 load 同语义：admin 删除文件即移除全部 owner，
     /// fail-closed）。
     pub fn reload(&self) -> Result<()> {
-        let (fresh, via_code) = Self::load_active(&self.path)?;
         let mut state = self.state.lock().unwrap();
+        let (fresh, via_code) = Self::load_active(&self.path)?;
         state.current = Arc::new(SnapshotInner {
             generation: ledger::next_generation(),
             active: fresh,
@@ -1147,5 +1153,40 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// ②（r8-P0-1 同构回归，owners 侧）：并发 register 与 reload 交错——
+    /// 写序列化协议下 reload 的读盘归并与发布同锁，刚完成的 register 不被
+    /// 锁外读得的旧快照回退（每轮双线程 join 后立即断言内存快照；终态再
+    /// 经 reload 从磁盘复核）
+    #[test]
+    fn concurrent_register_and_reload_active_set_never_regresses() {
+        let dir = TempDir::new().unwrap();
+        let reg =
+            std::sync::Arc::new(OwnerRegistry::load(&dir.path().join("owners.jsonl")).unwrap());
+        const ITERS: u8 = 24;
+        for i in 0..ITERS {
+            let register = {
+                let reg = std::sync::Arc::clone(&reg);
+                std::thread::spawn(move || reg.register(&key(i), &key(100 + i)).unwrap())
+            };
+            let reload = {
+                let reg = std::sync::Arc::clone(&reg);
+                std::thread::spawn(move || reg.reload().unwrap())
+            };
+            register.join().unwrap();
+            reload.join().unwrap();
+            assert!(
+                reg.snapshot().contains(&key(i), &key(100 + i)),
+                "第 {i} 轮：register 完成后活跃集合不得被 reload 旧快照回退"
+            );
+        }
+        // 终态：静默后一次 reload（磁盘事实）+ 全量复核
+        reg.reload().unwrap();
+        let snap = reg.snapshot();
+        for i in 0..ITERS {
+            assert!(snap.contains(&key(i), &key(100 + i)), "终态第 {i} 键在册");
+        }
+        assert_eq!(snap.len(), ITERS as usize);
     }
 }
