@@ -264,15 +264,20 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   fabric」链）**：admission 锁内、**远端 register 发出前**写
   `<DWEB_HOME>/fabric-admission.json`（0600，tmp+fsync+rename）：
   `{server 归一化, code_hash, fabric_id, root, attempt, last_error?, ts}`。
-  恢复路径（register 超时/进程崩溃后重启/陈锁接管）MUST 先以 journal
-  中的**同一 tuple** 重发 register（命中服务端幂等回放）或确认服务端
-  状态：确认成功→补写 leases→清 journal；确认明确未登记（如
-  code-invalid 且非本 tuple 已兑）→允许新决策；**远端结果未知
-  （不可达/超时）=fail-closed，禁止生成第二 fabric**（提示人工恢复
-  文案）。journal 陈旧/损坏=fail-closed 人工恢复（不猜）；code 已
-  耗尽且本 tuple 未确认=提示联系管理者核实（幂等回放对同键仍可确认
-  兑换事实）。Scenario 三组：响应丢失、register 后落账前崩溃、陈锁
-  接管——均断言远端最多一条登记、恢复用同一 tuple、账本最终一致。
+  **恢复状态机（r16-P1-1——journal 只存 hash，重放需原始码）**：
+  发现 journal 后 join MUST 拒绝一切新 fabric 决策，提示**重新输入
+  原邀请码**（CLI 交互）：①重输码规范化 hash==journal.code_hash →
+  以 journal 的 fabric_id/root/server + 新 ts 重签 POST /register
+  （命中幂等回放）→200→补写 leases→清 journal；②无重输码 / hash
+  不符 / 网络未知 / `code-pending`=fail-closed 且 journal **保留**；
+  ③同码得 `code-invalid`/`code-expired`=**不得**据此判定「明确未
+  登记」（码可能已被本 tuple 兑换后耗尽——服务端对该键回放仍会 200，
+  但不同码路径不可区分）→人工恢复文案（联系管理者核实该 tuple 兑换
+  事实）；④异码绝不修改 journal、绝不生成第二 fabric。子断言：无
+  重输码不得发 register、不得新 fabric 决策；同码可回放并补账；异码
+  零副作用。Scenario 三组（响应丢失/register 后落账前崩溃/陈锁接管）
+  均含上述子断言+远端最多一条登记+账本终态一致。journal 陈旧/损坏=
+  fail-closed 人工恢复（不猜）。
   全链顺序（r13-P2-1 统一）：**CLI join/register → SDK createRoot
   (fabricId=租约值, dataDir=DWEB_HOME, deferStart)/open →
   fabricId+endpointId 断言 → ensure/start/connect**；负向（错 fabric/
@@ -586,7 +591,8 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r15 | NOT-READY 7.8，P1×1 | 全处置（v16，本版）：pending admission journal（register 前持久化 tuple；恢复先同 tuple 幂等回放/确认；远端未知=fail-closed 禁新 fabric；journal 损坏/不可达/code 耗尽各有人工恢复文案；三组崩溃 Scenario）（§2.1） |
+| r16 | NOT-READY 8.0，P1×1 | 全处置（v17，本版）：恢复状态机（journal 只存 hash、重放需原始码——发现 journal 后拒绝新 fabric 决策并要求重输原码：hash 相符→同 tuple+新 ts 重签回放→补账清 journal；无码/不符/未知/pending=fail-closed 保留 journal；code-invalid/expired 不得判「未登记」→人工恢复；异码零副作用）（§2.1） |
+| r15 | NOT-READY 7.8，P1×1 | 全处置（v16）：pending admission journal（register 前持久化 tuple；恢复先同 tuple 幂等回放/确认；远端未知=fail-closed 禁新 fabric；journal 损坏/不可达/code 耗尽各有人工恢复文案；三组崩溃 Scenario）（§2.1） |
 | r14 | NOT-READY 7.6，P1×1+P2×2 | 全处置（v15）：P1-1 fabric-admission 锁（per-DWEB_HOME 独立 O_EXCL 锁覆盖 preflight→决策→services→register→回执→落账全窗口；锁序 admission→ledger；并发异 fabric join 最多一个远端 register；陈锁/超时/幂等补偿边界可测）（§2.1）；P2-1 两处残留反向顺序统一；P2-2 取消三分法矛盾句修正（shutdown 取消 Closed 不可重试/底层失败 Failed 可重试/不 await 不感知） |
 | r13 | NOT-READY 7.8，P1×1+P2×4 | 全处置（v14）：P1-1 单 fabric 约束（选项 1：join preflight 读既有 fabric，不等=fail-closed 不 register；H7 多租约冻结为多 server/同 fabric 子集；正负 Scenario）（§2.1）；P2-1 tuple Scenario 顺序统一为 CLI join→SDK 消费；P2-2 createRoot 既有 roster 一律 AlreadyExists、open 负责复用+tuple 校验（Node delta 修订）；P2-3 取消三分法（shutdown 取消=resolve 已取消不可重试/启动失败=reject 可重试/调用方放弃=状态机不感知）；P2-4 三文档意图元数据头+[H8] 映射拆 a/b 两项 |
 | r12 | NOT-READY 7.8，P1×1 | 全处置（v13）：同 seed 供给改为**目录供给方案（零新 API）**——消费路径 Fabric dataDir 固定=DWEB_HOME，SDK 既有默认身份解析天然读 join 的 identity.key（同文件同源）；dataDir≠DWEB_HOME 构造禁止；seed 缺失/损坏=构造前明确错误；单设备单 roster 与 join fabric 复用裁决一致；无需再扩 [H8]（§2.1） |
