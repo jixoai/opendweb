@@ -171,7 +171,23 @@ init 检测目标 data_dir（默认 hub-data 或 `--data-dir`）与 cwd 既有
   ④此后才允许任何 join/connect（首次拨号前完成）。签发失败/非 root/
   server_id 或 URL 与租约不匹配/token 未出现在 RelayMap=MUST fail-closed
   （连接终止并明确报错，不得静默降级为无凭证、不得写租约）。端到端
-  Scenario MUST 断言 root 身份前提（createRoot 形态）与时序。端到端断言：restricted 中枢注册后
+  Scenario MUST 断言 root 身份前提（createRoot 形态）与时序。
+- **身份 tuple 同源冻结（r7-P1-1——杜绝 register 与票据消费的 fabric
+  分叉）**：register body 与 lease 条目的 `(fabric_id, root)` 的**唯一
+  数据源 = SDK roster 实际值**——join 消费前以与 register 相同的设备
+  seed 创建/打开 root roster，读 `Fabric.fabric_id_hex()` 与
+  `endpoint_id()` 用于 register 与落账（**禁止另行随机/独立选择
+  fabric_id**——现状 join.mjs:283-303 的独立选取在本 change 中改造）；
+  roster 已存在=只允许 `open` 同一 roster（identity seed/roster/data_dir
+  复用规则：重试、重启、换 server 均不得静默生成第二个 roster 或第二个
+  seed）。**首次 relay 拨号前断言三元组连续性**：`Fabric.fabric_id_hex()
+  == lease.fabric_id`、`Fabric.endpoint_id() == lease.root`、capability 的
+  (fabric_id, issuer, server_id) 覆盖租约——任一不符/旧 roster/不同
+  seed/server 或 URL 不匹配=fail-closed（首拨前拒绝，不写不更新
+  leases）。Scenario 双向：正向 fresh createRoot→register→ensure→
+  restricted 握手成功；负向（篡改 lease.fabric_id/另一 data_dir seed/
+  stale roster）在首拨前拒绝且账本不变——不得把「实际握手失败」当
+  唯一发现手段。端到端断言：restricted 中枢注册后
   实际 relay 握手成功、无票连接被拒 `dweb/no-capability`、跨 server
   capability 被拒、SDK relay mode=custom（非 N0Default）；malformed
   server_id/URL 在落租约前失败。
@@ -426,7 +442,8 @@ n0 公共 relay 的用户）不在本结论内。
 | 轮 | 结论 | 处置 |
 |---|---|---|
 | r1（02545d5） | NOT-READY 6.2，P1×9+P2×5 | 全处置（v2，330fa8f）——详表见 git 历史 |
-| r6 | NOT-READY 7.8，P1×1（attach 非 root 必败） | 全处置（v7，本版）：采纳选项 A——构造器限定 createRoot/open 既有 root（租约消费=join 注册形态=root 身份）；attach/invite 成员路径排除出本时序（SDK 既有机制另行使用）；Scenario 断言 root 前提（§2.1） |
+| r7 | NOT-READY 7.8，P1×1（租约 tuple 与 SDK roster 不同源可 unknown-owner） | 全处置（v8，本版）：身份 tuple 唯一数据源=SDK roster 实际值（join 独立选 fabric_id 的现状被改造；roster 只 open 不另建/seed 不另生）+首拨前三元组连续性断言（fabric/root/capability 覆盖）+正负 Scenario（§2.1） |
+| r6 | NOT-READY 7.8，P1×1（attach 非 root 必败） | 全处置（v7）：采纳选项 A——构造器限定 createRoot/open 既有 root（租约消费=join 注册形态=root 身份）；attach/invite 成员路径排除出本时序（SDK 既有机制另行使用）；Scenario 断言 root 前提（§2.1） |
 | r5 | NOT-READY 7.8，P1×1+P2×2（十条基线 8 PASS+2 CONDITIONAL） | 全处置（v6）：P1-1 capability 签发时序冻结（构造→显式 ensureRelayCapabilities→断言覆盖与同实例注入→方可拨号；任何不符 fail-closed）（§2.1）；P2-1 preflight「恰一」与「第一条合法者」措辞冲突修正为「至少一条+多候选取第一条」（§2.1）；P2-2 PM 证据基线补 [H7] |
 | r4 | NOT-READY 7.5，P1×1+P2×4（十条基线 9 PASS+1 BLOCKED） | 全处置（v5）：P1-1 消费契约改为 relays:[{url,serverId}]（CustomWithCaps，root 自签 capability，杜绝 no-capability 主路径阻断）+端到端 Scenario（§2.1）；P2-1 join preflight 顺序冻结（register 前恰一可用 relay+URL 校验+复核+幂等回放补偿路径）（§2.1）；P2-2 PM 头部裁决范围 [H0]-[H7]；P2-3 encode_canonical/decode_accepts 两集合拆分+测试表格（§3.1）；P2-4 batch golden 帧补样例（§6） |
 | r3 | NOT-READY 7.3，P1×4+P2×4 | 全处置（v4）：P1-1 DWEB_ADMIN_TOKEN 链入口注入（覆盖继承 env）+readiness 双探断言（无 token 401≠404 + token 200）+失败停机清锁（§1.3）；P1-2 relay null/disabled=join fail-closed 不落租约+连接器从租约构造 custom（§2.1）；P1-3 短码严格 canonical（歧义字符拒绝不映射+连字符仅固定分组位置+大小写折叠）+IPv6 bracket URL 冻结 V2 断言（§3.1）；P1-4 全部 error 帧补 jsonrpc 字段+严格 validator 逐帧校验（§6）；P2-1 proposal/PM 旧词残留清理+rg 门禁；P2-2 G-3 acceptance 模板六字段+NOT-EXECUTABLE 客观条件（§7）；P2-3 生成物 quoting 冻结+特殊路径 Scenario（§1.4）；P2-4 capability v1 冻结（§5.1） |
