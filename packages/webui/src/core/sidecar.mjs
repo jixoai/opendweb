@@ -321,6 +321,12 @@ export async function createSidecar(opts = {}) {
         now,
         ...(sdk !== undefined ? { sdk } : {}),
         ...(leasesLoader !== undefined ? { leasesLoader } : {}),
+        // LAN 直连宣告（v1：env 注入——本地 relay HTTP-only 无 QUIC 数据面，
+        // 直连是家庭场景主路径；invite 令牌携带 issuer 直连地址）
+        ...(process.env.DWEB_FABRIC_ADVERTISE_ADDRS
+          ? { advertiseAddrs: process.env.DWEB_FABRIC_ADVERTISE_ADDRS.split(",").map((s) => s.trim()).filter(Boolean) }
+          : {}),
+        ...(process.env.DWEB_FABRIC_BIND_ADDR ? { bindAddr: process.env.DWEB_FABRIC_BIND_ADDR } : {}),
       }));    pluginsRuntime = await buildPluginRuntimes({ home: path.resolve(homeDir), fabric: fabricHost, log: (line) => log(`sidecar: ${line}`), now });
   }
   const plugins =
@@ -339,6 +345,16 @@ export async function createSidecar(opts = {}) {
         log(`sidecar: fabric start on ${id} enable failed: ${e?.message ?? e}`);
       });
     };
+    // 恢复路径（真双机验收抓出）：重启后持久化 enabled 的数据面插件不再产生
+    // enable 转换——启动期按账本直接补触发，否则数据面在重启后静默不可用
+    const alreadyEnabled = plugins
+      .list()
+      .plugins.some((p) => (p.id === "ports" || p.id === "files" || p.id === "sync") && p.status === "enabled");
+    if (alreadyEnabled) {
+      fabricHost.ensureStarted().catch((e) => {
+        log(`sidecar: fabric start on restart (already-enabled plugins) failed: ${e?.message ?? e}`);
+      });
+    }
   }
   if (plugins !== null && fabricHost !== null) {
     // 聚合路由：/wpk1/<plugin>/<...> → 各 runtime handler（ports 按 peer 缓存
@@ -624,6 +640,60 @@ export async function createSidecar(opts = {}) {
     // 三族都在本 handler 内分派。零凭证（无 token/argv/env 读取）。
     if (plugins !== null && (req.url === "/sidecar/plugins" || req.url?.startsWith("/sidecar/plugins/"))) {
       await handlePlugins(req, res, startedAt);
+      return;
+    }
+    // 3g. 设备配对面（webui 薄核「互联」义务；真双机验收补齐的引导面——CLI
+    // join 只做 server 台账登记，fabric 名册互认需一次性 invite→redeem）：
+    // POST /sidecar/fabric/invite {ttlMs?}（签发）· POST /sidecar/fabric/join
+    // {token}（凭令牌加入对方 fabric；已有本属 roster 时明确报错引导）。
+    // 写路由精确 Origin 纪律沿用；零凭证。
+    if (fabricHost !== null && req.url === "/sidecar/fabric/invite" && req.method === "POST") {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const body = await readBodyWithLimit(req, res);
+      if (body === null) return;
+      let ttlMs;
+      let recipient = "";
+      try {
+        const parsed = JSON.parse(body.toString("utf8"));
+        ttlMs = typeof parsed?.ttlMs === "number" ? parsed.ttlMs : undefined;
+        recipient = typeof parsed?.recipient === "string" ? parsed.recipient : "";
+      } catch {
+        /* 空/非 JSON body=落 recipient 校验错误 */
+      }
+      try {
+        const out = await fabricHost.issueInvite({ ttlMs, recipient });
+        sendJson(res, 200, out);
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 503, { error: { code: "fabric-unavailable", message: safeError(e) } });
+        logAccess(req, 503, startedAt);
+      }
+      return;
+    }
+    if (fabricHost !== null && req.url === "/sidecar/fabric/join" && req.method === "POST") {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const body = await readBodyWithLimit(req, res);
+      if (body === null) return;
+      let token = "";
+      try {
+        const parsed = JSON.parse(body.toString("utf8"));
+        token = typeof parsed?.token === "string" ? parsed.token : "";
+      } catch {
+        /* 落到下方 invalid-request */
+      }
+      if (token === "") {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {token: string}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      try {
+        const out = await fabricHost.joinWithToken({ token });
+        sendJson(res, 200, out);
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 409, { error: { code: "join-failed", message: safeError(e) } });
+        logAccess(req, 409, startedAt);
+      }
       return;
     }
     if (req.method !== "POST") {

@@ -83,14 +83,33 @@ export async function createPluginHost(opts = {}) {
   }
 
   // 重启恢复：按落盘状态重建（未知 id 条目保留在账本不丢弃，但不进注册表——
-  // v1 注册表全集=编译期集合；外部包不运行时加载）。
+  // v1 注册表全集=编译期集合；外部包不运行时加载）。恢复 enabled 不只是置位：
+  // **必须重放 enable 的运行时副作用（onEnable 钩子）**，否则重启后 listeners/
+  // watcher/调度器静默缺席（真双机验收抓出的恢复缺口——与 sidecar 侧 fabric
+  // 补触发同族）。重放失败不回滚状态位：置 enabled + 记录运行时错误，管理面
+  // 呈现后可再 disable/enable 修复。
   const persisted = await loadPluginState(home);
+  /** @type {Promise<void>[]} */
+  const restoreRuntimeEffects = [];
   for (const [id, entry] of entries) {
     const rec = persisted.plugins[id];
     if (rec?.status === "enabled") entry.status = "enabled";
     else if (rec?.status === "disabled") entry.status = "disabled";
     if (rec !== undefined && rec.config !== null && typeof rec.config === "object") entry.config = { ...rec.config };
+    if (entry.status === "enabled") {
+      entry.disposed = false;
+      restoreRuntimeEffects.push(
+        (async () => {
+          try {
+            await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}` });
+          } catch (e) {
+            entry.runtimeError = e instanceof Error ? e.message : String(e);
+          }
+        })(),
+      );
+    }
   }
+  await Promise.all(restoreRuntimeEffects);
 
   /**
    * 条目投影（控制面 GET /sidecar/plugins 的行形状；component 非序列化不外发）。

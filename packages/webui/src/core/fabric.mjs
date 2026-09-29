@@ -38,10 +38,60 @@
 import os from "node:os";
 import { loadLeases } from "opendweb/src/leases.mjs";
 
-/** 真实 SDK 面（动态 import——原生二进制只在首次 ensureStarted 才加载）。 */
+/** z-base-32（iroh to_z32 语义）→ hex64 小写。字母表与 MSB-first 位序经
+ * SDK ground-truth 向量校准（seed 0x07×32 → hex ea4a6c63…d22c ↔ z32 7jfgaa9n…4esy）。
+ * @param {string} z32
+ * @returns {string} */
+export function z32ToHex(z32) {
+  const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+  let bits = 0;
+  let value = 0n;
+  const bytes = [];
+  for (const ch of z32) {
+    const idx = A.indexOf(ch);
+    if (idx < 0) throw new Error(`invalid z32 char ${JSON.stringify(ch)}`);
+    value = value * 32n + BigInt(idx);
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push(Number((value >> BigInt(bits)) & 0xffn));
+      value = value % (1n << BigInt(bits));
+    }
+  }
+  return Buffer.from(bytes).toString("hex");
+}
+
+/** hex64 小写 → z-base-32（iroh to_z32 语义；z32ToHex 的逆）。
+ * @param {string} hex
+ * @returns {string} */
+export function hexToZ32(hex) {
+  const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+  const bytes = Buffer.from(hex, "hex");
+  let bits = 0;
+  let value = 0n;
+  let out = "";
+  for (const b of bytes) {
+    value = (value << 8n) | BigInt(b);
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += A[Number((value >> BigInt(bits)) & 31n)];
+      value = value % (1n << BigInt(bits));
+    }
+  }
+  if (bits > 0) out += A[Number(value & 31n)];
+  return out;
+}
+
+/** 真实 SDK 面（动态 import——原生二进制只在首次 ensureStarted 才加载）。
+ * 主入口是 NAPI CJS 加载器：cjs-module-lexer 无法静态识别其命名导出（真双机
+ * 实测 import() 仅得 default），故 Fabric 必须经 default 互操作取；/http 子路径
+ * 为手写 ESM 胶水，命名导出可靠。 */
 async function defaultSdk() {
   const [sdk, httpGlue] = await Promise.all([import("@jixo/opendweb-client-sdk"), import("@jixo/opendweb-client-sdk/http")]);
-  return { Fabric: sdk.Fabric, fetchHttp: httpGlue.fetchHttp, serveHttp: httpGlue.serveHttp };
+  const Fabric = sdk.Fabric ?? sdk.default?.Fabric;
+  if (typeof Fabric !== "function") throw new Error("client-sdk Fabric export not found (main entry interop)");
+  return { Fabric, fetchHttp: httpGlue.fetchHttp ?? httpGlue.default?.fetchHttp, serveHttp: httpGlue.serveHttp ?? httpGlue.default?.serveHttp };
 }
 
 /** 静态 JSON 响应（serveHttp handler 形状）。 */
@@ -74,6 +124,11 @@ export async function createFabricHost(opts = {}) {
 
   /** @type {{ Fabric: object, fetchHttp: Function, serveHttp: Function } | null} */
   let sdk = opts.sdk ?? null;
+  /** LAN 直连宣告（host:port 列表；进 invite 令牌）与本端 QUIC 绑定地址。 */
+  const advertiseAddrs = Array.isArray(opts.advertiseAddrs)
+    ? opts.advertiseAddrs.filter((a) => typeof a === "string" && a !== "")
+    : [];
+  const bindAddr = typeof opts.bindAddr === "string" && opts.bindAddr !== "" ? opts.bindAddr : null;
   const loadSdk = async () => {
     if (sdk === null) sdk = await defaultSdk();
     return sdk;
@@ -203,14 +258,33 @@ export async function createFabricHost(opts = {}) {
       });
     }
     const s = await loadSdk();
-    // ① deferStart 构造（零网络出站；open=既有 root 名册路径——home 设备 join 后
-    // roster 已在 <DWEB_HOME>，createRoot 会 AlreadyExists）
-    const f = await s.Fabric.open({
+    // ① deferStart 构造（零网络出站）。home-hub v17 §2 冻结语义：CLI join 是
+    // 纯 JS（不建 roster）；roster 是 SDK createRoot 的产物——**首次 SDK 接触的
+    // 已 join 设备没有 roster.facts**，open() 会 "no persisted roster"。正确次序：
+    // 先 open（既有 roster 复用）；无 roster 错误 → createRoot 采纳租约 fabricId
+    // 建册（真双机验收抓出的集成缺陷）。
+    const ctorArgs = {
       dataDir: home,
       relay: { mode: "custom", relays: identity.relays },
       deferStart: true,
       fabricId: identity.fabricId,
-    });
+      // LAN 直连宣告（真双机验收定论：本地 relay 为 HTTP-only——QUIC 数据面需
+      // TLS 证书未启用，P2P 唯一路径=直连；invite 令牌携带 issuer 直连地址，
+      // 未宣告时对端无路可拨=dial-timeout）。来源：组装层 env 注入。
+      ...(advertiseAddrs.length > 0 ? { advertiseAddrs } : {}),
+      ...(bindAddr !== null ? { bindAddr } : {}),
+    };
+    let f;
+    /** createRoot 采纳路径（自身为 root 建册）——fabricId 断言只在此路径成立 */
+    let adoptedOwnFabric = false;
+    try {
+      f = await s.Fabric.open(ctorArgs);
+    } catch (e) {
+      const msg = String(/** @type {Error} */ (e)?.message ?? e);
+      if (!/no persisted roster/i.test(msg)) throw e;
+      f = await s.Fabric.createRoot(ctorArgs);
+      adoptedOwnFabric = true;
+    }
     if (status === "closed") {
       await f.shutdown().catch(() => {});
       throw Object.assign(new Error("fabric host closed during start"), { code: "closed" });
@@ -221,12 +295,21 @@ export async function createFabricHost(opts = {}) {
       const caps = await f.ensureRelayCapabilities();
       // ③ 覆盖断言（不匹配=fail-closed 不 start）
       assertRelayCoverage(caps, identity.relays);
-      // ④ 元组断言（fabric_id / endpointId 与租约连续性——桥接层错误防御）
-      const fabricIdHex = await f.fabricIdHex();
-      if (fabricIdHex !== identity.fabricId) {
-        throw new Error(`fabric id mismatch: roster ${fabricIdHex} != lease ${identity.fabricId}`);
+      // ④ 元组断言（endpointId 连续性恒断言；fabricId 连续性只在 createRoot
+      // 采纳路径断言——open 到的既有 roster 可能是设备配对（/sidecar/fabric/
+      // join）加入的**对方 fabric**，其 fabricId ≠ 本机租约 fabricId 属预期，
+      // dataDir 单 fabric 语义下该 roster 即权威）
+      if (adoptedOwnFabric) {
+        const fabricIdHex = await f.fabricIdHex();
+        if (fabricIdHex !== identity.fabricId) {
+          throw new Error(`fabric id mismatch: roster ${fabricIdHex} != lease ${identity.fabricId}`);
+        }
       }
-      if (f.endpointId !== identity.endpointId) {
+      // SDK 的 endpointId 是 z32 展示串（iroh to_z32：字母表 ybndrfg8ejkmcpqxot
+      // 1uwisza345h769、MSB-first 位序——data_encoding 语义），租约 root 是 hex64
+      // 小写（server 台账/server-access-roles 冻结形态）——同钥异码，先归一再比
+      // （真双机验收抓出的断言缺陷：裸字符串比对恒 mismatch）。
+      if (z32ToHex(f.endpointId) !== identity.endpointId.toLowerCase()) {
         throw new Error(`endpoint id mismatch: fabric ${f.endpointId} != lease root ${identity.endpointId}`);
       }
       // ⑤ start（原构造期语义后移——缓存票据注入/bind/online）
@@ -283,6 +366,30 @@ export async function createFabricHost(opts = {}) {
     return startPromise;
   }
 
+  /** 拆除当前 fabric 句柄（close 与 joinWithToken 接管共用；幂等）。 */
+  async function teardownFabric() {
+    for (const s of servers.values()) {
+      try {
+        s.close?.();
+      } catch {
+        /* 关闭中的 server 异常不阻塞拆除 */
+      }
+    }
+    servers.clear();
+    connectedPeers.clear();
+    for (const peer of [...sessions.keys()]) evictSession(peer);
+    sessionPeers.clear();
+    try {
+      unsubscribeEvents?.();
+    } catch {
+      /* 退订异常忽略 */
+    }
+    unsubscribeEvents = null;
+    const f = fabric;
+    fabric = null;
+    if (f !== null) await f.shutdown().catch(() => {});
+  }
+
   return {
     /** 惰性启动（single-flight；触发=数据面插件 enable 或消费侧首用）。 */
     ensureStarted,
@@ -299,6 +406,11 @@ export async function createFabricHost(opts = {}) {
      */
     async sessionResolver(peer) {
       if (typeof peer !== "string" || peer === "") throw new Error("sessionResolver: peer endpoint id is required");
+      // 归一：账本/租约存 hex64（server 台账冻结形态），SDK connect/openSession
+      // 期望 z32 展示串——同钥异码（真双机验收抓出），hex 形态先转 z32 再用；
+      // 缓存键也用归一后的 z32，避免同 peer 双键双会话。
+      const peerKey = /^[0-9a-f]{64}$/.test(peer) ? hexToZ32(peer) : peer;
+      peer = peerKey;
       const f = await ensureStarted();
       const hit = sessions.get(peer);
       if (hit !== undefined && !hit.closed) return hit.session;
@@ -368,6 +480,61 @@ export async function createFabricHost(opts = {}) {
       return () => peerOnlineCallbacks.delete(cb);
     },
 
+    /**
+     * 设备配对——签发 invite 令牌（SDK 既有 invite 机制；webui 薄核「互联」义务，
+     * 真双机验收补齐的引导面：CLI join 只做 server 台账登记，fabric 名册互认需
+     * 一次性 invite→redeem）。
+     * @param {{ ttlMs?: number }} [opts]
+     * @returns {Promise<{ token: string }>}
+     */
+    async issueInvite(opts = {}) {
+      // v2 invite（appendix A）：嵌入的 relay capability 必须预绑定受邀方
+      // EndpointId——recipient 必填（hex64 或 z32 均可，SDK 侧按其解析面接受）。
+      if (typeof opts?.recipient !== "string" || opts.recipient === "") {
+        throw Object.assign(new Error("recipient (invitee endpoint id) is required for v2 invites"), { code: "invalid-request" });
+      }
+      const f = await ensureStarted();
+      const token = await f.invite(opts.ttlMs ?? 10 * 60_000, opts.recipient);
+      return { token };
+    },
+
+    /**
+     * 设备配对——凭令牌加入对方 fabric（joinWithToken：attach+兑换+名册持久化，
+     * 一次性；此后 open() 沿用该名册）。要求 dataDir 尚无本属 fabric 的 roster
+     * （单目录单 fabric——既有 roster 时报错并引导，不静默替换）。
+     * @param {{ token: string }} opts
+     * @returns {Promise<{ fabricId: string }>}
+     */
+    async joinWithToken(opts) {
+      if (typeof opts?.token !== "string" || opts.token === "") {
+        throw Object.assign(new Error("token is required"), { code: "invalid-request" });
+      }
+      const identity = await readIdentity();
+      if (identity === null) {
+        throw Object.assign(new Error("no lease with a usable relay on this device; join a hub first"), { code: "no-lease" });
+      }
+      const s = await loadSdk();
+      const joined = await s.Fabric.joinWithToken(
+        {
+          dataDir: home,
+          relay: { mode: "custom", relays: identity.relays },
+          deferStart: true,
+        },
+        opts.token,
+      );
+      // 配对即接管：停旧 fabric 句柄（若有），换入 joined（deferred→caps→start）
+      await teardownFabric().catch(() => {});
+      fabric = joined;
+      const caps = await joined.ensureRelayCapabilities();
+      assertRelayCoverage(caps, identity.relays);
+      await joined.start();
+      status = "started";
+      failureCode = null;
+      failureMessage = null;
+      const fabricIdHex = await joined.fabricIdHex();
+      return { fabricId: fabricIdHex };
+    },
+
     /** 观测面（测试/日志）。 */
     status() {
       return { status, failureCode, failureMessage, sessions: sessions.size, servers: servers.size, fabric: fabric !== null };
@@ -384,7 +551,7 @@ export async function createFabricHost(opts = {}) {
      * 会话关闭 → 事件退订 → fabric.shutdown()。幂等。
      */
     async close() {
-      if (status === "closed") return;
+      await teardownFabric().catch(() => {});
       status = "closed";
       startPromise = null;
       for (const s of servers.values()) {
@@ -404,9 +571,6 @@ export async function createFabricHost(opts = {}) {
         /* 退订异常忽略 */
       }
       unsubscribeEvents = null;
-      const f = fabric;
-      fabric = null;
-      if (f !== null) await f.shutdown().catch(() => {});
     },
   };
 }
