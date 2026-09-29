@@ -56,13 +56,52 @@ pub struct ConnHandle {
     pub initiator: crate::identity::EndpointId,
     /// 主动关闭标记（supervisor 据此区分「换连接」与「意外死亡→重连」）。
     pub deliberate: std::sync::atomic::AtomicBool,
+    /// rx 静默采样（正向活性信号——真双机验收实证 2026-09-30）：
+    /// iroh 每 5s 心跳且活对端必 ACK（rx 计数增长）；静默超过两个心跳周期
+    /// 且 close_reason 仍 None 的连接按尸体处理（winner 规则不得让无声尸体
+    /// 掐死重加入者的新连接）。采样在构造与每次活性检查时刷新。
+    pub(crate) rx_sample: std::sync::Mutex<RxSample>,
+}
+
+/// rx 采样点：最近一次观测到的 udp_rx 计数与时刻。
+pub(crate) struct RxSample {
+    pub(crate) datagrams: u64,
+    pub(crate) at: std::time::Instant,
 }
 
 impl ConnHandle {
+    pub fn new(conn: iroh::endpoint::Connection, initiator: crate::identity::EndpointId) -> Self {
+        let datagrams = conn.stats().udp_rx.datagrams;
+        Self {
+            conn,
+            initiator,
+            deliberate: std::sync::atomic::AtomicBool::new(false),
+            rx_sample: std::sync::Mutex::new(RxSample {
+                datagrams,
+                at: std::time::Instant::now(),
+            }),
+        }
+    }
+
     pub fn close_deliberate(&self, reason: &[u8]) {
         self.deliberate
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.conn.close(0u32.into(), reason);
+    }
+
+    /// 连接自最近一次收到 UDP 数据报以来静默了多久（采样式）：
+    /// 计数增长即刷新采样点并返回 ~0；不增长则返回距上次采样点的时长。
+    /// 活连接的心跳 ACK 周期 ≈ 5s（iroh HEARTBEAT_INTERVAL），故静默 ≥10s
+    /// （两个周期）= 对端已不在的强信号。
+    pub(crate) fn rx_silent_for(&self) -> std::time::Duration {
+        let now_datagrams = self.conn.stats().udp_rx.datagrams;
+        let mut sample = self.rx_sample.lock().unwrap();
+        if now_datagrams > sample.datagrams {
+            sample.datagrams = now_datagrams;
+            sample.at = std::time::Instant::now();
+            return std::time::Duration::ZERO;
+        }
+        sample.at.elapsed()
     }
 }
 
@@ -115,6 +154,57 @@ impl ContinuityState {
     pub async fn active(&self, peer: &crate::identity::EndpointId) -> Option<Arc<ConnHandle>> {
         let slots = self.slots.lock().await;
         slots.get(peer).and_then(|s| s.handle.clone())
+    }
+
+    /// 代次 fence 摘除：仅当槽位句柄仍是 `handle` 本身时清除（返回 true）。
+    /// 供尸体驱逐/迟到的 supervisor 死亡观测使用——旧代次死亡不得摘除已被
+    /// 新连接接管的槽位（真双机验收实证 2026-09-30）。
+    pub async fn clear_if_current(
+        &self,
+        peer: &crate::identity::EndpointId,
+        handle: &Arc<ConnHandle>,
+    ) -> bool {
+        let mut slots = self.slots.lock().await;
+        match slots.get_mut(peer) {
+            Some(slot) => match &slot.handle {
+                Some(h) if Arc::ptr_eq(h, handle) => {
+                    slot.handle = None;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        }
+    }
+
+    /// supervisor 死亡观测的原子收口：检查代次 + 清柄 + 置 Disconnected 在同一
+    /// 槽位锁内完成（消灭「fence 通过后、置相位前新连接被采纳」的 TOCTOU——
+    /// 该窗口曾把新活连接的柄摘掉、相位拉回 Disconnected）。返回 false =
+    /// 槽位已由新连接接管（调用方静默退出，不改任何状态）。
+    pub async fn mark_disconnected_if_current(
+        &self,
+        peer: &crate::identity::EndpointId,
+        handle: &Arc<ConnHandle>,
+        reason: String,
+    ) -> bool {
+        let mut slots = self.slots.lock().await;
+        let Some(slot) = slots.get_mut(peer) else {
+            return false;
+        };
+        let is_current = slot.handle.as_ref().is_some_and(|h| Arc::ptr_eq(h, handle));
+        if !is_current {
+            return false;
+        }
+        slot.handle = None;
+        slot.tx.send_modify(|snap| {
+            let s = Arc::make_mut(snap);
+            s.phase = ConnectionPhase::Disconnected;
+            s.reason = Some(reason);
+            s.changed_at_ms = now_ms();
+            s.state_seq = slot.seq_next;
+            slot.seq_next += 1;
+        });
+        true
     }
 
     /// 采纳连接（winner 规则在 manager 层裁决后调用）：epoch+1、phase=Ready。

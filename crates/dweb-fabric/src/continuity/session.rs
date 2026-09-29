@@ -561,10 +561,7 @@ impl SessionShared {
     fn complete_resume_install_checked(&self) -> bool {
         let mut ctl = self.resume_control.lock().unwrap();
         if !self.closing.load(std::sync::atomic::Ordering::Acquire)
-            && matches!(
-                ctl.phase,
-                SessionPhase::Active | SessionPhase::Recovering
-            )
+            && matches!(ctl.phase, SessionPhase::Active | SessionPhase::Recovering)
         {
             ctl.phase = SessionPhase::Active;
             return true;
@@ -667,13 +664,10 @@ impl SessionShared {
             let ctl = self.resume_control.lock().unwrap();
             let valid = ctl.phase != SessionPhase::Dead
                 && !self.closing.load(std::sync::atomic::Ordering::Acquire)
-                && ctl
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        decision_matches_pending(&pending.decision, &decision)
-                            && (decision.cached || pending.installed_owner.is_none())
-                    });
+                && ctl.pending.as_ref().is_some_and(|pending| {
+                    decision_matches_pending(&pending.decision, &decision)
+                        && (decision.cached || pending.installed_owner.is_none())
+                });
             drop(ctl);
             if !valid {
                 let _ = send.finish();
@@ -2039,7 +2033,11 @@ impl SessionChannel {
         payload: Bytes,
     ) -> Result<(), FabricError> {
         // R2-P1c：刻意关闭中拒绝新流（close 快照后新开的流不得逃过 RESET）
-        if self.shared.closing.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .shared
+            .closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Err(FabricError::Session(SessionError::Connect(
                 "session closing".into(),
             )));
@@ -2377,8 +2375,15 @@ impl Session {
 /// 并发 INIT 败方收敛（R3-3c）：从本地注册表采纳 canonical 会话——等待
 /// 本端 accept 侧把胜方 INIT 登记进注册表并装好通道，返回复用句柄
 /// （不重复 pump；发送面经 shared 解析当前代通道）。
-async fn adopt_session(fabric: &Fabric, canonical: [u8; 16]) -> Result<Session, FabricError> {
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+/// `grace`：本地观察到 canonical 的宽限（真双机验收实证 2026-09-30：
+/// 崩溃重启的客户端本地没有旧 canonical——等满 HANDSHAKE_TIMEOUT 只会把
+/// 重加入失败推迟一个超时周期；调用方以短宽限 + 传输类重试承接）。
+async fn adopt_session(
+    fabric: &Fabric,
+    canonical: [u8; 16],
+    grace: std::time::Duration,
+) -> Result<Session, FabricError> {
+    let deadline = tokio::time::Instant::now() + grace;
     loop {
         if let Some(shared) = fabric.inner.continuity_sessions.get(&canonical).await
             && let Some(chan) = shared.current_channel()
@@ -2583,11 +2588,22 @@ impl SessionRegistry {
                     .shared
                     .current_channel()
                     .is_none_or(|c| c.is_dead());
+            // 真双机验收实证（2026-09-30）：Active 但通道已死（对端崩溃后旧
+            // 连接被 winner 替换/传输层死亡尚未被 pump 处理完）同样放行新
+            // INIT——通道已死的 Active 无法交付任何帧，滞留只会让重加入者的
+            // 首个会话吃一次 ALREADY_ACTIVE 拒绝（pump 处理完流终结前存在
+            // 该竞态窗口）。
+            let active_dead_channel = existing_phase == SessionPhase::Active
+                && existing
+                    .shared
+                    .current_channel()
+                    .is_none_or(|c| c.is_dead());
             let incoming_wins = (existing_phase == SessionPhase::Negotiating
                 && existing
                     .initiator
                     .is_some_and(|id| (incoming_endpoint, session_id) < (id, canonical_sid)))
-                || recovering_dead_channel;
+                || recovering_dead_channel
+                || active_dead_channel;
             if !incoming_wins {
                 return InitAdmission::Canonical(Arc::clone(&existing.shared));
             }
@@ -3088,8 +3104,14 @@ enum TryAgain {
 }
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const CONVERGENCE_RETRY: usize = 3;
+/// 收敛重试预算（真双机验收实证 2026-09-30）：对端崩溃后存活方槽位里的
+/// 半开尸体（close_reason 未判死）会把重加入者的前几个候选连接按 winner
+/// 规则判负掐掉，直到尸体被 rx 静默阈值驱逐（两个心跳周期 ≈10s）——
+/// 首建会话的传输类错误重试必须覆盖该窗口（原 3×250ms 在双机仿真 cargo
+/// 测试实测 4/8 失败，即分钟级不收敛缺陷的微观形态）。
+const CONVERGENCE_RETRY: usize = 10;
 const CONVERGENCE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+const CONVERGENCE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Wait for a local per-peer campaign to publish its channel. A waiter never
 /// starts a second dial; if the owner terminates before publishing, propagate
@@ -3167,6 +3189,7 @@ pub async fn open_session(
         .await
         .insert(peer_id.to_string(), InitCampaign { session_id });
     let mut last: Option<FabricError> = None;
+    let mut backoff = CONVERGENCE_BACKOFF;
     for _ in 0..CONVERGENCE_RETRY {
         match open_session_attempt(fabric, peer_id, session_id, token, Arc::clone(&shared)).await {
             Ok(s) => return Ok(s),
@@ -3181,9 +3204,12 @@ pub async fn open_session(
             }
             Err(TryAgain::Transport(e)) => {
                 // 首建会话与对端接受侧并发拨号：winner 收敛可能关闭本流所绑
-                // 连接（Phase 1 t4 实证形态）——重开新流重试（sid/token 复用）
+                // 连接（Phase 1 t4 实证形态）——重开新流重试（sid/token 复用）。
+                // 退避指数增长（250ms 起、2s 封顶）：预算须覆盖尸体驱逐窗口
+                // （~10s），让重加入者的候选连接最终落在存活方采纳的新代次上。
                 last = Some(e);
-                tokio::time::sleep(CONVERGENCE_BACKOFF).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(CONVERGENCE_BACKOFF_MAX);
             }
         }
     }
@@ -3305,10 +3331,22 @@ async fn open_session_attempt(
                         .continuity_sessions
                         .remove_if(&session_id)
                         .await;
-                    let session = adopt_session(fabric, canonical)
-                        .await
-                        .map_err(TryAgain::Definitive)?;
-                    return Ok(session);
+                    // 真双机验收实证（2026-09-30）：ALREADY_ACTIVE 的 canonical
+                    // 只在「本端 accept 侧已登记胜方」时本地可得（真并发双
+                    // INIT）。崩溃重启的客户端本地没有旧 canonical——短宽限
+                    // 观察不到即按传输类可重试：provider 侧旧 canonical 的
+                    // 死通道替换（admit_init_ordered）会在下一轮 INIT 生效，
+                    // 不得以 Definitive 语义等满 HANDSHAKE_TIMEOUT 后放弃
+                    // （重加入者首个会话曾因此卡 10s 后失败）。
+                    const ADOPT_CANONICAL_GRACE: std::time::Duration =
+                        std::time::Duration::from_millis(500);
+                    match adopt_session(fabric, canonical, ADOPT_CANONICAL_GRACE).await {
+                        Ok(session) => return Ok(session),
+                        Err(e) => {
+                            strace!("canonical not local ({e}); retrying init");
+                            return Err(TryAgain::Transport(e));
+                        }
+                    }
                 }
                 if reason == init_reason::MALFORMED || reason == init_reason::POLICY_DENIED {
                     return Err(TryAgain::Definitive(FabricError::Session(
@@ -3476,15 +3514,11 @@ async fn accept_session_init(
         // 通道已死的 Recovering 不得压制新 INIT（canonical 由 reap_terminal
         // 懒清；放弃看门狗负责转 Dead；死通道 Recovering 即时替换语义见
         // admit_init_ordered）。
-        let local_is_active = local_shared
-            .as_ref()
-            .is_some_and(|shared| {
-                matches!(shared.phase_sync(), SessionPhase::Active)
-                    || (shared.phase_sync() == SessionPhase::Recovering
-                        && shared
-                            .current_channel()
-                            .is_some_and(|c| !c.is_dead()))
-            });
+        let local_is_active = local_shared.as_ref().is_some_and(|shared| {
+            matches!(shared.phase_sync(), SessionPhase::Active)
+                || (shared.phase_sync() == SessionPhase::Recovering
+                    && shared.current_channel().is_some_and(|c| !c.is_dead()))
+        });
         let incoming_wins = (incoming_endpoint, sid) < (local_endpoint, campaign.session_id);
         if local_is_active || !incoming_wins {
             let canonical = fabric
@@ -4216,7 +4250,9 @@ mod tests {
         );
         // decision: None 路径（客户端 resume 形态）
         let (send_none, recv_none) = link.transport(1).await.into_split();
-        shared.closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        shared
+            .closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             shared
                 .install_channel(send_none, recv_none, InstallPolicy::Force, None, None)
@@ -4232,9 +4268,14 @@ mod tests {
         );
         assert_eq!(shared.phase_sync(), SessionPhase::Recovering);
         // 流登记拒绝（send_open 的闸门锚点）
-        assert!(shared.reserve_stream_slot(1).await.is_err(), "closing 中新流登记必须被拒");
+        assert!(
+            shared.reserve_stream_slot(1).await.is_err(),
+            "closing 中新流登记必须被拒"
+        );
         // 对照：清旗后同路径恢复可用（合法恢复不受误拒）
-        shared.closing.store(false, std::sync::atomic::Ordering::SeqCst);
+        shared
+            .closing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let (send_ok, recv_ok) = link.transport(2).await.into_split();
         assert!(
             shared

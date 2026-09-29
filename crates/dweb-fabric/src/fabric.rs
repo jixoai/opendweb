@@ -568,6 +568,129 @@ fn upsert_relay_caps(store: &mut Vec<(String, String)>, incoming: &[(String, Str
     changed
 }
 
+// ==== known_addrs 持久化（真双机验收实证 2026-09-30） ==========================
+//
+// open 路径重启不重跑 join，内存 known_addrs 清零后对 root 只剩 relay 配置
+// 候选——relay 客户端退避期间拨号全部超时（iroh 停在 relay 相位不回落
+// direct，与回环 relay 停滞同族）。直连候选是 LAN 拓扑下的第一回落资本，
+// 必须跨重启存活。advisory 地址提示（非信任数据）：加载损坏按空表起步 +
+// warn，写失败 warn 不阻断连接路径。
+
+/// data_dir 内的 known_addrs 存储文件。
+pub const KNOWN_ADDRS_FILE: &str = "known_addrs.json";
+
+fn known_addrs_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(KNOWN_ADDRS_FILE)
+}
+
+/// 读取持久化快照；文件缺失/损坏 = 空表（+ warn），不 fail-fast。
+fn load_known_addrs(data_dir: &std::path::Path) -> KnownAddrs {
+    let path = known_addrs_path(data_dir);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return KnownAddrs::default();
+    };
+    match serde_json::from_slice::<Vec<(String, Vec<String>)>>(&bytes) {
+        Ok(entries) => KnownAddrs::from_persisted(entries),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "known_addrs store corrupted; starting with an empty address table"
+            );
+            KnownAddrs::default()
+        }
+    }
+}
+
+/// 快照落盘（原子写：tmp+rename）。写失败 warn（地址学习是尽力而为面）。
+fn persist_known_addrs_entries(data_dir: &std::path::Path, entries: &[(String, Vec<String>)]) {
+    let path = known_addrs_path(data_dir);
+    let json = match serde_json::to_string_pretty(entries) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::warn!(error = %e, "known_addrs snapshot encode failed");
+            return;
+        }
+    };
+    let mut tmp = std::ffi::OsString::from(path.as_os_str());
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()
+    };
+    if let Err(e) = write().and_then(|()| std::fs::rename(&tmp, &path)) {
+        tracing::warn!(path = %path.display(), error = %e, "known_addrs persist failed");
+    }
+}
+
+/// 学习一条对端地址（内存 push + 全量快照落盘）。幂等（重复地址不触发写）。
+async fn learn_known_addr(inner: &Arc<FabricInner>, remote: EndpointId, addr: String) {
+    let (changed, snapshot) = {
+        let mut ka = inner.known_addrs.lock().await;
+        let before = ka.get(&remote).map(<[String]>::len);
+        ka.push(remote, addr);
+        let changed = before != ka.get(&remote).map(<[String]>::len);
+        (changed, ka.snapshot_for_persist())
+    };
+    if changed {
+        persist_known_addrs_entries(&inner.data_dir, &snapshot);
+    }
+}
+
+/// 配置序 relay URL 列表（罚期摘除用；与快照 urls 同源）。
+fn relay_config_urls(relay: &RelayConfig) -> Vec<String> {
+    match relay {
+        RelayConfig::Disabled => Vec::new(),
+        RelayConfig::Custom(urls) => urls.clone(),
+        RelayConfig::N0Default => n0_default_urls(),
+        RelayConfig::CustomWithCaps(entries) => entries.iter().map(|e| e.url.clone()).collect(),
+    }
+}
+
+/// 罚期结束后的 relay 条目重注入。票源与启动注入同源简化（ensured 缓存票
+/// 加 CustomWithCaps 静态票，同 URL ensured 优先）；重注入后 iroh relay
+/// 客户端自行重连，快照经 watcher 恢复 online。
+fn reinject_relay_entries(inner: &Arc<FabricInner>) {
+    let Some(map) = &inner.relay_map else {
+        return;
+    };
+    let mut to_inject: Vec<(String, String)> = Vec::new();
+    {
+        let cached = inner.relay_caps.lock().unwrap().clone();
+        let ensured = inner.ensured_caps.lock().unwrap().clone();
+        let now = now_ms();
+        for (url, token) in cached {
+            if ensured.iter().any(|(eu, _)| same_relay_url(eu, &url)) {
+                continue;
+            }
+            match crate::protocol::RelayCapV1::decode(&token) {
+                Ok(cap) if cap.expires_at > now => to_inject.push((url, token)),
+                _ => {}
+            }
+        }
+        to_inject.extend(ensured);
+    }
+    if let RelayConfig::CustomWithCaps(entries) = &inner.relay {
+        for entry in entries {
+            if let Some(token) = entry.local_token()
+                && !to_inject.iter().any(|(u, _)| same_relay_url(u, &entry.url))
+            {
+                to_inject.push((entry.url.clone(), token.to_owned()));
+            }
+        }
+    }
+    inject_relay_tokens(map, &to_inject);
+    // 解除罚期（下一个观察周期由 watcher/拨号结果重新裁决）
+    *inner.relay_dial_penalty_until.lock().unwrap() = None;
+}
+
 /// [H8] Phase 0：deferred 构造的缓存票据预检（design §2.1 r9-P1-1 冻结）。
 /// 逐条 decode 校验 tuple `(relay_url ∈ 配置, fabric_id == roster,
 /// issuer == roster root, server_id == 配置条目)` 且未过期（过期条目已被
@@ -786,6 +909,29 @@ fn invite_v2_relay_order<'a>(
     front
 }
 
+/// 有界关闭 endpoint（shutdown/启动取消路径共用）。
+/// 真双机验收实证（2026-09-30）：endpoint.close() 内部等待全部 QUIC 连接
+/// 排干（wait_all_draining）——活跃会话（continuity 连接）存在时该等待可
+/// 无限期不终结（TERM 后进程对 drain 无响应，只能 kill -9；样本进程排干
+/// 挂起 4 分钟以上且 relay TCP 已断——传输层无进展排干）。有界等待：超时
+/// 即放弃排干继续收尾（Endpoint 句柄随 FabricInner 释放，进程退出面无资源
+/// 滞留），close 的幂等性保证并发调用安全。
+async fn close_endpoint_bounded(inner: &Arc<FabricInner>) {
+    let Some(endpoint) = inner.endpoint.get() else {
+        return;
+    };
+    const ENDPOINT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    if tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, endpoint.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_secs = ENDPOINT_CLOSE_TIMEOUT.as_secs(),
+            "endpoint close did not finish draining; continuing shutdown"
+        );
+    }
+}
+
 /// shutdown drain 主体（R4 P1-1：由后台任务持有，调用方 Future 取消不中断）。
 /// 全部收尾完成后 `send_replace(true)`——无订阅者也落值，顺序晚到调用即见 true。
 async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
@@ -838,9 +984,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
         )
         .await;
     // [H8] deferred 未启动即 shutdown：endpoint 从未 bind，无网络面可关。
-    if let Some(endpoint) = inner.endpoint.get() {
-        endpoint.close().await;
-    }
+    close_endpoint_bounded(&inner).await;
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
     // 生产者可以把晚到 child push 到已 take 的表中。
     let accept_loop = { inner.accept_loop_task.lock().unwrap().take() };
@@ -1497,6 +1641,12 @@ pub struct FabricInner {
     peer_epoch: std::sync::atomic::AtomicU64,
     /// relay 状态快照缓存（D4：快照先于事件可用；std 锁，读取零等待）。
     relay_snapshot: Arc<std::sync::Mutex<RelayStatusSnapshot>>,
+    /// relay 相位拨号罚期（真双机验收实证 2026-09-30）：relay 客户端闪断
+    /// 期间发起的全量候选拨号被硬上界放弃后，同 NodeId 的紧随拨号会被
+    /// iroh 的 pending-dial 状态卡住（实证：8s 放弃 + 8s 二次拨号双停）。
+    /// 罚期内拨号候选偏好强制直连（有 IP 候选时），不再发起 relay 相位
+    /// 拨号；罚期由 watcher/下一次成功的 relay 观测自然解除。
+    pub(crate) relay_dial_penalty_until: std::sync::Mutex<Option<std::time::Instant>>,
     /// home relay watcher 任务（Disabled 模式不启动；shutdown 显式 abort + join）。
     relay_watcher_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// detached connect 任务登记（HB 4.1）：join deadline 到期后 connect
@@ -1767,6 +1917,10 @@ enum JoinPhaseError {
 /// detached connect 任务 shutdown 等待上限（HB 4.1）：endpoint 关闭后残留
 /// 的后台 connect 最多再等 5s 自然结束，超时 abort（保证进程退出无悬挂）。
 const DETACHED_CONNECT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// relay 相位拨号罚期（真双机验收实证 2026-09-30）：全量候选拨号被硬上界
+/// 放弃后的观察期——期内拨号偏好强制直连（有 IP 候选时），不再发起注定
+/// 挂起的 relay 相位拨号；期满或 relay 恢复后自然解除。
+pub(crate) const RELAY_DIAL_PENALTY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 单次 send 的网络 I/O 上限（R9 P1）：open_bi + write + finish 的流控等待
 /// 有界化——对端停读/额度耗尽时调用方拿到明确超时，而非无限期挂起。
@@ -2222,9 +2376,7 @@ impl Fabric {
                 }
                 // bind 已完成但未到 spawn 段的 endpoint：显式关闭——
                 // shutdown 返回后无晚到网络事件（watcher 从未启动）。
-                if let Some(endpoint) = inner.endpoint.get() {
-                    endpoint.close().await;
-                }
+                close_endpoint_bounded(inner).await;
                 Ok(StartOutcome::CancelledByShutdown)
             }
             // 正常完成：同步尾部 spawn（序列内无 await——取消只能落在 work
@@ -2248,9 +2400,7 @@ impl Fabric {
                     // 极端竞态：work 完成与 shutdown 裁判同时就绪且 shutdown
                     // 先落 Closed——撤销刚 spawn 的常驻任务 + 关 endpoint，
                     // 保持「shutdown 返回后无晚到网络事件」。
-                    if let Some(endpoint) = inner.endpoint.get() {
-                        endpoint.close().await;
-                    }
+                    close_endpoint_bounded(inner).await;
                     for abort in aborts {
                         abort.abort();
                     }
@@ -2277,9 +2427,7 @@ impl Fabric {
                     }
                 };
                 if won_shutdown {
-                    if let Some(endpoint) = inner.endpoint.get() {
-                        endpoint.close().await;
-                    }
+                    close_endpoint_bounded(inner).await;
                     Ok(StartOutcome::CancelledByShutdown)
                 } else {
                     Err(FabricError::StartFailedShared(shared))
@@ -2477,6 +2625,10 @@ impl Fabric {
         }));
         // c2：会话自动重连通道（closed_task 发送 -> manager 消费派发 worker）
         let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        // 真双机验收实证（2026-09-30）：known_addrs 跨重启持久（open 路径不重跑
+        // join，内存清零后对 root 只剩 relay 候选——relay 客户端退避期间拨号
+        // 全超时）。加载损坏按空表起步 + warn（advisory 地址提示，非信任数据）。
+        let persisted_known_addrs = load_known_addrs(&config.data_dir);
         // [H8] 生命周期状态机（eager 内联航班从 gen 1 起步）
         let (lifecycle_tx, _) = tokio::sync::watch::channel(0u64);
         let (startup_cancel, _) = tokio::sync::watch::channel(false);
@@ -2497,12 +2649,13 @@ impl Fabric {
             relay_caps: std::sync::Mutex::new(persisted_relay_caps),
             pending_cache_caps: std::sync::Mutex::new(pending_inject),
             ensured_caps: std::sync::Mutex::new(Vec::new()),
-            known_addrs: Mutex::new(KnownAddrs::default()),
+            known_addrs: Mutex::new(persisted_known_addrs),
             recent_disconnects: Mutex::new(HashMap::new()),
             connect_inflight: Mutex::new(InflightState::default()),
             flight_generation: std::sync::atomic::AtomicU64::new(0),
             peer_epoch: std::sync::atomic::AtomicU64::new(0),
             relay_snapshot,
+            relay_dial_penalty_until: std::sync::Mutex::new(None),
             relay_watcher_task: std::sync::Mutex::new(None),
             detached_connects: std::sync::Mutex::new(DetachedConnects::default()),
             // shutdown 完成门（R3 P1-1）：started 与 done 配对——首次调用执行
@@ -3026,11 +3179,14 @@ impl Fabric {
                 learned.push(token.invite.issuer_relay_url.clone());
             }
             learned.extend(token.invite.issuer_direct_addrs.iter().cloned());
-            self.inner
-                .known_addrs
-                .lock()
-                .await
-                .set(token.invite.issuer, learned);
+            let snapshot = {
+                let mut ka = self.inner.known_addrs.lock().await;
+                ka.set(token.invite.issuer, learned);
+                ka.snapshot_for_persist()
+            };
+            // 持久化（真双机验收实证 2026-09-30）：open 路径重启不重跑 join，
+            // 直连候选必须落盘才能在 relay 失效时兜底重拨。
+            persist_known_addrs_entries(&self.inner.data_dir, &snapshot);
         }
         // 5：既有目录名册 fabric != 令牌 fabric（目录归属，区别于 issuer 侧
         //    redeem_verify 的 WrongFabric——后者经 Other 透出为 TOKEN_INVALID）。
@@ -3164,11 +3320,14 @@ impl Fabric {
             let mut learned: Vec<String> =
                 token.invite.relays.iter().map(|r| r.url.clone()).collect();
             learned.extend(token.invite.direct_addrs.iter().map(|a| a.to_string()));
-            self.inner
-                .known_addrs
-                .lock()
-                .await
-                .set(token.invite.issuer, learned);
+            let snapshot = {
+                let mut ka = self.inner.known_addrs.lock().await;
+                ka.set(token.invite.issuer, learned);
+                ka.snapshot_for_persist()
+            };
+            // 持久化（真双机验收实证 2026-09-30）：同 v1 路径——直连候选跨
+            // 重启存活是 relay 失效时的回落资本。
+            persist_known_addrs_entries(&self.inner.data_dir, &snapshot);
         }
         // 5：目录归属
         {
@@ -3457,6 +3616,15 @@ impl Fabric {
     /// 实际拨号（connect 的 single-flight 保护下的执行体）。
     async fn connect_dial(&self, id: &EndpointId) -> Result<(), FabricError> {
         let addr = self.endpoint_addr_for(id).await?;
+        // 直连-only 回落候选（真双机验收实证 2026-09-30）：iroh 的拨号停在
+        // relay 相位不回落 direct（relay 客户端退避/失效时整段 dial 挂起至
+        // 自身超时，与回环 relay 停滞同族）。存在 IP 候选时：
+        // - relay 快照已知离线 → 首选直连（不起注定挂起的 relay 相位拨号；
+        //   被 abandoning 的半开拨号还会卡该 NodeId 的后续拨号）；
+        // - 全量候选失败 → 第二次尝试剥掉 relay 只拨直连。
+        let direct_only = Self::strip_relay_candidates(&addr);
+        let relay_known_down = !Self::relay_snapshot_online(&self.inner);
+        let prefer_direct = relay_known_down && !direct_only.addrs.is_empty();
         // 预沉降：刚主动断开过的对端，补足去重窗口再拨（实证窗口约 3s；
         // 期间强行拨号会制造卡死连接并延长坏状态，且重试无法恢复）。
         {
@@ -3476,19 +3644,68 @@ impl Fabric {
         // 第二次拨号时旧连接已被双方清理，窗口不再命中。
         const CONNECT_HELLO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         const CONNECT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2500);
+        // 拨号硬上界（真双机验收实证 2026-09-30）：iroh 停在 relay 相位的
+        // connect 不自报错误——relay 客户端退避重连期间可挂起 ~60s，
+        // single-flight 航班被它占死（waiter 只见 concurrent connect failed）。
+        // 超时即放弃该次拨号换候选重试；被放弃的半开拨号由 iroh 自身超时
+        // 回收，饥饿代价低于无界挂起。
+        const CONNECT_DIAL_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
         for attempt in 0..2 {
-            // connect 本身不施加超时：取消中的 iroh connect 会留下半开连接，
-            // 卡死该 NodeId 的后续拨号（实证）。握手在传输层毫秒级完成，
-            // 无界风险由 HELLO 阶段超时 + 干净 close 兜底。
+            // 候选选择：attempt 0 按快照偏好（relay 离线且有直连 → 直连优先）；
+            // attempt 1 交替候选集（direct 优先时换全量——relay 可能已恢复；
+            // 否则剥 relay 只拨直连——relay 相位饿死回落）。无直连候选恒用全量。
+            let dial_addr = if direct_only.addrs.is_empty() || (attempt == 0 && !prefer_direct) {
+                addr.clone()
+            } else {
+                direct_only.clone()
+            };
             // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
             let endpoint = self.inner.require_endpoint()?;
-            let conn = endpoint.connect(addr.clone(), ALPN_REGULAR).await?;
+            let outcome = tokio::time::timeout(
+                CONNECT_DIAL_BOUND,
+                endpoint.connect(dial_addr, ALPN_REGULAR),
+            )
+            .await;
+            // 真双机验收实证（2026-09-30）：attempt 0 的 connect 错误/超时（iroh
+            // 停在 relay 相位直至自身超时——relay 客户端退避时零出站）不得直接
+            // 上抛：有直连候选时落入 attempt 1 剥 relay 重拨（此前 `?` 提前返回
+            // 让回落路径永不执行，重拨饿死）。NotStarted 等本地错误即时上抛。
+            let conn = match outcome {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    if attempt == 0 && !direct_only.addrs.is_empty() {
+                        tracing::debug!(
+                            peer = %endpoint_id_display(id),
+                            error = %e,
+                            "full-candidate dial failed; retrying with direct-only candidates"
+                        );
+                        tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    // 超时放弃（relay 相位挂起）：进入罚期并**不再立即二拨**——
+                    // 被 abandon 的 pending 拨号会卡住同 NodeId 的紧随拨号
+                    // （真双机实证：8s 放弃 + 8s 二次拨号双停 = 每请求 18.5s
+                    // 连败）。罚期收口动作含摘除死 relay 条目（强制后续拨号
+                    // 重建 IP 路径）+ 定时重注入。
+                    Self::enter_relay_dial_penalty(&self.inner).await;
+                    return Err(FabricError::Session(SessionError::Connect(format!(
+                        "connect dial exceeded {}s bound (relay path stalled)",
+                        CONNECT_DIAL_BOUND.as_secs()
+                    ))));
+                }
+            };
             match tokio::time::timeout(CONNECT_HELLO_TIMEOUT, self.register_dialed(conn.clone()))
                 .await
             {
                 Ok(Ok(())) => {
                     // 成功：清除该对端的近期断开记录（沉降窗口已无意义）
                     self.inner.recent_disconnects.lock().await.remove(id);
+                    // 直连路径学习（持久化 known_addrs）：LAN 直连可达性跨重启
+                    // 存活，是 relay 失效时的回落资本。
+                    Self::learn_selected_direct_addr(&self.inner, id, &conn).await;
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -3517,11 +3734,92 @@ impl Fabric {
         unreachable!()
     }
 
+    /// 剥掉 EndpointAddr 的 relay 候选，只留 IP 直连候选（dial 回落用）。
+    pub(crate) fn strip_relay_candidates(addr: &EndpointAddr) -> EndpointAddr {
+        let mut direct = EndpointAddr::new(addr.id);
+        for a in &addr.addrs {
+            if let iroh_base::TransportAddr::Ip(sa) = a {
+                direct = direct.with_ip_addr(*sa);
+            }
+        }
+        direct
+    }
+
+    /// relay 快照是否已知离线（Disabled 模式恒 true；快照未沉降视作在线——
+    /// 拨号候选偏好用的保守信号，不是权威状态）。relay 相位拨号罚期内同样
+    /// 视作离线（全量候选被硬上界放弃后的观察期）。
+    pub(crate) fn relay_snapshot_online(inner: &Arc<FabricInner>) -> bool {
+        if matches!(inner.relay, RelayConfig::Disabled) {
+            return false;
+        }
+        if inner
+            .relay_dial_penalty_until
+            .lock()
+            .unwrap()
+            .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            return false;
+        }
+        let snap = inner.relay_snapshot.lock().unwrap();
+        !matches!(snap.online, Some(false))
+    }
+
+    /// 进入 relay 相位拨号罚期（真双机验收实证 2026-09-30 的收口动作）。
+    /// relay 客户端闪断后，对端 NodeId 的已解析路径仍指向死 relay 传输——
+    /// 后续任何候选集的拨号都静默零出站（tcpdump 实证无 UDP 离机）。
+    /// 处置为：从运行期 RelayMap 摘掉 relay 条目（强制后续 resolve 重建 IP
+    /// 路径），并在罚期结束后定时重注入（票源与启动注入同源，重注入后
+    /// relay 客户端自行重连，快照恢复 online）。
+    pub(crate) async fn enter_relay_dial_penalty(inner: &Arc<FabricInner>) {
+        {
+            let mut penalty = inner.relay_dial_penalty_until.lock().unwrap();
+            *penalty = Some(std::time::Instant::now() + RELAY_DIAL_PENALTY);
+        }
+        // 摘除运行期 relay 条目（endpoint 与共享句柄同一张表）
+        if let Some(endpoint) = inner.endpoint.get() {
+            for url_s in relay_config_urls(&inner.relay) {
+                if let Ok(url) = url_s.parse::<iroh::RelayUrl>() {
+                    endpoint.remove_relay(&url).await;
+                }
+            }
+        }
+        // 罚期结束后重注入（一次性任务，无循环）
+        let inner2 = Arc::clone(inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(RELAY_DIAL_PENALTY).await;
+            reinject_relay_entries(&inner2);
+        });
+    }
+
+    /// 从已采纳连接的当前选中路径学习直连地址（写入 known_addrs 并持久化）。
+    /// 真双机验收实证（2026-09-30）：known_addrs 是纯内存结构，成员重启
+    /// （open 路径不重跑 join）后对 root 只剩 relay 配置候选——relay 客户端
+    /// 退避期间拨号全部超时且无 direct 回落资本。学习面必须在连接健康期
+    /// 落盘，重启后回落路径才存在。
+    pub(crate) async fn learn_selected_direct_addr(
+        inner: &Arc<FabricInner>,
+        remote: &EndpointId,
+        conn: &iroh::endpoint::Connection,
+    ) {
+        let paths = conn.paths();
+        let Some(sa) = paths
+            .iter()
+            .find(|p| p.is_selected())
+            .and_then(|p| match p.remote_addr() {
+                iroh_base::TransportAddr::Ip(sa) => Some(*sa),
+                _ => None,
+            })
+        else {
+            return;
+        };
+        learn_known_addr(inner, *remote, sa.to_string()).await;
+    }
+
     /// 显式登记对端可达地址（relay URL 或 ip:port），供后续 connect 使用。
     /// 有界（HB 3.1）：per-endpoint 超限淘汰最旧地址；重复地址幂等。
     pub async fn add_known_addr(&self, id: &str, addr: String) -> Result<(), FabricError> {
         let id = endpoint_id_parse(id).map_err(|_| FabricError::BadEndpointId(id.into()))?;
-        self.inner.known_addrs.lock().await.push(id, addr);
+        learn_known_addr(&self.inner, id, addr).await;
         Ok(())
     }
 

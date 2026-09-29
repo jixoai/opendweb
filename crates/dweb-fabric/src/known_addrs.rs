@@ -87,6 +87,33 @@ impl KnownAddrs {
             v.drain(..overflow);
         }
     }
+
+    /// 持久化快照（endpoint z32 展示串 -> 地址列表，插入序保持）。
+    /// 真双机验收实证（2026-09-30）：open 路径重启不重跑 join，内存地址表
+    /// 清零——直连候选必须跨重启存活（relay 客户端退避期间的回落资本）。
+    pub(crate) fn snapshot_for_persist(&self) -> Vec<(String, Vec<String>)> {
+        self.order
+            .iter()
+            .filter_map(|id| {
+                self.map
+                    .get(id)
+                    .map(|v| (crate::identity::endpoint_id_display(id), v.clone()))
+            })
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    }
+
+    /// 从持久化快照重建（已知键经 endpoint_id_parse 校验，坏键跳过——
+    /// advisory 数据不 fail-fast）。
+    pub(crate) fn from_persisted(entries: Vec<(String, Vec<String>)>) -> Self {
+        let mut out = Self::default();
+        for (id_str, addrs) in entries {
+            if let Ok(id) = crate::identity::endpoint_id_parse(&id_str) {
+                out.set(id, addrs);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

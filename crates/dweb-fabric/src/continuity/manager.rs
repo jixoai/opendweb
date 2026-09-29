@@ -35,6 +35,27 @@ pub(crate) struct DialingGuard {
     inner: tokio::sync::Mutex<HashMap<EndpointId, std::sync::Arc<tokio::sync::Semaphore>>>,
 }
 
+/// 连接已死（非阻塞判定）：`close_reason` 仅在连接终结后为 Some——QUIC 半开
+/// （对端崩溃、无 close 帧）时由 iroh 心跳/空闲超时兜底，期间此检查为 false。
+/// 真双机验收实证（2026-09-30）：对端 kill -9 后同 key 重启再拨，存活方槽位
+/// 里的死句柄在传输层死亡被观测到之前仍是「既有时续」——winner 规则若按
+/// initiator 比较裁决，会把新活连接判负掐掉（candidate.initiator ==
+/// old.initiator，`<` 恒 false），重加入者的每个会话都被 connection lost。
+fn conn_is_dead(h: &ConnHandle) -> bool {
+    h.conn.close_reason().is_some()
+}
+
+/// 尸体静默阈值：两个 iroh 心跳周期（HEARTBEAT_INTERVAL=5s）。活连接的心跳
+/// ACK 让 rx 计数每 ~5s 增长；静默 ≥10s 且传输层未判死的连接按尸体裁决
+/// （存活方自己的旧拨号在瞬断重拨后被对端崩溃留成半开尸体——initiator
+/// 较小仍会压制重加入者，真双机验收实证 2026-09-30）。
+const CORPSE_SILENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 尸体判定：传输层已判死，或 rx 静默超过两个心跳周期（正向活性信号缺失）。
+fn is_corpse(h: &ConnHandle) -> bool {
+    conn_is_dead(h) || h.rx_silent_for() > CORPSE_SILENCE
+}
+
 impl DialingGuard {
     /// 取该 peer 的拨号许可（无人拨号时立即获得；有在途拨号则排队等其
     /// 完成后再获得——获得者复查 fast-path 决定是否还需拨号）。
@@ -59,7 +80,7 @@ pub(crate) async fn ensure_connection(
     remote: &EndpointId,
 ) -> Result<Arc<ConnHandle>, FabricError> {
     loop {
-        if let Some(h) = inner.continuity.active(remote).await {
+        if let Some(h) = live_active(inner, remote).await {
             return Ok(h);
         }
         if inner.lifecycle_closing() {
@@ -69,7 +90,7 @@ pub(crate) async fn ensure_connection(
         }
         // 拿到许可（在途拨号者完成后）后复查 fast-path：他人已完成则直接复用
         let _permit = inner.continuity_dialing.permit(remote).await;
-        if let Some(h) = inner.continuity.active(remote).await {
+        if let Some(h) = live_active(inner, remote).await {
             return Ok(h);
         }
         if inner.lifecycle_closing() {
@@ -80,6 +101,22 @@ pub(crate) async fn ensure_connection(
         dial_and_adopt(inner, remote).await?;
         // 采纳成功：loop 头 fast-path 取回句柄
     }
+}
+
+/// `ContinuityState::active` 的活性过滤：传输层已终结（close_reason=Some）
+/// 或 rx 静默超阈值（尸体）的槽位句柄按不存在处理，并顺手摘除——死句柄
+/// 短路的 fast-path 曾让重加入会话整个死亡检测窗口内无路可走（真双机
+/// 验收实证 2026-09-30）。
+async fn live_active(inner: &Arc<FabricInner>, remote: &EndpointId) -> Option<Arc<ConnHandle>> {
+    let h = inner.continuity.active(remote).await?;
+    if is_corpse(&h) {
+        // 传输层已判死/静默超阈：摘除槽位（supervisor 迟到时由 fence 分支
+        // 静默退出）
+        h.close_deliberate(b"evicted-dead");
+        inner.continuity.clear_if_current(remote, &h).await;
+        return None;
+    }
+    Some(h)
 }
 
 /// 拨号 + winner 采纳 + supervisor 派生。
@@ -110,18 +147,100 @@ async fn dial_and_adopt(
     let addr = endpoint_addr_for(inner, remote).await?;
     // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
     let endpoint = inner.require_endpoint()?;
-    let conn = match endpoint.connect(addr, super::ALPN_CONTINUITY).await {
+    // 直连-only 回落候选：iroh 拨号停在 relay 相位不回落 direct（真双机验收
+    // 实证 2026-09-30——relay 客户端退避期间全量候选拨号挂起至自身超时，
+    // 与回环 relay 停滞同族）。relay 快照已知离线且有 IP 候选时首选直连
+    // （不起注定挂起的 relay 相位拨号——abandon 的半开拨号还会卡该 NodeId
+    // 的后续拨号）；首选候选失败时换另一组候选再拨一次。
+    let direct_only = Fabric::strip_relay_candidates(&addr);
+    let prefer_direct = !Fabric::relay_snapshot_online(inner) && !direct_only.addrs.is_empty();
+    let (first_addr, second_addr) = if prefer_direct {
+        (direct_only.clone(), addr.clone())
+    } else {
+        (addr.clone(), direct_only.clone())
+    };
+    // 拨号硬上界（真双机验收实证 2026-09-30）：iroh 停在 relay 相位的
+    // connect 不自报错误——relay 客户端退避期间可挂起 ~60s。
+    const DIAL_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
+    // 超时放弃（relay 相位挂起）标记：进入罚期并**不立即二拨**——被 abandon
+    // 的 pending 拨号会卡住同 NodeId 的紧随拨号（真双机实证 8s+8s 双停）；
+    // 重试交给 supervisor 退避（≥1s 间隔，届时强制直连偏好）。
+    let relay_phase_stalled = std::sync::atomic::AtomicBool::new(false);
+    let first: Result<iroh::endpoint::Connection, String> = match tokio::time::timeout(
+        DIAL_BOUND,
+        endpoint.connect(first_addr.clone(), super::ALPN_CONTINUITY),
+    )
+    .await
+    {
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => {
+            relay_phase_stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(format!(
+                "dial exceeded {}s bound (relay path stalled)",
+                DIAL_BOUND.as_secs()
+            ))
+        }
+    };
+    if relay_phase_stalled.load(std::sync::atomic::Ordering::SeqCst) {
+        Fabric::enter_relay_dial_penalty(inner).await;
+        let reason = first.expect_err("stalled marker implies Err");
+        state
+            .set_phase(
+                remote,
+                ConnectionPhase::Disconnected,
+                Some(reason.clone()),
+                false,
+            )
+            .await;
+        return Err(FabricError::Session(SessionError::Connect(reason)));
+    }
+    let conn = match first {
         Ok(c) => c,
-        Err(e) => {
-            state
-                .set_phase(
-                    remote,
-                    ConnectionPhase::Disconnected,
-                    Some(format!("{e}")),
-                    false,
-                )
-                .await;
-            return Err(FabricError::Session(SessionError::Connect(format!("{e}"))));
+        Err(first) => {
+            if second_addr.addrs.is_empty() || second_addr == first_addr {
+                state
+                    .set_phase(
+                        remote,
+                        ConnectionPhase::Disconnected,
+                        Some(first.clone()),
+                        false,
+                    )
+                    .await;
+                return Err(FabricError::Session(SessionError::Connect(first)));
+            }
+            let second: Result<iroh::endpoint::Connection, String> = match tokio::time::timeout(
+                DIAL_BOUND,
+                endpoint.connect(second_addr, super::ALPN_CONTINUITY),
+            )
+            .await
+            {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => Err("fallback dial exceeded bound".to_owned()),
+            };
+            match second {
+                Ok(c) => {
+                    tracing::debug!(
+                        peer = %endpoint_id_display(remote),
+                        first = %first,
+                        "continuity dial fell back to alternate candidates"
+                    );
+                    c
+                }
+                Err(second) => {
+                    let msg = format!("{first}; fallback: {second}");
+                    state
+                        .set_phase(
+                            remote,
+                            ConnectionPhase::Disconnected,
+                            Some(msg.clone()),
+                            false,
+                        )
+                        .await;
+                    return Err(FabricError::Session(SessionError::Connect(msg)));
+                }
+            }
         }
     };
     // Handshaking 仅在无活跃连接时宣告（对端来连可能已把本端采纳为 Ready——
@@ -131,11 +250,7 @@ async fn dial_and_adopt(
             .set_phase(remote, ConnectionPhase::Handshaking, None, false)
             .await;
     }
-    let handle = Arc::new(ConnHandle {
-        conn: conn.clone(),
-        initiator: inner.identity.endpoint_id(),
-        deliberate: std::sync::atomic::AtomicBool::new(false),
-    });
+    let handle = Arc::new(ConnHandle::new(conn.clone(), inner.identity.endpoint_id()));
     match adopt_with_winner(inner, remote, handle).await {
         Some(h) => Ok(h),
         None => {
@@ -156,16 +271,23 @@ pub(crate) async fn register_incoming(
     remote: EndpointId,
     conn: iroh::endpoint::Connection,
 ) {
-    let handle = Arc::new(ConnHandle {
-        conn,
-        initiator: remote,
-        deliberate: std::sync::atomic::AtomicBool::new(false),
-    });
+    let handle = Arc::new(ConnHandle::new(conn, remote));
     let _ = adopt_with_winner(inner, &remote, handle).await;
 }
 
 /// winner 采纳：无既有 → 安装；并存 → 发起方 EndpointId 较小者胜，
 /// 败者 deliberate 关闭。返回胜者句柄（新连接败选时返回既有句柄）。
+/// 真双机验收实证修正（2026-09-30）：
+/// - **尸体不参裁**：既有时续的传输层已终结（close_reason=Some）或 rx 静默
+///   超两个心跳周期时按无既有时续处理——驱逐（标记 deliberate 使其在途
+///   supervisor 静默退出）后采纳新连接。崩溃对端同 key 重加入的每个新连接
+///   都曾因尸体占位被 `superseded-by-older-initiator` 掐死。
+/// - **平局保持既有**（`<` 不含等号）：同 initiator（同一远端再次来连/本端
+///   再次拨出）且既有健康时，新连接判负——拨号方经 fast-path 复用健康既有
+///   连接收敛。曾改判新胜（`<=`）造成并行拨号方（open_session 重试 +
+///   supervisor 重拨 + 人工 connect）互相换代健康连接的自激 churn（真双机
+///   反向验收实证：iMac 重启后 mini 侧 connection lost 连续 ~25s）。重加入
+///   场景由尸体驱逐承接，无需平局新胜。
 async fn adopt_with_winner(
     inner: &Arc<FabricInner>,
     remote: &EndpointId,
@@ -173,6 +295,16 @@ async fn adopt_with_winner(
 ) -> Option<Arc<ConnHandle>> {
     let state = &inner.continuity;
     let existing = state.active(remote).await;
+    let existing = match existing {
+        Some(old) if is_corpse(&old) => {
+            // 尸体驱逐：置 deliberate（迟到的 supervisor 见标记静默退出，
+            // 不把新连接的 Ready 状态拉回 Disconnected）+ 摘除槽位。
+            old.close_deliberate(b"evicted-dead");
+            state.clear_if_current(remote, &old).await;
+            None
+        }
+        other => other,
+    };
     let winner = match existing {
         None => candidate,
         Some(old) => {
@@ -191,7 +323,7 @@ async fn adopt_with_winner(
             }
         }
     };
-    let path = winner
+    let selected = winner
         .conn
         .paths()
         .iter()
@@ -202,12 +334,22 @@ async fn adopt_with_winner(
             _ => LinkStatus::Unknown,
         })
         .unwrap_or(LinkStatus::Unknown);
+    let path = selected;
     state.adopt(remote, Arc::clone(&winner), path).await;
+    // 直连路径学习 + 持久化（真双机验收实证 2026-09-30）：known_addrs 跨重启
+    // 存活是对端崩溃/relay 失效时的回落资本（open 路径不重跑 join）。
+    if selected == LinkStatus::Direct {
+        Fabric::learn_selected_direct_addr(inner, remote, &winner.conn).await;
+    }
     spawn_supervisor(inner, *remote, Arc::clone(&winner));
     Some(winner)
 }
 
 /// 连接监督：死亡 →（非 deliberate）状态翻转 + 退避重连。
+/// 真双机验收实证修正（2026-09-30）：supervisor 只为自己代次的句柄翻转状态
+/// ——若槽位已被新连接接管（同 key 重加入被采纳），迟到的死亡观测静默退出，
+/// 不得把新连接的 handle 摘除、也不得把 phase 拉回 Disconnected（曾造成
+/// 尸体死亡事件反复毒化新会话的状态面）。
 fn spawn_supervisor(inner: &Arc<FabricInner>, remote: EndpointId, handle: Arc<ConnHandle>) {
     let inner_for_task = Arc::clone(inner);
     let task = tokio::spawn(async move {
@@ -220,18 +362,23 @@ fn spawn_supervisor(inner: &Arc<FabricInner>, remote: EndpointId, handle: Arc<Co
             return;
         }
         if handle.deliberate.load(std::sync::atomic::Ordering::SeqCst) {
-            // winner 替换：状态由新连接的 adopt 覆盖；这里只退出
+            // winner 替换/尸体驱逐：状态由新连接的 adopt 覆盖；这里只退出
             return;
         }
+        // 代次 fence 原子收口：槽位已由新连接接管时静默退出（不翻状态、不摘
+        // 新柄）——检查+清柄+置相位在同一槽位锁内完成。
         let reason = handle
             .conn
             .close_reason()
             .map(|e| format!("{e}"))
             .unwrap_or_else(|| "connection lost".into());
-        inner_for_task
+        if !inner_for_task
             .continuity
-            .set_phase(&remote, ConnectionPhase::Disconnected, Some(reason), true)
-            .await;
+            .mark_disconnected_if_current(&remote, &handle, reason)
+            .await
+        {
+            return;
+        }
         // 退避重连（可被 shutdown 提前唤醒）
         let mut backoff = BACKOFF_START;
         loop {
