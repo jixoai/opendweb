@@ -25,6 +25,7 @@ import {
   hubTokenFile,
   hubPidFile,
   hubStateFile,
+  hubStatus,
   launchAgentPlistPath,
   readHubPidTriple,
   runHub,
@@ -925,6 +926,59 @@ test("status: uninitialized prints guidance with exit 0; initialized-not-running
     assert.match(out, /机器：Mac-mini-书房/);
     assert.match(out, /地址：http:\/\/192\.168\.2\.13:8787（局域网）/);
     assert.match(out, /开机自启：已关闭/);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("hub status 成员行：/admin/owners 真实包装形状 {generation,owners} 解析（真双机实测缺陷回归）", async () => {
+  const { home, cleanup } = await tmpHome();
+  try {
+    await fsp.writeFile(
+      hubStateFile(home),
+      JSON.stringify({
+        version: 1,
+        data_dir: path.join(home, "hub-data"),
+        gateway_bind: "127.0.0.1:18787",
+        relay_bind: "127.0.0.1:13340",
+        autostart: false,
+        initialized_at: new Date().toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+    await fsp.writeFile(hubTokenFile(home), "unit-admin-token-0123456789abcdef0123456\n", { mode: 0o600 });
+    const lines = [];
+    /** @param {string} url */
+    const fetchImpl = async (url) => {
+      if (url.endsWith("/healthz")) return new Response("ok", { status: 200 });
+      // 真实 admin 面形状：owners 为包装对象（generation + owners 数组），非裸数组
+      if (url.endsWith("/admin/owners")) {
+        return Response.json({
+          generation: 16,
+          owners: [
+            { fabric_id: "7162fdff", root: "aadd560f", alias: "Mac mini 实机成员", status: "active", expires_in: 2591985033 },
+            { fabric_id: "bb63c1ee", root: "1122ab", alias: "旧成员", status: "active", expires_in: 1 },
+          ],
+        });
+      }
+      if (url.endsWith("/admin/status")) {
+        return Response.json({ mode: "restricted", generation: 16, visitors_online: 1, knocks_pending: 2, codes_active: 1 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const code = await hubStatus([], {
+      home,
+      fetchImpl,
+      isPidAlive: () => false,
+      stdout: (l) => lines.push(l),
+      hostname: "unit.host",
+    });
+    assert.equal(code, 0);
+    assert.ok(lines.some((l) => l.includes("运行中")), "健康网关 → 运行中");
+    assert.ok(
+      lines.includes("成员：2 个租户 · 1 个访客在线 · 2 台设备在敲门"),
+      `成员行必须按包装形状计数（旧代码恒 0），实际输出：${lines.join(" | ")}`,
+    );
   } finally {
     await cleanup();
   }

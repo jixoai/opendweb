@@ -1572,9 +1572,16 @@ async function describeMembers(c, base) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   };
-  const owners = /** @type {unknown[]} */ (await get("/admin/owners"));
+  const owners = await get("/admin/owners");
   const status = /** @type {{ visitors_online?: unknown, knocks_pending?: unknown }} */ (await get("/admin/status"));
-  const tenants = Array.isArray(owners) ? owners.length : 0;
+  // /admin/owners 实际返回 {generation, owners:[…]} 包装对象（真双机实测抓到
+  // 的缺陷：按裸数组解析导致成员行恒 0）；裸数组形态保留兼容以防未来收紧
+  const ownersList = Array.isArray(owners)
+    ? owners
+    : Array.isArray(/** @type {{ owners?: unknown[] }} */ (owners)?.owners)
+      ? /** @type {{ owners: unknown[] }} */ (owners).owners
+      : [];
+  const tenants = ownersList.length;
   const visitors = typeof status.visitors_online === "number" ? status.visitors_online : 0;
   const knocks = typeof status.knocks_pending === "number" ? status.knocks_pending : 0;
   return `成员：${tenants} 个租户 · ${visitors} 个访客在线 · ${knocks} 台设备在敲门`;
