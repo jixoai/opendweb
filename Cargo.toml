@@ -40,4 +40,10 @@ napi-derive = "3"
 lto = "fat"
 codegen-units = 1
 opt-level = "z"
-strip = true
+# 不得用 cargo 的 strip（true/"debuginfo" 均会）：rustc 把 strip 交给链接器
+# 执行，对本 cdylib 会产出 "mis-aligned LINKEDIT string pool" 的坏 Mach-O
+# （dyld 拒载、逐字节确定性复现——真双机验收第二轮实证 2026-09-29；触发
+# 面随符号分布漂移，此前构建侥幸通过）。瘦身改由 client-sdk 的 build 脚本
+# 后处理（/usr/bin/strip -Sx + ad-hoc codesign——实证安全），链接器产物
+# 保持完整。
+strip = false

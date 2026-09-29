@@ -289,17 +289,30 @@ async fn relay_offline_probe_closed_port_instant_refusal() {
 #[tokio::test]
 async fn relay_offline_probe_dns_failure() {
     let _g = TEST_LOCK.lock().await;
-    // .invalid TLD（RFC 6761）：解析必然失败，计入 2s 探针预算
+    // .invalid TLD（RFC 6761）：干净网络解析必然失败 → 探针失败 →
+    // RelayOffline。Fake-IP 代理环境（mihomo/Clash 系——真双机验收机实测
+    // 2026-09-29：no-such-host-dweb.invalid 被解析进 198.18.0.0/15 且
+    // TCP:80 可达）下真探针恒"在线"，分类走探针在线路径
+    // （DialFailed）——两种环境下断言各自唯一正确的一侧，保住判别力；
+    // 探针句柄双向接线另由 probe_handle_is_replaceable 覆盖。
+    let resolves = std::net::ToSocketAddrs::to_socket_addrs(&("no-such-host-dweb.invalid", 80))
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false);
     let err = self_connect_join(
         "http://no-such-host-dweb.invalid:80",
         &[],
         JOIN_TIMEOUT_MS_DEFAULT,
     )
     .await;
+    let expected = if resolves {
+        Some(JoinErrorCode::DialFailed)
+    } else {
+        Some(JoinErrorCode::RelayOffline)
+    };
     assert_eq!(
         join_code(&err),
-        Some(JoinErrorCode::RelayOffline),
-        "{err:?}"
+        expected,
+        "{err:?} (dns resolves={resolves})"
     );
 }
 

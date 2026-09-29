@@ -957,12 +957,34 @@ async fn start_flight_work(inner: &Arc<FabricInner>) -> Result<(), FabricError> 
     if let Some(map) = &inner.relay_map {
         let ensured = inner.ensured_caps.lock().unwrap().clone();
         let is_ensured = |url: &str| ensured.iter().any(|(eu, _)| same_relay_url(eu, url));
+        let now_ms = now_ms();
         let mut to_inject: Vec<(String, String)> = Vec::new();
         {
             let pending = inner.pending_cache_caps.lock().unwrap();
             for (url, token) in pending.iter() {
-                if !is_ensured(url) {
-                    to_inject.push((url.clone(), token.clone()));
+                if is_ensured(url) {
+                    continue;
+                }
+                // 过期票不注入（真双机验收实证 2026-09-29）：relay 对过期
+                // capability 拒连（dweb/capability-expired），注入只会让
+                // RelayMap 持有一条恒败候选——iroh 路径选择停在 relay 相位
+                // 不回落 direct，拨号停滞零有效出站。静默跳过+warn（成员
+                // 重连引导面在 SDK 层：re-pair）。
+                match crate::protocol::RelayCapV1::decode(token) {
+                    Ok(cap) if cap.expires_at > now_ms => {
+                        to_inject.push((url.clone(), token.clone()));
+                    }
+                    Ok(cap) => {
+                        tracing::warn!(
+                            url,
+                            expires_at = cap.expires_at,
+                            "relay capability expired; skipping injection (re-pair to refresh)"
+                        );
+                    }
+                    Err(e) => {
+                        // load_relay_caps 已校验 decode；此处防御性跳过
+                        tracing::warn!(url, error = %e, "relay capability undecodable; skipping injection");
+                    }
                 }
             }
         }
@@ -2794,30 +2816,30 @@ impl Fabric {
         let relays: Vec<crate::protocol::InviteRelayV2> =
             invite_v2_relay_order(&entries, &snapshot)
                 .into_iter()
-            .map(|entry| {
-                let capability = entry.server_id.map(|sid| {
-                    crate::protocol::RelayCapV1::sign_and_encode(
-                        self.inner.identity.secret_key(),
-                        &fabric_id,
-                        &sid,
-                        &recipient,
-                        crate::protocol::MEMBER_CAPS,
-                        now,
-                        expires_at,
-                    )
-                });
-                let capability = capability.transpose().map_err(|e| {
-                    FabricError::Session(SessionError::Connect(format!(
-                        "bootstrap capability mint failed for {}: {e}",
-                        entry.url
-                    )))
-                })?;
-                Ok(crate::protocol::InviteRelayV2 {
-                    url: entry.url.clone(),
-                    capability,
+                .map(|entry| {
+                    let capability = entry.server_id.map(|sid| {
+                        crate::protocol::RelayCapV1::sign_and_encode(
+                            self.inner.identity.secret_key(),
+                            &fabric_id,
+                            &sid,
+                            &recipient,
+                            crate::protocol::MEMBER_CAPS,
+                            now,
+                            expires_at,
+                        )
+                    });
+                    let capability = capability.transpose().map_err(|e| {
+                        FabricError::Session(SessionError::Connect(format!(
+                            "bootstrap capability mint failed for {}: {e}",
+                            entry.url
+                        )))
+                    })?;
+                    Ok(crate::protocol::InviteRelayV2 {
+                        url: entry.url.clone(),
+                        capability,
+                    })
                 })
-            })
-            .collect::<Result<_, FabricError>>()?;
+                .collect::<Result<_, FabricError>>()?;
         let token = {
             // [R8-1] 与 v1 同一提交锁（签发属运行时名册面操作）
             let _commit = self.inner.roster_commit.lock().await;

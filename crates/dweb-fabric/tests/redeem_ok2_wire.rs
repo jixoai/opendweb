@@ -168,14 +168,15 @@ async fn client_endpoint(redeemer: &NodeIdentity) -> Endpoint {
 }
 
 /// 矩阵格 [v2 joiner × v2 issuer]：OK2(0x15) + 名册 + 附发 capability
-///（recipient 绑 redeemer、默认仅 RELAY、TTL ≤ min(invite 剩余, 90d)）。
+///（recipient 绑 redeemer、默认仅 RELAY、TTL = 90d 上限——长期 member
+/// capability，不随 invite 剩余收缩；invite 过期是兑换防重放窗口）。
 #[tokio::test]
 async fn v2_redeem_returns_ok2_with_member_caps() {
     let root = NodeIdentity::from_seed([0x11; 32]);
     let redeemer = NodeIdentity::from_seed([0x21; 32]);
     let (issuer, roster, _dir) = spawn_issuer(&root, vec![(RELAY_URL.to_owned(), SERVER_ID)]).await;
     let mut r = roster.lock().await;
-    let ttl = 3_600_000u64; // 1h < 90d → TTL = invite 剩余
+    let ttl = 3_600_000u64; // invite 兑换窗口 1h（< cap 的 90d——两者寿命独立）
     let now = now_ms();
     let token = issue_v2(&mut r, &root, &redeemer, ttl);
     drop(r);
@@ -210,7 +211,7 @@ async fn v2_redeem_returns_ok2_with_member_caps() {
     assert_eq!(cap.issuer, root.endpoint_id());
     assert_eq!(cap.server_id, SERVER_ID);
     assert_eq!(cap.caps, dweb_fabric::protocol::MEMBER_CAPS);
-    assert!(cap.expires_at <= now + ttl);
+    assert!(cap.expires_at >= now + dweb_fabric::protocol::MEMBER_CAP_TTL_MS);
     assert_eq!(receipt.skipped.skipped_malformed, 0);
 }
 

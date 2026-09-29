@@ -690,12 +690,7 @@ pub async fn handle_redeem_as_issuer_gated(
                         let minter = v2_minter.filter(|_| token_v2.is_some());
                         let cap_segment = match (minter, &token_v2) {
                             (Some(m), Some(token)) => {
-                                let caps = m.mint_for(
-                                    &redeemer,
-                                    token.invite.expires_at_ms,
-                                    &token.invite.relays,
-                                    now_ms(),
-                                );
+                                let caps = m.mint_for(&redeemer, &token.invite.relays, now_ms());
                                 encode_ok2_cap_segment(&caps)
                             }
                             (None, Some(_)) => encode_ok2_cap_segment(&[]),
@@ -838,7 +833,7 @@ pub fn endpoint_addr_from_invite_v2(token: &InviteV2Token) -> Result<EndpointAdd
         return Err(SessionError::NoAddressingInfo(
             crate::identity::endpoint_id_display(&token.invite.issuer),
         ));
-}
+    }
     Ok(addr)
 }
 
@@ -987,17 +982,21 @@ pub struct RedeemCapMinter<'a> {
 impl RedeemCapMinter<'_> {
     /// 对 invite v2 relay 列表中命中 restricted 配置的每条 relay 签发
     /// member capability：caps = 仅 RELAY（§7.2：member 默认不给 RDZ 位）、
-    /// recipient = redeemer、TTL = min(invite 剩余, 90d)。
+    /// recipient = redeemer、TTL = 90d 上限（spec fabric/session「回执帧版本化」：
+    /// 长期 member capability）。
+    ///
+    /// invite 的 expires_at 是**兑换防重放窗口**，不是成员寿命——cap 在兑换
+    /// 成功（invite 已 CAS 消费）后签发，钳到 invite 剩余会让 member 在
+    /// 兑换窗口（默认 10min）后失去 relay 访问且重启后永久无法重连
+    /// （真双机验收实证 2026-09-29：open 路径注入过期票 → relay 拒连 →
+    /// 拨号停滞零有效出站）。
     pub fn mint_for(
         &self,
         redeemer: &EndpointId,
-        invite_expires_at_ms: u64,
         invite_relays: &[crate::protocol::InviteRelayV2],
         now_ms: u64,
     ) -> Vec<(String, String)> {
-        let expires = now_ms
-            .saturating_add(MEMBER_CAP_TTL_MS)
-            .min(invite_expires_at_ms);
+        let expires = now_ms.saturating_add(MEMBER_CAP_TTL_MS);
         let mut out = Vec::new();
         for (url, server_id) in &self.restricted {
             if !invite_relays.iter().any(|r| r.url == *url) {
@@ -1511,26 +1510,22 @@ mod ok2_tests {
             },
             // r2 不在 invite 内 → 不附发
         ];
-        // invite 剩余 1h（< 90d）→ TTL 取 invite 剩余
-        let caps = minter.mint_for(&member.endpoint_id(), now + 3_600_000, &invite_relays, now);
+        // member capability 是长期票（spec fabric/session：TTL 上限 90d）——
+        // invite 剩余寿命与 cap TTL 无关（invite 过期是兑换防重放窗口；
+        // 钳制会让 member 在兑换窗口后失去 relay 访问，真双机验收实证）
+        let caps = minter.mint_for(&member.endpoint_id(), &invite_relays, now);
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].0, "https://r1.example");
         let parsed = RelayCapV1::decode(&caps[0].1).unwrap();
         assert_eq!(parsed.recipient, member.endpoint_id());
         assert_eq!(parsed.issuer, root.endpoint_id());
         assert_eq!(parsed.caps, crate::protocol::CAP_RELAY, "§7.2 默认仅 RELAY");
-        assert_eq!(parsed.expires_at, now + 3_600_000, "TTL = invite 剩余");
-        // invite 剩余 > 90d → TTL 取 90d 上限
-        let caps2 = minter.mint_for(
-            &member.endpoint_id(),
-            now + 400 * 24 * 3600 * 1000,
-            &invite_relays,
-            now,
+        assert_eq!(
+            parsed.expires_at,
+            now + MEMBER_CAP_TTL_MS,
+            "TTL = 90d 上限（不随 invite 剩余收缩）"
         );
-        let parsed2 = RelayCapV1::decode(&caps2[0].1).unwrap();
-        assert_eq!(parsed2.expires_at, now + MEMBER_CAP_TTL_MS);
-        assert!(parsed2.caps & !crate::protocol::CAP_KNOWN_MASK == 0);
-        let _ = CAP_KNOWN_MASK; // 域内引用（位图常量一致性）
+        assert!(parsed.caps & !CAP_KNOWN_MASK == 0);
     }
 
     // ==== 回环 relay 剔除（真双机验收实证 2026-09-29） ========================
@@ -1584,7 +1579,12 @@ mod ok2_tests {
             })
             .collect();
         assert_eq!(relay_urls, vec!["http://192.168.2.8:3340/".to_owned()]);
-        assert_eq!(addr.addrs.len(), 2, "one relay + one direct: {:?}", addr.addrs);
+        assert_eq!(
+            addr.addrs.len(),
+            2,
+            "one relay + one direct: {:?}",
+            addr.addrs
+        );
     }
 
     #[test]
