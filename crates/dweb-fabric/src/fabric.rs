@@ -917,6 +917,8 @@ fn invite_v2_relay_order<'a>(
 /// 即放弃排干继续收尾（Endpoint 句柄随 FabricInner 释放，进程退出面无资源
 /// 滞留），close 的幂等性保证并发调用安全。
 async fn close_endpoint_bounded(inner: &Arc<FabricInner>) {
+    // 直连拨号专用 endpoint 一并有界收尾（可能持有活跃 direct 会话）
+    Fabric::close_direct_dial_endpoint_bounded(inner).await;
     let Some(endpoint) = inner.endpoint.get() else {
         return;
     };
@@ -1647,6 +1649,15 @@ pub struct FabricInner {
     /// 罚期内拨号候选偏好强制直连（有 IP 候选时），不再发起 relay 相位
     /// 拨号；罚期由 watcher/下一次成功的 relay 观测自然解除。
     pub(crate) relay_dial_penalty_until: std::sync::Mutex<Option<std::time::Instant>>,
+    /// 直连拨号专用 endpoint（A-反向实证 2026-09-30 第二轮）：主 endpoint 上
+    /// 对端 NodeId 的已解析状态（relay 选中路径/尸体连接条目/被 abandon 的
+    /// pending 拨号）会把 QUIC Initial 饿死在死 relay 路径——候选集剥 relay
+    /// 救不了（resolve_remote 把一切候选折叠进 per-remote 映射地址，路径
+    /// 裁决在 iroh RemoteStateActor；tcpdump 实证直连候选存在时 3341 仍零
+    /// 出站）。此 endpoint 同 key、无 relay 传输、随机端口——remote 状态
+    /// 全新，Initial 直发 IP 候选。超时即弃置重建（半开拨号会卡同 NodeId
+    /// 后续拨号，与主 endpoint 同族约束）。
+    pub(crate) direct_dial_endpoint: tokio::sync::Mutex<Option<Endpoint>>,
     /// home relay watcher 任务（Disabled 模式不启动；shutdown 显式 abort + join）。
     relay_watcher_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// detached connect 任务登记（HB 4.1）：join deadline 到期后 connect
@@ -1912,6 +1923,8 @@ enum JoinPhaseError {
     Redeem(session::RedeemError),
     /// 外层 join deadline 到期（joinTimeoutMs <= 5s 时拥有唯一结果）。
     DeadlineElapsed,
+    /// 拨号前置本地错误（endpoint 未启动等，罕见）。
+    Other(String),
 }
 
 /// detached connect 任务 shutdown 等待上限（HB 4.1）：endpoint 关闭后残留
@@ -1939,8 +1952,7 @@ struct DetachedConnects {
 /// 已建立的连接。成功返回 (conn, facts, relay_caps)——由调用方关闭连接
 /// 并 merge（v1 路径 caps 恒空；v2 为 OK2 附发段，task 2.4）。
 async fn join_with_deadline(
-    endpoint: &Endpoint,
-    detached: &std::sync::Mutex<DetachedConnects>,
+    inner: &Arc<FabricInner>,
     addr: &EndpointAddr,
     token: &crate::protocol::InviteVersion,
     secret: &iroh_base::SecretKey,
@@ -1955,6 +1967,31 @@ async fn join_with_deadline(
     JoinPhaseError,
 > {
     let deadline = tokio::time::Instant::now() + timeout;
+    // A-反向同族修复（2026-09-30 第二轮 C 终验实证）：relay 客户端不可用
+    // （连不上/退避）时，主 endpoint 上的 join 拨号停在 relay 相位直至
+    // deadline（现场 [dial-timeout] join deadline exceeded 30000ms）。
+    // 令牌携带直连候选时改在独立 endpoint 上拨 direct-only——全新 remote
+    // 状态，Initial 直发 IP（与 connect_dial/dial_and_adopt 同构）。
+    // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+    let direct_only = Fabric::strip_relay_candidates(addr);
+    let use_scratch = !Fabric::relay_snapshot_online(inner) && !direct_only.addrs.is_empty();
+    let (dial_endpoint, dial_addr) = if use_scratch {
+        match Fabric::ensure_direct_dial_endpoint(inner).await {
+            Ok(ep) => (ep, direct_only),
+            Err(_) => {
+                // 独立 endpoint 不可用（bind 失败/关闭中）：回退主 endpoint 全量
+                let ep = inner
+                    .require_endpoint()
+                    .map_err(|e| JoinPhaseError::Other(format!("{e}")))?;
+                (ep, addr.clone())
+            }
+        }
+    } else {
+        let ep = inner
+            .require_endpoint()
+            .map_err(|e| JoinPhaseError::Other(format!("{e}")))?;
+        (ep, addr.clone())
+    };
     // connect 不被取消（P1-10：取消中的 iroh connect 会留下半开连接卡死该
     // NodeId 的后续拨号）。deadline 语义用 spawn 承载：到期时任务在后台自然
     // 跑完（iroh 内部超时或成功后 drop connection），此处直接归类超时。
@@ -1962,8 +1999,8 @@ async fn join_with_deadline(
     // 端 cancel-safe）；wrapper 句柄登记进 shutdown 可等待集合——JoinHandle
     // 非 Clone，不能既 await 又登记，wrapper 化后句柄专职登记、oneshot 专职
     // 传值。deadline 到期时接收端 drop，wrapper 的 send 落空无害。
-    let ep = endpoint.clone();
-    let addr = addr.clone();
+    let ep = dial_endpoint;
+    let addr = dial_addr;
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let connect_task = tokio::spawn(async move {
         let conn = ep.connect(addr, ALPN_REDEEM).await;
@@ -1977,7 +2014,7 @@ async fn join_with_deadline(
     // 到达的句柄不再进表——本地 abort + await 收割后按超时归类返回，
     // 保证 shutdown() 返回后登记表恒空。锁守卫严格限定在同步块内（不跨 await）。
     let arrived_after_shutdown = {
-        let mut reg = detached.lock().unwrap();
+        let mut reg = inner.detached_connects.lock().unwrap();
         if reg.shutting_down {
             true
         } else {
@@ -1995,7 +2032,14 @@ async fn join_with_deadline(
     }
     let conn = match tokio::time::timeout_at(deadline, result_rx).await {
         // 外层 deadline 到期（connect 阶段）：任务继续后台运行至自然结束
-        Err(_) => return Err(JoinPhaseError::DeadlineElapsed),
+        Err(_) => {
+            // 独立 endpoint 上的放弃拨号会卡该 NodeId 的后续拨号（与主
+            // endpoint 同族约束）：弃置重建（有界关闭）
+            if use_scratch {
+                Fabric::evict_direct_dial_endpoint(inner).await;
+            }
+            return Err(JoinPhaseError::DeadlineElapsed);
+        }
         // wrapper 被中断（shutdown abort / runtime 关闭等罕见情形）——按超时归类
         Ok(Err(_recv)) => return Err(JoinPhaseError::DeadlineElapsed),
         Ok(Ok(Err(e))) => return Err(JoinPhaseError::Connect(e)),
@@ -2656,6 +2700,7 @@ impl Fabric {
             peer_epoch: std::sync::atomic::AtomicU64::new(0),
             relay_snapshot,
             relay_dial_penalty_until: std::sync::Mutex::new(None),
+            direct_dial_endpoint: tokio::sync::Mutex::new(None),
             relay_watcher_task: std::sync::Mutex::new(None),
             detached_connects: std::sync::Mutex::new(DetachedConnects::default()),
             // shutdown 完成门（R3 P1-1）：started 与 done 配对——首次调用执行
@@ -3226,10 +3271,8 @@ impl Fabric {
         // 7：deadline 包住 connect + redeem（到期取消等待并关闭已建立的连接）。
         // token 克隆进 deadline 工作流（错误归因探针仍需原令牌字段）
         // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
-        let endpoint = self.inner.require_endpoint()?;
         let join_err = join_with_deadline(
-            &endpoint,
-            &self.inner.detached_connects,
+            &self.inner,
             &addr,
             &crate::protocol::InviteVersion::V1(token.clone()),
             self.inner.identity.secret_key(),
@@ -3277,6 +3320,10 @@ impl Fabric {
                 })
             }
             Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
+            Err(JoinPhaseError::Other(msg)) => Err(FabricError::Join {
+                code: JoinErrorCode::DialFailed,
+                message: format!("could not start the join dial: {msg}"),
+            }),
             Err(JoinPhaseError::DeadlineElapsed) => {
                 let note = match &self.relay_deny_note() {
                     // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
@@ -3377,10 +3424,8 @@ impl Fabric {
         // 7：deadline 包住 connect + redeem（token 克隆进工作流；后续错误
         // 归因仍需原令牌的 relay 列表）
         // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
-        let endpoint = self.inner.require_endpoint()?;
         let join_err = join_with_deadline(
-            &endpoint,
-            &self.inner.detached_connects,
+            &self.inner,
             &addr,
             &crate::protocol::InviteVersion::V2(token.clone()),
             self.inner.identity.secret_key(),
@@ -3441,6 +3486,10 @@ impl Fabric {
                 })
             }
             Err(JoinPhaseError::Redeem(e)) => Err(map_redeem_error(&e)),
+            Err(JoinPhaseError::Other(msg)) => Err(FabricError::Join {
+                code: JoinErrorCode::DialFailed,
+                message: format!("could not start the join dial: {msg}"),
+            }),
             Err(JoinPhaseError::DeadlineElapsed) => {
                 let note = match &self.relay_deny_note() {
                     // task 2.5：deny 已记录时 deadline 归因让位（iroh 对 deny
@@ -3619,9 +3668,12 @@ impl Fabric {
         // 直连-only 回落候选（真双机验收实证 2026-09-30）：iroh 的拨号停在
         // relay 相位不回落 direct（relay 客户端退避/失效时整段 dial 挂起至
         // 自身超时，与回环 relay 停滞同族）。存在 IP 候选时：
-        // - relay 快照已知离线 → 首选直连（不起注定挂起的 relay 相位拨号；
-        //   被 abandoning 的半开拨号还会卡该 NodeId 的后续拨号）；
-        // - 全量候选失败 → 第二次尝试剥掉 relay 只拨直连。
+        // - relay 实测不可用（罚期/快照离线/实时客户端未连接）→ 首选**独立
+        //   endpoint 直连**（A-反向实证 2026-09-30 第二轮：主 endpoint 上
+        //   该 NodeId 的 relay 选中路径/尸体连接/abandoned pending 拨号会把
+        //   直连候选也饿死——直连必须换全新 endpoint 拨）；
+        // - 全量候选失败/停滞 → 回落独立 endpoint 直连（relay 可能已恢复时
+        //   反向亦然）。
         let direct_only = Self::strip_relay_candidates(&addr);
         let relay_known_down = !Self::relay_snapshot_online(&self.inner);
         let prefer_direct = relay_known_down && !direct_only.addrs.is_empty();
@@ -3650,51 +3702,141 @@ impl Fabric {
         // 超时即放弃该次拨号换候选重试；被放弃的半开拨号由 iroh 自身超时
         // 回收，饥饿代价低于无界挂起。
         const CONNECT_DIAL_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
-        for attempt in 0..2 {
-            // 候选选择：attempt 0 按快照偏好（relay 离线且有直连 → 直连优先）；
-            // attempt 1 交替候选集（direct 优先时换全量——relay 可能已恢复；
-            // 否则剥 relay 只拨直连——relay 相位饿死回落）。无直连候选恒用全量。
-            let dial_addr = if direct_only.addrs.is_empty() || (attempt == 0 && !prefer_direct) {
-                addr.clone()
-            } else {
-                direct_only.clone()
-            };
-            // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
-            let endpoint = self.inner.require_endpoint()?;
-            let outcome = tokio::time::timeout(
-                CONNECT_DIAL_BOUND,
-                endpoint.connect(dial_addr, ALPN_REGULAR),
-            )
-            .await;
-            // 真双机验收实证（2026-09-30）：attempt 0 的 connect 错误/超时（iroh
-            // 停在 relay 相位直至自身超时——relay 客户端退避时零出站）不得直接
-            // 上抛：有直连候选时落入 attempt 1 剥 relay 重拨（此前 `?` 提前返回
-            // 让回落路径永不执行，重拨饿死）。NotStarted 等本地错误即时上抛。
-            let conn = match outcome {
-                Ok(Ok(c)) => c,
-                Ok(Err(e)) => {
-                    if attempt == 0 && !direct_only.addrs.is_empty() {
-                        tracing::debug!(
-                            peer = %endpoint_id_display(id),
-                            error = %e,
-                            "full-candidate dial failed; retrying with direct-only candidates"
-                        );
-                        tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
-                        continue;
+        // 两步拨号计划（A-反向修复）：relay 实测不可用且有直连候选时，第一
+        // 步优先直连、第二步回主 endpoint 全量（relay 可能已恢复）；反之
+        // 第一步主 endpoint 全量、第二步直连回落。直连步骤的载体按 relay
+        // 配置分流：**配置了 relay 的 fabric 用独立 endpoint**（主 endpoint 上
+        // 该 NodeId 的 relay 选中路径/尸体连接/abandoned pending 拨号会把
+        // 直连候选也饿死——A-反向实证）；**Disabled fabric 用主 endpoint
+        // direct-only**（无 relay 状态可逃，独立 endpoint 反而制造双连接
+        // displacement 抖动——continuity_session 幂等用例实证）。
+        #[derive(Clone, Copy)]
+        enum DialStep {
+            ScratchDirect,
+            MainDirect,
+            MainFull,
+        }
+        let relay_disabled = matches!(self.inner.relay, RelayConfig::Disabled);
+        let direct_step = if relay_disabled {
+            DialStep::MainDirect
+        } else {
+            DialStep::ScratchDirect
+        };
+        let steps: [DialStep; 2] = if direct_only.addrs.is_empty() {
+            [DialStep::MainFull, DialStep::MainFull]
+        } else if prefer_direct {
+            [direct_step, DialStep::MainFull]
+        } else {
+            [DialStep::MainFull, direct_step]
+        };
+        for (attempt, step) in steps.into_iter().enumerate() {
+            // shutdown 感知（g3 实证：拨号链变长后 owner 须在 lifecycle 关闭
+            // 后即时退出，不因罚期/退避/独立 endpoint 拖过 drain 窗口）
+            if self.inner.lifecycle_closing() {
+                return Err(FabricInner::shutting_down_error());
+            }
+            let conn = match step {
+                DialStep::MainFull => {
+                    // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+                    let endpoint = self.inner.require_endpoint()?;
+                    match tokio::time::timeout(
+                        CONNECT_DIAL_BOUND,
+                        endpoint.connect(addr.clone(), ALPN_REGULAR),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            // 真双机验收实证（2026-09-30）：attempt 0 的 connect
+                            // 错误不得直接上抛：有直连候选时回落下一步直连
+                            // （此前 `?` 提前返回让回落路径永不执行，重拨饿死）。
+                            // NotStarted 等本地错误即时上抛。
+                            if attempt == 0 && !direct_only.addrs.is_empty() {
+                                tracing::debug!(
+                                    peer = %endpoint_id_display(id),
+                                    error = %e,
+                                    "full-candidate dial failed; retrying with direct-only candidates"
+                                );
+                                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                        Err(_) => {
+                            // 主 endpoint 超时放弃（relay 相位挂起）：进入罚期。
+                            // relay 配置面：**不就此返回**——下一步独立 endpoint
+                            // 直连不受主 endpoint 上被 abandon 的 pending 拨号
+                            // 卡死（A-反向修复点：redial 在主 endpoint 上无限
+                            // 重演 relay-first 停滞 = 150s 全 500 活锁）。
+                            // Disabled 面：维持「停滞即返回」旧语义（主 endpoint
+                            // 二次拨号同停的实证约束）。
+                            Self::enter_relay_dial_penalty(&self.inner).await;
+                            if attempt == 1 || relay_disabled || direct_only.addrs.is_empty() {
+                                return Err(FabricError::Session(SessionError::Connect(format!(
+                                    "connect dial exceeded {}s bound (relay path stalled)",
+                                    CONNECT_DIAL_BOUND.as_secs()
+                                ))));
+                            }
+                            continue;
+                        }
                     }
-                    return Err(e.into());
                 }
-                Err(_) => {
-                    // 超时放弃（relay 相位挂起）：进入罚期并**不再立即二拨**——
-                    // 被 abandon 的 pending 拨号会卡住同 NodeId 的紧随拨号
-                    // （真双机实证：8s 放弃 + 8s 二次拨号双停 = 每请求 18.5s
-                    // 连败）。罚期收口动作含摘除死 relay 条目（强制后续拨号
-                    // 重建 IP 路径）+ 定时重注入。
-                    Self::enter_relay_dial_penalty(&self.inner).await;
-                    return Err(FabricError::Session(SessionError::Connect(format!(
-                        "connect dial exceeded {}s bound (relay path stalled)",
-                        CONNECT_DIAL_BOUND.as_secs()
-                    ))));
+                DialStep::MainDirect => {
+                    // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
+                    let endpoint = self.inner.require_endpoint()?;
+                    match tokio::time::timeout(
+                        CONNECT_DIAL_BOUND,
+                        endpoint.connect(direct_only.clone(), ALPN_REGULAR),
+                    )
+                    .await
+                    {
+                        Ok(Ok(c)) => c,
+                        Ok(Err(e)) => {
+                            if attempt == 0 {
+                                tracing::debug!(
+                                    peer = %endpoint_id_display(id),
+                                    error = %e,
+                                    "direct-only dial failed; retrying with full candidates"
+                                );
+                                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                                continue;
+                            }
+                            return Err(e.into());
+                        }
+                        Err(_) => {
+                            Self::enter_relay_dial_penalty(&self.inner).await;
+                            return Err(FabricError::Session(SessionError::Connect(format!(
+                                "connect dial exceeded {}s bound (direct candidates stalled)",
+                                CONNECT_DIAL_BOUND.as_secs()
+                            ))));
+                        }
+                    }
+                }
+                DialStep::ScratchDirect => {
+                    match Self::direct_dial(
+                        &self.inner,
+                        &direct_only,
+                        ALPN_REGULAR,
+                        CONNECT_DIAL_BOUND,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            // 独立 endpoint 直连失败（超时已弃置该 endpoint）：
+                            // 若还有下一步则回主 endpoint 全量重试
+                            if attempt == 0 {
+                                tracing::debug!(
+                                    peer = %endpoint_id_display(id),
+                                    error = %e,
+                                    "direct dial on fresh endpoint failed; retrying with full candidates"
+                                );
+                                tokio::time::sleep(CONNECT_RETRY_BACKOFF).await;
+                                continue;
+                            }
+                            return Err(FabricError::Session(SessionError::Connect(e)));
+                        }
+                    }
                 }
             };
             match tokio::time::timeout(CONNECT_HELLO_TIMEOUT, self.register_dialed(conn.clone()))
@@ -3745,9 +3887,14 @@ impl Fabric {
         direct
     }
 
-    /// relay 快照是否已知离线（Disabled 模式恒 true；快照未沉降视作在线——
-    /// 拨号候选偏好用的保守信号，不是权威状态）。relay 相位拨号罚期内同样
-    /// 视作离线（全量候选被硬上界放弃后的观察期）。
+    /// relay 是否可作为拨号相位（拨号候选偏好信号，非权威状态）。三重判定：
+    /// - Disabled 模式恒不可；
+    /// - relay 相位拨号罚期内不可（全量候选被硬上界放弃后的观察期）；
+    /// - **实时 relay 客户端传输态**（A-反向实证 2026-09-30 第二轮）：快照是
+    ///   周期聚合观测，客户端 TCP 已死（退避重连不成）的窗口内快照可能仍
+    ///   Some(true)——拨号偏好必须看 home_relay_status 的当前值，任一 relay
+    ///   is_connected 才算可走；否则 relay 相位拨号注定挂起（Initial 被
+    ///   路由进死 relay 路径，直连候选轮不到）。
     pub(crate) fn relay_snapshot_online(inner: &Arc<FabricInner>) -> bool {
         if matches!(inner.relay, RelayConfig::Disabled) {
             return false;
@@ -3760,8 +3907,111 @@ impl Fabric {
         {
             return false;
         }
+        if let Some(endpoint) = inner.endpoint.get() {
+            let live = endpoint
+                .home_relay_status()
+                .get()
+                .iter()
+                .any(|s| s.is_connected());
+            if !live {
+                return false;
+            }
+        }
         let snap = inner.relay_snapshot.lock().unwrap();
         !matches!(snap.online, Some(false))
+    }
+
+    /// 直连拨号专用 endpoint：惰性创建、复用直至超时弃置或 shutdown。
+    /// 同 secret key（对端按 NodeId 鉴权/名册互认）、RelayMode::Disabled
+    /// （无 relay 传输——不注册 relay，不存在同 NodeId 降位互搏）、随机
+    /// 端口、与主 endpoint 相同 ALPN 集。
+    async fn ensure_direct_dial_endpoint(
+        inner: &Arc<FabricInner>,
+    ) -> Result<Endpoint, FabricError> {
+        // shutdown 门：关闭后不再创建（新 endpoint 无失败源，会拖过 drain 窗口）
+        if inner.lifecycle_closing() {
+            return Err(FabricInner::shutting_down_error());
+        }
+        let mut slot = inner.direct_dial_endpoint.lock().await;
+        if let Some(ep) = slot.as_ref()
+            && !ep.is_closed()
+        {
+            return Ok(ep.clone());
+        }
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .secret_key(inner.identity.secret_key().clone())
+            .alpns(vec![
+                ALPN_REGULAR.to_vec(),
+                ALPN_REDEEM.to_vec(),
+                crate::continuity::ALPN_CONTINUITY.to_vec(),
+            ])
+            .bind()
+            .await
+            .map_err(|e| {
+                FabricError::Session(SessionError::Connect(format!(
+                    "direct-dial endpoint bind: {e}"
+                )))
+            })?;
+        *slot = Some(endpoint.clone());
+        // 独立 endpoint 同样受理来连（一等 mesh 成员）：对端会从采纳连接
+        // 学习到本 endpoint 的（临时）端口并回拨——无 accept 循环则回拨成
+        // 死端（continuity_session 幂等用例 + 反向用例 displacement 抖动
+        // 实证）。accept 循环随 endpoint 关闭/弃置自然退出，随 lifecycle
+        // 关闭退出。
+        tokio::spawn(spawn_accept_loop(inner, endpoint.clone()));
+        Ok(endpoint)
+    }
+
+    /// 弃置直连拨号专用 endpoint（有界关闭；半开拨号会卡该 NodeId 的后续
+    /// 拨号——主 endpoint / 独立 endpoint / join 拨号的统一收口）。
+    pub(crate) async fn evict_direct_dial_endpoint(inner: &Arc<FabricInner>) {
+        let abandoned = inner.direct_dial_endpoint.lock().await.take();
+        if let Some(ep) = abandoned {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ep.close()).await;
+        }
+    }
+
+    /// 在直连专用 endpoint 上拨 direct-only 候选（A-反向核心修复）。
+    /// 全新 endpoint 的 remote 状态为空——Initial 直发 IP 候选，不被主
+    /// endpoint 上滞留的 relay 选中路径/尸体连接/abandoned pending 拨号
+    /// 卡死。**超时即弃置该 endpoint**（半开拨号会卡同 NodeId 的后续拨号
+    /// ——与主 endpoint 同族约束；弃置后下次重拨重建全新状态）。
+    pub(crate) async fn direct_dial(
+        inner: &Arc<FabricInner>,
+        direct: &EndpointAddr,
+        alpn: &[u8],
+        bound: std::time::Duration,
+    ) -> Result<iroh::endpoint::Connection, String> {
+        let endpoint = match Self::ensure_direct_dial_endpoint(inner).await {
+            Ok(ep) => ep,
+            Err(e) => return Err(format!("{e}")),
+        };
+        match tokio::time::timeout(bound, endpoint.connect(direct.clone(), alpn)).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(format!("{e}")),
+            Err(_) => {
+                Self::evict_direct_dial_endpoint(inner).await;
+                Err(format!(
+                    "direct dial exceeded {}s bound (fresh endpoint)",
+                    bound.as_secs()
+                ))
+            }
+        }
+    }
+
+    /// 直连拨号专用 endpoint 的有界收尾（随主 endpoint 关闭路径调用）。
+    pub(crate) async fn close_direct_dial_endpoint_bounded(inner: &Arc<FabricInner>) {
+        let endpoint = inner.direct_dial_endpoint.lock().await.take();
+        if let Some(ep) = endpoint {
+            const CLOSE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+            if tokio::time::timeout(CLOSE_BOUND, ep.close()).await.is_err() {
+                tracing::warn!(
+                    timeout_secs = CLOSE_BOUND.as_secs(),
+                    "direct-dial endpoint close did not finish; continuing"
+                );
+            }
+        }
     }
 
     /// 进入 relay 相位拨号罚期（真双机验收实证 2026-09-30 的收口动作）。

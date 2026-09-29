@@ -149,98 +149,146 @@ async fn dial_and_adopt(
     let endpoint = inner.require_endpoint()?;
     // 直连-only 回落候选：iroh 拨号停在 relay 相位不回落 direct（真双机验收
     // 实证 2026-09-30——relay 客户端退避期间全量候选拨号挂起至自身超时，
-    // 与回环 relay 停滞同族）。relay 快照已知离线且有 IP 候选时首选直连
-    // （不起注定挂起的 relay 相位拨号——abandon 的半开拨号还会卡该 NodeId
-    // 的后续拨号）；首选候选失败时换另一组候选再拨一次。
+    // 与回环 relay 停滞同族）。relay 实测不可用（罚期/快照离线/实时客户端
+    // 未连接）且有 IP 候选时，**首选独立 endpoint 直连**（A-反向实证
+    // 2026-09-30 第二轮：主 endpoint 上该 NodeId 的 relay 选中路径/尸体
+    // 连接/abandoned pending 拨号会把直连候选也饿死——直连必须换全新
+    // endpoint 拨）；失败再换另一组候选（反向亦然）。
     let direct_only = Fabric::strip_relay_candidates(&addr);
     let prefer_direct = !Fabric::relay_snapshot_online(inner) && !direct_only.addrs.is_empty();
-    let (first_addr, second_addr) = if prefer_direct {
-        (direct_only.clone(), addr.clone())
-    } else {
-        (addr.clone(), direct_only.clone())
-    };
     // 拨号硬上界（真双机验收实证 2026-09-30）：iroh 停在 relay 相位的
     // connect 不自报错误——relay 客户端退避期间可挂起 ~60s。
     const DIAL_BOUND: std::time::Duration = std::time::Duration::from_secs(8);
-    // 超时放弃（relay 相位挂起）标记：进入罚期并**不立即二拨**——被 abandon
-    // 的 pending 拨号会卡住同 NodeId 的紧随拨号（真双机实证 8s+8s 双停）；
-    // 重试交给 supervisor 退避（≥1s 间隔，届时强制直连偏好）。
-    let relay_phase_stalled = std::sync::atomic::AtomicBool::new(false);
-    let first: Result<iroh::endpoint::Connection, String> = match tokio::time::timeout(
-        DIAL_BOUND,
-        endpoint.connect(first_addr.clone(), super::ALPN_CONTINUITY),
-    )
-    .await
-    {
-        Ok(Ok(c)) => Ok(c),
-        Ok(Err(e)) => Err(format!("{e}")),
-        Err(_) => {
-            relay_phase_stalled.store(true, std::sync::atomic::Ordering::SeqCst);
-            Err(format!(
-                "dial exceeded {}s bound (relay path stalled)",
-                DIAL_BOUND.as_secs()
-            ))
-        }
-    };
-    if relay_phase_stalled.load(std::sync::atomic::Ordering::SeqCst) {
-        Fabric::enter_relay_dial_penalty(inner).await;
-        let reason = first.expect_err("stalled marker implies Err");
-        state
-            .set_phase(
-                remote,
-                ConnectionPhase::Disconnected,
-                Some(reason.clone()),
-                false,
-            )
-            .await;
-        return Err(FabricError::Session(SessionError::Connect(reason)));
+    // 两步拨号（与 facade connect_dial 同构）：
+    // - prefer_direct：[直连, 主 endpoint 全量]
+    // - 否则：[主 endpoint 全量, 直连回落]（无直连候选时两步全量）
+    // 直连步骤载体按 relay 配置分流：配置了 relay 的 fabric 用**独立
+    // endpoint**（主 endpoint 上该 NodeId 的 relay 选中路径/尸体连接/
+    // abandoned pending 拨号会把直连候选也饿死——A-反向实证）；Disabled
+    // fabric 用主 endpoint direct-only（无 relay 状态可逃，独立 endpoint
+    // 反而制造双连接 displacement 抖动）。主 endpoint 停滞（超时）→ relay
+    // 配置面进罚期后仍走独立 endpoint 第二步（不受主 endpoint pending-dial
+    // 卡死——A-反向活锁修复点）；Disabled 面维持停滞即返旧语义。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DialStep {
+        ScratchDirect,
+        MainDirect,
+        MainFull,
     }
-    let conn = match first {
-        Ok(c) => c,
-        Err(first) => {
-            if second_addr.addrs.is_empty() || second_addr == first_addr {
-                state
-                    .set_phase(
-                        remote,
-                        ConnectionPhase::Disconnected,
-                        Some(first.clone()),
-                        false,
-                    )
-                    .await;
-                return Err(FabricError::Session(SessionError::Connect(first)));
-            }
-            let second: Result<iroh::endpoint::Connection, String> = match tokio::time::timeout(
+    let relay_disabled = matches!(inner.relay, crate::fabric::RelayConfig::Disabled);
+    let direct_step = if relay_disabled {
+        DialStep::MainDirect
+    } else {
+        DialStep::ScratchDirect
+    };
+    let steps: [DialStep; 2] = if direct_only.addrs.is_empty() {
+        [DialStep::MainFull, DialStep::MainFull]
+    } else if prefer_direct {
+        [direct_step, DialStep::MainFull]
+    } else {
+        [DialStep::MainFull, direct_step]
+    };
+    let mut last_err: Option<String> = None;
+    let mut conn: Option<iroh::endpoint::Connection> = None;
+    for (i, step) in steps.iter().enumerate() {
+        // shutdown 感知（g3 实证：拨号链变长后须在 lifecycle 关闭后即时退出）
+        if inner.lifecycle_closing() {
+            state
+                .set_phase(
+                    remote,
+                    ConnectionPhase::Disconnected,
+                    Some("fabric is shutting down".into()),
+                    false,
+                )
+                .await;
+            return Err(FabricError::Session(SessionError::Connect(
+                "fabric is shutting down".into(),
+            )));
+        }
+        let res: Result<iroh::endpoint::Connection, String> = match step {
+            DialStep::MainFull => match tokio::time::timeout(
                 DIAL_BOUND,
-                endpoint.connect(second_addr, super::ALPN_CONTINUITY),
+                endpoint.connect(addr.clone(), super::ALPN_CONTINUITY),
             )
             .await
             {
                 Ok(Ok(c)) => Ok(c),
                 Ok(Err(e)) => Err(format!("{e}")),
-                Err(_) => Err("fallback dial exceeded bound".to_owned()),
-            };
-            match second {
-                Ok(c) => {
+                Err(_) => {
+                    // 主 endpoint 超时放弃（relay 相位挂起）：进罚期
+                    Fabric::enter_relay_dial_penalty(inner).await;
+                    if relay_disabled || direct_only.addrs.is_empty() {
+                        Err(format!(
+                            "dial exceeded {}s bound (relay path stalled)",
+                            DIAL_BOUND.as_secs()
+                        ))
+                    } else {
+                        Err(format!(
+                            "dial exceeded {}s bound (relay path stalled); falling back to fresh-endpoint direct",
+                            DIAL_BOUND.as_secs()
+                        ))
+                    }
+                }
+            },
+            DialStep::MainDirect => match tokio::time::timeout(
+                DIAL_BOUND,
+                endpoint.connect(direct_only.clone(), super::ALPN_CONTINUITY),
+            )
+            .await
+            {
+                Ok(Ok(c)) => Ok(c),
+                Ok(Err(e)) => Err(format!("{e}")),
+                Err(_) => {
+                    Fabric::enter_relay_dial_penalty(inner).await;
+                    Err(format!(
+                        "dial exceeded {}s bound (direct candidates stalled)",
+                        DIAL_BOUND.as_secs()
+                    ))
+                }
+            },
+            DialStep::ScratchDirect => {
+                Fabric::direct_dial(inner, &direct_only, super::ALPN_CONTINUITY, DIAL_BOUND).await
+            }
+        };
+        match res {
+            Ok(c) => {
+                if i > 0
+                    && let Some(first) = last_err.take()
+                {
                     tracing::debug!(
                         peer = %endpoint_id_display(remote),
                         first = %first,
                         "continuity dial fell back to alternate candidates"
                     );
-                    c
                 }
-                Err(second) => {
-                    let msg = format!("{first}; fallback: {second}");
-                    state
-                        .set_phase(
-                            remote,
-                            ConnectionPhase::Disconnected,
-                            Some(msg.clone()),
-                            false,
-                        )
-                        .await;
-                    return Err(FabricError::Session(SessionError::Connect(msg)));
-                }
+                conn = Some(c);
+                break;
             }
+            Err(e) => {
+                // 中间步骤失败：若与下一步同型（无直连候选的两步全量）则不再
+                // 重试同型拨号
+                let next = steps.get(i + 1);
+                if next.is_none() || next == Some(step) {
+                    last_err = Some(e);
+                    break;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            let reason = last_err.unwrap_or_else(|| "dial produced no result".to_owned());
+            state
+                .set_phase(
+                    remote,
+                    ConnectionPhase::Disconnected,
+                    Some(reason.clone()),
+                    false,
+                )
+                .await;
+            return Err(FabricError::Session(SessionError::Connect(reason)));
         }
     };
     // Handshaking 仅在无活跃连接时宣告（对端来连可能已把本端采纳为 Ready——
