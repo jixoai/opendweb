@@ -11,12 +11,12 @@ files 插件 SHALL 在提供侧（A 机）维护共享账本 `<DWEB_HOME>/plugin
 - **WHEN** iMac 共享目录（ro）授权 mini，mini 在 webui 浏览该目录、下载一个文件、随后 root 改 rw 后上传一个大文件（分片）
 - **THEN** 浏览与下载内容一致（Range 续读可用）；上传在 commit 校验（总长+hash）通过后以单次原子 rename 落盘，中途可见的只有进度而非半文件
 
-#### Scenario: 路径逃逸与 symlink 防护
+#### Scenario: 路径逃逸与 symlink 防护（含父目录组件竞态，r2-B2）
 
-- **WHEN** 请求 path 含 `..` 越界、绝对路径注入、或指向 root 内 symlink 的路径（symlink 指向 root 外）
-- **THEN** 全部拒绝（明确错误），零字节越界读/写；symlink 不被跟随
+- **WHEN** 请求 path 含 `..` 越界、绝对路径注入、或指向 root 内 symlink 的路径；**且攻击者循环地把共享根内的中间目录替换为指向 root 外的 symlink，同时并发发起读写请求**
+- **THEN** 全部拒绝（明确错误），零字节越界读/写；symlink 不被跟随（fd 链逐组件遍历：每级目录组件拒绝 symlink，最终操作只作用于已验证 fd）——并发竞态下 root 外零读写副作用（以 root 外文件系统监测断言）
 
-#### Scenario: 断线中断与 staging 回收
+#### Scenario: 断线中断与幂等续传（r2-B7 冻结）
 
-- **WHEN** 分片上传中途会话断开且未再恢复，staging 目录留存
-- **THEN** TTL 到期后被回收；正式目录中无对应半文件；同 uploadId 重试可幂等续传或整体重来（语义明确二选一并冻结）
+- **WHEN** 分片上传中途会话断开后以同 uploadId 重试（重复 PUT 同 seq/offset/hash 分片），或彻底放弃（不再重试）
+- **THEN** 重复分片幂等（不重复落盘不报错）；重试续传并在 commit 全片校验（总长+hash）后单次原子 rename；放弃的 uploadId staging 由 TTL 回收；正式目录永无半文件

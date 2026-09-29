@@ -1,4 +1,4 @@
-# webui-plugin-kernel 技术设计 v1
+# webui-plugin-kernel 技术设计 v2（吸收 r2 设计评审 B1-B7）
 
 <!--
 意图（2026-09-24）：把 Owner 思维原型（[W0]-[W6]）与构型讨论 r1（docs/webui-plugin-kernel-discussion-r1.md，
@@ -18,7 +18,7 @@ Codex 共同架构师轮全裁定）收敛为可冻结设计。[W7]-[W11] 为讨
 | [W5] | webui 薄核（服务启动/设备发现/认证/互联/管理）+ 插件系统 | Owner 原话 |
 | [W6] | 首发=三件套；vpn/clash/AI/ssh/屏幕共享「即将推出」占位 | Owner 原话 |
 | [W7] | 端口共享 v1 请求体有界（默认 8MiB 可配）+ 超限 413；流式请求体 ABI 扩展为后续 change（不动 app-protocol-layer 边界） | 推荐，待追认 |
-| [W8] | 同步组=多成员数据模型（每设备一 ref：refs/devices/<endpointId>/main）；v1 验收双机；组模型不加 schema 迁移可扩 N 端 | 推荐（W4「多台」导出），待追认 |
+| [W8] | 同步组账本/ref 命名自 v1 记录 N 成员（每设备一 ref）；**v1 同步执行与收敛只保证双机**（pairwise），第三成员加入/多端 fan-in 收敛为后续 change 显式义务（r2-B4 收窄） | 推荐（W4「多台」导出），待追认 |
 | [W9] | 首次建组：UI 显式选择一端为初始权威（seed authority），不做首次自动合并 | 推荐，待追认 |
 | [W10] | 插件包安装仅 CLI（opendweb plugin add 家族）；webui 面板只管启停/配置，不触发 npm 安装 | 推荐，待追认 |
 | [W11] | 既有 --token/DWEB_ADMIN_TOKEN 入口=先前冻结的受控例外（OS 可见性披露在案）；本 change 全部新面零 argv 凭证，不扩大例外 | 推荐，待追认 |
@@ -59,18 +59,35 @@ sidecar 控制面 /sidecar/*（Host 守卫 + 写路由精确 Origin——既有�
   `./opendweb-webui-plugin`；旧 `./opendweb-plugin` 契约零变化 [P6]）：
   `{ id, webuiApi: 1, pages: [{id,title,nav,icon,type,component?}], routes?: [...],
      dataEndpoints?: [...], configSchema }`——字段集在本 change spec delta 冻结。
-- 内置三插件=workspace 包静态发现（编译期注册表）；外部 npm 插件 v1 不加载运行时
-  （面板可列出 marketplace 候选+「安装需 CLI」引导 [W10]）。
+- 内置三插件=workspace 包静态发现（编译期注册表）；**外部 npm 插件 v1 不加载
+  运行时（r2-B6 收口）**：v1 面板只管理编译内置的 ports/files/sync 三插件的
+  启停/配置；marketplace 的 CLI 插件候选**不**在 webui 面板呈现为「可安装/
+  可启用的 WebUI 插件」（CLI 插件清单是独立入口）；「即将推出」占位（vpn/
+  clash/ai/ssh/screen）与「外部 WebUI 插件=后续版本」并列标注。CLI `opendweb
+  plugin add` 安装的是 `./opendweb-plugin` 命令插件，**不产生**可被 webui 启用的
+  插件——两契约分版本并存，安装语义互不冒充。
+- **UI 路由接入协议（r2-B5 冻结）**：
+  - 静态 route registry（编译期生成）：`{routeId: "#/p/<pluginId>/<pageId>",
+     component, nav 区, 视角可见性（admin|member|both）, title}`；routeId 全局
+    唯一（前缀 `#/p/` 与既有路由空间隔离，routeFor 扩展消费该表）；
+  - App.svelte 分派扩展：`#/p/*` → 查 registry → 命中且插件 enabled → 渲染
+    组件；命中但 disabled/未知 → **按既有基线收敛语义**（未知 hash 收敛
+    #/overview）处理；
+  - 导航：SideNav 新增「工具」区（三视角通用；按视角可见性过滤行）；
+  - 深链刷新=注册表重放（页面可达）；停用后深链=基线收敛（不残留死页）；
+  - 既有路由（#/overview|#/lease|#/visits|#/tenants|#/visitors|#/online）
+    行为零变化（零回归门覆盖）。
 - **信任模型=可信插件**：用户显式安装的包在宿主 Node 权限内执行，v1 不宣称沙箱
   （manifest safeParse 不是沙箱——既有事实）。文档明示。
 
 ### 2.2 生命周期与停用语义（r1 遗漏维度 6 的闭合）
 
-状态机：`registered → enabled ⇄ disabled`（包卸载经 CLI；宿主只管启停）。
-停用顺序：**先拒新请求**（路由/页/数据端点摘牌）→ 在途流 drain（有界超时）→
+状态机：`registered → enabled ⇇ disabled`（包卸载经 CLI；宿主只管启停）。
+停用顺序：**先拒新请求**（路由/页/数据端点摘牌）→ 在途流 drain（有界超时，
+默认 10s 可配，超时后强制取消并给稳定错误响应）→
 dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable 逆序装配。
-崩溃恢复：状态文件原子写（0600+tmpfs rename，沿用既有纪律）；重启按落盘状态重建，
-半写状态由既有原子写纪律排除。
+崩溃恢复：状态文件原子写（0600+**同一持久文件系统内**临时文件+rename，沿用既有
+纪律）；重启按落盘状态重建，半写状态由既有原子写纪律排除。
 
 ### 2.3 双账本（P6）
 
@@ -95,13 +112,22 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   按 (peer endpointId, plugin, share/port, operation) **deny-by-default** 判定；
   授权数据落各插件的共享/映射账本（§5/§6），会话密码学身份=第一道门。
 
-## 4. SDK 传输事实与使用边界（r1 地基事实 1-3 的冻结陈述）
+## 4. SDK 传输事实与使用边界（r1 地基事实 1-3 + r2-B1 修订）
 
 - 请求体=静态分块（Array<Uint8Array>）——**v1 一切上行按 [W7] 有界**：
-  ports 代理 8MiB 默认（可配）；files 分片上传 chunk 默认 4MiB；sync 对象单传
-  默认 16MiB（超限对象 v1 拒绝并提示，pack 化后置）。
-- 响应体=pull-first AsyncIterable（流式 ✓）+ 双向取消（provider AbortSignal /
-  消费端 signal）——SSE 走 respondStreaming。
+  ports 代理 8MiB 默认（可配范围 1MiB–64MiB 硬上限，超范围配置拒绝）；files 分片
+  chunk 默认 4MiB；sync 对象单传默认 16MiB（超限对象 v1 拒绝并提示，pack 化后置）。
+  未知 Content-Length 的入站请求 MUST 边读边累计、达到上限立即断开拒绝（不得先
+  缓冲后判）；**跨请求并发累计内存预算 MUST 强制**（ports/files/sync 各自并发
+  上限 ×上限值入预算表，超预算拒绝新请求直至回落）。
+- 响应体=pull-first AsyncIterable（流式 ✓）；SSE 走 respondStreaming。
+- **取消两阶段协议（r2-B1 冻结）**：
+  - 阶段 A（响应头等待期）：消费端 `request.signal.abort()` → 即时 RESET →
+    provider `request.signal` 触发（既有 cancel-key 表语义）；
+  - 阶段 B（响应体传输期）：`request.signal` 的取消键在响应头返回后已注销——
+    消费端 MUST 监听本机下游连接断开并调用**响应句柄 `HttpClientResponse.abort()`**
+    → RESET → provider `request.signal` 触发、上游 socket 收敛；
+  - 两阶段各有独立 Scenario（§5/specs）；SSE/长下载属阶段 B。
 - **完整性自证**（r1 地基事实 2）：recv 非成功终态映射为 EOF ⇒ 传输层 EOF 不可
   作为完整性证据；一切对象/分片带预期长度+OID/hash，落盘前校验。
 - WS=字节隧道形态 ⇒ v1 无 WebSocket/raw TCP 透传（面板「即将推出」）[P3/Q3]。
@@ -110,14 +136,16 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 
 - 消费侧映射账本 `<DWEB_HOME>/plugins/ports/mappings.json`：
   `{id, name, peer(endpointId), remotePort, localPort, enabled}`。
-- 本机 net listener（默认 127.0.0.1；0.0.0.0 需 [W7] 级追认+本地鉴权设计——v1 不做）
+- 本机 net listener（默认且 v1 仅 127.0.0.1；非 loopback 监听属后续独立裁决，
+  需本地鉴权设计——本 change 不做）
   → 逐请求 `fetchHttp(session, {path:"/wpk1/ports/proxy/<remotePort>", …})` →
   对端 handler 转发 `localhost:<remotePort>`。
 - 提供侧 allowlist `<DWEB_HOME>/plugins/ports/allowlist.json`：
   `(peer, remotePort)` 显式授权，默认 deny；端口冲突明确报错不静默换端口。
 - header 规则：hop-by-hop 头剥除清单冻结（connection/keep-alive/transfer-encoding/
-  upgrade/proxy-*）；敏感回显头（server/via）重写。请求体上限 [W7] 超限 413。
-- 取消传播：本地连接断开 → fetchHttp abort → 对端 handler signal。
+  upgrade/proxy-*）；敏感回显头（server/via）重写。请求体上限 [W7]（含未知长度
+  边读边拒）超限 413。
+- 取消传播按 §4 两阶段协议执行（阶段 B=下游断开→resp.abort()）。
 - 语义边界明示：HTTP 方法/头/体/状态码/SSE 透传；WS×（§4）；「等同直接访问」
   在 [W7] 有界范围内成立。
 
@@ -130,10 +158,20 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   语义：offset/len+OID/etag 版本标识；重命名后由客户端重拉列表恢复）/
   `PUT chunk`（分片上传：{uploadId, seq, offset, bytes}→临时 staging）/ 
   `POST commit`（总长+hash 校验→原子 rename 落盘）/ `POST mkdir|rename|delete`。
-- **路径安全**（Q7）：share root realpath 冻结 + 每操作对解析后路径做包含校验 +
-  **禁 symlink 跟随**（O_NOFOLLOW 语义：lstat 校验后打开，检查-打开竞态用打开后
-  fstat 复核——r1 遗漏维度的落点）；单请求/chunk 上限 §4；staging 带 TTL 回收，
-  取消/断线不暴露半文件（临时名不进正式命名空间）。
+- **路径安全（r2-B2 冻结：fd 链遍历，非 lstat+open）**：share root 以目录 fd
+  打开并冻结（realpath 仅作展示）；**每操作从 root fd 按路径组件逐级打开**
+  （每级拒绝 symlink——目录组件用 O_DIRECTORY+O_NOFOLLOW 语义，最终组件按操作
+  类型带 O_NOFOLLOW），逐级持有父目录 fd 再开子组件（macOS 经 /dev/fd/<fd>/
+  组合实现 fd 相对打开；win32 等效实现为实现期义务）；最终操作只作用于已验证
+  fd（fstat 复核类型）。**中间目录组件被并发替换为指向 root 外 symlink 的逃逸
+  Scenario 为验收门**（攻击者循环替换 vs 并发请求，断言 root 外零读写副作用）。
+  若目标平台确无等效原语，降级边界=该平台 share root 限制为插件管理的受控目录
+  （降级必须显式落文档，不得静默）。
+- 上传重试语义（r2-B7 冻结）：**幂等续传**——同 (uploadId, seq, offset, hash)
+  重复 `PUT chunk` 幂等；staging 按 uploadId 目录化；`commit` 校验全部分片
+  （总长+hash）后原子 rename；取消/TTL 过期回收整个 uploadId staging。
+- 单请求/chunk 上限 §4；staging 带 TTL 回收，取消/断线不暴露半文件（临时名不进
+  正式命名空间）。
 - B 侧 UI（类型化专属页）：浏览/面包屑/上传（进度）/下载/改名/删除；写按钮按
   share.mode 与授权显隐。
 - ignore：`<root>/.opendweb-ignore`（行 glob，忽略清单不下传——共享语义由提供侧定）。
@@ -150,9 +188,13 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 
 - 同步组账本 `<DWEB_HOME>/plugins/sync/groups.json`：
   `{id, name, members:[{endpointId, deviceName}], roots:[{localPath, seedAuthority}]}`。
-- **组模型=多成员**（[W8]）：每设备一个 ref `refs/devices/<endpointId>/main` +
-  组收敛 ref `refs/heads/main`（快进/合并可解析时）；冲突身份=endpointId 排序
-  稳定 ours/theirs（r1 P5 要求）。
+- **组模型=多成员账本、双机执行（r2-B4 收窄 [W8]）**：账本/ref 命名自 v1 起
+  记录 N 成员（每设备一个 ref `refs/devices/<endpointId>/main` + 组收敛 ref
+  `refs/heads/main`）；**v1 同步执行与收敛保证只覆盖双机**（pairwise 两端语义：
+  fetch 对端 device ref + 本地 merge + CAS 推进组 ref）；第三成员加入/追赶/
+  多端 fan-in 顺序与收敛确定性为后续 change 的显式义务，v1 不承诺（存储形状
+  兼容 ≠ N 端行为承诺——r2-B4 原话语义）。冲突身份=endpointId 排序稳定
+  ours/theirs（r1 P5 要求）。
 - gitdir 布局：`<DWEB_HOME>/plugins/sync/<groupId>/<rootId>/git`（独立于用户目录；
   工作树=用户目录 root 本体）；`<root>/.dweb-sync` 元数据（ignore 规则继承
   `.gitignore` 语义 + `.dweb-sync/exclude`）。
@@ -169,6 +211,27 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   （r1 Q5：无 last-write-wins）。**单写者**：每 repo 同时只允许一个本地
   merge/ref writer（插件内互斥+账本锁）。
 - 幂等：操作 id=对象 OID 天然幂等；staging 目录崩溃回收（启动扫描+TTL）。
+- **闭包校验（r2-B7）**：`push` 收到的新 commit MUST 携带完整 parent 闭包 +
+  树/blob 闭包；对象库缺任一引用对象 → 整个 push 拒绝（明确缺项清单）且
+  **零 ref 变化**。
+
+### 7.3.1 崩溃恢复协议（r2-B3 冻结：intent 日志 + 确定性 roll-forward）
+
+工作树物化与 ref 推进 MUST 经单一持久化事务协议（不留二选一）：
+
+1. **prepare**：在 gitdir 旁写 intent 日志（0600 原子写）：{txId, targetCommit,
+   路径操作清单（write=path/oid、delete=path）, 旧 ref 快照}；
+2. **物化**：逐操作执行——write 从对象库读内容→同文件系统临时文件→fsync→
+   rename 到目标路径（逐文件原子）；delete 直接 unlink；每步幂等（重放安全）；
+3. **推进**：ref CAS 到 targetCommit；
+4. **提交标记**：intent 追加 done 标记（原子写）。
+- **崩溃恢复（重启扫描）**：发现未 done 的 intent → **确定性 roll-forward**
+  （幂等重放物化+推进，永不 rollback——intent 内操作全部幂等）；roll-forward
+  后补 done。
+- 用户在同步根的未提交本地改动与协议的关系：物化前本地改动 MUST 已被
+  commit 进 device ref（scanning 阶段保证），故物化只触碰已提交内容的投影。
+- **验收（B3）**：在 prepare 后/物化中/推进后/标记前四个边界逐个注入崩溃 →
+  重启恢复后断言：文件内容、ref、用户未提交改动三者一致且无半成品。
 
 ### 7.4 合并算法（自持三方树合并）
 
@@ -205,11 +268,11 @@ packages/*/test 用例），并纳入 §9 双机验收矩阵。
 |---|---|
 | 浏览器→sidecar | Host 守卫+写路由精确 Origin（既有）；capability 单次消费；新面零 argv 凭证 [W11] |
 | 会话→数据端点 | sessionId 隔离键；(peer,plugin,share/port,op) deny-by-default；版本化路径 |
-| 路径 | root realpath 冻结+包含校验+禁 symlink+打开后 fstat 复核 |
-| 落盘 | 0600 原子写+symlink 拒绝（既有纪律）；staging 临时名+TTL |
+| 路径 | §6 fd 链逐组件遍历（拒绝每级 symlink）+最终 fstat 复核+并发逃逸验收门 |
+| 落盘 | 0600 原子写+symlink 拒绝（既有纪律，同一持久文件系统内临时文件+rename）；staging 临时名+TTL |
 | 用户数据 | 不触碰 ~/.opendweb/nodes.json 等宿主数据；sync gitdir 独立；删除操作需 UI 确认 |
 | 明文告知 | 沿用既有 insecure 披露模式（会话层 E2E，webui 本机回环） |
-| 资源 | §4 上行有界+§7.5 预算+请求取消传播 |
+| 资源 | §4 上行有界（含未知长度边读边拒+并发累计预算）+§7.5 预算+两阶段取消传播 |
 
 ## 9. 分期与验收（Q8）
 
@@ -223,7 +286,10 @@ packages/*/test 用例），并纳入 §9 双机验收矩阵。
 - **Phase 3 sync**：单向（seed/pull/跟随）→ 双向（commit/push/CAS/自动合并/
   冲突决议 UI/重连收敛）；双机验收矩阵（agents-skills 真目录）：单边变更跟随 /
   非重叠双方变更自动合并 / 重叠冲突→选版本→收敛 / 同步中断→恢复→两端 OID 与
-  工作树一致 / [W9] 首次建组非空对端阻断。
+  工作树一致 / [W9] 首次建组非空对端阻断；**协议边界（r2-B7 补入矩阵）**：
+  push 缺 parent/树/blob 闭包→拒绝且 ref 不动 / 显式 abort→零 ref 与工作树
+  变化+staging TTL 回收 / type 与 mode 冲突→文件级决议 UI / >16MiB 对象拒绝且
+  ref 不动 / §7.3.1 四边界崩溃注入→roll-forward 收敛。
 - 每 Phase 绿门：对应包 node --test + 既有套件全绿 + strict 校验；
   最终 Codex 实现终验 + Owner 双机实走。
 
@@ -231,4 +297,5 @@ packages/*/test 用例），并纳入 §9 双机验收矩阵。
 
 | 轮 | 结论 | 处置 |
 |---|---|---|
-| r1 讨论 | 构型收敛：P1-P6/Q1-Q8 全裁定；六遗漏维度全部闭合进本 v1（§1 控制数据面分离/§2.2 停用语义/§7.2 组模型/§7.3 恢复/§7.5 预算/§2.1 信任模型）；五分歧→[W7]-[W11] 推荐裁决 | 本 v1 全文吸收 |
+| r1 讨论 | 构型收敛：P1-P6/Q1-Q8 全裁定；五分歧→[W7]-[W11] 推荐裁决 | v1 全文吸收 |
+| r2 设计评审 | NOT-READY 5/10：B1 取消两阶段混谈/B2 路径父组件竞态/B3 崩溃恢复二选一/B4 N 成员承诺过宽/B5 插件页路由未接线/B6 安装账本断链/B7 Scenario 缺口；另 W7 需硬上限、两处文档错误 | v2 全部闭合：§4 两阶段取消协议+硬上限（1-64MiB）+未知长度边读边拒+并发累计预算；§6 fd 链遍历+逃逸验收门+幂等续传冻结；§7.3.1 intent 日志+确定性 roll-forward+四边界注入；[W8]/§7.2 承诺收窄；§2.1 路由接入协议（#/p/ 前缀+registry+停用收敛）；§2.1 B6 收口（面板只管内置三插件）；§9 矩阵补 B7 五项；tmpfs→同文件系统临时文件+rename；0.0.0.0 误引 [W7] 删除 |
