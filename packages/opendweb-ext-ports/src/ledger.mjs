@@ -330,7 +330,9 @@ export async function revokeAccess(home, peer, remotePort, ctx = {}) {
 }
 
 /**
- * 授权判定（默认 deny）。
+ * 授权判定（默认 deny）。peer 编码归一（真双机验收实证）：账本/控制面存的
+ * 是 hex64（server 台账冻结形态），fabric 会话（serveHttp/fetchHttp）对端是
+ * z-base-32 展示串——同钥异码先归一再比，防「已授权仍 403」。
  * @param {string} home
  * @param {string} peer
  * @param {number} remotePort
@@ -338,7 +340,32 @@ export async function revokeAccess(home, peer, remotePort, ctx = {}) {
  */
 export async function isAccessAllowed(home, peer, remotePort) {
   const ledger = await loadAllowlist(home);
-  return ledger.entries.some((e) => e.peer === peer && e.remotePort === remotePort);
+  const wanted = normalizePeerId(peer);
+  return ledger.entries.some((e) => normalizePeerId(e.peer) === wanted && e.remotePort === remotePort);
+}
+
+/** peer id 归一：z-base-32（iroh to_z32：字母表 ybndrfg8ejkmcpqxot
+ * 1uwisza345h769、MSB-first 位序）→ hex64 小写；hex64 与未知形态原样返回。
+ * 实现与 webui core/fabric.mjs 的 z32ToHex 同源（包边界隔离，本包不反向
+ * 依赖 webui）。 */
+function normalizePeerId(peer) {
+  if (typeof peer !== "string") return peer;
+  if (/^[0-9a-f]{64}$/.test(peer)) return peer;
+  if (!/^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(peer)) return peer;
+  const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+  let bits = 0;
+  let value = 0n;
+  const bytes = [];
+  for (const ch of peer) {
+    value = value * 32n + BigInt(A.indexOf(ch));
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push(Number((value >> BigInt(bits)) & 0xffn));
+      value = value % (1n << BigInt(bits));
+    }
+  }
+  return Buffer.from(bytes).toString("hex");
 }
 
 /**

@@ -2566,6 +2566,20 @@ impl Fabric {
         Ok(self.inner.roster.lock().await.is_member(&id, now_ms()))
     }
 
+    /// 名册 root 的 EndpointId（z-base-32 展示串；空册无 Genesis = None）。
+    /// 消费面「本机是否 root」的判定源：`ensure_relay_capabilities` 等
+    /// root-only 操作的准入检查（member 句柄调用即
+    /// [`crate::roster::RosterError::NotRoot`]——member 的 relay capability
+    /// 由 v2 兑换 OK2 附发，不走 ensure 路径）。
+    pub async fn root_endpoint_id(&self) -> Option<String> {
+        self.inner
+            .roster
+            .lock()
+            .await
+            .root()
+            .map(|id| endpoint_id_display(&id))
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<FabricEvent> {
         self.inner.events.subscribe()
     }
@@ -2689,12 +2703,19 @@ impl Fabric {
         // = joiner 经它必然可达 issuer），并映射回配置原样字符串（HB 8.1：
         // 对外回显配置形态，不做规范化改写）。快照未就绪（刚启动尚未沉降
         // online）时回退配置序首条——与旧行为一致，宁缺勿假。
-        let relay_url = {
+        let mut relay_url = {
             let snapshot = self.inner.relay_snapshot.lock().unwrap().clone();
             invite_relay_url(&self.inner.relay, &snapshot)
         };
         // 安全门只信一个来源：显式 advertise_addrs（构造期已校验/去重）。
         let addrs = self.inner.advertise_addrs.clone();
+        // 回环 relay 剔除（真双机验收实证）：issuer 本机视角的回环 relay 对
+        // 跨机 joiner 恒不可达——iroh 路径选择优先 relay 相位，死 relay 令
+        // 整个 dial 停滞超 join deadline 而不回落 direct。直连地址在场时
+        // 回环 relay 纯属死重（同机 joiner 亦可经直连地址抵达），一律不签。
+        if !addrs.is_empty() && session::relay_url_is_loopback(&relay_url) {
+            relay_url = String::new();
+        }
         if relay_url.is_empty() && addrs.is_empty() && !opts.allow_relayless {
             return Err(FabricError::InviteWithoutRelay);
         }
@@ -2741,10 +2762,6 @@ impl Fabric {
             _ => return Err(FabricError::InviteV2RequiresRecipient),
         };
         let addrs = self.inner.advertise_addrs.clone();
-        let relays_any = !entries.is_empty();
-        if !relays_any && addrs.is_empty() && !opts.allow_relayless {
-            return Err(FabricError::InviteWithoutRelay);
-        }
         // v2 直连地址 = 二进制 SocketAddr（构造期已校验 advertise_addrs）
         let direct_addrs: Vec<std::net::SocketAddr> = addrs
             .iter()
@@ -2756,6 +2773,17 @@ impl Fabric {
                     })
             })
             .collect::<Result<_, _>>()?;
+        // 回环 relay 剔除（真双机验收实证；与 v1 路径同源——见 invite_with）：
+        // 直连地址在场时不签回环 relay 条目（含其 bootstrap capability）。
+        let entries: Vec<RelayEntry> = entries
+            .iter()
+            .filter(|e| direct_addrs.is_empty() || !session::relay_url_is_loopback(&e.url))
+            .cloned()
+            .collect();
+        let relays_any = !entries.is_empty();
+        if !relays_any && addrs.is_empty() && !opts.allow_relayless {
+            return Err(FabricError::InviteWithoutRelay);
+        }
         let now = now_ms();
         let expires_at = now.checked_add(ttl_ms).ok_or_else(|| {
             FabricError::Session(SessionError::Connect("invite ttl overflow".into()))
@@ -2763,8 +2791,9 @@ impl Fabric {
         let snapshot = self.inner.relay_snapshot.lock().unwrap().clone();
         let fabric_id = self.inner.roster.lock().await.fabric_id();
         // bootstrap capability：restricted 条目逐条现签（recipient 预绑定）
-        let relays: Vec<crate::protocol::InviteRelayV2> = invite_v2_relay_order(entries, &snapshot)
-            .into_iter()
+        let relays: Vec<crate::protocol::InviteRelayV2> =
+            invite_v2_relay_order(&entries, &snapshot)
+                .into_iter()
             .map(|entry| {
                 let capability = entry.server_id.map(|sid| {
                     crate::protocol::RelayCapV1::sign_and_encode(

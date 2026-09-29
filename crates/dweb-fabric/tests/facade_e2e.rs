@@ -383,3 +383,99 @@ async fn secret_injection_semantics() {
         Err(dweb_fabric::secret::SecretExportError::Auth)
     ));
 }
+
+/// v2 recipient-bound invite 的 join 全链（真双机验收形态：restricted relay
+/// 配置 + 直连地址主路径——relay 不可达不妨碍直连兑换），并冻结消费面
+/// root 判定语义：
+/// - `root_endpoint_id`：root 册=Some(self)；attach 空册=None；join 后
+///   member 册=Some(issuer)（消费面据此分流 root-only 操作）。
+/// - `ensure_relay_capabilities` 对 member 句柄按设计拒绝（NotRoot，
+///   caller=member、root=issuer）——member 的 capability 由 OK2 附发，
+///   这是 webui 侧 join 接管序列不得调用 ensure 的内核依据。
+#[tokio::test]
+async fn v2_recipient_bound_join_member_root_accessors_and_ensure_refusal() {
+    let dir_a = TempDir::new().unwrap();
+    let dir_b = TempDir::new().unwrap();
+
+    // A（root）：CustomWithCaps restricted 条目 + 固定端口直连宣告——
+    // invite_with 由此分派 v2 签发路径（has_restricted）。
+    let port = reserve_loopback_port();
+    let relay_entry = dweb_fabric::RelayEntry {
+        url: "https://127.0.0.1:1".to_owned(),
+        server_id: Some([0xA1; 32]),
+        token: None,
+    };
+    let a = Fabric::create_root(FabricConfig {
+        relay: RelayConfig::CustomWithCaps(vec![relay_entry.clone()]),
+        ..cfg_fixed_port(&dir_a, port)
+    })
+    .await
+    .unwrap();
+
+    // root 判定：root 册 = Some(self)
+    assert_eq!(a.root_endpoint_id().await.as_deref(), Some(a.endpoint_id().as_str()));
+
+    let fabric_id = a.fabric_id_hex().await;
+    // B（joiner）：同为 CustomWithCaps（消费面装配形态），attach 空册
+    let b = Fabric::attach(
+        FabricConfig {
+            relay: RelayConfig::CustomWithCaps(vec![relay_entry]),
+            ..cfg(&dir_b)
+        },
+        &fabric_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.root_endpoint_id().await, None, "empty attach roster has no root");
+
+    // v2 邀请：recipient 恒必填（Some(B)）→ dweb2. 令牌（直连地址随签）
+    let token = a
+        .invite_with(300_000, Some(&b.endpoint_id()), dweb_fabric::InviteOptions::default())
+        .await
+        .unwrap();
+    assert!(token.starts_with("dweb2."), "restricted relay config signs v2 tokens");
+    // 回环 relay 剔除（真双机验收实证）：直连地址在场时 issuer 本机回环
+    // relay 条目不签入令牌——跨机 joiner 的 relay 相位死等会拖垮整个 dial
+    //（iroh 路径选择不回落 direct，实测 30s join deadline 全耗尽）。
+    let decoded_v2 = dweb_fabric::protocol::InviteV2Token::decode(&token).unwrap();
+    assert!(
+        decoded_v2.invite.relays.is_empty(),
+        "loopback relay entries must be dropped when direct addrs exist: {:?}",
+        decoded_v2.invite.relays
+    );
+    assert_eq!(
+        decoded_v2.invite.direct_addrs,
+        vec![format!("127.0.0.1:{port}").parse().unwrap()]
+    );
+
+    // 兑换（relay 不可达，直连主路径）→ member 册 root = issuer
+    b.join(&token).await.expect("v2 recipient-bound join via direct addr");
+    assert_eq!(b.members().await.len(), 2, "joiner is a member after redeem");
+    assert_eq!(
+        b.root_endpoint_id().await.as_deref(),
+        Some(a.endpoint_id().as_str()),
+        "member roster root is the issuer"
+    );
+
+    // member 句柄 ensure 拒绝（内核设计）：caller=member、root=issuer——
+    // 消费面（webui joinWithToken/startSequence）必须按 root 判定分流。
+    let refused = b.ensure_relay_capabilities().await;
+    match refused {
+        Err(dweb_fabric::FabricError::Roster(
+            dweb_fabric::roster::RosterError::NotRoot { caller, root },
+        )) => {
+            assert_eq!(
+                dweb_fabric::identity::endpoint_id_display(&caller),
+                b.endpoint_id()
+            );
+            assert_eq!(
+                root.map(|r| dweb_fabric::identity::endpoint_id_display(&r)),
+                Some(a.endpoint_id())
+            );
+        }
+        other => panic!("member ensure must refuse with NotRoot, got {other:?}"),
+    }
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+}

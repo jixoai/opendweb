@@ -7,10 +7,14 @@
 //    - relay 凭证从租约装配 CustomWithCaps：relays=[{url: lease.relay_url,
 //      serverId: lease.server_id}]（无凭证 urls 形态在 restricted 中枢被拒——
 //      relay.rs 事实，不采用）；
-//    - deferStart 五步时序：①Fabric.open(deferStart=true——构造期零网络出站)
-//      → ②ensureRelayCapabilities（deferred 态可执行）→ ③断言返回条目覆盖租约
-//      (relay_url) 且 token 注入同实例 → ④fabric_id/endpointId 元组断言
-//      （fabricIdHex()==lease.fabric_id、endpointId==lease.root）→ ⑤fabric.start()。
+//    - deferStart 五步时序（root 姿态）：①Fabric.open(deferStart=true——构造期
+//      零网络出站；不携带 fabricId 期望——dataDir 单 fabric 语义下既有 roster 即
+//      权威，可能是设备配对加入的对方 fabric）→ ②root 姿态判定
+//      （rootEndpointId==本机 endpointId）：root 走 ensureRelayCapabilities+
+//      ③断言返回条目覆盖租约 (relay_url)；member（对方 fabric）跳过 ②③——
+//      ensure 是 root-only（member 调用即 RosterError::NotRoot），其 capability
+//      由 v2 兑换 OK2 附发并持久化、start() 同源注入 → ④endpointId 元组断言
+//      （fabricId 断言只在 createRoot 采纳路径）→ ⑤fabric.start()。
 //      ②③④任一不符=fail-closed（不 start、明确报错、不静默降级）。
 // 2. 惰性启动：构造本模块零 Fabric 构造、零网络——ensureStarted() 才走五步
 //    （single-flight）。触发源=任一数据面插件 enable（sidecar 组装处 onTransition）
@@ -62,6 +66,11 @@ export function z32ToHex(z32) {
 }
 
 /** hex64 小写 → z-base-32（iroh to_z32 语义；z32ToHex 的逆）。
+ * 尾组对齐（真双机验收第二轮实证修正）：32B 键 = 256 bit = 51 字符 + 1 bit，
+ * data_encoding 语义把残余位**左移到末字符 MSB**、低位补零——此前写成
+ * `value & 31`（残余位落在 LSB），末位为 1 的键（约半数设备）产出错误末
+ * 字符（对端解析成另一把公钥）；末位为 0 时两种写法重合（首轮双机恰好
+ * 两台末端 bit 均 0 而侥幸通过）。
  * @param {string} hex
  * @returns {string} */
 export function hexToZ32(hex) {
@@ -79,7 +88,7 @@ export function hexToZ32(hex) {
       value = value % (1n << BigInt(bits));
     }
   }
-  if (bits > 0) out += A[Number(value & 31n)];
+  if (bits > 0) out += A[Number((value << BigInt(5 - bits)) & 31n)];
   return out;
 }
 
@@ -167,7 +176,34 @@ export async function createFabricHost(opts = {}) {
    * 读租约并推导身份/relays（home-hub §2：单 fabric 约束——leases 的 fabric 维度
    * 恒 1，取首条为元组断言期望）。无租约/无可用 relay 条目 → null（本设备未加入
    * 任何中枢——数据面不可用是明示事实，不是错误）。
+   *
+   * 回环 relay LAN 化（真双机验收实证）：中枢机自 join 的租约 relay_url 是
+   * issuer 本机回环形态（http://127.0.0.1:3340）——对本机 relay 连接无碍，但
+   * 以此装配 fabric 后签出的 invite 会把回环 relay 交给对端（跨机恒不可达；
+   * 内核侧已按「直连在场剔回环」过滤，令牌将退化为纯直连——对端拿不到
+   * bootstrap capability，redeem 后也没有 OK2 member capability 可持久化，
+   * 会话期 relay 发现无路径）。宣告了 LAN 直连地址（advertiseAddrs）时把
+   * 回环 host 改写为宣告地址的 host——relay 服务监听通配（*:3340），LAN
+   * 形态对 issuer 本机与对端同等可用；无宣告则保留原样（单机部署语义）。
    */
+  function lanRelayUrl(url) {
+    if (advertiseAddrs.length === 0) return url;
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      return url;
+    }
+    const host = parsed.hostname;
+    const isLoopback = host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+    if (!isLoopback) return url;
+    const advHost = advertiseAddrs.map((a) => a.replace(/^\[|\]/g, "").split(":")[0]).find((h) => /^[0-9a-fA-F.:]+$/.test(h) && h !== "localhost" && !h.startsWith("127."));
+    if (advHost === undefined) return url;
+    parsed.hostname = advHost.includes(":") ? `[${advHost}]` : advHost;
+    // URL 规范化会给空路径补尾 "/"——relay 配置串纪律是无尾斜杠原样形态
+    return parsed.toString().replace(/\/$/, "");
+  }
+
   async function readIdentity() {
     const ledger = await leasesLoader(home);
     const valid = ledger.leases.filter(
@@ -177,7 +213,7 @@ export async function createFabricHost(opts = {}) {
     const lease = valid[0];
     return {
       lease,
-      relays: valid.map((l) => ({ url: l.relay_url, serverId: l.server_id })),
+      relays: valid.map((l) => ({ url: lanRelayUrl(l.relay_url), serverId: l.server_id })),
       fabricId: lease.fabric_id,
       endpointId: lease.root,
       deviceName: opts.deviceName ?? lease.alias ?? os.hostname(),
@@ -246,6 +282,31 @@ export async function createFabricHost(opts = {}) {
   }
 
   /**
+   * Fabric 事件接线（startSequence 与 joinWithToken 接管两路共用）：
+   * peer-connected 绑 serveHttp + 在线回调；peer-disconnected 拆线+逐出会话。
+   * @param {object} f Fabric 实例
+   * @returns {() => void} 退订函数
+   */
+  function wireFabricEvents(f) {
+    return f.on((ev) => {
+      if (ev?.type === "peer-connected" && typeof ev.endpointId === "string") {
+        connectedPeers.add(ev.endpointId);
+        bindPeer(ev.endpointId).catch((err) => log(`fabric: serveHttp bind failed for ${ev.endpointId}: ${err?.message ?? err}`));
+        for (const cb of peerOnlineCallbacks) {
+          try {
+            cb(ev.endpointId);
+          } catch {
+            /* 回调异常不进事件泵 */
+          }
+        }
+      } else if (ev?.type === "peer-disconnected" && typeof ev.endpointId === "string") {
+        connectedPeers.delete(ev.endpointId);
+        unbindPeer(ev.endpointId);
+      }
+    });
+  }
+
+  /**
    * 五步时序（home-hub §2 冻结；②→③→④→⑤逐条 fail-closed）。
    * @returns {Promise<object>} Fabric 实例
    */
@@ -267,7 +328,6 @@ export async function createFabricHost(opts = {}) {
       dataDir: home,
       relay: { mode: "custom", relays: identity.relays },
       deferStart: true,
-      fabricId: identity.fabricId,
       // LAN 直连宣告（真双机验收定论：本地 relay 为 HTTP-only——QUIC 数据面需
       // TLS 证书未启用，P2P 唯一路径=直连；invite 令牌携带 issuer 直连地址，
       // 未宣告时对端无路可拨=dial-timeout）。来源：组装层 env 注入。
@@ -278,11 +338,16 @@ export async function createFabricHost(opts = {}) {
     /** createRoot 采纳路径（自身为 root 建册）——fabricId 断言只在此路径成立 */
     let adoptedOwnFabric = false;
     try {
+      // open 不携带 fabricId 期望（真双机验收实证修正）：dataDir 单 fabric 语义
+      // 下既有 roster 即权威——它可能是设备配对（/sidecar/fabric/join）加入的
+      // **对方 fabric**（fabricId ≠ 本机租约；携带期望会 DirFabricMismatch 误杀
+      // member 重启）。无 roster 时 NotFound（"no persisted roster"）仍是
+      // createRoot 采纳入口。
       f = await s.Fabric.open(ctorArgs);
     } catch (e) {
       const msg = String(/** @type {Error} */ (e)?.message ?? e);
       if (!/no persisted roster/i.test(msg)) throw e;
-      f = await s.Fabric.createRoot(ctorArgs);
+      f = await s.Fabric.createRoot({ ...ctorArgs, fabricId: identity.fabricId });
       adoptedOwnFabric = true;
     }
     if (status === "closed") {
@@ -291,10 +356,21 @@ export async function createFabricHost(opts = {}) {
     }
     fabric = f;
     try {
-      // ② 显式 ensure（deferred 态可执行——root roster 与 RelayMap 已就绪）
-      const caps = await f.ensureRelayCapabilities();
-      // ③ 覆盖断言（不匹配=fail-closed 不 start）
-      assertRelayCoverage(caps, identity.relays);
+      // ② 姿态判定（root vs member）：ensureRelayCapabilities 是 root-only 的
+      // 自签 own capability——member（设备配对加入的对方 fabric）调用即
+      // RosterError::NotRoot（真双机验收实证：caller=本机、root=邀请方）。
+      // member 的 relay capability 由 v2 兑换 OK2 附发（join 内核已持久化
+      // relay.caps.json），start() 同源注入；③的租约覆盖断言对 member 同样
+      // 不适用——member 覆盖由邀请方 relay 集定义，非本机租约。
+      const rootId = await f.rootEndpointId();
+      const amRoot = rootId !== null && rootId === f.endpointId;
+      if (amRoot) {
+        const caps = await f.ensureRelayCapabilities();
+        // ③ 覆盖断言（不匹配=fail-closed 不 start）
+        assertRelayCoverage(caps, identity.relays);
+      } else {
+        log(`fabric: member posture (roster root ${rootId ?? "unset"} != local ${f.endpointId}); skipping root-only capability ensure`);
+      }
       // ④ 元组断言（endpointId 连续性恒断言；fabricId 连续性只在 createRoot
       // 采纳路径断言——open 到的既有 roster 可能是设备配对（/sidecar/fabric/
       // join）加入的**对方 fabric**，其 fabricId ≠ 本机租约 fabricId 属预期，
@@ -321,24 +397,9 @@ export async function createFabricHost(opts = {}) {
     }
     // 事件接线（start 后才有会话事件）：peer-connected 绑 serveHttp + 在线回调；
     // peer-disconnected 拆线+逐出会话
-    unsubscribeEvents = f.on((ev) => {
-      if (ev?.type === "peer-connected" && typeof ev.endpointId === "string") {
-        connectedPeers.add(ev.endpointId);
-        bindPeer(ev.endpointId).catch((err) => log(`fabric: serveHttp bind failed for ${ev.endpointId}: ${err?.message ?? err}`));
-        for (const cb of peerOnlineCallbacks) {
-          try {
-            cb(ev.endpointId);
-          } catch {
-            /* 回调异常不进事件泵 */
-          }
-        }
-      } else if (ev?.type === "peer-disconnected" && typeof ev.endpointId === "string") {
-        connectedPeers.delete(ev.endpointId);
-        unbindPeer(ev.endpointId);
-      }
-    });
+    unsubscribeEvents = wireFabricEvents(f);
     status = "started";
-    log(`fabric: started (endpoint ${f.endpointId}, relays ${identity.relays.length})`);
+    log(`fabric: started (endpoint ${f.endpointId}, relays ${identity.relays.length}${adoptedOwnFabric ? "" : ", existing roster"})`);
     return f;
   }
 
@@ -500,8 +561,9 @@ export async function createFabricHost(opts = {}) {
 
     /**
      * 设备配对——凭令牌加入对方 fabric（joinWithToken：attach+兑换+名册持久化，
-     * 一次性；此后 open() 沿用该名册）。要求 dataDir 尚无本属 fabric 的 roster
-     * （单目录单 fabric——既有 roster 时报错并引导，不静默替换）。
+     * 一次性；此后 open() 沿用该名册——重启走 startSequence 的 member 分支）。
+     * 要求 dataDir 尚无本属 fabric 的 roster（单目录单 fabric——既有 roster 时
+     * 报错并引导，不静默替换）。
      * @param {{ token: string }} opts
      * @returns {Promise<{ fabricId: string }>}
      */
@@ -522,12 +584,22 @@ export async function createFabricHost(opts = {}) {
         },
         opts.token,
       );
-      // 配对即接管：停旧 fabric 句柄（若有），换入 joined（deferred→caps→start）
+      // 配对即接管（member 语义——真双机验收实证修正）：join 成功后本机是对方
+      // fabric 的 **member**，ensureRelayCapabilities 是 root-only 自签 own
+      // capability（member 调用即 RosterError::NotRoot：caller=本机、root=邀请方
+      // ——此前接管序列照抄 root 五步的 ②③ 即现场报错根因）。member capability
+      // 已由 v2 兑换 OK2 附发并持久化（relay.caps.json），start() 同源注入；租约
+      // 覆盖断言对 member 不适用（覆盖由邀请方 relay 集定义，非本机租约）。
+      // 兜底断言：兑换合并后名册必须有 Genesis root，且是邀请方而非本机。
+      const rootId = await joined.rootEndpointId();
+      if (rootId === null || rootId === joined.endpointId) {
+        await joined.shutdown().catch(() => {});
+        throw Object.assign(new Error(`joined fabric root is ${rootId ?? "unset"}; expected the inviter (redeem did not establish membership)`), { code: "join-failed" });
+      }
       await teardownFabric().catch(() => {});
       fabric = joined;
-      const caps = await joined.ensureRelayCapabilities();
-      assertRelayCoverage(caps, identity.relays);
       await joined.start();
+      unsubscribeEvents = wireFabricEvents(joined);
       status = "started";
       failureCode = null;
       failureMessage = null;

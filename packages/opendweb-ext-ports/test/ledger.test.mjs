@@ -162,3 +162,41 @@ test("ledger: mutateMappings surfaces lock contention as {ok:false,code:'lock'}"
     await rm(home, { recursive: true, force: true });
   }
 });
+
+test("ledger: isAccessAllowed normalizes hex/z32 peer encodings (same key, two forms)", async () => {
+  // 真双机验收实证：账本存 hex64（控制面冻结形态），fabric 会话对端是 z32
+  // 展示串——同钥异码必须命中授权（此前「已授权仍 403」）。
+  const home = await tempHome("wpk-ledger-z32-");
+  try {
+    const hex = "ec80ba47821deba5019c2fee2ecab2ccdca81885dd8d61f9d67907463e2a879a";
+    const z32 = hexToZ32Local(hex);
+    assert.equal(z32, "71ymwthndzi4kychf9zn71i13uqkogrf5sgsd6qsxrdwcxtko6py", "ground-truth z32 pair");
+    await grantAccess(home, hex, 8080);
+    assert.equal(await isAccessAllowed(home, z32, 8080), true, "z32 peer matches hex ledger entry");
+    assert.equal(await isAccessAllowed(home, hex, 8080), true, "hex peer matches hex ledger entry");
+    assert.equal(await isAccessAllowed(home, hexToZ32Local("cb416b034d43f11ea2fd4862ea52e6044d91a7b06a4fa7066f68d8df847934b0"), 8080), false, "other peer still denied");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+/** 与 src/ledger.mjs normalizePeerId 的编码面同源向量的本地引用（roundtrip
+ * 由 webui fabric-host 测试覆盖；此处只消费 ground-truth 对）。 */
+function hexToZ32Local(hex) {
+  const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+  const bytes = Buffer.from(hex, "hex");
+  let bits = 0;
+  let value = 0n;
+  let out = "";
+  for (const b of bytes) {
+    value = (value << 8n) | BigInt(b);
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += A[Number((value >> BigInt(bits)) & 31n)];
+      value = value % (1n << BigInt(bits));
+    }
+  }
+  if (bits > 0) out += A[Number((value << BigInt(5 - bits)) & 31n)];
+  return out;
+}

@@ -765,10 +765,42 @@ pub async fn handle_redeem_as_issuer_gated(
     }
 }
 
+/// relay URL 是否指向本机回环（issuer 视角的「只有同机 joiner 可达」地址）。
+/// 真双机验收实证（2026-09-29）：令牌携带 issuer 回环 relay 时，跨机 joiner 的
+/// iroh 路径选择优先走 relay 相位——回环不可达即整段 dial 停滞（30s join
+/// deadline 内不回落 direct）；同机 joiner 则恒可用 direct 地址替代。故
+/// 签发侧与拨号侧在存在直连地址时一律剔除回环 relay（见
+/// [`endpoint_addr_from_invite`] / [`endpoint_addr_from_invite_v2`] 与
+/// fabric 层 invite 签发过滤）。
+pub fn relay_url_is_loopback(url: &str) -> bool {
+    let Ok(parsed) = url.parse::<RelayUrl>() else {
+        return false;
+    };
+    match parsed.host_str() {
+        Some(host) => {
+            // url crate 的 IPv6 host 带方括号（"[::1]"）——去括号后再解析
+            let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+            match unbracketed.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip.is_loopback(),
+                Err(_) => host.eq_ignore_ascii_case("localhost"),
+            }
+        }
+        None => false,
+    }
+}
+
 /// 由邀请令牌构造对 issuer 的 EndpointAddr（relay + 直连地址）。
+/// 直连地址存在时剔除回环 relay（见 [`relay_url_is_loopback`]）。
 pub fn endpoint_addr_from_invite(token: &InviteToken) -> Result<EndpointAddr, SessionError> {
     let mut addr = EndpointAddr::new(token.invite.issuer);
-    if let Ok(url) = token.invite.issuer_relay_url.parse::<RelayUrl>() {
+    let has_direct = token
+        .invite
+        .issuer_direct_addrs
+        .iter()
+        .any(|a| a.parse::<std::net::SocketAddr>().is_ok());
+    if let Ok(url) = token.invite.issuer_relay_url.parse::<RelayUrl>()
+        && (!has_direct || !relay_url_is_loopback(&token.invite.issuer_relay_url))
+    {
         addr = addr.with_relay_url(url);
     }
     for a in &token.invite.issuer_direct_addrs {
@@ -786,11 +818,16 @@ pub fn endpoint_addr_from_invite(token: &InviteToken) -> Result<EndpointAddr, Se
 
 /// 由 v2 邀请令牌构造 EndpointAddr：relay 列表全部并入候选（附录 A；
 /// capability 注入是 RelayMap 条目级动作，由 fabric 层在拨号前完成，
-/// EndpointAddr 只承载路径候选）。
+/// EndpointAddr 只承载路径候选）。直连地址存在时剔除回环 relay
+/// （见 [`relay_url_is_loopback`]）。
 pub fn endpoint_addr_from_invite_v2(token: &InviteV2Token) -> Result<EndpointAddr, SessionError> {
     let mut addr = EndpointAddr::new(token.invite.issuer);
+    let has_direct = !token.invite.direct_addrs.is_empty();
     for relay in &token.invite.relays {
         if let Ok(url) = relay.url.parse::<RelayUrl>() {
+            if has_direct && relay_url_is_loopback(&relay.url) {
+                continue;
+            }
             addr = addr.with_relay_url(url);
         }
     }
@@ -801,7 +838,7 @@ pub fn endpoint_addr_from_invite_v2(token: &InviteV2Token) -> Result<EndpointAdd
         return Err(SessionError::NoAddressingInfo(
             crate::identity::endpoint_id_display(&token.invite.issuer),
         ));
-    }
+}
     Ok(addr)
 }
 
@@ -1494,5 +1531,68 @@ mod ok2_tests {
         assert_eq!(parsed2.expires_at, now + MEMBER_CAP_TTL_MS);
         assert!(parsed2.caps & !crate::protocol::CAP_KNOWN_MASK == 0);
         let _ = CAP_KNOWN_MASK; // 域内引用（位图常量一致性）
+    }
+
+    // ==== 回环 relay 剔除（真双机验收实证 2026-09-29） ========================
+
+    #[test]
+    fn relay_url_is_loopback_classification() {
+        assert!(relay_url_is_loopback("http://127.0.0.1:3340"));
+        assert!(relay_url_is_loopback("https://127.0.0.1:1"));
+        assert!(relay_url_is_loopback("http://localhost:3340"));
+        assert!(relay_url_is_loopback("http://[::1]:3340"));
+        assert!(!relay_url_is_loopback("http://192.168.2.8:3340"));
+        assert!(!relay_url_is_loopback("https://relay.example.com"));
+        assert!(!relay_url_is_loopback("not a url"));
+    }
+
+    /// 签一支 v2 令牌（recipient 绑定；capability 缺省——addr 构造不校验）。
+    fn v2_token(relays: Vec<&str>, direct: Vec<std::net::SocketAddr>) -> InviteV2Token {
+        let root = crate::identity::NodeIdentity::from_seed([7u8; 32]);
+        let recipient = crate::identity::NodeIdentity::from_seed([8u8; 32]);
+        let invite = crate::protocol::InviteV2 {
+            fabric_id: crate::protocol::FabricId([9u8; 32]),
+            invite_id: crate::protocol::random_bytes::<16>(),
+            issuer: root.endpoint_id(),
+            expires_at_ms: 4_102_444_800_000,
+            recipient: recipient.endpoint_id(),
+            relays: relays
+                .into_iter()
+                .map(|url| crate::protocol::InviteRelayV2 {
+                    url: url.to_owned(),
+                    capability: None,
+                })
+                .collect(),
+            direct_addrs: direct,
+        };
+        InviteV2Token::sign(invite, root.secret_key()).unwrap()
+    }
+
+    #[test]
+    fn endpoint_addr_v2_drops_loopback_relays_when_direct_present() {
+        let token = v2_token(
+            vec!["http://127.0.0.1:3340", "http://192.168.2.8:3340"],
+            vec!["192.168.2.8:3341".parse().unwrap()],
+        );
+        let addr = endpoint_addr_from_invite_v2(&token).unwrap();
+        let relay_urls: Vec<String> = addr
+            .addrs
+            .iter()
+            .filter_map(|a| match a {
+                iroh_base::TransportAddr::Relay(url) => Some(url.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relay_urls, vec!["http://192.168.2.8:3340/".to_owned()]);
+        assert_eq!(addr.addrs.len(), 2, "one relay + one direct: {:?}", addr.addrs);
+    }
+
+    #[test]
+    fn endpoint_addr_v2_keeps_loopback_relay_without_direct() {
+        // 同机 relay-only 拓扑（redeem_ok2_wire 形态）：无直连地址时回环 relay
+        // 是唯一路径，必须保留
+        let token = v2_token(vec!["http://127.0.0.1:3340"], vec![]);
+        let addr = endpoint_addr_from_invite_v2(&token).unwrap();
+        assert_eq!(addr.addrs.len(), 1, "loopback relay kept: {:?}", addr.addrs);
     }
 }

@@ -15,6 +15,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createSidecar } from "../src/core/sidecar.mjs";
+import { hexToZ32 } from "../src/core/fabric.mjs";
 import { request } from "./helpers.mjs";
 
 const LEASE = {
@@ -51,7 +52,11 @@ function makeFakeSdk() {
   const fetchResponses = [];
   const sessions = [];
   const fabric = {
-    endpointId: LEASE.root,
+    // SDK endpointId 是 z32 展示串（租约 root 的 hex64 同钥异码——④断言先归一）
+    endpointId: hexToZ32(LEASE.root),
+    async rootEndpointId() {
+      return fabric.endpointId;
+    },
     async fabricIdHex() {
       return LEASE.fabric_id;
     },

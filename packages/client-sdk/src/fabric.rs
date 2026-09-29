@@ -637,6 +637,14 @@ impl Fabric {
         self.inner.is_member(&endpoint_id).await.map_err(fabric_err)
     }
 
+    /// 名册 root 的 EndpointId（z-base-32；空册=null）。「本机是否 root」的
+    /// 判定源——ensureRelayCapabilities 是 root-only，member 姿态（设备配对
+    /// 加入的对方 fabric）不得调用（capability 由 v2 兑换 OK2 附发）。
+    #[napi]
+    pub async fn root_endpoint_id(&self) -> Option<String> {
+        self.inner.root_endpoint_id().await
+    }
+
     /// 签发邀请令牌（root-only）。返回 dweb1. 前缀的自包含字符串。
     /// 第三参 opts 透传签发安全门逃生阀：relay 为空且 advertiseAddrs 为空时，
     /// 无 opts 或 allowRelayless !== true => reject（[invite-without-relay]）。
