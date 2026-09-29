@@ -1,0 +1,28 @@
+{
+  "name": "@jixo/opendweb-ext-files",
+  "version": "0.1.0",
+  "description": "opendweb webui plugin (webuiApi 1) - files folder sharing: fd-frozen-root wire filesystem (list/stat/read/chunk/commit/mkdir/rename/delete) with share ledger, staging TTL and .opendweb-ignore",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "files": [
+    "src"
+  ],
+  "exports": {
+    ".": {
+      "default": "./src/index.mjs"
+    },
+    "./opendweb-webui-plugin": {
+      "default": "./src/plugin.mjs"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/opendweb.git"
+  }
+}
