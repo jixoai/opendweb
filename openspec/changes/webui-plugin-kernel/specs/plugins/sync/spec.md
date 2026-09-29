@@ -36,20 +36,30 @@ sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对
 - **WHEN** 对象传输/合并进行中用户显式中止或会话断开
 - **THEN** ref 与工作树零变化；staging 目录经 TTL 回收；后续同步从头幂等重算（无残留部分状态）
 
-#### Scenario: type 与 mode 冲突的文件级决议（r2-B7）
+#### Scenario: type 冲突的文件级决议（file↔directory，r4 拆分）
 
-- **WHEN** 双向同步中一端把路径从文件改为目录（或改变可执行位等 mode），另一端修改了原文件内容
-- **THEN** 判为文件级冲突进入 conflicted 态（不做 hunk 合并）；UI 呈现两版本整文件选择（保留目录/保留文件内容），决议后收敛
+- **WHEN** 一端把路径从文件改为目录（含子树），另一端修改了原文件内容
+- **THEN** 判为文件级冲突进入 conflicted 态（不做 hunk 合并）；UI 呈现两版本整路径选择（保留目录子树/保留文件内容），决议后收敛
 
-#### Scenario: 超限对象拒绝（r2-B7）
+#### Scenario: mode 冲突的文件级决议（可执行位，r4 拆分）
 
-- **WHEN** 同步根中出现 >16MiB 的单 blob
-- **THEN** 该对象传输被拒绝并明示（含分批/排除建议）；ref 零变化；其余小对象同步不受影响
+- **WHEN** 双方内容相同但一方改变了可执行位（mode 冲突）
+- **THEN** 判为文件级冲突；UI 呈现 ours/theirs 整体条目选择（内容+mode 一体，不可拆开选）；决议后最终 git tree mode 与工作树执行位一致
 
-#### Scenario: 崩溃边界注入与确定性 roll-forward（r2-B3）
+#### Scenario: 超限对象拒绝（r4-N3 统一：整 push 原子拒绝）
 
-- **WHEN** 分别在 intent prepare 之后、工作树物化进行中、ref 推进之后、done 标记写入之前四个边界杀死进程，随后重启
-- **THEN** 每个边界下恢复协议唯一执行确定性 roll-forward（幂等重放物化+推进）；恢复后文件内容、ref、用户未提交本地改动三者一致且无半成品
+- **WHEN** 同步根的某 commit 树引用了 >16MiB 的单 blob
+- **THEN** 引用该 blob 的整个 push 被拒绝并明示（含排除/拆分建议）——部分对象成功不构成合法实现；ref 与工作树零变化；不含该 blob 的其他同步根与后续 commit 不受影响（文件级跳过大对象=过滤树语义，非 v1）
+
+#### Scenario: 崩溃边界注入与路径级三态恢复（r4-N2：含引擎半写区分）
+
+- **WHEN** 分别在 intent prepare 之后、工作树物化进行中（含某路径已 rename 出 target 内容后）、ref 推进之后、done 标记写入之前四个边界杀死进程，随后重启
+- **THEN** 恢复按**路径级三态分类**执行：实际状态==preimage 记录（判定元组含 type/mode）→应用该路径操作；实际状态==目标 postimage（含 type/mode）→该路径视为已完成（引擎自己的半写不得误判为用户冲突）；其他→用户新改动，保留内容转冲突绝不静默覆盖；ref 侧三态：==targetCommit→仅补 done（不再 CAS、不再重放）；==oldRef→物化完成后 CAS；其他→冲突停止保留现场；恢复后文件内容、ref、用户未提交本地改动三者一致且无半成品
+
+#### Scenario: 扫描后、恢复前的用户编辑保护（r4-N2 独立用例）
+
+- **WHEN** 目标路径在扫描后、恢复前被用户再次修改（实际状态既非 preimage 亦非 postimage，含仅 chmod/类型变化）
+- **THEN** 该路径新内容被保留并转冲突（intent 保留现场供用户决议），绝不静默覆盖；其余路径照常恢复；type/mode 变化与内容变化同等被检出（判定元组含类型与权限位）
 
 #### Scenario: 中断恢复与完整性
 

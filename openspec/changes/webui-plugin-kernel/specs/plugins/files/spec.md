@@ -16,7 +16,7 @@ files 插件 SHALL 在提供侧（A 机）维护共享账本 `<DWEB_HOME>/plugin
 - **WHEN** 请求 path 含 `..` 越界、绝对路径注入、或指向 root 内 symlink 的路径；**且攻击者循环地把共享根内的中间目录替换为指向 root 外的 symlink，同时并发发起读写请求**
 - **THEN** 全部拒绝（明确错误），零字节越界读/写；symlink 不被跟随（fd 链逐组件遍历：每级目录组件拒绝 symlink，最终操作只作用于已验证 fd）——并发竞态下 root 外零读写副作用（以 root 外文件系统监测断言）
 
-#### Scenario: 断线中断与幂等续传（r2-B7 冻结）
+#### Scenario: 断线中断与幂等续传（r4-N5 扩充验收）
 
-- **WHEN** 分片上传中途会话断开后以同 uploadId 重试（重复 PUT 同 seq/offset/hash 分片），或彻底放弃（不再重试）
-- **THEN** 重复分片幂等（不重复落盘不报错）；重试续传并在 commit 全片校验（总长+hash）后单次原子 rename；放弃的 uploadId staging 由 TTL 回收；正式目录永无半文件
+- **WHEN** 分片上传中途会话断开后以同 uploadId 重试（重复 PUT 同 seq/offset 分片且 chunkHash 相符）；或同幂等键但 bytes 内容不同（chunkHash 不符）；或伪造 chunkHash（与 bytes 重算不符）；或 commit 时整文件 hash 与分片拼接结果不符
+- **THEN** 同键同内容=幂等成功（不重复落盘不报错）；同键异内容=明确拒绝不覆盖；伪造 chunkHash=拒绝；整文件摘要不符=整体拒绝且零落盘；合法路径在 commit 全片校验（总长+hash）后单次原子 rename；放弃的 uploadId staging 由 TTL 回收；正式目录永无半文件

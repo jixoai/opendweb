@@ -157,7 +157,10 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 - wire（`/wpk1/files/<shareId>/<op>`）：
   `GET list?path=` / `GET stat?path=` / `GET read?path=&offset=&len=`（流式响应+Range
   语义：offset/len+OID/etag 版本标识；重命名后由客户端重拉列表恢复）/
-  `PUT chunk`（分片上传：{uploadId, seq, offset, bytes}→临时 staging）/ 
+  `PUT chunk`（分片上传：{uploadId, seq, offset, bytes, chunkHash}→临时 staging；
+  chunkHash=客户端声明块摘要，服务端从 bytes 重算比对——同幂等键
+  (uploadId,seq,offset) 同内容幂等成功、不同内容明确拒绝不覆盖 [r4-N5 与
+  delta 统一]）/ 
   `POST commit`（总长+hash 校验→原子 rename 落盘）/ `POST mkdir|rename|delete`。
 - **路径安全（r2-B2 冻结：fd 链遍历，非 lstat+open）**：share root 以目录 fd
   打开并冻结（realpath 仅作展示）；**每操作从 root fd 按路径组件逐级打开**
@@ -168,9 +171,11 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   Scenario 为验收门**（攻击者循环替换 vs 并发请求，断言 root 外零读写副作用）。
   若目标平台确无等效原语，降级边界=该平台 share root 限制为插件管理的受控目录
   （降级必须显式落文档，不得静默）。
-- 上传重试语义（r2-B7 冻结）：**幂等续传**——同 (uploadId, seq, offset, hash)
-  重复 `PUT chunk` 幂等；staging 按 uploadId 目录化；`commit` 校验全部分片
-  （总长+hash）后原子 rename；取消/TTL 过期回收整个 uploadId staging。
+- 上传重试语义（r2-B7 冻结；r4-N5 统一字段）：**幂等续传**——幂等键=
+  (uploadId, seq, offset)，内容判据=chunkHash（同键同内容幂等成功/同键异内容
+  明确拒绝不覆盖/伪造 chunkHash 即 bytes 重算不符=拒绝）；staging 按 uploadId
+  目录化；`commit` 按序核对全部分片（总长+整文件 hash）后原子 rename，整文件
+  摘要不匹配=整体拒绝；取消/TTL 过期回收整个 uploadId staging。
 - 单请求/chunk 上限 §4；staging 带 TTL 回收，取消/断线不暴露半文件（临时名不进
   正式命名空间）。
 - B 侧 UI（类型化专属页）：浏览/面包屑/上传（进度）/下载/改名/删除；写按钮按
@@ -228,18 +233,23 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
    rename 到目标路径（逐文件原子）；delete 直接 unlink；每步幂等（重放安全）；
 3. **推进**：ref CAS 到 targetCommit；
 4. **提交标记**：intent 追加 done 标记（原子写）。
-- **崩溃恢复（重启扫描，r3-N2 冻结恢复 ref 三态判定）**：发现未 done 的
-  intent → 按恢复判定执行：`currentRef == targetCommit` → 推进视为已完成，
-  仅补 done（**不得**再按旧快照 CAS——该 CAS 必失败）；`currentRef ==
-  oldRef` → 执行 CAS 推进；其他值 → 视为冲突：停止、保留现场、进 conflicted
-  态交用户。之后确定性 roll-forward（幂等重放物化），补 done。
-- **preimage 保护（r3-N2）**：intent 的路径操作清单 MUST 记录每路径的预期
-  前像（preimage OID 或不存在）；物化与恢复前逐路径复核——**实际前像与记录
-  不符（扫描后/崩溃期间用户新写入）→ 该路径保留新内容并转冲突/另存，绝不
-  静默覆盖**；四边界 Scenario 附加用例：目标路径在扫描后、恢复前被修改。
+- **崩溃恢复（重启扫描；r4-N2 冻结：路径级三态 × ref 三态，先分诊后执行）**：
+  发现未 done 的 intent →
+  1. **ref 分诊**：`currentRef == targetCommit` → 物化与推进均视为完成，逐路径
+     完成性核验后仅补 done（**不得**再按旧快照 CAS，也不重放物化）；
+     `currentRef == oldRef` → 进入路径分诊+物化，完成后 CAS；其他值 → 冲突：
+     停止、保留现场、conflicted 态交用户。
+  2. **路径分诊（仅 oldRef 分支执行）**：intent 的路径操作清单 MUST 记录每路径
+     的预期前像 preimage（OID 或不存在）与目标后像 postimage（OID 或不存在），
+     **判定元组=（OID，entry type，mode）**——OID 单独不可分辨 chmod/type 变化；
+     实际状态==preimage → 应用该路径操作；实际状态==postimage → 该路径已完成
+     （**引擎自己的半写不得误判为用户冲突**）；其他 → 用户新改动：保留内容、
+     保留 intent 现场、转冲突，绝不静默覆盖。
+  3. 全部路径完成且无冲突 → CAS → done；存在用户冲突路径 → conflicted 态
+     （intent 保留至用户决议后继续）。
 - 用户在同步根的未提交本地改动与协议的关系：物化前本地改动 MUST 已被
-  commit 进 device ref（scanning 阶段保证），故物化只触碰已提交内容的投影；
-  扫描后到物化间的新改动由 preimage 保护承接。
+  commit 进 device ref（scanning 阶段保证）；扫描后到物化/恢复间的新改动由
+  路径分诊第三态承接（保留+冲突）。
 - **验收（B3）**：在 prepare 后/物化中/推进后/标记前四个边界逐个注入崩溃 →
   重启恢复后断言：文件内容、ref、用户未提交改动三者一致且无半成品。
 
