@@ -315,6 +315,51 @@ packages/*/test 用例），并纳入 §9 双机验收矩阵。
 - 每 Phase 绿门：对应包 node --test + 既有套件全绿 + strict 校验；
   最终 Codex 实现终验 + Owner 双机实走。
 
+### 9.1 真双机验收实录（iMac ↔ Mac mini，2026-09-29/30）
+
+实现四阶段全绿（webui 256 / ext-ports 35 / ext-files 52 / ext-sync 49 /
+client-sdk 95 / tray 26 / opendweb 245，strict 通过）后进入真双机验收，
+两轮共抓出 **9 个真实缺陷**（单机/替身测试全部测不出的类别）：
+
+**第一轮（cb6533a + 9e50d20）**：① NAPI 主入口 CJS 互操作（cjs-module-lexer
+不识别命名导出，Fabric 须经 default 取）；② 首次 SDK 接触的已 join 设备无
+roster（CLI join 纯 JS）→ open 失败回落 createRoot 采纳租约 fabricId；
+③ endpointId z32↔hex 同钥异码（字母表+MSB-first 位序经 SDK ground-truth
+校准）；④ 会话 peer 编码归一；⑤ 重启恢复双缺口（fabric 惰性触发只在 enable
+转换 + 宿主恢复不重放 onEnable）；⑥ relay HTTP-only 无 QUIC 数据面 →
+LAN 直连为主路径，invite 必须携带直连地址（advertiseAddrs/bindAddr env）；
+⑦ member 句柄照抄 root 五步的 `ensureRelayCapabilities`（root-only）即
+`RosterError::NotRoot`——新增内核 `rootEndpointId()` 姿态分流；⑧ hexToZ32
+尾组对齐 bug（残余位须左移 MSB，末位为 1 的键产出错误末字符）；⑨ 回环 relay
+死候选令 iroh dial 停滞不回落 direct → 签发/拨号双侧回环剔除。
+
+**第二轮（abc3459）**：⑩ **member relay cap TTL 被钳到 invite 兑换窗口**
+（`mint_for` 的 `.min(invite_expires_at_ms)`）——invite 默认 10 分钟 TTL
+导致成员 10 分钟后失去 relay 访问、重启后永久无法重连（open 路径拨号零出站
+停滞的根因）；活 spec（fabric/session「回执帧版本化」）冻结的是"长期 member
+capability（TTL 上限 90 天）"，invite 过期是兑换防重放窗口、不是成员寿命。
+同轮：NAPI release 产物 strip 损坏（cargo strip=true 经链接器产出
+mis-aligned LINKEDIT 坏 Mach-O——profile 改 strip=false + 构建脚本
+`strip -Sx`+codesign 后处理）；join_classification 的 DNS 失败假设在本机
+mihomo Fake-IP 环境不成立（.invalid 解析进 198.18.0.0/15 且 TCP 可达）→
+环境感知断言。
+
+**验收里程碑（ports 等价性）**：mini `curl localhost:19090` → HTTP 200 /
+42231B / python http.server 目录列表，与 iMac 直连 `127.0.0.1:8080` 等同；
+member 重启（graceful）后 open 路径自动恢复（member 姿态+90d cap 注入+
+relay ≤4s 连接）。
+
+**进行中（深挖代理）**：⑪ 崩溃恢复不收敛——会话建立后成员被 kill -9，
+仅重启成员不恢复（存活方陈旧对端会话/连续性状态掐死新会话
+`continuity stream io: connection lost` + 重拨饿死 relay 退避；双侧重启
+0.4s 收敛）；⑫ sidecar close()/TERM drain 挂死（健康 fabric 也复现，
+两机多例）；⑬ 在位配对路由（POST /sidecar/fabric/join）干净状态终验
+（此前 4 次停滞系僵尸同键端点环境污染，独立进程同代码稳定成功）。
+
+**验收方法论沉淀**（全局 AGENTS.md）：cdylib 重建门禁必须含真实 dlopen；
+Fake-IP 环境下网络假设测试需环境感知；kill 后必须验证死亡（TERM 被 drain
+挂死吞掉真实存在，僵尸同身份端点是"新进程网络全断"的首要嫌疑）。
+
 ## 10. 评审处置表
 
 | 轮 | 结论 | 处置 |
