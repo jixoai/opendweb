@@ -4,12 +4,16 @@
 	// 我的中枢视角 = 既有四页（server-access-roles 冻结面零回退）+ 接入卡片卡/
 	// 中枢状态卡（总览置顶）；我的租约 / 我的到访 = 单页台账（无侧栏导航）；
 	// member 态访问中枢页 → no-hub 诚实页。视角切换 = hash 驱动整页重渲。
+	// webui-plugin-kernel Phase 0（r2-B5）：#/p/* → 注册表组件分派（admin=hub 壳
+	// 内；member=独立壳）；停用/未知深链 → 基线收敛（#/overview，不残留死页）。
 	import { Button } from "$lib/components/ui/button";
 	import { Skeleton } from "$lib/components/ui/skeleton";
 	import { Toaster } from "$lib/components/ui/sonner";
 	import { RefreshCw } from "@lucide/svelte";
 	import { untrack } from "svelte";
 	import { consoleStore as cs } from "$lib/console.svelte";
+	import { findPluginRoute } from "$lib/plugin-registry";
+	import { pluginPageComponent } from "$lib/plugin-pages";
 	import SetupWizard from "./components/SetupWizard.svelte";
 	import TopBar from "./components/TopBar.svelte";
 	import SideNav from "./components/SideNav.svelte";
@@ -40,6 +44,20 @@
 		if (cs.appWorld) untrack(() => cs.$poll());
 	});
 
+	// 插件注册表随世界起步首拉（webui-plugin-kernel Phase 0；启停动作后显式刷新，
+	// 深链渲染裁决与 SideNav 工具区行依赖它）。同样 untrack（D2 防线同源）。
+	$effect(() => {
+		if (cs.appWorld) untrack(() => void cs.refreshPlugins());
+	});
+
+	// 插件深链收敛（r2-B5 四场景之一）：命中 #/p/<managed> 但服务端 disabled/未知
+	// → 按既有未知 hash 收敛语义落 #/overview（不残留死页/错误页）。pending=
+	// 服务端状态未加载（深链首拍）——等待，不抢收敛。
+	$effect(() => {
+		if (cs.pluginDecision !== "converge") return;
+		untrack(() => cs.applyHash("#/overview"));
+	});
+
 	// 各页数据拉取：中枢四页（admin）进页即拉，动作后各自刷新；租约/到访页由
 	// 3s 列表轮询覆盖（首拍在 $poll 内）。
 	$effect(() => {
@@ -60,6 +78,9 @@
 	const setupWorld = $derived((cs.phase === "setup" && cs.role !== "member") || cs.connectResult?.ok === true);
 	// 中枢视角的首页数据条件（admin：四页；member：no-hub）
 	const hubPerspective = $derived(cs.perspective === "hub");
+	// 插件页分派原料（routeId → 注册表条目 → 编译期组件绑定；缺绑定=fail-fast 抛错）
+	const pluginEntry = $derived(cs.route.view === "plugin" ? findPluginRoute(cs.route.routeId) : null);
+	const PluginPage = $derived(pluginEntry !== null ? pluginPageComponent(pluginEntry) : null);
 </script>
 
 <Toaster position="bottom-right" richColors={false} />
@@ -112,12 +133,20 @@
 							<TenantsView />
 						{:else if cs.route.view === "visitors"}
 							<VisitorsView />
+						{:else if cs.route.view === "plugin" && pluginEntry !== null && PluginPage !== null}
+							<!-- 插件页（admin）：hub 壳内渲染（SideNav 工具区高亮同源） -->
+							<PluginPage entry={pluginEntry} />
 						{:else}
 							<OnlineView />
 						{/if}
 					</div>
 				</main>
 			</div>
+		{:else if cs.route.view === "plugin" && pluginEntry !== null && PluginPage !== null}
+			<!-- 插件页（member 姿态的 both 可见页——如插件面板）：独立壳直给 -->
+			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">
+				<PluginPage entry={pluginEntry} />
+			</main>
 		{:else if cs.route.view === "lease"}
 			<!-- 我的租约：单页直给，不虚构层级 -->
 			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">

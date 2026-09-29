@@ -29,6 +29,14 @@
 //    Origin 严格策略（四类冻结：same-origin 200 / 缺失 Origin 403 / 伪造 403 /
 //    坏 Host 403；基线 guard 的缺失放行不适用于新写路由）；probe 另有角色
 //    守卫（r18 P1-1/裁决 #14：到访簿仅成员侧写入——非 member 姿态 403）；
+// 3e. /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0，
+//    design §3.1；homeDir 注入即启用——插件宿主与运行账本跟随本机 DWEB_HOME；
+//    admin/member 姿态均服务——插件宿主是设备本地运行时，与远端中枢 admin 面
+//    无关）：GET /sidecar/plugins（注册表+状态+「即将推出」+外部插件标注）·
+//    POST /sidecar/plugins/<id>/enable|disable · GET/PUT
+//    /sidecar/plugins/<id>/config。读路由=基线 Host 守卫；写路由（enable/
+//    disable/PUT config）=精确 Origin 四类。零凭证：不读 token/argv/env——
+//    插件面无 capability 之外的任何秘密（spec「控制面授权与零凭证」）。
 // 4. stdlib http/https.request 按解析 IP + SNI + Host 逐请求连接（agent:false
 //    + 响应结束/abort 即 destroy socket）；body 界 64KiB/1MiB；10s 超时；
 // 5. 日志只记 method/path/status/耗时——token 不进任何日志/响应。
@@ -46,6 +54,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateTarget } from "./target.mjs";
 import { NodeStore, publicNode } from "./nodes.mjs";
+import { createPluginHost } from "./plugins/host.mjs";
 import {
   hubProjection,
   hubSnapshotSlot,
@@ -243,6 +252,7 @@ export async function createSidecar(opts = {}) {
     homeFetch,
     homeIsPidAlive,
     homeProbeTimeoutMs,
+    pluginsHost,
   } = opts;
   if (target && (typeof token !== "string" || token === "")) {
     throw new Error("startSidecar: target requires a token");
@@ -273,6 +283,14 @@ export async function createSidecar(opts = {}) {
       () => null,
     );
   }
+  /**
+   * WebUI 插件宿主（webui-plugin-kernel Phase 0）：pluginsHost 注入即用（测试
+   * 慢存储/超时注入面）；否则 homeDir 给出即创建（运行账本 <DWEB_HOME>/plugins/
+   * state.json，损坏 fail-fast 拒启——与 NodeStore 同纪律）。两态（admin/member）
+   * 均服务：插件宿主是设备本地运行时，不属远端中枢 admin 面。
+   * @type {import("./plugins/host.mjs").PluginHost | null}
+   */
+  const plugins = pluginsHost ?? (homeDir === null ? null : await createPluginHost({ home: path.resolve(homeDir) }));
   /**
    * 节点簿添加配对码（独立于 setup 配对面；每次成功添加或连败 5 次即轮换新码
    * 并打印终端——「每次新配对码」；措辞避开 "pairing code: " 前缀，防与 setup
@@ -515,6 +533,13 @@ export async function createSidecar(opts = {}) {
     // 值不进任何日志/响应。非 createConsole sidecar 无此面（维持既有 404）。
     if (capabilities !== null && req.method === "GET" && (req.url === "/sidecar/session" || req.url?.startsWith("/sidecar/session?"))) {
       handleSession(req, res, startedAt);
+      return;
+    }
+    // WebUI 插件控制面（webui-plugin-kernel Phase 0，design §3.1）：plugins 宿主
+    // 存在（homeDir/pluginsHost）即启用。先于下方 POST-only 门——GET/PUT/POST
+    // 三族都在本 handler 内分派。零凭证（无 token/argv/env 读取）。
+    if (plugins !== null && (req.url === "/sidecar/plugins" || req.url?.startsWith("/sidecar/plugins/"))) {
+      await handlePlugins(req, res, startedAt);
       return;
     }
     if (req.method !== "POST") {
@@ -832,6 +857,98 @@ export async function createSidecar(opts = {}) {
       return;
     }
 
+    sendJson(res, 404, { error: { code: "not-found" } });
+    logAccess(req, 404, startedAt);
+  }
+
+  // ---- /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0） ---------
+
+  /**
+   * 插件控制面（design §3.1 冻结路由集）：
+   * - GET  /sidecar/plugins：注册表+状态+「即将推出」（vpn/clash/ai/ssh/screen）
+   *   +「外部 WebUI 插件=后续版本」标注——读路由基线 Host 守卫（缺失 Origin 放行）。
+   * - POST /sidecar/plugins/<id>/enable|disable：写路由精确 Origin 四类
+   *   （same-origin 200 / 缺失 403 / 伪造 403 / 坏 Host 403）。disable 等待
+   *   drain 收敛（有界，默认 10s）后才应答。
+   * - GET/PUT /sidecar/plugins/<id>/config：读=基线守卫；PUT=写路由精确 Origin。
+   * 零凭证：本 handler 族不读 token/argv/env——响应与日志零秘密。
+   */
+  async function handlePlugins(req, res, startedAt) {
+    const url = req.url ?? "";
+    // GET /sidecar/plugins：面板数据源（admin/member 两态皆可读——设备本地面）
+    if (req.method === "GET" && url === "/sidecar/plugins") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      sendJson(res, 200, plugins.list());
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    const actionMatch = /^\/sidecar\/plugins\/([a-z][a-z0-9-]*)\/(enable|disable|config)$/.exec(url);
+    if (actionMatch === null) {
+      sendJson(res, 404, { error: { code: "not-found" } });
+      logAccess(req, 404, startedAt);
+      return;
+    }
+    const id = actionMatch[1];
+    const action = actionMatch[2];
+    if (action === "enable" || action === "disable") {
+      if (req.method !== "POST") {
+        sendJson(res, 404, { error: { code: "not-found" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const r = action === "enable" ? await plugins.enable(id) : await plugins.disable(id);
+      if (!r.ok) {
+        // unknown-plugin=404；invalid-transition=409（registered 无可停用物）；
+        // busy=409（同插件并发启停）；lock=503（账本锁获取失败）
+        const status = r.code === "unknown-plugin" ? 404 : r.code === "lock" ? 503 : 409;
+        sendJson(res, status, { error: { code: r.code, message: pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, { plugin: r.plugin });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    // config：GET 读 / PUT 写（PUT 是写路由——精确 Origin 四类）
+    if (req.method === "GET" && action === "config") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      const config = plugins.getConfig(id);
+      if (config === null) {
+        sendJson(res, 404, { error: { code: "not-found", message: "unknown webui plugin id" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      sendJson(res, 200, { config });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    if (req.method === "PUT" && action === "config") {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const body = await readBody(req, res);
+      if (body === null) {
+        logAccess(req, 413, startedAt);
+        return;
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(body.toString("utf8"));
+      } catch {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be a JSON object of config values" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const r = await plugins.setConfig(id, parsed);
+      if (!r.ok) {
+        const status = r.code === "unknown-plugin" ? 404 : r.code === "invalid-config" || r.code === "busy" ? 400 : 503;
+        sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, { config: r.config });
+      logAccess(req, 200, startedAt);
+      return;
+    }
     sendJson(res, 404, { error: { code: "not-found" } });
     logAccess(req, 404, startedAt);
   }
@@ -1235,6 +1352,7 @@ export async function createSidecar(opts = {}) {
       for (const r of inflight) r.destroy();
       inflight.clear();
       capabilities?.close(); // 会话 capability close 即失效（design §5.1）
+      await plugins?.close(); // 插件宿主拆运行时（不落盘状态变更——重启按账本恢复）
       const closing = new Promise((resolve) => server.close(() => resolve(undefined)));
       server.closeAllConnections?.();
       await closing;
@@ -1253,6 +1371,7 @@ export async function createSidecar(opts = {}) {
  * @property {{ switchNode: (nodeId: string) => Promise<{ ok: true, node: object } | { ok: false, status: number, code: string, message: string }>, snapshot: () => { mode: "setup" | "ready", node: { id: string, name: string, server_host: string, added_at: number, current: boolean } | null, hub: { present: true, machine: string, primary_url: string, short_code: string, running: boolean | null } | null, role: "admin" | "member" } }} controls
  * @property {import("./events.mjs").EventBus | null} bus
  * @property {import("./capability.mjs").CapabilityRegistry | null} capabilities
+ * @property {import("./plugins/host.mjs").PluginHost | null} plugins WebUI 插件宿主（homeDir/pluginsHost 启用；缺省 null）
  * @property {() => Promise<void>} close
  */
 
@@ -1273,4 +1392,22 @@ function safeError(e) {
   let out = "";
   for (const ch of s) out += ch >= "\x20" && ch <= "\x7e" ? ch : "?";
   return out;
+}
+
+/** 插件控制面错误文案（ASCII 程序常量——零秘密） */
+function pluginErrorMessage(code) {
+  switch (code) {
+    case "unknown-plugin":
+      return "unknown webui plugin id";
+    case "invalid-transition":
+      return "plugin was never enabled; there is nothing to disable";
+    case "busy":
+      return "another enable/disable/config change is in flight for this plugin";
+    case "invalid-config":
+      return "config values do not match the plugin config schema";
+    case "lock":
+      return "cannot acquire the plugin state lock; try again";
+    default:
+      return "plugin operation failed";
+  }
 }

@@ -7,26 +7,35 @@
 
 ## 1. Phase 0 —— 插件宿主（地基，其余 Phase 的前置）
 
-- [ ] WebUI 插件契约：`./opendweb-webui-plugin` export（webuiApi 1：id/pages/
+- [x] WebUI 插件契约：`./opendweb-webui-plugin` export（webuiApi 1：id/pages/
       routes/dataEndpoints/configSchema）+ 类型面；CLI `./opendweb-plugin`
       apiVersion 1 契约零变化（既有测试零回归证明）
-- [ ] 宿主运行时：进程内注册表（编译期静态注册内置三插件）、生命周期状态机
+      ——契约权威源=packages/webui/src/core/plugins/contract.mjs（零依赖校验器，
+      包根 export 面 + index.d.ts 类型面）；第一个真实导出该子路径的包在 Phase 1
+- [x] 宿主运行时：进程内注册表（编译期静态注册内置三插件）、生命周期状态机
       （registered→enabled、enabled⇄disabled 两条有向转换）、停用顺序
       （先拒新→drain 默认 10s 可配超时强制取消+稳定错误→dispose→落盘）
-- [ ] 双账本：`<DWEB_HOME>/plugins/state.json`（0600 原子写+锁家族）+
+      ——core/plugins/{registry,host}.mjs；runtimes 钩子通道（onEnable/onDispose）
+- [x] 双账本：`<DWEB_HOME>/plugins/state.json`（0600 原子写+锁家族）+
       `<DWEB_HOME>/plugins/<id>/` 数据目录；安装账本 plugins.json 零接触
-- [ ] 控制面路由：`/sidecar/plugins`（GET 注册表+状态）、
+      ——core/plugins/state.mjs（leases.mjs acquireFileLock/atomicWrite0600 复用）
+- [x] 控制面路由：`/sidecar/plugins`（GET 注册表+状态）、
       `/sidecar/plugins/<id>/enable|disable`（POST 精确 Origin）、
       `/sidecar/plugins/<id>/config`（GET/PUT）；Host 守卫沿用；零凭证
-- [ ] UI 接入：编译期 route registry（`#/p/<pluginId>/<pageId>`）+ routeFor
+      ——sidecar.mjs 3e 段（admin/member 姿态均服务——设备本地运行时）
+- [x] UI 接入：编译期 route registry（`#/p/<pluginId>/<pageId>`）+ routeFor
       扩展 + App.svelte 分派（命中且 enabled 渲染；disabled/未知按既有基线
       收敛）+ SideNav「工具」区（视角可见性过滤）+ 插件面板页（启停/配置/
       「即将推出」占位 vpn·clash·ai·ssh·screen + 「外部 WebUI 插件=后续」
       标注；marketplace CLI 候选不呈现为可启用）
-- [ ] 测试：生命周期 drain/摘牌、控制面四类 Origin 矩阵、路由接入四场景
+      ——ui/src/lib/plugin-registry.ts（路由形状权威源+渲染裁决）+ plugin-pages.ts
+      （组件绑定）+ 插件面板 #/p/host/panel（both 可见；member 深链直达）
+- [x] 测试：生命周期 drain/摘牌、控制面四类 Origin 矩阵、路由接入四场景
       （可达/深链刷新/停用收敛/未知收敛+既有路由零变化）、双账本分离、
       既有 webui 全套零回归
-- [ ] dist 重建入库
+      ——test/plugins-{host,sidecar,route}.test.mjs（30 用例；全套 225/225，
+      基线 195 零回归）
+- [x] dist 重建入库
 
 ## 2. Phase 1 —— ports 端口共享插件
 

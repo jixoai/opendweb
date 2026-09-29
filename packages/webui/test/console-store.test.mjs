@@ -27,7 +27,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(HERE, "..");
 const LIB_DIR = path.join(PKG_ROOT, "ui", "src", "lib");
 const COMPILED = path.join(HERE, ".console-store.compiled.mjs");
-const LOCAL_SPECIFIERS = ["./api", "./route", "./hex", "./terms", "./member", "./format"];
+const LOCAL_SPECIFIERS = ["./api", "./route", "./hex", "./terms", "./member", "./format", "./plugin-registry"];
 
 // ---- 编译 harness：console.svelte.ts → 可在 node 运行的 runes 模块 ------------------
 

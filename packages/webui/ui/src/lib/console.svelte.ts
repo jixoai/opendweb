@@ -20,9 +20,12 @@ import {
 	disconnectByEndpoint,
 	disconnectByFabric,
 	dismissKnock,
+	disableSidecarPlugin,
+	enableSidecarPlugin,
 	fetchSidecarHub,
 	fetchSidecarLeases,
 	fetchSidecarNodes,
+	fetchSidecarPlugins,
 	fetchSidecarState,
 	fetchSidecarVisits,
 	grantVisitor,
@@ -40,6 +43,7 @@ import {
 	patchVisitorMeta,
 	postConnect,
 	probeSidecarVisit,
+	putSidecarPluginConfig,
 	registerOwner,
 	renewOwner,
 	revokeCode,
@@ -56,12 +60,15 @@ import {
 	type KnockEntry,
 	type LeaseEntry,
 	type OwnersData,
+	type PluginConfigValues,
+	type PluginsData,
 	type Receipt,
 	type SidecarNode,
 	type SidecarState,
 	type StatusData,
 	type VisitEntry,
 	type VisitorEntry,
+	type WebuiPluginEntry,
 } from "./api";
 import {
 	PERSPECTIVE_HASH,
@@ -74,6 +81,7 @@ import {
 	type Perspective,
 	type Route,
 } from "./route";
+import { pluginRouteDecision } from "./plugin-registry";
 import { validateHex64 } from "./hex";
 import { aliasEditError, aliasEditSubmit, type DisconnectPhase } from "./terms";
 import { labelEditError, labelEditSubmit } from "./member";
@@ -268,6 +276,17 @@ class ConsoleStore {
 	/** 「测一下」进行中的目标 origin（按钮 Loading 锁，防重复触发）。 */
 	probeBusy = $state<string | null>(null);
 
+	// ---- 插件面（webui-plugin-kernel Phase 0：/sidecar/plugins* 本机控制面） ----------
+
+	pluginsData = $state<PluginsData | null>(null);
+	pluginsError = $state<AdminError | null>(null);
+	/** 启停动作锁（一次一插件一动作；"<id>:enable" | "<id>:disable"）。 */
+	pluginActionBusy = $state<string | null>(null);
+	/** 配置保存锁（一次一插件）。 */
+	pluginConfigBusy = $state<string | null>(null);
+	/** 配置表单草稿（插件 id → 值；面板/通用页共用——保存成功即清除）。 */
+	pluginConfigDraft = $state<Record<string, PluginConfigValues>>({});
+
 	detailsOpen = $state(false);
 	onlineFilter = $state<string | null>(null);
 
@@ -290,6 +309,15 @@ class ConsoleStore {
 	}
 	get route(): Route {
 		return routeFor(this.hash, this.appWorld ? "ready" : "setup", this.role);
+	}
+	/**
+	 * 插件页渲染裁决（plugin-registry.pluginRouteDecision 的薄封装）：
+	 * render=渲染；converge=停用/未知 → 基线收敛；pending=服务端状态未加载。
+	 * App 壳的收敛 effect 与插件页组件共用本派生。
+	 */
+	get pluginDecision(): "render" | "converge" | "pending" {
+		if (this.route.view !== "plugin") return "render";
+		return pluginRouteDecision(this.route.pluginId, this.pluginsData).action;
 	}
 	/** 当前视角（切换器高亮与外壳分派）。 */
 	get perspective(): Perspective {
@@ -672,6 +700,89 @@ class ConsoleStore {
 			return false;
 		} finally {
 			this.probeBusy = null;
+		}
+	}
+
+	// ---- 插件面动作（启停/配置；写路由由浏览器 same-origin Origin 承载） ---------------
+
+	/** 面板数据源（appWorld 起步拉 + 动作后刷新；404=该 sidecar 无插件面——面板呈现不可用态）。 */
+	async refreshPlugins(): Promise<void> {
+		try {
+			this.pluginsData = await fetchSidecarPlugins();
+			this.pluginsError = null;
+		} catch (e) {
+			this.pluginsError = toAdminError(e);
+		}
+	}
+
+	/** 启用插件（registered/disabled→enabled；幂等）。返回 {ok} 供 toast。 */
+	async enablePlugin(id: string): Promise<boolean> {
+		if (this.pluginActionBusy !== null) return false;
+		this.pluginActionBusy = `${id}:enable`;
+		try {
+			await enableSidecarPlugin(id);
+			await this.refreshPlugins();
+			return true;
+		} catch (e) {
+			this.pluginsError = toAdminError(e);
+			return false;
+		} finally {
+			this.pluginActionBusy = null;
+		}
+	}
+
+	/**
+	 * 停用插件（摘牌→drain（有界）→dispose→落盘；请求在 drain 收敛后应答——
+	 * 慢停用是设计行为，按钮 Loading 锁全程持有）。返回 {ok} 供 toast。
+	 */
+	async disablePlugin(id: string): Promise<boolean> {
+		if (this.pluginActionBusy !== null) return false;
+		this.pluginActionBusy = `${id}:disable`;
+		try {
+			await disableSidecarPlugin(id);
+			await this.refreshPlugins();
+			return true;
+		} catch (e) {
+			this.pluginsError = toAdminError(e);
+			return false;
+		} finally {
+			this.pluginActionBusy = null;
+		}
+	}
+
+	/** 配置草稿写入（受控输入；离开面板不清除——同插件回访保留未保存编辑）。 */
+	setPluginConfigDraft(id: string, key: string, value: string | number | boolean): void {
+		const prev = this.pluginConfigDraft[id] ?? {};
+		this.pluginConfigDraft = { ...this.pluginConfigDraft, [id]: { ...prev, [key]: value } };
+	}
+
+	/** 草稿起点：进入表单时以服务端 config 为底（已有草稿则保留）。 */
+	seedPluginConfigDraft(plugin: WebuiPluginEntry): void {
+		if (this.pluginConfigDraft[plugin.id] !== undefined) return;
+		this.pluginConfigDraft = { ...this.pluginConfigDraft, [plugin.id]: { ...plugin.config } };
+	}
+
+	cancelPluginConfigDraft(id: string): void {
+		const next = { ...this.pluginConfigDraft };
+		delete next[id];
+		this.pluginConfigDraft = next;
+	}
+
+	/** 保存配置（PUT——服务端 configSchema 校验；成功清除草稿）。返回 {ok} 供 toast。 */
+	async savePluginConfig(id: string): Promise<boolean> {
+		const draft = this.pluginConfigDraft[id];
+		if (draft === undefined || this.pluginConfigBusy !== null) return false;
+		this.pluginConfigBusy = id;
+		try {
+			await putSidecarPluginConfig(id, draft);
+			this.cancelPluginConfigDraft(id);
+			await this.refreshPlugins();
+			return true;
+		} catch (e) {
+			this.pluginsError = toAdminError(e);
+			return false;
+		} finally {
+			this.pluginConfigBusy = null;
 		}
 	}
 

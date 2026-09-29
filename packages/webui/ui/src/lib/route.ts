@@ -7,6 +7,13 @@
 // #/access→#/visitors、#/online→#/online、#/overview→#/overview、其余未知
 // hash→#/overview。setup 态任何 hash 都落引导（v1 基座不变）。member 态访问
 // 中枢四页 → no-hub（这台设备没有中枢身份的诚实页，无 admin 概念）。
+// webui-plugin-kernel Phase 0（r2-B5 冻结协议）：`#/p/<pluginId>/<pageId>` 前缀
+// = 编译期插件路由注册表（plugin-registry.ts）——命中且视角可见 → plugin 视图
+// （渲染还需服务端 enabled，裁决在 pluginRouteDecision/App 壳）；命中但不可见
+// → overview（member 再映射 no-hub，与中枢四页同拍）；未知/畸形 #/p/* →
+// 既有未知 hash 收敛（#/overview）。既有路由行为零变化（零回归门覆盖）。
+
+import { findPluginRoute, visibleToRole } from "./plugin-registry.ts";
 
 export type RouteView =
 	| "setup"
@@ -18,7 +25,15 @@ export type RouteView =
 	| "visits"
 	| "no-hub";
 
-export type Route = { view: RouteView };
+/** 插件页视图（routeId 命中注册表；渲染门控见 plugin-registry.pluginRouteDecision）。 */
+export interface PluginRouteView {
+	view: "plugin";
+	pluginId: string;
+	pageId: string;
+	routeId: string;
+}
+
+export type Route = { view: RouteView } | PluginRouteView;
 
 /** 三视角（home-hub 组 B 命名冻结；切换器的身份锚点）。 */
 export type Perspective = "hub" | "lease" | "visits";
@@ -59,12 +74,19 @@ const CONVERGE: Record<string, string> = {
 const HUB_VIEWS = new Set(["overview", "tenants", "visitors", "online"]);
 
 function canonicalFor(hash: string | null | undefined): string {
-	const h = String(hash ?? "").replace(/^#\/?/, "");
-	const [head, second] = h.split("/");
-	// v1 深链细分：#/access/online 的「在线」意图保留（父段 access 仍收敛门禁页）
-	if (head === "access" && second === "online") return "#/online";
-	if (head in CONVERGE) return CONVERGE[head];
-	return "#/overview"; // 未知 hash → 总览（不 404）
+  const h = String(hash ?? "").replace(/^#\/?/, "");
+  const [head, second] = h.split("/");
+  // 插件路由空间（r2-B5）：注册表命中=规范形态原样（member 不可见页也保留
+  // URL——与 member 访问中枢四页的既有语义同拍）；未知/畸形 #/p/* → 未知 hash
+  // 收敛（#/overview，不 404）
+  if (head === "p") {
+    const full = `#/${h}`;
+    return findPluginRoute(full) !== null ? full : "#/overview";
+  }
+  // v1 深链细分：#/access/online 的「在线」意图保留（父段 access 仍收敛门禁页）
+  if (head === "access" && second === "online") return "#/online";
+  if (head in CONVERGE) return CONVERGE[head];
+  return "#/overview"; // 未知 hash → 总览（不 404）
 }
 
 /**
@@ -81,17 +103,23 @@ export function canonicalHashFor(hash: string | null | undefined): string | null
  * @param role home-hub 2b：sidecar 姿态（缺省 admin——旧调用面不变）
  */
 export function routeFor(hash: string | null | undefined, phase: string, role: "admin" | "member" = "admin"): Route {
-	if (phase !== "ready") return { view: "setup" };
-	const view = canonicalFor(hash).slice(2);
-	if (role === "member" && HUB_VIEWS.has(view)) return { view: "no-hub" };
-	return { view: view as Exclude<RouteView, "setup"> };
+  if (phase !== "ready") return { view: "setup" };
+  // 插件路由（r2-B5）：命中且视角可见 → plugin 视图；命中但不可见 → overview
+  // （走下方 member 映射——与中枢四页同拍；URL 不重写）
+  const pluginEntry = findPluginRoute(hash);
+  if (pluginEntry !== null && visibleToRole(pluginEntry.visibility, role)) {
+    return { view: "plugin", pluginId: pluginEntry.pluginId, pageId: pluginEntry.pageId, routeId: pluginEntry.routeId };
+  }
+  const view = pluginEntry !== null ? "overview" : canonicalFor(hash).slice(2);
+  if (role === "member" && HUB_VIEWS.has(view)) return { view: "no-hub" };
+  return { view: view as Exclude<RouteView, "setup"> };
 }
 
 /** 视图 → 所属视角（切换器高亮与外壳分派的唯一依据）。 */
-export function perspectiveFor(view: RouteView): Perspective {
-	if (view === "lease") return "lease";
-	if (view === "visits") return "visits";
-	return "hub"; // setup/no-hub/中枢四页均属中枢视角外壳
+export function perspectiveFor(view: Route["view"]): Perspective {
+  if (view === "lease") return "lease";
+  if (view === "visits") return "visits";
+  return "hub"; // setup/no-hub/plugin/中枢四页均属中枢视角外壳
 }
 
 /**

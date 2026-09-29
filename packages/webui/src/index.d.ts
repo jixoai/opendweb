@@ -341,3 +341,164 @@ export function createConsole(opts: {
 
 /** urlFor/open 的会话 capability query 参数名 */
 export const CAPABILITY_QUERY_PARAM: string;
+
+// ---- core/plugins/*（webui-plugin-kernel Phase 0：插件宿主地基） -----------------
+//
+// WebUI 插件契约 ./opendweb-webui-plugin（webuiApi 1）——独立于 CLI
+// ./opendweb-plugin（apiVersion 1 零变化）。Phase 0 宿主只静态注册编译内置的
+// ports/files/sync 占位 descriptor；第一个真实导出该子路径的 workspace 包在
+// Phase 1（@jixo/opendweb-ext-ports）。
+
+export const WEBUI_PLUGIN_API: 1;
+
+export type PluginPagePerspective = "admin" | "member" | "both";
+export type PluginPageType = "settings" | "page";
+
+export interface WebuiPluginPage {
+  id: string;
+  title: string;
+  /** 导航区（"tools"=SideNav 工具区）；null/缺省=不进导航 */
+  nav?: string | null;
+  /** lucide 图标名（kebab-case；可缺省） */
+  icon?: string | null;
+  /** settings=通用 renderer（简单配置/表格页）；page=插件专属组件 */
+  type: PluginPageType;
+  /** 视角可见性 */
+  perspective: PluginPagePerspective;
+  /** 宿主编译期绑定的 Svelte 组件（非 wire 契约；可缺省） */
+  component?: unknown;
+}
+
+export interface PluginConfigProperty {
+  type: "string" | "number" | "boolean";
+}
+
+export interface PluginConfigSchema {
+  type: "object";
+  properties: Record<string, PluginConfigProperty>;
+  required?: string[];
+}
+
+export interface WebuiPluginDescriptor {
+  id: string;
+  webuiApi: 1;
+  pages: WebuiPluginPage[];
+  /** 声明面（后续 Phase 消费；可缺省） */
+  routes?: Array<{ id: string }>;
+  /** 声明面（/wpk1 wire 端点；可缺省） */
+  dataEndpoints?: Array<{ id: string; path?: string }>;
+  configSchema: PluginConfigSchema;
+}
+
+/** descriptor 校验（字段集冻结：未知字段拒绝；信任模型=可信插件，非沙箱）。 */
+export function validateWebuiPluginDescriptor(
+  value: unknown,
+): { ok: true; value: WebuiPluginDescriptor } | { ok: false; error: string };
+
+/** config 值校验（未知键/类型不符/缺 required 拒绝；返回规范化副本）。 */
+export function validatePluginConfig(
+  schema: PluginConfigSchema,
+  values: unknown,
+): { ok: true; value: Record<string, string | number | boolean> } | { ok: false; error: string };
+
+/** 内置三插件占位 descriptor（ports/files/sync；每调用返回新对象）。 */
+export function builtinWebuiPluginDescriptors(): WebuiPluginDescriptor[];
+
+/** 「即将推出」占位清单（[W6]：vpn/clash/ai/ssh/screen——无实现仅展示）。 */
+export function comingSoonPlugins(): Array<{ id: string }>;
+
+/** 外部 WebUI 插件标注（v1=后续版本；安装仅 CLI；CLI 命令插件不可被 webui 启用）。 */
+export const EXTERNAL_WEBUI_PLUGINS_NOTE: string;
+
+export function assertDescriptorsValid(
+  descriptors: WebuiPluginDescriptor[],
+): { ok: true } | { ok: false; error: string };
+
+export type PluginStatus = "registered" | "enabled" | "disabled";
+
+export interface PublicWebuiPlugin {
+  id: string;
+  webui_api: 1;
+  status: PluginStatus;
+  pages: Array<{
+    id: string;
+    title: string;
+    nav: string | null;
+    icon: string | null;
+    type: PluginPageType;
+    perspective: PluginPagePerspective;
+  }>;
+  config_schema: PluginConfigSchema;
+  config: Record<string, string | number | boolean>;
+}
+
+/** Phase 1+ 运行时钩子通道（契约 descriptor 不承载可调用物）。 */
+export interface PluginRuntime {
+  onEnable?(ctx: { home: string; dataDir: string }): Promise<void>;
+  onDispose?(): Promise<void>;
+}
+
+export interface PluginHost {
+  list(): {
+    plugins: PublicWebuiPlugin[];
+    coming_soon: Array<{ id: string }>;
+    external_webui_plugins: { available: boolean; note: string };
+  };
+  get(id: string): PublicWebuiPlugin | null;
+  /** 摘牌语义：仅 enabled 接受新活动 */
+  isAccepting(id: string): boolean;
+  /** 登记在途活动；非 enabled → 稳定拒绝 */
+  beginActivity(
+    id: string,
+    activity: { cancel: () => void },
+  ): { ok: true; end: () => void } | { ok: false; code: "plugin-disabled" | "unknown-plugin" };
+  enable(id: string): Promise<{ ok: true; plugin: PublicWebuiPlugin } | { ok: false; code: "unknown-plugin" | "busy" | "lock" }>;
+  disable(id: string): Promise<
+    | { ok: true; plugin: PublicWebuiPlugin; drained: boolean; timedOut: boolean }
+    | { ok: false; code: "unknown-plugin" | "invalid-transition" | "busy" | "lock" }
+  >;
+  getConfig(id: string): Record<string, string | number | boolean> | null;
+  setConfig(
+    id: string,
+    values: unknown,
+  ): Promise<
+    | { ok: true; config: Record<string, string | number | boolean> }
+    | { ok: false; code: "unknown-plugin" | "busy" | "invalid-config" | "lock"; error?: string }
+  >;
+  dataDir(id: string): string;
+  /** 拆运行时不落盘（重启按账本恢复）；幂等 */
+  close(): Promise<void>;
+  onTransition: ((id: string, transition: string) => void) | null;
+}
+
+export const DRAIN_TIMEOUT_MS: number;
+
+/** 停用 drain 默认 10s（可配） */
+export function createPluginHost(opts?: {
+  home: string;
+  descriptors?: WebuiPluginDescriptor[];
+  runtimes?: Record<string, PluginRuntime>;
+  drainTimeoutMs?: number;
+  now?: () => number;
+}): Promise<PluginHost>;
+
+// 运行账本 <DWEB_HOME>/plugins/state.json（0600 原子写 + acquireFileLock 家族；
+// 安装账本 ~/.opendweb/plugins.json 零接触）
+
+export const PLUGINS_DIR: string;
+export const STATE_FILE: string;
+export const STATE_LOCK: string;
+
+export interface PluginStateFile {
+  version: 1;
+  plugins: Record<string, { status: PluginStatus; config?: Record<string, string | number | boolean> }>;
+}
+
+export function pluginStatePath(home: string): string;
+export function loadPluginState(home: string): Promise<PluginStateFile>;
+export function mutatePluginState(
+  home: string,
+  fn: (state: PluginStateFile) => void | Promise<void>,
+  ctx?: { now?: () => number; isPidAlive?: (pid: number) => boolean },
+): Promise<{ ok: true } | { ok: false; code: "lock" }>;
+export function ensurePluginDataDir(home: string, id: string): Promise<string>;

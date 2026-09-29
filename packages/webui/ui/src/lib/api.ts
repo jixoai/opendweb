@@ -266,6 +266,72 @@ export function fetchSidecarHub(): Promise<HubData> {
   return jsonFetch("/sidecar/hub") as Promise<HubData>;
 }
 
+// ---- /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0） -----------
+
+/** 插件页声明（服务端 descriptor 投影；与宿主契约 webuiApi 1 同形）。 */
+export interface WebuiPluginPageMeta {
+  id: string;
+  title: string;
+  nav: string | null;
+  icon: string | null;
+  type: "settings" | "page";
+  perspective: "admin" | "member" | "both";
+}
+
+export interface PluginConfigSchema {
+  type: "object";
+  properties: Record<string, { type: "string" | "number" | "boolean" }>;
+  required?: string[];
+}
+
+export type PluginConfigValues = Record<string, string | number | boolean>;
+
+/** 插件投影（注册表条目 + 生命周期状态 + 配置面）。 */
+export interface WebuiPluginEntry {
+  id: string;
+  webui_api: 1;
+  status: "registered" | "enabled" | "disabled";
+  pages: WebuiPluginPageMeta[];
+  config_schema: PluginConfigSchema;
+  config: PluginConfigValues;
+}
+
+/** GET /sidecar/plugins 投影（面板数据源；零凭证面——无任何秘密字段）。 */
+export interface PluginsData {
+  plugins: WebuiPluginEntry[];
+  coming_soon: Array<{ id: string }>;
+  external_webui_plugins: { available: boolean; note: string };
+}
+
+/** GET /sidecar/plugins（读路由——基线 Host 守卫）。 */
+export function fetchSidecarPlugins(): Promise<PluginsData> {
+  return jsonFetch("/sidecar/plugins") as Promise<PluginsData>;
+}
+
+/** POST /sidecar/plugins/<id>/enable（写路由——浏览器 same-origin 自动带 Origin）。 */
+export function enableSidecarPlugin(id: string): Promise<{ plugin: WebuiPluginEntry }> {
+  return jsonFetch(`/sidecar/plugins/${encodeURIComponent(id)}/enable`, { method: "POST" }) as Promise<{ plugin: WebuiPluginEntry }>;
+}
+
+/** POST /sidecar/plugins/<id>/disable（停用按序执行：摘牌→drain→dispose→落盘）。 */
+export function disableSidecarPlugin(id: string): Promise<{ plugin: WebuiPluginEntry }> {
+  return jsonFetch(`/sidecar/plugins/${encodeURIComponent(id)}/disable`, { method: "POST" }) as Promise<{ plugin: WebuiPluginEntry }>;
+}
+
+/** GET /sidecar/plugins/<id>/config。 */
+export function fetchSidecarPluginConfig(id: string): Promise<{ config: PluginConfigValues }> {
+  return jsonFetch(`/sidecar/plugins/${encodeURIComponent(id)}/config`) as Promise<{ config: PluginConfigValues }>;
+}
+
+/** PUT /sidecar/plugins/<id>/config（值经服务端 configSchema 校验；未知键 400）。 */
+export function putSidecarPluginConfig(id: string, config: PluginConfigValues): Promise<{ config: PluginConfigValues }> {
+  return jsonFetch(`/sidecar/plugins/${encodeURIComponent(id)}/config`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(config),
+  }) as Promise<{ config: PluginConfigValues }>;
+}
+
 // ---- /api/* 业务代理面（wire 冻结于 sdk-mgmt-surface specs/server） -----------
 
 /** GET /api/status → {mode, policy, generation, active_connections[], …} */
