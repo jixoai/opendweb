@@ -349,12 +349,32 @@ mihomo Fake-IP 环境不成立（.invalid 解析进 198.18.0.0/15 且 TCP 可达
 member 重启（graceful）后 open 路径自动恢复（member 姿态+90d cap 注入+
 relay ≤4s 连接）。
 
-**进行中（深挖代理）**：⑪ 崩溃恢复不收敛——会话建立后成员被 kill -9，
-仅重启成员不恢复（存活方陈旧对端会话/连续性状态掐死新会话
-`continuity stream io: connection lost` + 重拨饿死 relay 退避；双侧重启
-0.4s 收敛）；⑫ sidecar close()/TERM drain 挂死（健康 fabric 也复现，
-两机多例）；⑬ 在位配对路由（POST /sidecar/fabric/join）干净状态终验
-（此前 4 次停滞系僵尸同键端点环境污染，独立进程同代码稳定成功）。
+**第三轮（3a97044 + 1ea8d26，深挖代理两轮）**：⑪ **崩溃恢复不收敛**四层根因
+（continuity winner 让半开尸体参裁掐死同 key 重加入者 / 存活方旧拨号尸体 +
+supervisor TOCTOU / provider canonical 回 ALREADY_ACTIVE 卡 10s / known_addrs
+纯内存致 open 重启无直连回落资本）——尸体驱逐（rx 静默活性信号）+ 代次
+fence + 会话重试预算 + 拨号 8s 硬上界 + known_addrs 落盘 + shutdown 5s 有界；
+⑫ **close/TERM drain 挂死**（endpoint.close 内部 wait_all_draining 无界）
+——统一 5s 有界；⑬ **A-反向活锁**（存活 member 的 iroh per-remote 状态：
+selected_path 停在死 relay 路径 + abandoned pending 拨号卡同 NodeId，罚期只
+摘 RelayMap 不动 per-remote）——relay 实时活性判定 + 直连拨号专用 endpoint
+（同 key、RelayMode::Disabled、随机端口）+ 两步拨号计划。双机实证：正向
+15s/反向 37s 收敛（修复前分钟级活锁）、TERM 1s 退出、SDK 级配对 10.1s。
+
+**架构级定论与 [W12] 提案（第三轮收敛）**：hub 的 **HTTP-only relay 只能承载
+注册、不能转发端点间数据**（QUIC 数据面需 TLS 未启用——relay.rs 既有告警）。
+把它配置进 fabric 的 relay 位即是持续投毒：relay 客户端"已连接"→ iroh 路径
+选择 relay-first → 数据吞没 → 各种缓解（上界/罚期/专用端点）只能止血不能
+根治（长驻 member 空闲掉线后重拨仍复现停滞；both-fresh 才稳）。对照实证：
+disabled-relay 会话 2.3s 通 vs relay 配置会话 115s SESSION_INIT 超时；attach
+直连 27ms。**[W12] 推荐裁决（待 Owner/Codex 追认）：数据面 fabric 默认
+RelayMode::Disabled（直连 + invite/known_addrs 发现）；hub 租约的 relay 只
+服务 hub 访问面（leases/rendezvous）；server relay 补齐 QUIC/TLS 后再开放
+数据面 relay 位**。影响：root 五步的 ②③（ensure+覆盖断言）在 direct-only
+形态下跳过；LAN 场景 invite 的 relay 条目退化为可选；离 LAN 纯 relay 拓扑
+在 server QUIC 就绪前不支持（当前事实上也不可用）。遗留跟进：known_addrs
+墓地（专用端点随机端口累积死地址，root 侧实证 16 条——需 TTL/活性修剪）；
+mihomo conntrack 单端口 UDP 黑洞（环境级，DELETE /connections 可清）。
 
 **验收方法论沉淀**（全局 AGENTS.md）：cdylib 重建门禁必须含真实 dlopen；
 Fake-IP 环境下网络假设测试需环境感知；kill 后必须验证死亡（TERM 被 drain
