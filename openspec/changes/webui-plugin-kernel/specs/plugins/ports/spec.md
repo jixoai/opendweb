@@ -11,10 +11,25 @@ ports 插件 SHALL 在消费侧（B 机）维护映射账本 `<DWEB_HOME>/plugin
 - **WHEN** iMac（A）8080 起 HTTP 服务并 allowlist 授权 mini，mini（B）添加映射 9090→A:8080 后 `curl localhost:9090`；随后分别在「响应头未返回前」与「SSE/长响应体传输中」断开本地连接
 - **THEN** 响应（状态码/头/体）等同直连 A:8080；阶段 A（头等待期）断开经请求 signal 即时取消；阶段 B（响应体期）断开经响应句柄 abort() 发 RESET——两种情况 A 侧 provider signal 均触发且上游 localhost socket 收敛，零资源悬挂
 
-#### Scenario: 有界请求体与授权默认拒绝（含未知长度与预算）
+#### Scenario: 已知长度超限拒绝
 
-- **WHEN** B 侧向映射端口分别：POST 带已知 Content-Length 超上限的请求体；POST 未知 Content-Length 的流式请求体（边读边累计过上限）；并发发起 >16 个在飞代理请求；配置映射上限为 128MiB；未授权 peer 的设备向 `/wpk1/ports/proxy/<port>` 发起请求
-- **THEN** 分别为 413（含上限说明）/累计达上限立即断开拒绝（不先缓冲）/超额请求收到 429 直至在飞回落/该配置被拒绝（超出 1-64MiB 硬范围，映射不启动）/deny（fabric 会话身份不匹配 allowlist），零转发发生
+- **WHEN** B 侧向映射端口 POST 带已知 Content-Length 超过上限的请求体
+- **THEN** 收到 413（含上限说明），零转发
+
+#### Scenario: 未知长度累计拒绝
+
+- **WHEN** B 侧 POST 未知 Content-Length 的流式请求体，累计达上限
+- **THEN** 立即断开拒绝（不先缓冲后判），零转发
+
+#### Scenario: 并发预算与配置硬域
+
+- **WHEN** 并发发起 >16 个在飞代理请求；或配置映射上限为 128MiB
+- **THEN** 超额请求收到 429 直至在飞回落；超范围配置被拒绝（1-64MiB 硬域外，映射不启动）
+
+#### Scenario: 授权默认拒绝
+
+- **WHEN** 未授权 peer 的设备向 `/wpk1/ports/proxy/<port>` 发起请求
+- **THEN** deny（fabric 会话身份不匹配 allowlist），零转发发生
 
 #### Scenario: SSE 透传与端口冲突明确失败
 

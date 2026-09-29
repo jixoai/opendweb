@@ -236,7 +236,9 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 - **崩溃恢复（重启扫描；r4-N2 冻结：路径级三态 × ref 三态，先分诊后执行）**：
   发现未 done 的 intent →
   1. **ref 分诊**：`currentRef == targetCommit` → 物化与推进均视为完成，逐路径
-     完成性核验后仅补 done（**不得**再按旧快照 CAS，也不重放物化）；
+     完成性核验（**只接受 postimage**；任一路径处于 preimage 或其他状态 →
+     **不得补 done**：保留 intent 现场、进 conflicted 态，经用户决议形成新的
+     同步提交后才清理）后仅补 done（**不得**再按旧快照 CAS，也不重放物化）；
      `currentRef == oldRef` → 进入路径分诊+物化，完成后 CAS；其他值 → 冲突：
      停止、保留现场、conflicted 态交用户。
   2. **路径分诊（仅 oldRef 分支执行）**：intent 的路径操作清单 MUST 记录每路径

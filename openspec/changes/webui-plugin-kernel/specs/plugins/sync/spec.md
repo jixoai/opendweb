@@ -41,10 +41,10 @@ sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对
 - **WHEN** 一端把路径从文件改为目录（含子树），另一端修改了原文件内容
 - **THEN** 判为文件级冲突进入 conflicted 态（不做 hunk 合并）；UI 呈现两版本整路径选择（保留目录子树/保留文件内容），决议后收敛
 
-#### Scenario: mode 冲突的文件级决议（可执行位，r4 拆分）
+#### Scenario: mode 冲突的文件级决议（r5 重构：真实三方竞争）
 
-- **WHEN** 双方内容相同但一方改变了可执行位（mode 冲突）
-- **THEN** 判为文件级冲突；UI 呈现 ours/theirs 整体条目选择（内容+mode 一体，不可拆开选）；决议后最终 git tree mode 与工作树执行位一致
+- **WHEN** base=非可执行文件（内容 V0）；ours=设了可执行位（内容仍 V0）；theirs=修改内容为 V1（mode 未变）——双方对同一路径竞争性变更（mode 变化 vs 内容变化）
+- **THEN** 判为文件级冲突（mode 与内容竞争变更不做自动组合——保守规则：mode 变化与另一端内容变化一律文件级冲突，单侧 mode 变化才按三方合并自动传播）；UI 呈现 ours/theirs 整体条目选择（内容+mode 一体，不可拆开选）；决议后最终 git tree mode 与工作树执行位一致
 
 #### Scenario: 超限对象拒绝（r4-N3 统一：整 push 原子拒绝）
 
@@ -54,7 +54,7 @@ sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对
 #### Scenario: 崩溃边界注入与路径级三态恢复（r4-N2：含引擎半写区分）
 
 - **WHEN** 分别在 intent prepare 之后、工作树物化进行中（含某路径已 rename 出 target 内容后）、ref 推进之后、done 标记写入之前四个边界杀死进程，随后重启
-- **THEN** 恢复按**路径级三态分类**执行：实际状态==preimage 记录（判定元组含 type/mode）→应用该路径操作；实际状态==目标 postimage（含 type/mode）→该路径视为已完成（引擎自己的半写不得误判为用户冲突）；其他→用户新改动，保留内容转冲突绝不静默覆盖；ref 侧三态：==targetCommit→仅补 done（不再 CAS、不再重放）；==oldRef→物化完成后 CAS；其他→冲突停止保留现场；恢复后文件内容、ref、用户未提交本地改动三者一致且无半成品
+- **THEN** 恢复按**路径级三态分类**执行：实际状态==preimage 记录（判定元组含 type/mode）→应用该路径操作；实际状态==目标 postimage（含 type/mode）→该路径视为已完成（引擎自己的半写不得误判为用户冲突）；其他→用户新改动，保留内容转冲突绝不静默覆盖；ref 侧三态：==targetCommit→逐路径核验**只接受 postimage**（任一路径非 postimage=不得补 done、保留 intent 现场、conflicted 态交用户决议）；==oldRef→物化完成后 CAS；其他→冲突停止保留现场；恢复后文件内容、ref、用户未提交本地改动三者一致且无半成品
 
 #### Scenario: 扫描后、恢复前的用户编辑保护（r4-N2 独立用例）
 
