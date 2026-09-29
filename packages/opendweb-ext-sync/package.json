@@ -1,0 +1,29 @@
+{
+  "name": "@jixo/opendweb-ext-sync",
+  "version": "0.1.0",
+  "description": "opendweb webui plugin — file sync (virtual git: one-way mirror / two-way merge with diff3 conflict resolution, object-level transport over fetchHttp, intent-transaction crash recovery)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./opendweb-webui-plugin": "./src/webui-plugin.mjs"
+  },
+  "files": [
+    "src",
+    "test"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+  },
+  "dependencies": {
+    "isomorphic-git": "^1.42.3",
+    "node-diff3": "^3.2.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/opendweb.git"
+  }
+}
