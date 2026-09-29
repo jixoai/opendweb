@@ -28,6 +28,10 @@ import {
 	fetchSidecarPlugins,
 	fetchSidecarState,
 	fetchSidecarVisits,
+	fetchSyncGroups,
+	fetchSyncStatus,
+	filesBridge,
+	grantPortsAccess,
 	grantVisitor,
 	grantVisitorFromKnock,
 	issueCode,
@@ -47,6 +51,7 @@ import {
 	registerOwner,
 	renewOwner,
 	revokeCode,
+	revokePortsAccess,
 	revokeVisitor,
 	switchSidecarNode,
 	toAdminError,
@@ -56,19 +61,44 @@ import {
 	type BlocklistData,
 	type CodeEntry,
 	type ConnectionsData,
+	type FilesBridgeRequest,
+	type FilesBridgeResponse,
+	type FilesShareRow,
 	type HubData,
 	type KnockEntry,
 	type LeaseEntry,
 	type OwnersData,
 	type PluginConfigValues,
 	type PluginsData,
+	type PortsAllowEntry,
+	type PortsMappingRow,
 	type Receipt,
 	type SidecarNode,
 	type SidecarState,
 	type StatusData,
+	type SyncGroupDraft,
+	type SyncGroupRow,
+	type SyncJobRow,
 	type VisitEntry,
 	type VisitorEntry,
 	type WebuiPluginEntry,
+	createFilesShare,
+	createPortsMapping,
+	createSyncGroup,
+	deleteFilesShare,
+	deletePortsMapping,
+	deleteSyncGroup,
+	fetchFilesShares,
+	fetchPortsAllowlist,
+	fetchPortsMappings,
+	fetchSyncConflicts,
+	fetchSyncSeedBlock,
+	resolveSyncConflicts,
+	resolveSyncSeedBlock,
+	setFilesShareMode,
+	setFilesSharePeers,
+	setPortsMappingEnabled,
+	syncNow,
 } from "./api";
 import {
 	PERSPECTIVE_HASH,
@@ -287,6 +317,27 @@ class ConsoleStore {
 	/** 配置表单草稿（插件 id → 值；面板/通用页共用——保存成功即清除）。 */
 	pluginConfigDraft = $state<Record<string, PluginConfigValues>>({});
 
+	// ---- 三插件管理面（webui-plugin-kernel 收官接线：/sidecar/plugins/<id>/<mgmt>） ---
+
+	portsMappings = $state<PortsMappingRow[] | null>(null);
+	portsAllowlist = $state<PortsAllowEntry[] | null>(null);
+	/** ports 页顶层错误（端口冲突/超范围配置等服务端明确文案）。 */
+	portsError = $state<string | null>(null);
+	portsBusy = $state(false);
+
+	filesShares = $state<FilesShareRow[] | null>(null);
+	filesError = $state<string | null>(null);
+	filesBusy = $state(false);
+
+	syncGroups = $state<SyncGroupRow[] | null>(null);
+	syncJobs = $state<SyncJobRow[]>([]);
+	/** 每 root 冲突会话（ConflictPage 装配源；null=未加载）。 */
+	syncConflictSessions = $state<Array<{ groupId: string; rootId: string; session: unknown }> | null>(null);
+	/** seed 阻断三方对照（GroupsPage 阻断面板；null=无）。 */
+	syncSeedBlock = $state<{ groupId: string; rootId: string; block: unknown } | null>(null);
+	syncError = $state<string | null>(null);
+	syncBusy = $state(false);
+
 	detailsOpen = $state(false);
 	onlineFilter = $state<string | null>(null);
 
@@ -302,6 +353,22 @@ class ConsoleStore {
 	/** hub 本机自动形态（row 2）——中枢视角/中枢状态卡的数据源。 */
 	get hubLocal(): boolean {
 		return this.sidecar?.hub_local === true;
+	}
+	/**
+	 * ports 映射表单的对端选项源：本机租约的 fabric root（home-hub §2——
+	 * lease.root=对端中枢设备的 endpointId；「把中枢那台设备的端口映射到本机」
+	 * 是 v1 主用例）。节点簿是 server 面孔（无 endpointId），不在此列。
+	 */
+	get portsPeerOptions(): Array<{ endpointId: string; label: string }> {
+		const leases = Array.isArray(this.leasesData?.leases) ? this.leasesData!.leases : [];
+		const seen = new Set<string>();
+		const out: Array<{ endpointId: string; label: string }> = [];
+		for (const l of leases) {
+			if (typeof l.root !== "string" || l.root === "" || seen.has(l.root)) continue;
+			seen.add(l.root);
+			out.push({ endpointId: l.root, label: l.label ?? l.alias ?? l.server });
+		}
+		return out;
 	}
 	/** 应用世界：ready(admin) 或 member——setup 引导只在 admin 姿态无目标时出现。 */
 	get appWorld(): boolean {
@@ -783,6 +850,304 @@ class ConsoleStore {
 			return false;
 		} finally {
 			this.pluginConfigBusy = null;
+		}
+	}
+
+	// ---- 三插件管理面动作（收官接线；错误经各面 error 态呈现，动作返回 {ok} 供 toast） ---
+
+	/** ports：映射+授权账本（页面进入/动作后刷新）。 */
+	async refreshPorts(): Promise<void> {
+		try {
+			const [m, a] = await Promise.all([fetchPortsMappings(), fetchPortsAllowlist()]);
+			this.portsMappings = m.mappings;
+			this.portsAllowlist = a.entries;
+			this.portsError = null;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+		}
+	}
+
+	async createPortMapping(input: { name: string; peer: string; remotePort: number; localPort: number }): Promise<boolean> {
+		if (this.portsBusy) return false;
+		this.portsBusy = true;
+		try {
+			await createPortsMapping(input);
+			this.portsError = null;
+			await this.refreshPorts();
+			return true;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.portsBusy = false;
+		}
+	}
+
+	async togglePortMapping(id: string, enabled: boolean): Promise<boolean> {
+		if (this.portsBusy) return false;
+		this.portsBusy = true;
+		try {
+			await setPortsMappingEnabled(id, enabled);
+			this.portsError = null;
+			await this.refreshPorts();
+			return true;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.portsBusy = false;
+		}
+	}
+
+	async removePortMapping(id: string): Promise<boolean> {
+		if (this.portsBusy) return false;
+		this.portsBusy = true;
+		try {
+			await deletePortsMapping(id);
+			this.portsError = null;
+			await this.refreshPorts();
+			return true;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.portsBusy = false;
+		}
+	}
+
+	/** ports 提供侧授权（allowlist 授予/回收）。 */
+	async grantPortAccess(peer: string, remotePort: number): Promise<boolean> {
+		if (this.portsBusy) return false;
+		this.portsBusy = true;
+		try {
+			await grantPortsAccess(peer, remotePort);
+			await this.refreshPorts();
+			return true;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.portsBusy = false;
+		}
+	}
+
+	async revokePortAccess(peer: string, remotePort: number): Promise<boolean> {
+		if (this.portsBusy) return false;
+		this.portsBusy = true;
+		try {
+			await revokePortsAccess(peer, remotePort);
+			await this.refreshPorts();
+			return true;
+		} catch (e) {
+			this.portsError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.portsBusy = false;
+		}
+	}
+
+	/** files：提供侧共享账本。 */
+	async refreshFilesShares(): Promise<void> {
+		try {
+			this.filesShares = (await fetchFilesShares()).shares;
+			this.filesError = null;
+		} catch (e) {
+			this.filesError = toAdminError(e).message;
+		}
+	}
+
+	async createFileShare(input: { name: string; root: string; mode?: "ro" | "rw"; peers?: string[] }): Promise<boolean> {
+		if (this.filesBusy) return false;
+		this.filesBusy = true;
+		try {
+			await createFilesShare(input);
+			this.filesError = null;
+			await this.refreshFilesShares();
+			return true;
+		} catch (e) {
+			this.filesError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.filesBusy = false;
+		}
+	}
+
+	async removeFileShare(id: string): Promise<boolean> {
+		if (this.filesBusy) return false;
+		this.filesBusy = true;
+		try {
+			await deleteFilesShare(id);
+			this.filesError = null;
+			await this.refreshFilesShares();
+			return true;
+		} catch (e) {
+			this.filesError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.filesBusy = false;
+		}
+	}
+
+	async setFileShareMode(id: string, mode: "ro" | "rw"): Promise<boolean> {
+		if (this.filesBusy) return false;
+		this.filesBusy = true;
+		try {
+			await setFilesShareMode(id, mode);
+			this.filesError = null;
+			await this.refreshFilesShares();
+			return true;
+		} catch (e) {
+			this.filesError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.filesBusy = false;
+		}
+	}
+
+	async setFileSharePeers(id: string, peers: string[]): Promise<boolean> {
+		if (this.filesBusy) return false;
+		this.filesBusy = true;
+		try {
+			await setFilesSharePeers(id, peers);
+			this.filesError = null;
+			await this.refreshFilesShares();
+			return true;
+		} catch (e) {
+			this.filesError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.filesBusy = false;
+		}
+	}
+
+	/** B 侧 wire 转发（FileBrowserPage 控制器的 transport 底座）。 */
+	async filesBridgeCall(req: FilesBridgeRequest): Promise<FilesBridgeResponse> {
+		return filesBridge(req);
+	}
+
+	/** sync：组账本+任务态（进入/动作后刷新；冲突会话与 seed 阻断按需跟随）。 */
+	async refreshSync(): Promise<void> {
+		try {
+			const [g, s] = await Promise.all([fetchSyncGroups(), fetchSyncStatus()]);
+			this.syncGroups = g.groups;
+			this.syncJobs = s.jobs;
+			this.syncError = null;
+			await this.refreshSyncConflicts();
+			await this.refreshSyncSeedBlock();
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+		}
+	}
+
+	/** 冲突会话装配：仅拉取 hasConflicts 的 root（会话缺失=conflict 文件不存在）。 */
+	async refreshSyncConflicts(): Promise<void> {
+		if (this.syncGroups === null) return;
+		const wanted = this.syncGroups.flatMap((g) =>
+			g.roots.filter((r) => r.hasConflicts).map((r) => ({ groupId: g.id, rootId: r.id })),
+		);
+		const sessions: Array<{ groupId: string; rootId: string; session: unknown }> = [];
+		for (const w of wanted) {
+			try {
+				sessions.push({ ...w, session: (await fetchSyncConflicts(w.groupId, w.rootId)).session });
+			} catch {
+				// 单 root 拉取失败不拖垮整页（页面 error 面呈现其余数据）
+			}
+		}
+		this.syncConflictSessions = sessions;
+	}
+
+	/** seed 阻断三方对照（首个被阻断的 root——GroupsPage 阻断面板单实例）。 */
+	async refreshSyncSeedBlock(): Promise<void> {
+		if (this.syncGroups === null) return;
+		const blocked = this.syncGroups.flatMap((g) => g.roots.filter((r) => r.seedBlock).map((r) => ({ groupId: g.id, rootId: r.id })))[0];
+		if (blocked === undefined) {
+			this.syncSeedBlock = null;
+			return;
+		}
+		try {
+			this.syncSeedBlock = { ...blocked, block: (await fetchSyncSeedBlock(blocked.groupId, blocked.rootId)).block };
+		} catch {
+			this.syncSeedBlock = null;
+		}
+	}
+
+	async createSyncGroupAction(draft: SyncGroupDraft): Promise<boolean> {
+		if (this.syncBusy) return false;
+		this.syncBusy = true;
+		try {
+			await createSyncGroup(draft);
+			this.syncError = null;
+			await this.refreshSync();
+			return true;
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.syncBusy = false;
+		}
+	}
+
+	async deleteSyncGroupAction(id: string): Promise<boolean> {
+		if (this.syncBusy) return false;
+		this.syncBusy = true;
+		try {
+			await deleteSyncGroup(id);
+			this.syncError = null;
+			await this.refreshSync();
+			return true;
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.syncBusy = false;
+		}
+	}
+
+	async syncNowAction(id: string): Promise<boolean> {
+		if (this.syncBusy) return false;
+		this.syncBusy = true;
+		try {
+			await syncNow(id);
+			this.syncError = null;
+			await this.refreshSync();
+			return true;
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.syncBusy = false;
+		}
+	}
+
+	async resolveSyncConflictsAction(groupId: string, rootId: string, decisions: unknown): Promise<boolean> {
+		if (this.syncBusy) return false;
+		this.syncBusy = true;
+		try {
+			await resolveSyncConflicts(groupId, rootId, decisions);
+			this.syncError = null;
+			await this.refreshSync();
+			return true;
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.syncBusy = false;
+		}
+	}
+
+	async resolveSyncSeedBlockAction(groupId: string, rootId: string): Promise<boolean> {
+		if (this.syncBusy) return false;
+		this.syncBusy = true;
+		try {
+			await resolveSyncSeedBlock(groupId, rootId);
+			this.syncError = null;
+			await this.refreshSync();
+			return true;
+		} catch (e) {
+			this.syncError = toAdminError(e).message;
+			return false;
+		} finally {
+			this.syncBusy = false;
 		}
 	}
 

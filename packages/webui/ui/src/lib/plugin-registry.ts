@@ -6,9 +6,10 @@
 // 2. 本表是**路由形状权威源**（哪些 #/p/ 路由存在 + 视角可见性 + 导航区 +
 //    展示元数据）；插件的启停**状态**真源在服务端（GET /sidecar/plugins）——
 //    渲染裁决=本表命中 × 服务端 enabled（pluginRouteDecision）。
-//    双源说明：宿主侧 descriptor（packages/webui/src/core/plugins/registry.mjs）
-//    与本表在 Phase 0 各自编译期冻结；Phase 1 三插件包化（@jixo/opendweb-ext-*）
-//    时收敛为单一 descriptor 源。
+//    双源说明（收官收敛）：宿主侧 descriptor 已收敛为各包
+//    ./opendweb-webui-plugin 单一事实源（packages/webui/src/core/plugins/
+//    registry.mjs）；本表与之对齐（页 id/标题/nav/icon/visibility 与包内
+//    descriptor 一致——files browser=both、sync=groups/status/conflicts）。
 // 3. managed=false = 宿主内建管理面（插件面板 #/p/host/panel）——不属于插件
 //    生命周期（宿主自身恒可渲染，不受启停门控）；内置三插件的页面 managed=true
 //    ——命中且服务端 enabled 才渲染，否则按既有未知 hash 收敛语义（#/overview）。
@@ -37,14 +38,19 @@ export interface PluginRouteEntry {
 }
 
 /**
- * Phase 0 冻结集：宿主面板页（host——both 可见，member 深链直达）+ 内置三插件
- * 的 settings 页（admin 可见；通用 renderer 承载，运行时 Phase 1-3 接入）。
+ * 冻结集（收官接线后与各包 descriptor 对齐——descriptor 单一事实源=
+ * packages/opendweb-ext-{ports,files,sync} 的 ./opendweb-webui-plugin）：
+ * host 面板（both，member 深链直达）+ ports mappings（admin）+ files browser
+ * （**both**——B 机成员姿态是浏览远端共享的核心用例，Phase 2 包 descriptor
+ * 裁决）+ sync groups/status/conflicts 三页（admin——同步组管理是本机管理面）。
  */
 export const PLUGIN_ROUTE_REGISTRY: readonly PluginRouteEntry[] = [
 	{ routeId: "#/p/host/panel", pluginId: "host", pageId: "panel", title: "插件面板", nav: "tools", icon: "puzzle", visibility: "both", managed: false },
 	{ routeId: "#/p/ports/mappings", pluginId: "ports", pageId: "mappings", title: "端口映射", nav: "tools", icon: "network", visibility: "admin", managed: true },
-	{ routeId: "#/p/files/browser", pluginId: "files", pageId: "browser", title: "文件浏览", nav: "tools", icon: "folder", visibility: "admin", managed: true },
+	{ routeId: "#/p/files/browser", pluginId: "files", pageId: "browser", title: "文件浏览", nav: "tools", icon: "folder", visibility: "both", managed: true },
 	{ routeId: "#/p/sync/groups", pluginId: "sync", pageId: "groups", title: "同步组", nav: "tools", icon: "refresh", visibility: "admin", managed: true },
+	{ routeId: "#/p/sync/status", pluginId: "sync", pageId: "status", title: "同步状态", nav: "tools", icon: "activity", visibility: "admin", managed: true },
+	{ routeId: "#/p/sync/conflicts", pluginId: "sync", pageId: "conflicts", title: "同步冲突", nav: "tools", icon: "triangle-alert", visibility: "admin", managed: true },
 ];
 
 /** 视角可见性判定（SideNav 行过滤与 routeFor 共用）。 */

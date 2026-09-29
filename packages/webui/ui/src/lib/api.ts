@@ -332,6 +332,301 @@ export function putSidecarPluginConfig(id: string, config: PluginConfigValues): 
   }) as Promise<{ config: PluginConfigValues }>;
 }
 
+// ---- /sidecar/plugins/<id>/<mgmt> 三插件管理面（webui-plugin-kernel 收官接线） ----
+
+// ports：映射账本 + listener 态（runtime.listMappings 投影——MappingsPage 行形状）
+
+export interface PortsMappingRow {
+	id: string;
+	name: string;
+	/** 对端 endpointId */
+	peer: string;
+	remotePort: number;
+	localPort: number;
+	enabled: boolean;
+	listener: "listening" | "stopped" | "failed" | "stopping";
+	error: string | null;
+}
+
+/** GET /sidecar/plugins/ports/mappings（读路由——基线 Host 守卫）。 */
+export function fetchPortsMappings(): Promise<{ mappings: PortsMappingRow[] }> {
+	return jsonFetch("/sidecar/plugins/ports/mappings") as Promise<{ mappings: PortsMappingRow[] }>;
+}
+
+/** POST /sidecar/plugins/ports/mappings（写路由——精确 Origin）。 */
+export function createPortsMapping(input: {
+	name: string;
+	peer: string;
+	remotePort: number;
+	localPort: number;
+}): Promise<{ mapping: PortsMappingRow }> {
+	return jsonFetch("/sidecar/plugins/ports/mappings", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ mapping: PortsMappingRow }>;
+}
+
+/** POST /sidecar/plugins/ports/mappings/<id>/enabled {enabled}。 */
+export function setPortsMappingEnabled(id: string, enabled: boolean): Promise<{ mapping: PortsMappingRow }> {
+	return jsonFetch(`/sidecar/plugins/ports/mappings/${encodeURIComponent(id)}/enabled`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ enabled }),
+	}) as Promise<{ mapping: PortsMappingRow }>;
+}
+
+/** DELETE /sidecar/plugins/ports/mappings/<id>。 */
+export function deletePortsMapping(id: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/ports/mappings/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** ports 提供侧授权条目（(peer, remotePort) 显式授权）。 */
+export interface PortsAllowEntry {
+	peer: string;
+	remotePort: number;
+	granted_at: number;
+}
+
+/** GET /sidecar/plugins/ports/allowlist。 */
+export function fetchPortsAllowlist(): Promise<{ version: 1; entries: PortsAllowEntry[] }> {
+	return jsonFetch("/sidecar/plugins/ports/allowlist") as Promise<{ version: 1; entries: PortsAllowEntry[] }>;
+}
+
+/** POST /sidecar/plugins/ports/allowlist {peer, remotePort}（授予）。 */
+export function grantPortsAccess(peer: string, remotePort: number): Promise<{ ok: true }> {
+	return jsonFetch("/sidecar/plugins/ports/allowlist", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ peer, remotePort }),
+	}) as Promise<{ ok: true }>;
+}
+
+/** POST /sidecar/plugins/ports/allowlist/revoke {peer, remotePort}（回收）。 */
+export function revokePortsAccess(peer: string, remotePort: number): Promise<{ ok: true }> {
+	return jsonFetch("/sidecar/plugins/ports/allowlist/revoke", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ peer, remotePort }),
+	}) as Promise<{ ok: true }>;
+}
+
+// files：提供侧共享账本 + B 侧 bridge（浏览器→sidecar→fabric fetchHttp）
+
+export interface FilesShareRow {
+	id: string;
+	name: string;
+	root: string;
+	mode: "ro" | "rw";
+	peers: string[];
+	created: number;
+}
+
+/** GET /sidecar/plugins/files/shares。 */
+export function fetchFilesShares(): Promise<{ shares: FilesShareRow[] }> {
+	return jsonFetch("/sidecar/plugins/files/shares") as Promise<{ shares: FilesShareRow[] }>;
+}
+
+/** POST /sidecar/plugins/files/shares {name, root, mode?, peers?}（默认 ro）。 */
+export function createFilesShare(input: {
+	name: string;
+	root: string;
+	mode?: "ro" | "rw";
+	peers?: string[];
+}): Promise<{ share: FilesShareRow }> {
+	return jsonFetch("/sidecar/plugins/files/shares", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ share: FilesShareRow }>;
+}
+
+/** DELETE /sidecar/plugins/files/shares/<id>。 */
+export function deleteFilesShare(id: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/files/shares/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** POST /sidecar/plugins/files/shares/<id>/mode {mode}。 */
+export function setFilesShareMode(id: string, mode: "ro" | "rw"): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/files/shares/${encodeURIComponent(id)}/mode`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ mode }),
+	}) as Promise<{ ok: true }>;
+}
+
+/** POST /sidecar/plugins/files/shares/<id>/peers {peers}。 */
+export function setFilesSharePeers(id: string, peers: string[]): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/files/shares/${encodeURIComponent(id)}/peers`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ peers }),
+	}) as Promise<{ ok: true }>;
+}
+
+/** files bridge 信封（B 侧 wire 转发——路径钉死 /wpk1/files/<shareId>/）。 */
+export interface FilesBridgeRequest {
+	peer: string;
+	shareId: string;
+	method: "GET" | "PUT" | "POST";
+	path: string;
+	headers?: Array<{ name: string; value: string }>;
+	body?: Uint8Array | null;
+}
+
+/** files bridge 响应（fetchHttp 投影——body 经 base64 过 JSON 面）。 */
+export interface FilesBridgeResponse {
+	status: number;
+	headers: Record<string, string>;
+	bodyBase64: string;
+}
+
+/** POST /sidecar/plugins/files/bridge（wire 信封转发；bridge 错误=502 envelope）。 */
+export async function filesBridge(req: FilesBridgeRequest): Promise<FilesBridgeResponse> {
+	return (await jsonFetch("/sidecar/plugins/files/bridge", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({
+			peer: req.peer,
+			shareId: req.shareId,
+			method: req.method,
+			path: req.path,
+			...(req.headers !== undefined ? { headers: req.headers } : {}),
+			...(req.body != null ? { bodyBase64: bytesToBase64(req.body) } : {}),
+		}),
+	})) as FilesBridgeResponse;
+}
+
+/** Uint8Array → base64（分块过 btoa——大分片不爆 String.fromCharCode 栈）。 */
+function bytesToBase64(bytes: Uint8Array): string {
+	let out = "";
+	const CH = 0x8000;
+	for (let i = 0; i < bytes.length; i += CH) {
+		out += String.fromCharCode(...bytes.subarray(i, i + CH));
+	}
+	return btoa(out);
+}
+
+/** base64 → Uint8Array（bridge 响应体解码）。 */
+export function base64ToBytes(b64: string): Uint8Array {
+	const bin = atob(b64);
+	const out = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+	return out;
+}
+
+// sync：组账本/状态/冲突/seed（投影形状=GroupView/JobView/ConflictSessionView 同构——
+// 服务端 runtime.listGroups/status()/conflicts() 直投）
+
+export type SyncMode = "oneway" | "twoway";
+
+export interface SyncMemberRow {
+	endpointId: string;
+	deviceName: string;
+}
+
+export interface SyncRootRow {
+	id: string;
+	localPath: string;
+	mode: SyncMode;
+	seedAuthority: string | null;
+	isSeedAuthority: boolean;
+	groupRef: string | null;
+	deviceRef: string | null;
+	seedBlock: boolean;
+	hasConflicts: boolean;
+}
+
+export interface SyncGroupRow {
+	id: string;
+	name: string;
+	members: SyncMemberRow[];
+	roots: SyncRootRow[];
+	self: SyncMemberRow;
+}
+
+export interface SyncJobRow {
+	groupId: string;
+	rootId: string;
+	phase: "idle" | "scanning" | "fetching" | "merging" | "conflicted" | "pushing" | "done" | "error";
+	error: { code: string; message: string; hint?: string } | null;
+	progress: { fetched: number; fetchTotal: number; bytes: number };
+	updatedAt: number;
+}
+
+/** 建组草稿（GroupsPage 表单 → 服务端组装 members=[self, peer]）。 */
+export interface SyncGroupDraft {
+	name: string;
+	peerEndpointId: string;
+	peerDeviceName: string;
+	roots: Array<{ localPath: string; mode: SyncMode; seedAuthority: string }>;
+}
+
+/** GET /sidecar/plugins/sync/groups。 */
+export function fetchSyncGroups(): Promise<{ groups: SyncGroupRow[] }> {
+	return jsonFetch("/sidecar/plugins/sync/groups") as Promise<{ groups: SyncGroupRow[] }>;
+}
+
+/** POST /sidecar/plugins/sync/groups（seedAuthority "self" 在服务端解析为本端）。 */
+export function createSyncGroup(draft: SyncGroupDraft): Promise<{ group: SyncGroupRow }> {
+	return jsonFetch("/sidecar/plugins/sync/groups", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(draft),
+	}) as Promise<{ group: SyncGroupRow }>;
+}
+
+/** DELETE /sidecar/plugins/sync/groups/<id>。 */
+export function deleteSyncGroup(id: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/sync/groups/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** POST /sidecar/plugins/sync/groups/<id>/sync-now（要求插件 enabled）。 */
+export function syncNow(id: string): Promise<{ results: Array<{ rootId: string; result: unknown }> }> {
+	return jsonFetch(`/sidecar/plugins/sync/groups/${encodeURIComponent(id)}/sync-now`, { method: "POST" }) as Promise<{
+		results: Array<{ rootId: string; result: unknown }>;
+	}>;
+}
+
+/** GET /sidecar/plugins/sync/status。 */
+export function fetchSyncStatus(): Promise<{ jobs: SyncJobRow[] }> {
+	return jsonFetch("/sidecar/plugins/sync/status") as Promise<{ jobs: SyncJobRow[] }>;
+}
+
+/** GET /sidecar/plugins/sync/conflicts?group=&root=（无会话= {session: null}）。 */
+export function fetchSyncConflicts(groupId: string, rootId: string): Promise<{ session: unknown }> {
+	return jsonFetch(
+		`/sidecar/plugins/sync/conflicts?group=${encodeURIComponent(groupId)}&root=${encodeURIComponent(rootId)}`,
+	) as Promise<{ session: unknown }>;
+}
+
+/** POST /sidecar/plugins/sync/conflicts/<g>/<r>/resolve {decisions}。 */
+export function resolveSyncConflicts(groupId: string, rootId: string, decisions: unknown): Promise<unknown> {
+	return jsonFetch(
+		`/sidecar/plugins/sync/conflicts/${encodeURIComponent(groupId)}/${encodeURIComponent(rootId)}/resolve`,
+		{
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ decisions }),
+		},
+	);
+}
+
+/** GET /sidecar/plugins/sync/seed-block?group=&root=（无阻断= {block: null}）。 */
+export function fetchSyncSeedBlock(groupId: string, rootId: string): Promise<{ block: unknown }> {
+	return jsonFetch(
+		`/sidecar/plugins/sync/seed-block?group=${encodeURIComponent(groupId)}&root=${encodeURIComponent(rootId)}`,
+	) as Promise<{ block: unknown }>;
+}
+
+/** POST /sidecar/plugins/sync/seed-block/<g>/<r>/resolve（adopt-seed 显式处置）。 */
+export function resolveSyncSeedBlock(groupId: string, rootId: string): Promise<unknown> {
+	return jsonFetch(
+		`/sidecar/plugins/sync/seed-block/${encodeURIComponent(groupId)}/${encodeURIComponent(rootId)}/resolve`,
+		{ method: "POST" },
+	);
+}
+
 // ---- /api/* 业务代理面（wire 冻结于 sdk-mgmt-surface specs/server） -----------
 
 /** GET /api/status → {mode, policy, generation, active_connections[], …} */

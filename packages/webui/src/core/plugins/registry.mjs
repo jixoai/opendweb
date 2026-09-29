@@ -1,45 +1,54 @@
-// 编译期静态注册表（webui-plugin-kernel Phase 0 / design §2.1、§2.2）。
+// 编译期静态注册表（webui-plugin-kernel Phase 0 / design §2.1、§2.2；收官接线
+// 升级为双源收敛）。
 // 意图（2026-09-29）：
-// 1. 内置三插件（ports/files/sync）的占位 descriptor——经 contract 校验后由
-//    PluginHost 静态注册；运行时（listener/wire 端点/账本逻辑）在 Phase 1-3
-//    接入（tasks §2-§4）。descriptor 先行冻结页声明与配置面形状。
+// 1. 内置三插件（ports/files/sync）的 descriptor **单一事实源=各包
+//    ./opendweb-webui-plugin 子路径导出**（Phase 0 占位 → Phase 1-3 包化 →
+//    收官收敛：pages/perspective/dataEndpoints/configSchema 以包内 descriptor
+//    为准——files browser perspective=both（B 机成员姿态是浏览远端共享的核心
+//    用例）、sync pages=groups/status/conflicts 三页）。
 // 2. 「即将推出」占位清单（vpn/clash/ai/ssh/screen——[W6] Owner 裁决：无实现
 //    仅展示）与「外部 WebUI 插件=后续版本」标注（r2-B6 收口：v1 不加载外部
 //    npm WebUI 插件；marketplace CLI 候选不呈现为可启用的 WebUI 插件）。
-// 3. 本文件零 IO——纯数据工厂（每调用返回新对象，防共享可变状态）。
+// 3. 本文件零 IO——纯数据工厂（每调用返回深拷贝对象，防共享可变状态——ports
+//    包导出的是模块级常量，files/sync 是工厂函数，统一经 cloneDescriptor 归一）。
 // 注：webui 包自身不是自己的 WebUI 插件，故本包不导出 ./opendweb-webui-plugin
-// 子路径；第一个真实导出者是 Phase 1 的 @jixo/opendweb-ext-ports（契约见
-// contract.mjs）。宿主面板页（#/p/host/panel）是宿主内建管理面，不参与插件
+// 子路径。宿主面板页（#/p/host/panel）是宿主内建管理面，不参与插件
 // 生命周期（UI 侧 plugin-registry.ts 以 managed=false 标记）。
 
+import { descriptor as portsDescriptorSource } from "@jixo/opendweb-ext-ports/opendweb-webui-plugin";
+import { filesDescriptor } from "@jixo/opendweb-ext-files/opendweb-webui-plugin";
+import { syncWebuiPluginDescriptor } from "@jixo/opendweb-ext-sync/opendweb-webui-plugin";
 import { validateWebuiPluginDescriptor } from "./contract.mjs";
 
-/** 内置三插件的页声明（nav=tools → SideNav「工具」区；settings=通用 renderer） */
+/**
+ * descriptor 深拷贝（契约字段集冻结：顶层 plain object + pages/routes/
+ * dataEndpoints 数组的 plain object 元素——component 位除外（对象/函数，原样
+ * 保留——宿主绑定位本就非序列化数据））。
+ * @param {import("./contract.mjs").WebuiPluginDescriptor} d
+ * @returns {import("./contract.mjs").WebuiPluginDescriptor}
+ */
+function cloneDescriptor(d) {
+  /** @param {unknown} v */
+  const clonePage = (v) => {
+    if (v === null || typeof v !== "object") return v;
+    const p = /** @type {Record<string, unknown>} */ (v);
+    const out = {};
+    for (const [k, val] of Object.entries(p)) out[k] = val;
+    return out;
+  };
+  return {
+    id: d.id,
+    webuiApi: d.webuiApi,
+    pages: d.pages.map(clonePage),
+    ...(d.routes !== undefined ? { routes: d.routes.map(clonePage) } : {}),
+    ...(d.dataEndpoints !== undefined ? { dataEndpoints: d.dataEndpoints.map(clonePage) } : {}),
+    configSchema: { ...d.configSchema, properties: Object.fromEntries(Object.entries(d.configSchema.properties ?? {}).map(([k, v]) => [k, { ...v }])) },
+  };
+}
+
+/** 内置三插件 descriptor 工厂（包内 descriptor 为单一事实源）。 */
 function portsDescriptor() {
-  return {
-    id: "ports",
-    webuiApi: 1,
-    pages: [{ id: "mappings", title: "端口映射", nav: "tools", icon: "network", type: "settings", perspective: "admin" }],
-    configSchema: { type: "object", properties: {}, required: [] },
-  };
-}
-
-function filesDescriptor() {
-  return {
-    id: "files",
-    webuiApi: 1,
-    pages: [{ id: "browser", title: "文件浏览", nav: "tools", icon: "folder", type: "settings", perspective: "admin" }],
-    configSchema: { type: "object", properties: {}, required: [] },
-  };
-}
-
-function syncDescriptor() {
-  return {
-    id: "sync",
-    webuiApi: 1,
-    pages: [{ id: "groups", title: "同步组", nav: "tools", icon: "refresh", type: "settings", perspective: "admin" }],
-    configSchema: { type: "object", properties: {}, required: [] },
-  };
+  return cloneDescriptor(portsDescriptorSource);
 }
 
 /**
@@ -48,7 +57,7 @@ function syncDescriptor() {
  * @returns {import("./contract.mjs").WebuiPluginDescriptor[]}
  */
 export function builtinWebuiPluginDescriptors() {
-  return [portsDescriptor(), filesDescriptor(), syncDescriptor()];
+  return [portsDescriptor(), cloneDescriptor(filesDescriptor()), cloneDescriptor(syncWebuiPluginDescriptor())];
 }
 
 /**

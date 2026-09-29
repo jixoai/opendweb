@@ -29,14 +29,19 @@
 //    Origin 严格策略（四类冻结：same-origin 200 / 缺失 Origin 403 / 伪造 403 /
 //    坏 Host 403；基线 guard 的缺失放行不适用于新写路由）；probe 另有角色
 //    守卫（r18 P1-1/裁决 #14：到访簿仅成员侧写入——非 member 姿态 403）；
-// 3e. /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0，
-//    design §3.1；homeDir 注入即启用——插件宿主与运行账本跟随本机 DWEB_HOME；
-//    admin/member 姿态均服务——插件宿主是设备本地运行时，与远端中枢 admin 面
-//    无关）：GET /sidecar/plugins（注册表+状态+「即将推出」+外部插件标注）·
+// 3e. /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0 + 收官接线
+//    管理面，design §3.1；homeDir 注入即启用——插件宿主与运行账本跟随本机
+//    DWEB_HOME；admin/member 姿态均服务——插件宿主是设备本地运行时，与远端中枢
+//    admin 面无关）：GET /sidecar/plugins（注册表+状态+「即将推出」+外部插件标注）·
 //    POST /sidecar/plugins/<id>/enable|disable · GET/PUT
 //    /sidecar/plugins/<id>/config。读路由=基线 Host 守卫；写路由（enable/
 //    disable/PUT config）=精确 Origin 四类。零凭证：不读 token/argv/env——
 //    插件面无 capability 之外的任何秘密（spec「控制面授权与零凭证」）。
+// 3f. /sidecar/plugins/<id>/<mgmt> 三插件管理面（收官接线；Origin 纪律沿用
+//    3e）：ports mappings/allowlist CRUD、files shares CRUD + bridge（B 侧
+//    浏览器→sidecar→fabric fetchHttp 的 /wpk1/files/ 信封转发——路径钉死
+//    files wire 前缀，非通用代理）、sync groups/status/conflicts/seed-block
+//    （无租约设备=sync-unavailable 明示；数据面动作要求插件 enabled）。
 // 4. stdlib http/https.request 按解析 IP + SNI + Host 逐请求连接（agent:false
 //    + 响应结束/abort 即 destroy socket）；body 界 64KiB/1MiB；10s 超时；
 // 5. 日志只记 method/path/status/耗时——token 不进任何日志/响应。
@@ -55,6 +60,8 @@ import { fileURLToPath } from "node:url";
 import { validateTarget } from "./target.mjs";
 import { NodeStore, publicNode } from "./nodes.mjs";
 import { createPluginHost } from "./plugins/host.mjs";
+import { buildPluginRuntimes } from "./plugins/data-plane.mjs";
+import { createFabricHost, createWpkRouter, adaptSyncHandler } from "./fabric.mjs";
 import {
   hubProjection,
   hubSnapshotSlot,
@@ -218,16 +225,19 @@ export async function startSidecar(opts = {}) {
 /**
  * sidecar 全量内部句柄（home-hub 2a）：createConsole 的进程内宿主消费——
  * controls.switchNode=进程内切换（不经 HTTP）、controls.snapshot=同步快照。
- * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null, member?: boolean, hubLocal?: boolean, homeDir?: string | null, hostname?: string, interfaces?: object | null, homeFetch?: typeof fetch, homeIsPidAlive?: (pid: number) => boolean }} [opts]
+ * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null, member?: boolean, hubLocal?: boolean, homeDir?: string | null, hostname?: string, interfaces?: object | null, homeFetch?: typeof fetch, homeIsPidAlive?: (pid: number) => boolean, pluginsHost?: import("./plugins/host.mjs").PluginHost | null, fabricHost?: import("./fabric.mjs").FabricHost | null, sdk?: { Fabric: object, fetchHttp: Function, serveHttp: Function }, leasesLoader?: (home: string) => Promise<{ version: 1, leases: Array<Record<string, unknown>> }> }} [opts]
  *   - bus：事件总线注入（schema v1 帧派发；缺省 null=不发事件，既有行为不变）
  *   - capabilities：会话 capability 注册表注入（启用 /sidecar/session 引导面）
  *   - member（home-hub 2b design §4.2 row 3）：member 姿态——不生成配对码、
  *     connect/nodes 403、/api/* 404 零出站；仅服务租约/到访数据面与静态 SPA
  *   - hubLocal：row 2 标记（/sidecar/state.hub_local 与快照；hub 本机自动形态）
  *   - homeDir：DWEB_HOME（注入即启用 /sidecar 本机数据面——leases/visits/hub/
- *     probe/label；core/home.mjs）
+ *     probe/label + 插件宿主/数据面；core/home.mjs）
  *   - hostname/interfaces/homeFetch/homeIsPidAlive/homeProbeTimeoutMs：hub 投影
  *     与锁协议/探测注入面（测试）
+ *   - pluginsHost：插件宿主直接注入（测试；缺省按 homeDir 创建并接线 runtimes）
+ *   - fabricHost/sdk/leasesLoader：fabric 数据面宿主注入面（测试替身；缺省
+ *     真实 client-sdk + opendweb leases——惰性启动）
  * @returns {Promise<SidecarHandle>}
  */
 export async function createSidecar(opts = {}) {
@@ -253,6 +263,9 @@ export async function createSidecar(opts = {}) {
     homeIsPidAlive,
     homeProbeTimeoutMs,
     pluginsHost,
+    fabricHost: optsFabricHost,
+    sdk,
+    leasesLoader,
   } = opts;
   if (target && (typeof token !== "string" || token === "")) {
     throw new Error("startSidecar: target requires a token");
@@ -284,13 +297,84 @@ export async function createSidecar(opts = {}) {
     );
   }
   /**
-   * WebUI 插件宿主（webui-plugin-kernel Phase 0）：pluginsHost 注入即用（测试
-   * 慢存储/超时注入面）；否则 homeDir 给出即创建（运行账本 <DWEB_HOME>/plugins/
-   * state.json，损坏 fail-fast 拒启——与 NodeStore 同纪律）。两态（admin/member）
-   * 均服务：插件宿主是设备本地运行时，不属远端中枢 admin 面。
+   * WebUI 插件宿主（webui-plugin-kernel Phase 0 + 收官接线）：pluginsHost 注入
+   * 即用（测试慢存储/超时注入面）；否则 homeDir 给出即创建（运行账本
+   * <DWEB_HOME>/plugins/state.json，损坏 fail-fast 拒启——与 NodeStore 同纪律）。
+   * 两态（admin/member）均服务：插件宿主是设备本地运行时，不属远端中枢 admin 面。
+   * 收官接线（fabric 数据面）：homeDir 给出即组装 fabric 宿主（惰性——零构造
+   * 零出站）+ 三插件 runtimes（descriptor 双源=各包 ./opendweb-webui-plugin；
+   * 消费侧 sessionResolver/提供侧 resolvePeer 同源经 fabric 宿主）；聚合路由
+   * /wpk1/<plugin>/* 挂 serveHttp（未启用 deny/未知插件 404）；任一数据面插件
+   * enable → fabric 惰性启动（无数据面插件的 sidecar 零连接代价）。sdk/
+   * leasesLoader 注入面=测试替身（缺省真实 client-sdk + opendweb leases）。
    * @type {import("./plugins/host.mjs").PluginHost | null}
    */
-  const plugins = pluginsHost ?? (homeDir === null ? null : await createPluginHost({ home: path.resolve(homeDir) }));
+  let pluginsRuntime = null;
+  /** @type {import("./fabric.mjs").FabricHost | null} */
+  let fabricHost = null;
+  if (homeDir !== null) {
+    fabricHost =
+      optsFabricHost ??
+      (await createFabricHost({
+        home: path.resolve(homeDir),
+        log: (line) => log(`sidecar: ${line}`),
+        now,
+        ...(sdk !== undefined ? { sdk } : {}),
+        ...(leasesLoader !== undefined ? { leasesLoader } : {}),
+      }));    pluginsRuntime = await buildPluginRuntimes({ home: path.resolve(homeDir), fabric: fabricHost, log: (line) => log(`sidecar: ${line}`), now });
+  }
+  const plugins =
+    pluginsHost ??
+    (homeDir === null
+      ? null
+      : await createPluginHost({ home: path.resolve(homeDir), ...(pluginsRuntime !== null ? { runtimes: pluginsRuntime.channel } : {}) }));
+  if (plugins !== null && pluginsHost === undefined) {
+    // 数据面插件 enable → fabric 惰性启动（single-flight；失败进宿主 status 可观测，
+    // 不阻塞 enable 应答——控制面照常，数据面调用时报错）。
+    plugins.onTransition = (id, transition) => {
+      if (fabricHost === null) return;
+      if (transition !== "registered→enabled" && transition !== "disabled→enabled") return;
+      if (id !== "ports" && id !== "files" && id !== "sync") return;
+      fabricHost.ensureStarted().catch((e) => {
+        log(`sidecar: fabric start on ${id} enable failed: ${e?.message ?? e}`);
+      });
+    };
+  }
+  if (plugins !== null && fabricHost !== null) {
+    // 聚合路由：/wpk1/<plugin>/<...> → 各 runtime handler（ports 按 peer 缓存
+    // 提供侧 handler；files 直挂；sync 经适配器）；未启用 deny（503）/未知插件
+    // 404；每个入站请求登记 sessionId→peer（files 授权反查源）。
+    /** @type {Map<string, (req: object) => Promise<object | null | void>>} */
+    const portsHandlers = new Map();
+    const wpkRoutes = {
+      ports: (req, peer) => {
+        let h = portsHandlers.get(peer);
+        if (h === undefined) {
+          h = pluginsRuntime.management.ports.createProviderHandler(peer);
+          portsHandlers.set(peer, h);
+        }
+        return h(req);
+      },
+      files: (req) => pluginsRuntime.management.files.handler(req),
+      ...(pluginsRuntime.management.sync !== null
+        ? { sync: adaptSyncHandler((request) => pluginsRuntime.management.sync.handleSyncRequest(request)) }
+        : {
+            // sync 未装配（无租约设备）：路由存在但数据面明示 unavailable（对端
+            // 请求得 503 稳定错误，而非 404 冒充「无此插件」）
+            sync: async () => ({
+              status: 503,
+              headers: [{ name: "content-type", value: "application/json" }],
+              bodyChunks: [Buffer.from(JSON.stringify({ error: { code: "sync-unavailable", message: pluginsRuntimeManagement.syncUnavailable } }))],
+            }),
+          }),
+    };
+    const wpkRouter = createWpkRouter({ gate: (id) => plugins.isAccepting(id), routes: wpkRoutes });
+    fabricHost.setRouter((peer, req) => {
+      fabricHost.noteSession(req.sessionId, peer);
+      return wpkRouter(peer, req);
+    });
+  }
+  const pluginsRuntimeManagement = pluginsRuntime === null ? null : pluginsRuntime.management;
   /**
    * 节点簿添加配对码（独立于 setup 配对面；每次成功添加或连败 5 次即轮换新码
    * 并打印终端——「每次新配对码」；措辞避开 "pairing code: " 前缀，防与 setup
@@ -884,8 +968,9 @@ export async function createSidecar(opts = {}) {
     }
     const actionMatch = /^\/sidecar\/plugins\/([a-z][a-z0-9-]*)\/(enable|disable|config)$/.exec(url);
     if (actionMatch === null) {
-      sendJson(res, 404, { error: { code: "not-found" } });
-      logAccess(req, 404, startedAt);
+      // 插件管理面（收官接线）：/sidecar/plugins/<id>/<mgmt...> 分发到各 runtime
+      // 管理操作（未命中=基线 404）。
+      await handlePluginManagement(req, res, startedAt);
       return;
     }
     const id = actionMatch[1];
@@ -949,6 +1034,468 @@ export async function createSidecar(opts = {}) {
       logAccess(req, 200, startedAt);
       return;
     }
+    sendJson(res, 404, { error: { code: "not-found" } });
+    logAccess(req, 404, startedAt);
+  }
+
+  // ---- /sidecar/plugins/<id>/<mgmt> 三插件管理面（webui-plugin-kernel 收官接线） ----
+
+  /** files bridge 请求体上限（JSON envelope + base64 分片：4MiB chunk → ~5.4MiB base64）。 */
+  const PLUGIN_BRIDGE_BODY_MAX = 8 * 1024 * 1024;
+
+  /** 管理面统一读 body（默认 64KiB；bridge 路由放宽到 8MiB）。 */
+  function readPluginBody(req, res, max = LIMITS.requestBytes) {
+    return readBodyWithLimit(req, res, max);
+  }
+
+  /**
+   * 三插件管理面（收官接线；Origin 纪律沿用 Phase 0：GET=基线 Host 守卫，
+   * POST/DELETE=精确 Origin 四类）。账本类操作不要求插件 enabled（预备面）；
+   * 触发数据面的动作（sync-now/冲突决议/seed 处置）要求 enabled（停用=摘牌）。
+   * 未启用 runtime（无 homeDir）=本子域不存在（404，与 Phase 0 基线一致）。
+   */
+  async function handlePluginManagement(req, res, startedAt) {
+    const url = req.url ?? "";
+    const q = url.indexOf("?");
+    const pathOnly = q === -1 ? url : url.slice(0, q);
+    const query = q === -1 ? "" : url.slice(q + 1);
+
+    if (pluginsRuntimeManagement === null || fabricHost === null) {
+      sendJson(res, 404, { error: { code: "not-found" } });
+      logAccess(req, 404, startedAt);
+      return;
+    }
+    const { ports, files, sync, syncUnavailable } = pluginsRuntimeManagement;
+
+    /** 读 body + JSON 解析（失败发 400/413 并返回 undefined）。 */
+    async function readJson(max = LIMITS.requestBytes) {
+      if (!guardWriteOrigin(req, res, startedAt)) return undefined;
+      const body = await readPluginBody(req, res, max);
+      if (body === null) {
+        logAccess(req, 413, startedAt);
+        return undefined;
+      }
+      try {
+        return JSON.parse(body.toString("utf8"));
+      } catch {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be JSON" } });
+        logAccess(req, 400, startedAt);
+        return undefined;
+      }
+    }
+
+    /** ports：映射账本 + listener 状态。 */
+    if (pathOnly === "/sidecar/plugins/ports/mappings") {
+      if (req.method === "GET") {
+        if (!guardLocalOrigin(req, res, startedAt)) return;
+        sendJson(res, 200, { mappings: await ports.listMappings() });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+      if (req.method === "POST") {
+        const parsed = await readJson();
+        if (parsed === undefined) return;
+        const r = await ports.addMapping(parsed ?? {});
+        if (!r.ok) {
+          const status = r.code === "invalid" ? 400 : 503;
+          sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+          logAccess(req, status, startedAt);
+          return;
+        }
+        sendJson(res, 200, { mapping: r.mapping, listener: r.listener, error: r.error });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+    }
+    const mappingEnabledMatch = /^\/sidecar\/plugins\/ports\/mappings\/([a-zA-Z0-9-]+)\/enabled$/.exec(pathOnly);
+    if (req.method === "POST" && mappingEnabledMatch !== null) {
+      const parsed = await readJson();
+      if (parsed === undefined) return;
+      if (parsed === null || typeof parsed !== "object" || typeof parsed.enabled !== "boolean") {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {enabled: boolean}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const r = await ports.setMappingEnabled(mappingEnabledMatch[1], parsed.enabled);
+      if (!r.ok) {
+        const status = r.code === "not-found" ? 404 : r.code === "invalid" ? 400 : 503;
+        sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, { mapping: r.mapping, listener: r.listener, error: r.error });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    const mappingDelMatch = /^\/sidecar\/plugins\/ports\/mappings\/([a-zA-Z0-9-]+)$/.exec(pathOnly);
+    if (req.method === "DELETE" && mappingDelMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      const r = await ports.removeMapping(mappingDelMatch[1]);
+      if (!r.ok) {
+        const status = r.code === "not-found" ? 404 : 503;
+        sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, { ok: true });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    // ports：提供侧授权账本
+    if (pathOnly === "/sidecar/plugins/ports/allowlist") {
+      if (req.method === "GET") {
+        if (!guardLocalOrigin(req, res, startedAt)) return;
+        sendJson(res, 200, await ports.listAllowlist());
+        logAccess(req, 200, startedAt);
+        return;
+      }
+      if (req.method === "POST") {
+        const parsed = await readJson();
+        if (parsed === undefined) return;
+        const peer = typeof parsed?.peer === "string" ? parsed.peer : "";
+        const remotePort = Number(parsed?.remotePort);
+        if (peer === "" || !Number.isInteger(remotePort)) {
+          sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {peer: string, remotePort: number}" } });
+          logAccess(req, 400, startedAt);
+          return;
+        }
+        const r = await ports.grantAccess(peer, remotePort);
+        if (!r.ok) {
+          sendJson(res, r.code === "invalid" ? 400 : 503, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+          logAccess(req, r.code === "invalid" ? 400 : 503, startedAt);
+          return;
+        }
+        sendJson(res, 200, { ok: true });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+    }
+    if (req.method === "POST" && pathOnly === "/sidecar/plugins/ports/allowlist/revoke") {
+      const parsed = await readJson();
+      if (parsed === undefined) return;
+      const peer = typeof parsed?.peer === "string" ? parsed.peer : "";
+      const remotePort = Number(parsed?.remotePort);
+      if (peer === "" || !Number.isInteger(remotePort)) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {peer: string, remotePort: number}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const r = await ports.revokeAccess(peer, remotePort);
+      if (!r.ok) {
+        sendJson(res, 503, { error: { code: r.code, message: pluginErrorMessage(r.code) } });
+        logAccess(req, 503, startedAt);
+        return;
+      }
+      sendJson(res, 200, { ok: true });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+
+    // files：提供侧共享账本（JSON 错误形状=runtime WireError 投影）
+    /** files/sync runtime 异常 → HTTP（WireError 形状 {status,code,message} 惯例）。 */
+    const runtimeError = (e) => {
+      const err = /** @type {{ status?: number, code?: string, message?: string }} */ (/** @type {unknown} */ (e));
+      const status = typeof err.status === "number" ? err.status : err.name === "ShareValidationError" || err.name === "Error" ? 400 : 500;
+      return { status, code: err.code ?? "internal", message: err.message ?? pluginErrorMessage("internal") };
+    };
+    if (pathOnly === "/sidecar/plugins/files/shares") {
+      if (req.method === "GET") {
+        if (!guardLocalOrigin(req, res, startedAt)) return;
+        sendJson(res, 200, { shares: await files.shares.list() });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+      if (req.method === "POST") {
+        const parsed = await readJson();
+        if (parsed === undefined) return;
+        try {
+          const share = await files.shares.add(parsed ?? {});
+          sendJson(res, 200, { share });
+          logAccess(req, 200, startedAt);
+        } catch (e) {
+          const mapped = runtimeError(e);
+          sendJson(res, mapped.status, { error: { code: mapped.code, message: mapped.message } });
+          logAccess(req, mapped.status, startedAt);
+        }
+        return;
+      }
+    }
+    const shareMatch = /^\/sidecar\/plugins\/files\/shares\/([a-zA-Z0-9_-]+)$/.exec(pathOnly);
+    if (req.method === "DELETE" && shareMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      try {
+        await files.shares.remove(shareMatch[1]);
+        sendJson(res, 200, { ok: true });
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        const mapped = runtimeError(e);
+        sendJson(res, mapped.status, { error: { code: mapped.code, message: mapped.message } });
+        logAccess(req, mapped.status, startedAt);
+      }
+      return;
+    }
+    const shareModeMatch = /^\/sidecar\/plugins\/files\/shares\/([a-zA-Z0-9_-]+)\/mode$/.exec(pathOnly);
+    if (req.method === "POST" && shareModeMatch !== null) {
+      const parsed = await readJson();
+      if (parsed === undefined) return;
+      if (parsed === null || typeof parsed !== "object" || (parsed.mode !== "ro" && parsed.mode !== "rw")) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: 'body must be {mode: "ro"|"rw"}' } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      try {
+        await files.shares.setMode(shareModeMatch[1], parsed.mode);
+        sendJson(res, 200, { ok: true });
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        const mapped = runtimeError(e);
+        sendJson(res, mapped.status, { error: { code: mapped.code, message: mapped.message } });
+        logAccess(req, mapped.status, startedAt);
+      }
+      return;
+    }
+    const sharePeersMatch = /^\/sidecar\/plugins\/files\/shares\/([a-zA-Z0-9_-]+)\/peers$/.exec(pathOnly);
+    if (req.method === "POST" && sharePeersMatch !== null) {
+      const parsed = await readJson();
+      if (parsed === undefined) return;
+      if (parsed === null || typeof parsed !== "object" || !Array.isArray(parsed.peers)) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {peers: string[]}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      try {
+        await files.shares.setPeers(sharePeersMatch[1], parsed.peers);
+        sendJson(res, 200, { ok: true });
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        const mapped = runtimeError(e);
+        sendJson(res, mapped.status, { error: { code: mapped.code, message: mapped.message } });
+        logAccess(req, mapped.status, startedAt);
+      }
+      return;
+    }
+    // files bridge：B 侧浏览器 → 本 sidecar → fabric fetchHttp（/wpk1/files/<shareId>/
+    // 单一入口的信封转发——路径钉死 files wire 前缀，非通用代理；peer=对端提供侧）
+    if (req.method === "POST" && pathOnly === "/sidecar/plugins/files/bridge") {
+      const parsed = await readJson(PLUGIN_BRIDGE_BODY_MAX);
+      if (parsed === undefined) return;
+      const peer = typeof parsed?.peer === "string" ? parsed.peer : "";
+      const shareId = typeof parsed?.shareId === "string" ? parsed.shareId : "";
+      const method = typeof parsed?.method === "string" ? parsed.method.toUpperCase() : "";
+      const wirePath = typeof parsed?.path === "string" ? parsed.path : "";
+      if (peer === "" || shareId === "" || !/^(GET|PUT|POST)$/.test(method) || !wirePath.startsWith(`/wpk1/files/${shareId}/`)) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {peer, shareId, method, path} with path pinned to /wpk1/files/<shareId>/..." } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      /** @type {Array<{ name: string, value: string }> | undefined} */
+      let headers;
+      if (Array.isArray(parsed?.headers)) {
+        headers = parsed.headers
+          .filter((/** @type {{ name?: unknown, value?: unknown }} */ h) => typeof h?.name === "string" && typeof h?.value === "string")
+          .map((/** @type {{ name: string, value: string }} */ h) => ({ name: h.name, value: h.value }));
+      }
+      /** @type {Uint8Array | null} */
+      let body = null;
+      if (typeof parsed?.bodyBase64 === "string" && parsed.bodyBase64 !== "") {
+        try {
+          body = new Uint8Array(Buffer.from(parsed.bodyBase64, "base64"));
+        } catch {
+          sendJson(res, 400, { error: { code: "invalid-request", message: "bodyBase64 is not valid base64" } });
+          logAccess(req, 400, startedAt);
+          return;
+        }
+      }
+      try {
+        const session = await fabricHost.sessionResolver(peer);
+        const resp = await fabricHost.fetchHttpImpl(session, {
+          method,
+          path: wirePath,
+          ...(headers !== undefined ? { headers } : {}),
+          ...(body !== null ? { body: [body] } : {}),
+        });
+        /** @type {Buffer[]} */
+        const parts = [];
+        for (;;) {
+          const chunk = await resp.bodyNext();
+          if (chunk === null) break;
+          parts.push(chunk);
+        }
+        const out = Buffer.concat(parts);
+        sendJson(res, 200, {
+          status: resp.status,
+          headers: Object.fromEntries((resp.headers ?? []).map((/** @type {{ name: string, value: string }} */ h) => [h.name.toLowerCase(), h.value])),
+          bodyBase64: out.toString("base64"),
+        });
+        logAccess(req, 200, startedAt);
+      } catch (e) {
+        sendJson(res, 502, { error: { code: "bridge-unreachable", message: safeError(e) } });
+        logAccess(req, 502, startedAt);
+      }
+      return;
+    }
+
+    // sync：组账本/调度/冲突/seed（无租约设备=unavailable 明示，不冒充可同步）
+    const syncUnavailableResp = (res0, req0, startedAt0) => {
+      sendJson(res0, 503, { error: { code: "sync-unavailable", message: syncUnavailable } });
+      logAccess(req0, 503, startedAt0);
+    };
+    /** 数据面动作门（停用=摘牌——syncNow/决议/seed 处置只在 enabled 下发生）。 */
+    const syncGate = () => {
+      if (sync !== null && plugins !== null && plugins.isAccepting("sync")) return null;
+      sendJson(res, 409, { error: { code: "plugin-disabled", message: pluginErrorMessage("plugin-disabled") } });
+      logAccess(req, 409, startedAt);
+      return true;
+    };
+    if (pathOnly === "/sidecar/plugins/sync/groups") {
+      if (req.method === "GET") {
+        if (!guardLocalOrigin(req, res, startedAt)) return;
+        if (sync === null) return syncUnavailableResp(res, req, startedAt);
+        sendJson(res, 200, { groups: await sync.listGroups() });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+      if (req.method === "POST") {
+        const parsed = await readJson();
+        if (parsed === undefined) return;
+        if (sync === null) return syncUnavailableResp(res, req, startedAt);
+        const identity = await fabricHost.identity();
+        if (identity === null) return syncUnavailableResp(res, req, startedAt);
+        // GroupDraft（UI 契约）→ createGroup 输入：members=[self, peer]；
+        // seedAuthority "self" 解析为本端 endpointId（[W9] 显式选择）
+        const draft = /** @type {{ name?: unknown, peerEndpointId?: unknown, peerDeviceName?: unknown, roots?: unknown }} */ (parsed ?? {});
+        const name = typeof draft.name === "string" ? draft.name : "";
+        const peerEndpointId = typeof draft.peerEndpointId === "string" ? draft.peerEndpointId.trim().toLowerCase() : "";
+        const peerDeviceName = typeof draft.peerDeviceName === "string" ? draft.peerDeviceName : "";
+        const rootsIn = Array.isArray(draft.roots) ? draft.roots : [];
+        const roots = [];
+        for (const r of rootsIn) {
+          const rr = /** @type {{ localPath?: unknown, mode?: unknown, seedAuthority?: unknown }} */ (r ?? {});
+          const localPath = typeof rr.localPath === "string" ? rr.localPath : "";
+          const mode = rr.mode === "oneway" ? "oneway" : "twoway";
+          const seedRaw = typeof rr.seedAuthority === "string" ? rr.seedAuthority : "";
+          const seedAuthority = seedRaw === "self" ? identity.endpointId : seedRaw;
+          roots.push({ localPath, mode, seedAuthority });
+        }
+        const r = await sync.createGroup({
+          name,
+          members: [
+            { endpointId: identity.endpointId, deviceName: identity.deviceName },
+            { endpointId: peerEndpointId, deviceName: peerDeviceName },
+          ],
+          roots,
+        });
+        if (!r.ok) {
+          sendJson(res, r.code === "invalid" || r.code === "conflict" ? 400 : 503, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+          logAccess(req, r.code === "invalid" || r.code === "conflict" ? 400 : 503, startedAt);
+          return;
+        }
+        if (plugins !== null && plugins.isAccepting("sync")) sync.scheduler.start(r.group.id);
+        sendJson(res, 200, { group: r.group });
+        logAccess(req, 200, startedAt);
+        return;
+      }
+    }
+    const syncGroupMatch = /^\/sidecar\/plugins\/sync\/groups\/([a-zA-Z0-9_-]+)$/.exec(pathOnly);
+    if (req.method === "DELETE" && syncGroupMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      const r = await sync.deleteGroup(syncGroupMatch[1]);
+      if (!r.ok) {
+        sendJson(res, r.code === "not-found" ? 404 : 503, { error: { code: r.code, message: pluginErrorMessage(r.code) } });
+        logAccess(req, r.code === "not-found" ? 404 : 503, startedAt);
+        return;
+      }
+      sendJson(res, 200, { ok: true });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    const syncNowMatch = /^\/sidecar\/plugins\/sync\/groups\/([a-zA-Z0-9_-]+)\/sync-now$/.exec(pathOnly);
+    if (req.method === "POST" && syncNowMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      if (syncGate()) return;
+      const results = await sync.syncNow(syncNowMatch[1], { trigger: "manual" });
+      sendJson(res, 200, { results });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    if (req.method === "GET" && pathOnly === "/sidecar/plugins/sync/status") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      sendJson(res, 200, { jobs: sync.status() });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    if (req.method === "GET" && pathOnly === "/sidecar/plugins/sync/conflicts") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      const sp = new URLSearchParams(query);
+      const group = sp.get("group") ?? "";
+      const root = sp.get("root") ?? "";
+      if (group === "" || root === "") {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "query must be ?group=<id>&root=<id>" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      sendJson(res, 200, { session: await sync.conflicts(group, root) });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    const syncResolveMatch = /^\/sidecar\/plugins\/sync\/conflicts\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)\/resolve$/.exec(pathOnly);
+    if (req.method === "POST" && syncResolveMatch !== null) {
+      const parsed = await readJson();
+      if (parsed === undefined) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      if (syncGate()) return;
+      if (parsed === null || typeof parsed !== "object" || typeof parsed.decisions !== "object" || parsed.decisions === null) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be {decisions: {path: ...}}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      const r = await sync.resolveConflicts(syncResolveMatch[1], syncResolveMatch[2], parsed.decisions);
+      if (!r.ok) {
+        const status = r.code === "unknown-group" || r.code === "unknown-root" ? 404 : r.code === "invalid" ? 400 : 500;
+        sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, r);
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    if (req.method === "GET" && pathOnly === "/sidecar/plugins/sync/seed-block") {
+      if (!guardLocalOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      const sp = new URLSearchParams(query);
+      const group = sp.get("group") ?? "";
+      const root = sp.get("root") ?? "";
+      if (group === "" || root === "") {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "query must be ?group=<id>&root=<id>" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      sendJson(res, 200, { block: await sync.seedBlock(group, root) });
+      logAccess(req, 200, startedAt);
+      return;
+    }
+    const seedResolveMatch = /^\/sidecar\/plugins\/sync\/seed-block\/([a-zA-Z0-9_-]+)\/([a-zA-Z0-9_-]+)\/resolve$/.exec(pathOnly);
+    if (req.method === "POST" && seedResolveMatch !== null) {
+      if (!guardWriteOrigin(req, res, startedAt)) return;
+      if (sync === null) return syncUnavailableResp(res, req, startedAt);
+      if (syncGate()) return;
+      const r = await sync.resolveSeedBlock(seedResolveMatch[1], seedResolveMatch[2], "adopt-seed");
+      if (!r.ok) {
+        const status = r.code === "unknown-group" || r.code === "unknown-root" ? 404 : r.code === "invalid" ? 400 : 500;
+        sendJson(res, status, { error: { code: r.code, message: r.error ?? pluginErrorMessage(r.code) } });
+        logAccess(req, status, startedAt);
+        return;
+      }
+      sendJson(res, 200, r);
+      logAccess(req, 200, startedAt);
+      return;
+    }
+
     sendJson(res, 404, { error: { code: "not-found" } });
     logAccess(req, 404, startedAt);
   }
@@ -1271,13 +1818,17 @@ export async function createSidecar(opts = {}) {
   // ---- 共用工具 ----
 
   /**
-   * 读请求 body（cap 上限）。超限：发 413 并销毁连接，返回 null。
+   * 读请求 body（cap 上限；默认 LIMITS.requestBytes——files bridge 的 base64
+   * 信封放宽到 8MiB）。超限：发 413 并销毁连接，返回 null。
+   * @param {import("node:http").IncomingMessage} req
+   * @param {import("node:http").ServerResponse} res
+   * @param {number} max
    * @returns {Promise<Buffer | null>}
    */
-  function readBody(req, res) {
+  function readBodyWithLimit(req, res, max = LIMITS.requestBytes) {
     return new Promise((resolve) => {
       const declared = Number(req.headers["content-length"] ?? "0");
-      if (Number.isFinite(declared) && declared > LIMITS.requestBytes) {
+      if (Number.isFinite(declared) && declared > max) {
         sendJson(res, 413, { error: { code: "request-too-large" } });
         req.destroy();
         resolve(null);
@@ -1289,7 +1840,7 @@ export async function createSidecar(opts = {}) {
       req.on("data", (c) => {
         if (over) return;
         size += c.length;
-        if (size > LIMITS.requestBytes) {
+        if (size > max) {
           over = true;
           sendJson(res, 413, { error: { code: "request-too-large" } });
           req.destroy();
@@ -1308,6 +1859,10 @@ export async function createSidecar(opts = {}) {
         resolve(null);
       });
     });
+  }
+
+  function readBody(req, res) {
+    return readBodyWithLimit(req, res, LIMITS.requestBytes);
   }
 
   /** 日志纪律：只记 method/path（不含 query）/status/耗时——无 headers/token */
@@ -1353,6 +1908,7 @@ export async function createSidecar(opts = {}) {
       inflight.clear();
       capabilities?.close(); // 会话 capability close 即失效（design §5.1）
       await plugins?.close(); // 插件宿主拆运行时（不落盘状态变更——重启按账本恢复）
+      await fabricHost?.close(); // fabric 数据面（serveHttp 拆线→会话关闭→shutdown——在插件 drain 之后）
       const closing = new Promise((resolve) => server.close(() => resolve(undefined)));
       server.closeAllConnections?.();
       await closing;

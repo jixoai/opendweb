@@ -15,6 +15,10 @@
     "./opendweb-plugin": "./src/plugin.mjs"
   },
   "dependencies": {
+    "@jixo/opendweb-client-sdk": "workspace:*",
+    "@jixo/opendweb-ext-files": "workspace:*",
+    "@jixo/opendweb-ext-ports": "workspace:*",
+    "@jixo/opendweb-ext-sync": "workspace:*",
     "opendweb": "workspace:*"
   },
   "files": [

@@ -121,7 +121,8 @@ test("scenario D: unknown #/p/* converges like unknown hashes; existing routes u
 	assert.deepEqual(routeFor("#/xyz", "ready"), { view: "overview" });
 	assert.deepEqual(routeFor("#/access/online", "ready"), { view: "online" });
 	assert.deepEqual(routeFor("#/visitors", "ready", "member"), { view: "no-hub" });
-	assert.deepEqual(routeFor("#/p/files/browser", "ready", "member"), { view: "no-hub" }, "member 访问 admin-only 插件页 → 与中枢四页同拍收敛");
+	assert.deepEqual(routeFor("#/p/ports/mappings", "ready", "member"), { view: "no-hub" }, "member 访问 admin-only 插件页 → 与中枢四页同拍收敛");
+	assert.deepEqual(routeFor("#/p/files/browser", "ready", "member").view, "plugin", "files browser=both（收官 descriptor 裁决）——member 可达（B 侧浏览核心用例）");
 	assert.deepEqual(routeFor("#/p/anything/else", "setup"), { view: "setup" }, "setup 态任何 hash（含 #/p/*）一律全屏引导");
 	assert.deepEqual(routeFor("#/p/host/panel", "setup"), { view: "setup" });
 });
@@ -144,12 +145,12 @@ test("nav rows: tools section filtered by role and server-enabled state", () => 
 	// 全 registered：仍仅内建面
 	const fresh = pluginNavRows("admin", pluginsData({ ports: "registered", files: "registered", sync: "registered" }), null);
 	assert.deepEqual(fresh.map((r) => r.hash), ["#/p/host/panel"]);
-	// 部分启用：host + 启用行（受管行按 enabled 过滤）
+	// 部分启用：host + 启用行（受管行按 enabled 过滤；sync 启用=三行全出）
 	const partial = pluginNavRows("admin", pluginsData({ ports: "enabled", files: "disabled", sync: "enabled" }), "#/p/files/browser");
-	assert.deepEqual(partial.map((r) => r.hash), ["#/p/host/panel", "#/p/ports/mappings", "#/p/sync/groups"]);
+	assert.deepEqual(partial.map((r) => r.hash), ["#/p/host/panel", "#/p/ports/mappings", "#/p/sync/groups", "#/p/sync/status", "#/p/sync/conflicts"]);
 	assert.deepEqual(
 		partial.map((r) => r.routeId === r.activeRouteId),
-		[false, false, false],
+		[false, false, false, false, false],
 		"files 已停用——其行不出现，active 无从命中（收敛路径接管）");
 	const active = pluginNavRows("admin", pluginsData({ ports: "enabled", files: "enabled", sync: "disabled" }), "#/p/files/browser");
 	assert.deepEqual(active.map((r) => r.hash), ["#/p/host/panel", "#/p/ports/mappings", "#/p/files/browser"]);
@@ -157,8 +158,9 @@ test("nav rows: tools section filtered by role and server-enabled state", () => 
 		active.map((r) => r.routeId === r.activeRouteId),
 		[false, false, true],
 	);
-	// member：admin-only 行全滤（host=both 保留）
-	assert.deepEqual(pluginNavRows("member", ALL_ENABLED, null).map((r) => r.hash), ["#/p/host/panel"]);
-	// admin 全启用：四行
-	assert.equal(pluginNavRows("admin", ALL_ENABLED, null).length, 4);
+	// member：admin-only 行全滤（host=both 与 files browser=both 保留——收官
+	// descriptor 裁决 files 页 both）
+	assert.deepEqual(pluginNavRows("member", ALL_ENABLED, null).map((r) => r.hash), ["#/p/host/panel", "#/p/files/browser"]);
+	// admin 全启用：六行（host + ports + files + sync 三页）
+	assert.equal(pluginNavRows("admin", ALL_ENABLED, null).length, 6);
 });

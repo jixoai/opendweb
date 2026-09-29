@@ -323,3 +323,115 @@ test("r18-P1-1: probe buttons gated by cs.role member in Lease/Visits views (sou
     assert.equal(m[1].split("cs.probeServerTarget(").length - 1, 1, `${comp} member 块内只应有一个探测动作`);
   }
 });
+
+// ---- 收官接线：三插件管理面 store 动作（/sidecar/plugins/<id>/<mgmt> 转发） ---------
+
+test("wire-store: ports mappings actions refresh state and surface errors", async (t) => {
+  const env = browserEnv(t);
+  env.hash = "";
+  const posts = [];
+  const counts = countingTransport({
+    "/sidecar/plugins/ports/mappings": () => ok({ mappings: [{ id: "m1", name: "svc", peer: "ab", remotePort: 8080, localPort: 19080, enabled: true, listener: "listening", error: null }] }),
+    "/sidecar/plugins/ports/allowlist": () => ok({ version: 1, entries: [] }),
+  });
+  setApiFetch((p, init) => {
+    const pathOnly = p.split("?")[0];
+    counts[pathOnly] = (counts[pathOnly] ?? 0) + 1;
+    if (pathOnly === "/sidecar/plugins/ports/mappings" && init?.method === "POST") {
+      posts.push(JSON.parse(String(init.body)));
+      return Promise.resolve(ok({ mapping: { id: "m2" } }));
+    }
+    if (pathOnly === "/sidecar/plugins/ports/mappings/m1/enabled") return Promise.resolve(ok({ mapping: { id: "m1" } }));
+    if (pathOnly === "/sidecar/plugins/ports/mappings/m1" && init?.method === "DELETE") return Promise.resolve(ok({ ok: true }));
+    const routes = {
+      "/sidecar/leases": () => ok({ leases: [leaseEntry()] }),
+      "/sidecar/plugins/ports/mappings": () => ok({ mappings: [{ id: "m1", name: "svc", peer: "ab", remotePort: 8080, localPort: 19080, enabled: true, listener: "listening", error: null }] }),
+      "/sidecar/plugins/ports/allowlist": () => ok({ version: 1, entries: [] }),
+    };
+    return Promise.resolve((routes[pathOnly] ?? (() => ok({})))());
+  });
+  const { ConsoleStore } = await import(pathToFileURL(COMPILED).href);
+  const store = new ConsoleStore();
+  t.after(() => store.stop());
+
+  await store.refreshPorts();
+  await store.refreshLeases();
+  assert.equal(store.portsMappings?.length, 1);
+  assert.equal(store.portsMappings?.[0].listener, "listening");
+  assert.deepEqual(store.portsPeerOptions, [{ endpointId: "b".repeat(64), label: "kzf-MacBook" }], "peer options derive from leases (root + alias)");
+
+  assert.equal(await store.createPortMapping({ name: "n", peer: "p", remotePort: 1, localPort: 2 }), true);
+  assert.deepEqual(posts.at(-1), { name: "n", peer: "p", remotePort: 1, localPort: 2 });
+  assert.equal(await store.togglePortMapping("m1", false), true);
+  assert.equal(await store.removePortMapping("m1"), true);
+  assert.equal(store.portsError, null);
+
+  // 失败路径：错误文案进入 portsError（页面顶层呈现面）
+  setApiFetch(() => Promise.resolve(new Response(JSON.stringify({ error: { code: "invalid", message: "bad port" } }), { status: 400 })));
+  assert.equal(await store.createPortMapping({ name: "x", peer: "p", remotePort: 1, localPort: 2 }), false);
+  assert.equal(store.portsError, "bad port");
+});
+
+test("wire-store: sync refresh assembles groups, jobs, conflicts, and the seed block", async (t) => {
+  const env = browserEnv(t);
+  env.hash = "";
+  const group = {
+    id: "g1",
+    name: "agents",
+    members: [{ endpointId: "b".repeat(64), deviceName: "mini" }],
+    roots: [
+      { id: "r1", localPath: "/tmp/x", mode: "twoway", seedAuthority: "b".repeat(64), isSeedAuthority: true, groupRef: null, deviceRef: null, seedBlock: false, hasConflicts: true },
+      { id: "r2", localPath: "/tmp/y", mode: "twoway", seedAuthority: null, isSeedAuthority: false, groupRef: null, deviceRef: null, seedBlock: true, hasConflicts: false },
+    ],
+    self: { endpointId: "b".repeat(64), deviceName: "mini" },
+  };
+  const session = { algoVersion: "diff3-1", baseCommit: "o", oursCommit: "a", theirsCommit: "b", oursEndpoint: "b".repeat(64), conflicts: [] };
+  const seed = { groupId: "g1", rootId: "r2", seedCommit: "s", threeWay: { base: { label: "base", entries: [] }, seed: { label: "seed", entries: [] }, local: { label: "local", entries: [] } } };
+  const counts = countingTransport({
+    "/sidecar/plugins/sync/groups": () => ok({ groups: [group] }),
+    "/sidecar/plugins/sync/status": () => ok({ jobs: [{ groupId: "g1", rootId: "r1", phase: "conflicted", error: null, progress: { fetched: 0, fetchTotal: 0, bytes: 0 }, updatedAt: 1 }] }),
+    "/sidecar/plugins/sync/conflicts": () => ok({ session }),
+    "/sidecar/plugins/sync/seed-block": () => ok({ block: seed }),
+  });
+  setApiFetch((p) => {
+    const pathOnly = p.split("?")[0];
+    counts[pathOnly] = (counts[pathOnly] ?? 0) + 1;
+    const routes = {
+      "/sidecar/plugins/sync/groups": () => ok({ groups: [group] }),
+      "/sidecar/plugins/sync/status": () => ok({ jobs: [{ groupId: "g1", rootId: "r1", phase: "conflicted", error: null, progress: { fetched: 0, fetchTotal: 0, bytes: 0 }, updatedAt: 1 }] }),
+      "/sidecar/plugins/sync/conflicts": () => ok({ session }),
+      "/sidecar/plugins/sync/seed-block": () => ok({ block: seed }),
+    };
+    return Promise.resolve((routes[pathOnly] ?? (() => ok({})))());
+  });
+  const { ConsoleStore } = await import(pathToFileURL(COMPILED).href);
+  const store = new ConsoleStore();
+  t.after(() => store.stop());
+
+  await store.refreshSync();
+  assert.equal(store.syncGroups?.length, 1);
+  assert.equal(store.syncJobs.length, 1);
+  assert.equal(store.syncJobs[0].phase, "conflicted");
+  assert.deepEqual(store.syncConflictSessions, [{ groupId: "g1", rootId: "r1", session }], "conflict sessions fetched only for hasConflicts roots");
+  assert.deepEqual(store.syncSeedBlock, { groupId: "g1", rootId: "r2", block: seed });
+  assert.equal(store.syncError, null);
+});
+
+test("wire-store: filesBridgeCall carries the JSON envelope through the api layer", async (t) => {
+  const env = browserEnv(t);
+  env.hash = "";
+  const bodies = [];
+  setApiFetch((p, init) => {
+    bodies.push({ p, body: JSON.parse(String(init?.body ?? "{}")) });
+    return Promise.resolve(ok({ status: 200, headers: { "x-opendweb-oid": "oid" }, bodyBase64: Buffer.from("[]").toString("base64") }));
+  });
+  const { ConsoleStore } = await import(pathToFileURL(COMPILED).href);
+  const store = new ConsoleStore();
+  t.after(() => store.stop());
+
+  const res = await store.filesBridgeCall({ peer: "ab", shareId: "s1", method: "GET", path: "/wpk1/files/s1/list?path=" });
+  assert.equal(res.headers["x-opendweb-oid"], "oid");
+  assert.equal(Buffer.from(res.bodyBase64, "base64").toString("utf8"), "[]");
+  assert.equal(bodies[0].p, "/sidecar/plugins/files/bridge");
+  assert.deepEqual(bodies[0].body, { peer: "ab", shareId: "s1", method: "GET", path: "/wpk1/files/s1/list?path=" });
+});
