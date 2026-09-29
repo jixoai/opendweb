@@ -128,6 +128,20 @@ node scripts/walkthrough/knock.mjs --relay http://<中枢局域网IP>:3340
    然后 `opendweb-webui`（成员视角自动出现）；
 3. 短码编码的是中枢机的局域网 IP+端口——IP 变了重新 `hub card` 拿新码。
 
+## 附录 A-2 · 真双机实测记录（iMac ↔ Mac mini，2026-09-24）
+
+中枢 = iMac（BNUI-01deiMac，隔离 DWEB_HOME），成员 = Mac mini（bngjdeMac-mini-7.local，
+真实独立设备密钥，同版本 node 24.21.0/arm64）：
+
+- mini 以短码 `dwebh1.070ag-0k849-9s238` + 邀请码 join 成功（别名「Mac mini 实机成员」
+  服务端存储为真 UTF-8；回执 verified；租约/relay/fabric 全落 mini 本机账本）；
+- mini 成员台：`/sidecar/state` role=member、租约投影全字段、`/sidecar/hub` 404（成员机
+  负向）、same-origin 探测 200（五类映射 reachable，到访簿落账）；
+- 中枢名册（/admin/owners）出现该成员；**本次实测抓到并修复一处真缺陷**：`hub status`
+  成员行此前按裸数组解析 /admin/owners（实际为 {generation,owners} 包装），恒显示
+  0 个租户——修复 93c8de8 含真实形状回归测试；
+- Mac mini 实机全量绿门：opendweb 套件 244/244（hub e2e/短码/准入全过）。
+
 ## 附录 B · 深度体验（可选）
 
 - **G-3 停机观察**：成员侧开着「直连中」会话 → `hub stop` → 会话存活；纯借道场景
