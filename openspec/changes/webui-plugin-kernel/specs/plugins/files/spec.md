@@ -4,7 +4,7 @@
 
 ### Requirement: 文件夹共享插件（简单文件系统操作）
 
-files 插件 SHALL 在提供侧（A 机）维护共享账本 `<DWEB_HOME>/plugins/files/shares.json`（id/name/root 绝对路径/mode ro|rw/授权 peers，默认 ro），并在 Fabric 会话端点 `/wpk1/files/<shareId>/<op>` 暴露操作：`GET list`/`GET stat`/`GET read`（offset/len 流式响应 + OID/etag 版本标识）/`PUT chunk`（分片上传 staging：uploadId/seq/offset/bytes，单 chunk ≤4MiB）/`POST commit`（总长+hash 校验后原子 rename）/`POST mkdir|rename|delete`。B 机 webui MUST 提供类型化文件浏览器页（浏览/面包屑/上传进度/下载/改名/删除；写操作按 share.mode 与授权显隐）。路径安全 MUST：root realpath 冻结 + 每操作解析后包含校验 + 禁 symlink 跟随（lstat 校验后打开、打开后 fstat 复核防检查-打开竞态）；staging MUST 用临时名 + TTL 回收，取消/断线/校验失败 MUST NOT 暴露半文件（未 commit 内容不出现在正式命名空间）。`<root>/.opendweb-ignore`（行 glob）MUST 生效且语义仅由提供侧定义。删除操作 UI MUST 显式确认。
+files 插件 SHALL 在提供侧（A 机）维护共享账本 `<DWEB_HOME>/plugins/files/shares.json`（id/name/root 绝对路径/mode ro|rw/授权 peers，默认 ro），并在 Fabric 会话端点 `/wpk1/files/<shareId>/<op>` 暴露操作：`GET list`/`GET stat`/`GET read`（offset/len 流式响应 + OID/etag 版本标识）/`PUT chunk`（分片上传 staging：uploadId/seq/offset/bytes/**chunkHash**（客户端声明块摘要，服务端从 bytes 重算比对）；同幂等键（uploadId/seq/offset）同内容=幂等成功、不同内容=明确拒绝不覆盖；单 chunk ≤4MiB）/`POST commit`（按序核对全部分片总长+整文件 hash 后原子 rename）/`POST mkdir|rename|delete`。B 机 webui MUST 提供类型化文件浏览器页（浏览/面包屑/上传进度/下载/改名/删除；写操作按 share.mode 与授权显隐）。路径安全 MUST 为 fd 链逐组件遍历：share root 以目录 fd 冻结，每操作从 root fd 按路径组件逐级打开（目录组件带 O_DIRECTORY+O_NOFOLLOW 语义拒绝 symlink，最终组件按操作类型带 O_NOFOLLOW），逐级持有父目录 fd，最终操作只作用于已验证 fd（fstat 复核类型）——lstat+open 两步不构成合格实现；staging MUST 用临时名 + TTL 回收，取消/断线/校验失败 MUST NOT 暴露半文件（未 commit 内容不出现在正式命名空间）。`<root>/.opendweb-ignore`（行 glob）MUST 生效且语义仅由提供侧定义。删除操作 UI MUST 显式确认。
 
 #### Scenario: 浏览/下载/上传闭环（双机）
 

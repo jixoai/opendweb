@@ -82,7 +82,7 @@ sidecar 控制面 /sidecar/*（Host 守卫 + 写路由精确 Origin——既有�
 
 ### 2.2 生命周期与停用语义（r1 遗漏维度 6 的闭合）
 
-状态机：`registered → enabled ⇇ disabled`（包卸载经 CLI；宿主只管启停）。
+状态机：`registered → enabled`、`enabled ⇄ disabled`（两条有向转换：enable 与 disable 可往返；包卸载经 CLI；宿主只管启停）。
 停用顺序：**先拒新请求**（路由/页/数据端点摘牌）→ 在途流 drain（有界超时，
 默认 10s 可配，超时后强制取消并给稳定错误响应）→
 dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable 逆序装配。
@@ -118,8 +118,9 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   ports 代理 8MiB 默认（可配范围 1MiB–64MiB 硬上限，超范围配置拒绝）；files 分片
   chunk 默认 4MiB；sync 对象单传默认 16MiB（超限对象 v1 拒绝并提示，pack 化后置）。
   未知 Content-Length 的入站请求 MUST 边读边累计、达到上限立即断开拒绝（不得先
-  缓冲后判）；**跨请求并发累计内存预算 MUST 强制**（ports/files/sync 各自并发
-  上限 ×上限值入预算表，超预算拒绝新请求直至回落）。
+  缓冲后判）；**跨请求并发累计内存预算 MUST 强制且额度冻结**：ports 并发代理
+  ≤16 请求、files 并发传输（上传 chunk+读流合计）≤4、sync ≤2 流/组（既有），
+  在飞字节预算=并发上限×各自上限值，超预算拒绝新请求直至回落（429 语义）。
 - 响应体=pull-first AsyncIterable（流式 ✓）；SSE 走 respondStreaming。
 - **取消两阶段协议（r2-B1 冻结）**：
   - 阶段 A（响应头等待期）：消费端 `request.signal.abort()` → 即时 RESET →
@@ -205,7 +206,9 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 
 - `GET refs`（对端 refs 快照）；`POST want`（body：期望 commit + 已有 OID 摘要集
   （ Bloom/区间摘要——v1 用排序 OID 列表分页比对））→ 返回缺失对象清单；
-  `GET object/<oid>`（单松散对象，带类型+长度+OID；>16MiB 拒绝 §4）；
+  `GET object/<oid>`（单松散对象，带类型+长度+OID；>16MiB 拒绝 §4——引用该
+  blob 的整个 push 拒绝且 ref/工作树不变，其他独立 root 或不含该 blob 的后续
+  commit 不受影响；文件级跳过大对象=过滤树/commit 语义，非 v1）；
   `POST push`（commit DAG **parent 闭包** + 新对象集，staging 校验后 ref CAS）。
 - **CAS**：push/ref 更新带 expectedOldRef；不匹配=拒绝+提示重 fetch/merge
   （r1 Q5：无 last-write-wins）。**单写者**：每 repo 同时只允许一个本地
@@ -225,11 +228,18 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
    rename 到目标路径（逐文件原子）；delete 直接 unlink；每步幂等（重放安全）；
 3. **推进**：ref CAS 到 targetCommit；
 4. **提交标记**：intent 追加 done 标记（原子写）。
-- **崩溃恢复（重启扫描）**：发现未 done 的 intent → **确定性 roll-forward**
-  （幂等重放物化+推进，永不 rollback——intent 内操作全部幂等）；roll-forward
-  后补 done。
+- **崩溃恢复（重启扫描，r3-N2 冻结恢复 ref 三态判定）**：发现未 done 的
+  intent → 按恢复判定执行：`currentRef == targetCommit` → 推进视为已完成，
+  仅补 done（**不得**再按旧快照 CAS——该 CAS 必失败）；`currentRef ==
+  oldRef` → 执行 CAS 推进；其他值 → 视为冲突：停止、保留现场、进 conflicted
+  态交用户。之后确定性 roll-forward（幂等重放物化），补 done。
+- **preimage 保护（r3-N2）**：intent 的路径操作清单 MUST 记录每路径的预期
+  前像（preimage OID 或不存在）；物化与恢复前逐路径复核——**实际前像与记录
+  不符（扫描后/崩溃期间用户新写入）→ 该路径保留新内容并转冲突/另存，绝不
+  静默覆盖**；四边界 Scenario 附加用例：目标路径在扫描后、恢复前被修改。
 - 用户在同步根的未提交本地改动与协议的关系：物化前本地改动 MUST 已被
-  commit 进 device ref（scanning 阶段保证），故物化只触碰已提交内容的投影。
+  commit 进 device ref（scanning 阶段保证），故物化只触碰已提交内容的投影；
+  扫描后到物化间的新改动由 preimage 保护承接。
 - **验收（B3）**：在 prepare 后/物化中/推进后/标记前四个边界逐个注入崩溃 →
   重启恢复后断言：文件内容、ref、用户未提交改动三者一致且无半成品。
 
