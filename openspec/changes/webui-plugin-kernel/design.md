@@ -431,6 +431,28 @@ kevent，进程不退出；无会话/空载状态 TERM 0.02-0.2s 退出）。
 Fake-IP 环境下网络假设测试需环境感知；kill 后必须验证死亡（TERM 被 drain
 挂死吞掉真实存在，僵尸同身份端点是"新进程网络全断"的首要嫌疑）。
 
+**第六轮实录（sync 插件 agents-skills 全链，2026-09-30 下午）**：真双机
+第六批验收（docs/acceptance-webui-plugin-kernel-dualmachine.md）在 9/9 矩阵
+全通过的路径上抓出 **7 个真缺陷**（5 修复 3 commit：`94806e2`/`c5f5cb6`/
+`ef9c314`）：F4 引擎不 await 异步 sessionResolver（生产报 session.fetchHttp
+is not a function）；F-auth 端点授权 z32 wire peer vs hex 账本成员恒 403
+（同钥异码第三例）；F-sched onPeerOnline 同族（在线触发死路）；F3 建组路由
+不透传 id（对端永远无法建同 id 组）；**F6 数据丢失级——buildMaterializeOps
+对 ours 树目录条目生成 rm -rf 删除，真实目录树（变更/未变更混合）fast-forward
+后 27/30 未变更文件被连坐删除**（既有夹具全扁平从未命中）；F7 fetch 零缺失
+早退跳过对端 device ref 镜像 → unrelated-histories 误判；F5（sync config
+intervalMs/debounceMs 声明未接线，记录待裁定）。F2 在 sync 侧定型为**三层**
+（帧 1MiB/流 2MiB/**会话累计 8MiB**——第三层本批新暴露）+ 超限 blob 进
+device 历史后毒化后续全部 push、会话饱和后新请求也失败——均留裁定材料。
+**E1′（环境/内核级）**：fabric 会话层双向互毒（iMac mihomo TUN 本批意外
+开启→auto-route 劫持出站 UDP 使 QUIC 路径校验静默失败，关闭后单向恢复；
+残余为双方 per-remote 半开尸体+ALREADY_ACTIVE canonical+scratch 端口交叉
+学习死锁；裸 UDP 双向通、独立进程秒达成员判定层），mini→iMac 方向当日
+不可恢复——验收以「迁移模式」完成（mini 身份/家目录迁 iMac 主机运行，
+真 fabric 传输覆盖全部 push 方向故事与 kill -9/三层 F2 探针；接收端引擎轮
+经同进程双运行时 harness（真 home/工作树）；协议边界直打端点 handler），
+E1′ 修复后可原样重放。
+
 ## 10. 评审处置表
 
 | 轮 | 结论 | 处置 |

@@ -171,3 +171,132 @@ SSE 源进程验收毕已回收（kill -9 12772 验死 + 8081 端口释放）。
 - **F1 已修复**（commit `2b13084`，ext-files 授权 peer 编码归一 + 单测，三包绿门 54/36/258）。
 - **F2 阻塞待裁决**：上传链路 transport 上限（帧 1MiB / 流 journal 2MiB）低于插件默认 chunk 4MiB（UI 同）——真双机 >1MiB 上传默认必败；需 Owner/Codex 裁定修向（降默认 vs 抬上限），建议同批补「journal 帧账建模的 transport 替身」进测试电池，否则单机绿门永测不出此类分层缺陷。
 - E1（进程内拨号停滞）续 §9.1 第四轮遗留①跟档。
+
+---
+
+# webui-plugin-kernel 真双机验收实录——第六批（sync 插件 agents-skills 全链故事）
+
+> 时间：2026-09-30（UTC 02:46–04:0x / 本地 10:46–12:0x）
+> 环境：iMac（fabric root，192.168.2.8，sidecar 18801/3341）↔ Mac mini（member，192.168.2.10，`/usr/bin/ssh macmini`，sidecar 18801/3342）
+> worktree：`opendweb-sdk-mgmt-surface`（分支 sdk-mgmt-surface，起点 HEAD d8d0f9a → 本批推进至 `ef9c314`）
+> 语义依据：design §7（sync）/§7.3/§7.3.1/§7.5/§9 Phase 3 矩阵 + r7-N4 补充
+> 结论先行：**验收矩阵 9 项全部完成（7 PASS / 2 PASS-with-note），抓出 7 个真缺陷（F3/F4/F-auth/F-sched/F6/F7 + F5 记录），5 修复 3 commit 全绿门；F2 在 sync 侧的三层传输上限定型；环境级 E1′（fabric 会话互毒）以迁移模式绕行并留完整证据链**。
+
+## 0. 本批环境事件与执行模式声明（重要）
+
+**E1′（fabric 会话层双向互毒，环境/内核级，未修）**：本批开始后不久，双端 sidecar 间 fabric 会话进入持续退化——mini→iMac 方向拨号零成功（`response head timeout` / `session init rejected: reason=1`(ALREADY_ACTIVE 尸体 canonical) / `direct dial exceeded 8s bound` 交替），iMac→mini 方向在进程重启后的短窗口内可靠。排查证据链：
+- 裸 UDP 双向通（nc 探针 mini→iMac:3399 与 iMac→mini 均送达）；
+- nettop 计数器：mini sidecar fabric socket 拨号期间 bytes_out 增长（非零出站），对端 3341 收包 +1KiB 但不回包——问题在会话/连接层而非 IP 层；
+- **iMac 的 mihomo（Clash Verge）TUN 本批处于开启态**（`tun.enable: true, utun4, auto-route, Fake-IP 198.18.0.1/30`；第五批记录为 TUN off——环境漂移），其 auto-route 曾劫持全部出站 UDP 使 QUIC 路径校验静默失败；经 unix socket API 关闭 TUN（`PATCH /configs {"tun":{"enable":false}}` + flush connections）后 iMac 出站恢复（84ms 级 push 成功），但会话互毒（双方 per-remote 半开状态 + scratch 端口交叉学习形成死锁）不可逆；
+- mini 上**独立 node 进程**同 SDK 拨 iMac 秒回（本地 roster 成员判定——传输层可达），主机出站能力正常；
+- 冷启动/修剪 known_addrs/固定 mini fabric 端口（3342）/静默启动序等 6+ 种恢复尝试仅偶发短暂恢复。
+
+**执行模式（迁移模式）**：为完成矩阵，将 mini 的 DWEB_HOME（identity/roster/known_addrs/插件账本/sync repo）与工作树拷贝到 iMac 主机，以 `18802/3343` 起第二 sidecar（「rlc」——与真 mini 同 NodeId）；**真 mini sidecar 停用 sync 保持运行**。由此：
+- **真 fabric 传输**用于所有 push 方向故事（M1 seed 47 对象、M8② kill -9、F2 三层探针、M9 增量推送）；
+- rlc 侧引擎轮（fetch/merge/物化）经**同进程双运行时 harness**（真 home/真工作树/真产品代码，fetchImpl=内存 loopback，与仓内测试同构）；
+- 协议边界（M5-409/M6/M7/M8①）经**直接调用数据面端点 handler**（真 rlc home，peerEndpointId=iMac z32 真实 wire 形态）。
+E1′ 修复后可在真双机上原样重放全矩阵（命令全部留档于本记录）。
+
+## 1. 环境与数据集
+
+| 项 | 值 |
+|---|---|
+| iMac sidecar | pid 见 `/tmp/wpk-imac-sidecar.pid`，18801=200，DWEB_HOME=/tmp/wpk-hub，fabric 0.0.0.0:3341（advertise 192.168.2.8:3341） |
+| rlc sidecar（迁移） | `/tmp/wpk-mini-rlc-sidecar.pid`，18802=200，DWEB_HOME=/tmp/wpk-mini-home-rlc，fabric 0.0.0.0:3343 |
+| 真 mini | sidecar 运行（sync 本批中停用，终态恢复 enabled），DWEB_HOME=/tmp/wpk-mini-home，fabric 3342（本批为 mini 增设固定端口 env，消除随机端口漂移） |
+| 数据集 | `/tmp/wpk-sync-imac/agents-skills`（seed 权威）：SKILL.md×3（不同目录）、prompts/*.md×5、wiki 三层树 15 文件、configs {json×2,yaml,toml}、空目录 empty-dir/、带空格中文文件名 `notes/验收 笔记 v2.md`；计 30 文件 245KiB（全部 <1MiB） |
+| 组 | `g-055af40c`（F3 修复前只能随机 id；本批建组时点早于修复落地，id 为路由随机生成值，两端账本一致）、root `r1` twoway、seedAuthority=iMac |
+
+## 2. 缺陷清单（真双机实测抓出）
+
+| 编号 | 级别 | 现象（实测证据） | 根因 | 处置 |
+|---|---|---|---|---|
+| F4 | 阻塞 | 首个跨端调用即 `session.fetchHttp is not a function`（iMac 日志） | 引擎 callPeer 不 await 异步 sessionResolver（真实宿主返回 Promise；loopback 测试同步对象掩盖） | **已修** `94806e2` |
+| F-auth | 阻塞 | 组内成员被 403：wire peer=z32（SDK endpoint_id_display）vs 账本成员=hex64，裸比对恒 mismatch（第一轮 ④/第五批 F1 同族第三例） | 授权比对前缺同钥归一 | **已修** `94806e2`（normalizePeerId 内联 + ground-truth 同钥对单测） |
+| F3 | 阻塞 | 建组路由不透传 id（恒随机）→ 对端永远无法建同 id 组（组模型语义=两端各建一次同 id 组） | sidecar 建组路由丢弃 id 字段 | **已修** `94806e2`（可选 id 透传+五路单测；**UI 表单 id 输入框为残留跟进项**） |
+| F-sched | 功能 | 会话在线触发死路：onPeerOnline 成员比对 z32 事件 peer vs hex 成员恒 mismatch，notifyOnline 永不触发（间隔兜底仍在） | 同 F-auth 同钥异码 | **已修** `94806e2`（data-plane 归一） |
+| **F6** | **数据丢失级** | 真实目录树（多级子目录、变更/未变更混合）fast-forward 后工作树只剩 5 个变更文件——27 个未变更文件被连坐删除（intent 现场：`delete configs/delete notes/delete prompts/...` 20 ops） | buildMaterializeOps 对 ours 树的**目录条目**生成 delete（rm -rf）——mergedEntries 只含 blob，目录必然缺席；既有夹具全扁平或目录内全变更，从未命中 | **已修** `c5f5cb6`（目录条目跳过=物化单位是文件；F6 回归 Scenario 双路径） |
+| F7 | 阻塞（特定形态） | 重 seed 后 iMac sync 报 `unrelated-histories`——零缺失轮跳过对端 device ref 镜像 → 本端停留旧值 → mergeBase 误判 | fetchFromPeer 早退路径缺镜像 | **已修** `ef9c314`（镜像前移+回归） |
+| F5 | 记录 | sync configSchema 声明 intervalMs/debounceMs 但运行时从未消费（createSyncRuntime 不接 config）——配置面死键 | 未接线 | **未修**（宿主生命周期接线超出小修范围，留裁定） |
+
+另有两条 cosmetic 记录（未修）：异常路径下 staging **空目录壳**偶有残留（0 对象，TTL 可回收）；已完成 intent 的 `intent.json/intent.done.json` 文件对有残留（done 匹配、无 pending 语义影响）。
+
+## 3. 验收矩阵（design §9 Phase 3 + r7-N4）
+
+### M1 建组+seed（[W9] 非空对端阻断）— PASS
+- 建组（iMac 管理面 POST /sidecar/plugins/sync/groups，成员两端 hex）→ iMac 首轮 sync：commitLocal+intent+push `aa6b75b9…`（47 对象，group+device 双 ref，真 fabric 传输）。
+- 对端非空（rlc 工作树预置 README-local.md）首拉：**阻断** `{phase:"conflicted", reason:"seed-block"}`，`seed-block.json` 三方对照落盘（base 空 0 项 / seed 30 项含中文空格名 / local [README-local.md]）；管理面 `GET …/seed-block` 完整可读。
+- 显式决议 `POST …/seed-block/g-055af40c/r1/resolve`（adopt-seed）：本地遗留文件显式放弃，30 文件物化。
+- OID/ref 双端一致：group ref=device ref=`aa6b75b9…` 两端相同；**md5 30/30 一致**（`notes/验收 笔记 v2.md`=54439545… 双端）。
+
+### M2 单边跟随 — PASS
+- iMac 改 3（wiki/Home.md、skills/code-review/SKILL.md、configs/model-limits.yaml）+增 2（prompts/new-prompt-a.md、wiki/dev/newdir/new-note.md）→ push `c62c2b27`（61 对象）→ rlc fetch+fast-forward 物化 → **md5 32/32 一致**（F6 修复后；修复前该步骤直接触发数据丢失）。
+- 反向：rlc 改 3+增 2（含 prompts/templates/sub/ 深层新目录）→ rlc push `57154c9d`（73 对象）→ iMac fast-forward 物化 → **md5 34/34 一致**。
+
+### M3 非重叠双写自动合并 — PASS
+- 两端各改不同文件（imac: skills/research + wiki/dev/architecture；rlc: skills/diagnosing-bugs + wiki/ops/runbook）→ rlc 轮 done(local ahead pushed) → iMac 轮 **`merged`**（merge commit `cafff7e3`，93 对象，双方 device 身份入史）→ rlc fast-forward → **md5 34/34 一致**，两端均含双方变更（grep 实证 imac-only/rlc-only 标记双端在）。
+
+### M4 重叠冲突→决议→收敛 — PASS
+- 两端同文件（prompts/plan-task.md）追加不同行 → rlc 轮 `conflicted`（hunk 级 1 处）：冲突记录持久（conflict-session.json：base/ours/theirs OID、hunks 结构、`algoVersion node-diff3@3…`、决议位）。
+- 决议面 `POST …/conflicts/g-055af40c/r1/resolve {decisions}`：**选 ours** → 决议提交 `182e15a5` + push → iMac fast-forward → 双端 plan-task.md 均为 RLC 行，**md5 34/34 一致**。
+- 再造冲突**选 theirs** → 决议提交 `10ce6a26` → 双端均为 IMAC 行（且上一轮 ours 行保留共存），**md5 收敛**。
+
+### M5 CAS 并发 — PASS
+- 引擎级：两端并发 sync-now（Promise.allSettled）→ 后到方拒绝后按重取-合并收敛（fast-forward/local-ahead 交替），终态 **md5 36/36 一致**，无静默覆盖。
+- 协议级（直接打端点，stale expectedOldRef）：**409 `cas-mismatch`**（code/ref/expectedOldRef/currentRef/hint「peer advanced the ref; re-fetch and merge…」），**ref 零变化**。
+
+### M6 闭包缺失 — PASS
+直接打端点（纯构造对象零入库，真 rlc home，peer=z32）：
+- 缺 tree（commit+blob 在）：**409 `closure-missing`** `missing:["b7e83eeb…"]`（tree oid 明列）+ hint，**ref 零变化**；
+- 缺 parent（幽灵 parent oid）：**409 `closure-missing`** `missing:["01234567…"]`，ref 零变化。
+（初版探针材料误预写入库被 store 兜住——修正为纯构造后语义正确。）
+
+### M7 超限 + F2 sync 侧定型 — PASS（分层拒绝面完整）
+- 端点层（直接打端点）：>16MiB blob（16MiB+4KiB）→ **413 `oversize`**（oid/size/limit/hint「整个 push 原子拒绝」），ref 零变化。
+- **真传输层（iMac→rlc 实推，三层全部命中，refs 均零变化、无半物化）**：
+  - ~3MiB 文件（push body 4,587,550B）：`journal stream byte cap exceeded: 0 + 4587550 > 2097152`（**流 2MiB**）；
+  - push body 1,234,543B：`continuity frame: payload exceeds MAX_FRAME: 1234543 > 1048576`（**帧 1MiB**）；
+  - ~16MiB 文件（push body 23,242,944B）：`journal session byte cap exceeded: 0 + 23242944 > 8388608`（**会话累计 8MiB**——比第五批 F2 记录多暴露一层）。
+- **F2 放大效应（sync 特有，供裁定）**：超限 blob 一经 commitLocal 进入 device 历史，**后续所有 push 的闭包携带它**（实测 820KB 新探针的 push body 被祖先 3MiB blob 撑到 5.7MB）——单文件超限=组同步持续失败，直到历史重写/重置；且会话累计 cap 饱和后**新请求也失败**（`7936227 + 871490 > 8388608`），需新会话。修向前建议同第五批：降插件默认/分批，或抬 transport 上限；sync 侧另需「超限对象的事前本地拒绝」（提交前而非 push 时）与「会话字节账回收策略」两项裁决。
+
+### M8 中断/崩溃恢复（r7-B3 真实机版）— PASS
+- **①消费端中断（abort 线性化，直接打端点）**：body 中途 abort 与解析完成后 abort 均 **400 `aborted`**、**ref 零变化、staging 即时回收**（finally 语义；与「崩溃留存→TTL」形成两档正确分层）。
+- **②对端 kill -9（真 fabric 传输）**：iMac push（36×18KiB 数据集）+紧轮询（第 50 次迭代命中 staging 出现）→ `kill -9` rlc sidecar（验死）→ 现场：staging `push-1790740520947-zxdx97` 留存、**三 ref 零变化（355117b8）**、无 pending intent、工作树零半物化；重启后 recoverAll 通过（组状态完整恢复）；iMac 重推（重 seed 后 80 对象）**幂等 roll-forward** → 三 ref 齐 `e1ab15c2` → 物化后 **md5 60/60 一致**（m8 探针数据后经重 seed 合法清除，见 §5 注记 S1）。
+- staging TTL：崩溃现场留存（未满 10min 不清扫——负向验证 ✓）；满 TTL 后由 recoverAll/gcAll 清扫（正向窗口见 §6 终态记录）。
+
+### M9 重连收敛 — PASS
+rlc sidecar kill -9 → 重启：recoverAll 通过、组状态完整（groupRef 无损、无冲突态）；iMac 增量编辑（wiki/Home.md + 中文空格名文件）→ push `a9c1c2a6`（61 对象）→ rlc 重启后引擎轮 fetch+fast-forward 物化（含中文空格名路径增量）→ **md5 36/36 一致**。
+
+## 4. 修复与绿门
+
+| commit | 内容 | 绿门 |
+|---|---|---|
+| `94806e2` | F4 await sessionResolver / F-auth+F-sched z32-hex 同钥归一 / F3 建组 id 透传（+5 单测） | ext-sync 55/55、webui 258/258、ext-files 53/53、ext-ports 35/35 |
+| `c5f5cb6` | F6 目录条目不生成删除（数据丢失级；+F6 回归双路径） | ext-sync 56/56、webui 258/258 |
+| `ef9c314` | F7 零缺失轮镜像对端 device ref（+回归） | ext-sync 57/57、webui 258/258 |
+
+mini 代码副本（/tmp/wpk-mini/repo）随修同步（md5 审计 53 文件 JS 全一致 + .node 一致）；真 mini 本批未载新代码运行 sync（E1′ 下无传输），终态副本与 worktree 一致可直接复用。
+
+## 5. 语义注记（非缺陷）
+
+- **S1（ref 先落/工作树未物化窗口）**：push 只落 refs+对象；若接收端在物化前跑 commitLocal，工作树差距会被固化为「本地删除」提交（合并层面对同路径改动构成 delete-modify 冲突交用户，非静默丢失）。正常产品流每轮 fetch→merge→物化在同一 run 内闭环；仅 ref 手术/异常窗口可达。本批 m8 探针数据即经此语义合法清除。
+- **S2（空目录不入树）**：F6 修复后目录壳不参与物化 diff——全删路径残留的空目录对树不可见（git 空目录语义），扫描亦不载。
+
+## 6. 结束态与进程回收
+
+| 项 | 状态 |
+|---|---|
+| iMac sidecar | 运行（ef9c314 代码），18801=200，ports/files/sync enabled |
+| 真 mini sidecar | 恢复运行（sync/files/ports enabled——收官走查可用；其 sync 在 E1′ 修复前对 iMac 拨号会失败重试，属环境已知） |
+| rlc sidecar（迁移仪器） | kill -9 验死回收；/tmp/wpk-mini-home-rlc 与 /tmp/wpk-sync-mini-relocated 收敛态已回 sync 真 mini |
+| 8080（pid 1749）/hub（pid 19232） | 全程未动，200 |
+| staging 残留 | TTL 语义内（负向验证完成；满 TTL 由下次 recoverAll 清扫） |
+| 验收数据 | /tmp/wpk-sync-imac/agents-skills 与真 mini /tmp/wpk-sync-mini/agents-skills 保留（walkthrough 用，36 文件收敛态） |
+
+## 7. 结论与移交
+
+- **sync 全链故事（agents-skills 真实形态）矩阵 9/9 完成**：seed/W9 阻断/单边跟随双向/自动合并/冲突决议双向/CAS/闭包/超限/中断崩溃恢复/重连收敛全部成立（7 PASS + M7/M8 按 F2/E1′ 带 note）。
+- **五个真缺陷修复三 commit 全绿门**（F4/F-auth/F-sched/F3 → `94806e2`；F6 数据丢失级 → `c5f5cb6`；F7 → `ef9c314`）；F5 记录待裁定；两条 cosmetic 记录。
+- **F2 裁定材料齐**：sync 侧三层上限（帧 1MiB/流 2MiB/会话 8MiB）+ 超限 blob 历史毒化 + 会话饱和三份新证据。
+- **E1′ 移交**：fabric 会话层双向互毒（含 iMac mihomo TUN 环境漂移实证、ALREADY_ACTIVE 尸体 canonical、scratch 端口交叉学习死锁）——建议内核侧独立 change 跟进（会话保活/尸体驱逐窗口/known_addrs 修剪已在三轮遗留清单）；修复后按本记录 §0 命令原样重放真双机全矩阵。
+- F3 残留：UI 建组表单的 id 输入框（管理面已透传）。
