@@ -7,7 +7,9 @@
 //    argv/env 途径打印 OS 可见性提醒横幅；
 // 3. 启动 sidecar：打印访问 URL（setup 态同时打印一次性配对码）；
 //    --no-open 跳过浏览器（darwin `open`，其它平台仅打印 URL）；
-// 4. SIGINT/SIGTERM 清理退出；token 值不进任何 log/错误字符串。
+// 4. SIGINT/SIGTERM 清理退出（B5：close 完成后 2s unref 宽限——原生数据面
+//    句柄闩住 loop 时显式 exit；自然退出路径不变，见 settleExit）；token 值
+//    不进任何 log/错误字符串。
 // 双入口：bin（opendweb-webui，本文件 shebang 直跑）与 plugin envelope
 // （run({command,args,log,cwd,stdout,stderr}) → main(args, io)）。
 // 壳层职责冻结（design §5.1）：信号/开浏览器（openImpl 形态）/退出留在本层——
@@ -331,11 +333,46 @@ if (isDirect) {
   }
   main(args).then(
     (r) => {
-      process.exitCode = r.exit;
+      settleExit(r.exit);
     },
     (e) => {
       process.stderr.write(`error: webui: ${ascii(String(e?.message ?? e))}\n`);
-      process.exitCode = 1;
+      settleExit(1);
     },
   );
+}
+
+/** B5 兜底宽限（ms）：close() 完成后给 Node 句柄尾态的观察窗（见 settleExit）。 */
+export const TERM_LATCH_GRACE_MS = 2000;
+
+/**
+ * bin 直跑的收尾：置退出码 + 闩锁有界兜底（2026-09-30，r8-B5）。
+ *
+ * 根因（scratch 实例 + libuv 诊断报告实证）：数据面 serveHttp 的原生句柄
+ * （HttpServerJs 的 handler TSFN）与 JS 回调互持成环——TSFN 的 napi_ref 是
+ * 强根，回调闭包又引用 server 包装对象；close() 走完后该环只能靠 GC
+ * finalize 释放，而空闲事件循环（停泊 kevent）永不触发 GC → 进程对
+ * SIGTERM 不退出（实测 close 收尾后 >15s 仍存活；--expose-gc 强制 GC 亦
+ * 不解——环不经过 V8 可回收堆）。fabric 内核 5s drain 语义已闭合
+ * （incomplete-drain 如实上报），此处只兜 Node 侧句柄尾态。
+ *
+ * 边界纪律：
+ * - 计时器 unref——不改变自然退出路径：无闩锁时进程照常自行退出，本兜底
+ *   永不触发（空载 sidecar TERM 实测 0.0x s 退出，行为不变）；
+ * - 仅在 close() 完成（main 返回）之后装表，宽限 2s：内核 drain 最坏 5s
+ *   已在 close 内消耗，TERM → 退出合计 ≤7s；
+ * - 不掩盖内核层未 drain——incomplete-drain 错误/日志在 close 路径先行
+ *   如实上报，本兜底只处理「drain 已收尾但原生句柄闩住 loop」的尾态；
+ * - 仅 bin 壳层使用（design §5.1 进程语义冻结在壳）——plugin envelope 宿主
+ *   进程归 hub 所有，绝不在此处 exit。
+ */
+function settleExit(exitCode) {
+  process.exitCode = exitCode;
+  const watchdog = setTimeout(() => {
+    process.stderr.write(
+      "webui: shutdown complete but native data-plane handles still reference the event loop; forcing exit\n",
+    );
+    process.exit(exitCode);
+  }, TERM_LATCH_GRACE_MS);
+  watchdog.unref();
 }
