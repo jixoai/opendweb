@@ -968,24 +968,20 @@ const SHUTDOWN_DRAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// r11 实证修正：deadline 已耗尽时 `timeout_at` 不保证给被 abort 任务首次
 /// poll 机会（运行时取消处理尚未完成 → Pending → Elapsed）——accept-loop
 /// 停在半开握手的 connecting.await 上吃满全部预算后，后续 phase 的 abort
-/// join 全部假阴性（accept-child 被误记 incomplete-drain）。abort 后改用
-/// 固定宽限（100ms 覆盖运行时取消处理）：仅 degraded 路径最多按任务数
-/// 线性溢出预算，换取假阴性消除。join 仍不在宽限内完成（任务处于不可
-/// 取消的同步/不让出路径）时返回 false：句柄丢弃（detached），调用方记录
-/// incomplete-drain 错误。绝不无条件 `task.await`——那是预算外的无限等待
-/// （r7 指出的越界面）。
-async fn abort_join_bounded(
-    task: &mut tokio::task::JoinHandle<()>,
-    _deadline: tokio::time::Instant,
-    phase: &str,
-) -> bool {
+/// join 全部假阴性（accept-child 被误记 incomplete-drain）。故 abort 后改用
+/// **固定 100ms 宽限**（覆盖运行时取消处理，与 shutdown deadline 无关）：
+/// 仅 degraded 路径最多按任务数线性溢出预算，换取假阴性消除。join 仍不在
+/// 宽限内完成（任务处于不可取消的同步/不让出路径）时返回 false：句柄丢弃
+/// （detached），调用方记录 incomplete-drain 错误。绝不无条件 `task.await`
+/// ——那是预算外的无限等待（r7 指出的越界面）。
+async fn abort_join_bounded(task: &mut tokio::task::JoinHandle<()>, phase: &str) -> bool {
     task.abort();
     match tokio::time::timeout(std::time::Duration::from_millis(100), &mut *task).await {
         Ok(_) => true,
         Err(_) => {
             tracing::error!(
                 phase,
-                "task did not terminate after abort within the shutdown deadline; detaching"
+                "task did not terminate after abort within the fixed 100ms grace; detaching"
             );
             false
         }
@@ -1043,7 +1039,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     // guard 在显式作用域内释放，绝不跨 await。[B2] abort + 有界 join。
     let watcher_task = { inner.relay_watcher_task.lock().unwrap().take() };
     if let Some(mut task) = watcher_task
-        && !abort_join_bounded(&mut task, shutdown_deadline, "relay-watcher").await
+        && !abort_join_bounded(&mut task, "relay-watcher").await
     {
         note_incomplete!("relay-watcher");
     }
@@ -1051,7 +1047,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     // 重拨 worker；已在途的 worker 由 accept_children 登记表统一收割）
     let reconnect_manager = { inner.reconnect_manager_task.lock().unwrap().take() };
     if let Some(mut task) = reconnect_manager
-        && !abort_join_bounded(&mut task, shutdown_deadline, "reconnect-manager").await
+        && !abort_join_bounded(&mut task, "reconnect-manager").await
     {
         note_incomplete!("reconnect-manager");
     }
@@ -1080,7 +1076,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
             .is_err()
     {
         tracing::warn!("accept loop did not finish before the shutdown deadline; aborting (R8-2)");
-        if !abort_join_bounded(&mut task, shutdown_deadline, "accept-loop").await {
+        if !abort_join_bounded(&mut task, "accept-loop").await {
             note_incomplete!("accept-loop");
         }
     }
@@ -1116,7 +1112,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
                     "detached connect task did not finish before the shutdown deadline; \
                      aborting to guarantee clean shutdown (HB 4.1)"
                 );
-                if !abort_join_bounded(&mut task, shutdown_deadline, "detached-connect").await {
+                if !abort_join_bounded(&mut task, "detached-connect").await {
                     note_incomplete!("detached-connect");
                 }
             }
@@ -1137,7 +1133,7 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
                 tracing::warn!(
                     "accept child did not finish before the shutdown deadline; aborting (R7 P1-3)"
                 );
-                if !abort_join_bounded(&mut child, shutdown_deadline, "accept-child").await {
+                if !abort_join_bounded(&mut child, "accept-child").await {
                     note_incomplete!("accept-child");
                 }
             }
