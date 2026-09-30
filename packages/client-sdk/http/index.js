@@ -105,7 +105,7 @@ async function fetchHttp(session, request) {
  *   path: string;
  *   headers: Array<{ name: string; value: string }>;
  *   bodyNext: () => Promise<Buffer | null>;
- *   respondStreaming: (status: number, headers?: Array<{ name: string; value: string }>) => { write: (chunk: Uint8Array) => Promise<void>; finish: () => void; finished: boolean; cancelled: boolean; closed: boolean } | null;
+ *   respondStreaming: (status: number, headers?: Array<{ name: string; value: string }>) => { write: (chunk: Uint8Array) => Promise<void>; finish: () => void; abort: () => void; finished: boolean; cancelled: boolean; closed: boolean } | null;
  * }) => Promise<{ status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void> | { status: number; headers?: Array<{ name: string; value: string }>; bodyChunks?: Array<Uint8Array> } | null | void} handler
  */
 async function serveHttp(fabric, peerId, handler) {
@@ -174,10 +174,13 @@ async function serveHttp(fabric, peerId, handler) {
                 finalizeRequest(rid); // 本地半关：后续 cancel 无意义
               },
               // 中止（上游被取消/掐断）：向对端显式 RESET——截断不得伪装干净
-              // EOF（消费端按错误暴露）；旧 native 无此面时回落 finish
+              // EOF（消费端按错误暴露）。r11：native writer 缺 abort() 即 ABI
+              // 不匹配——明确失败，绝不回退 finish()（取消≠干净 EOF）。
               abort: () => {
-                if (typeof writer.abort === "function") writer.abort();
-                else writer.finish();
+                if (typeof writer.abort !== "function") {
+                  throw new TypeError("native StreamWriter lacks abort() ABI (refusing finish() fallback)");
+                }
+                writer.abort();
                 finalizeRequest(rid);
               },
               get finished() {

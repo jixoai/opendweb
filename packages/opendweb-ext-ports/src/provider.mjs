@@ -123,31 +123,29 @@ export function createPortsProxyHandler(opts) {
 
     // 转发（127.0.0.1:<remotePort>）+ 流式回写
     return await new Promise((resolve) => {
-      /** @type {{ write: (chunk: Uint8Array) => Promise<void>, finish: () => void } | null} */
+      /** @type {{ write: (chunk: Uint8Array) => Promise<void>, finish: () => void, abort: () => void } | null} */
       let writer = null;
       let streaming = false;
       let done = false;
       /**
        * 取消传播唯一入口（对端 RESET/遗弃 → request.signal）：上游 destroy
-       * （socket 收敛）+ 已开流时下游 finish。注意：已 aborted 的 signal 不会
-       * 对后注册的 listener 重放事件——注册前必须显式检查（防「abort 发生在
-       * http.request 建立前」的窗口漏取消）。
-       */
-      /**
-       * 取消传播唯一入口（对端 RESET/遗弃 → request.signal）：上游 destroy
        * （socket 收敛）+ 已开流时下游 abort（向对端显式 RESET——上游被取消
-       * 掐断的截断响应不得伪装干净 EOF，真双机实证 2026-09-30；无 abort 面
-       * 的旧 writer 回落 finish）。注意：已 aborted 的 signal 不会对后注册的
-       * listener 重放事件——注册前必须显式检查（防「abort 发生在 http.request
-       * 建立前」的窗口漏取消）。
+       * 掐断的截断响应不得伪装干净 EOF，真双机实证 2026-09-30）。注意：已
+       * aborted 的 signal 不会对后注册的 listener 重放事件——注册前必须显式
+       * 检查（防「abort 发生在 http.request 建立前」的窗口漏取消）。
+       * r11：native writer 缺 abort() 是 ABI 不匹配——明确失败（error 日志），
+       * 绝不回退 finish()（取消≠干净 EOF）。
        */
       const abortUpstream = () => {
         upstreamReq.destroy(); // 上游 socket 收敛（取消传播断言面）
         if (streaming && !done) {
           done = true;
+          if (typeof writer?.abort !== "function") {
+            log("error", "ports provider: native StreamWriter lacks abort() ABI; explicit RESET unavailable (refusing finish() fallback)");
+            return;
+          }
           try {
-            if (typeof writer?.abort === "function") writer.abort();
-            else writer?.finish();
+            writer.abort();
           } catch {
             /* 通道已死 */
           }
@@ -228,7 +226,7 @@ export function createPortsProxyHandler(opts) {
  * @property {string} path
  * @property {Array<{name: string, value: string}>} headers
  * @property {() => Promise<Buffer | null>} bodyNext
- * @property {(status: number, headers?: Array<{name: string, value: string}>) => { write: (chunk: Uint8Array) => Promise<void>, finish: () => void, abort?: () => void, finished: boolean, cancelled: boolean, closed: boolean } | null} respondStreaming
+ * @property {(status: number, headers?: Array<{name: string, value: string}>) => { write: (chunk: Uint8Array) => Promise<void>, finish: () => void, abort: () => void, finished: boolean, cancelled: boolean, closed: boolean } | null} respondStreaming
  *
  * @typedef {Object} HttpHandlerResponseLike
  * @property {number} status

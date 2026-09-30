@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
-    Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit, HttpResponse, fetch_http,
-    serve_http,
+    FetchCancel, Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit, HttpResponse,
+    fetch_http, serve_http,
 };
-use dweb_fabric::continuity::session::{self, SessionOptions};
+use dweb_fabric::continuity::session::{self, SessionOptions, StreamTerm};
+use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
     Fabric, FabricConfig, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig, RelayTlsTrust,
     SecretInjection,
@@ -819,5 +820,457 @@ async fn http_fetch_gate_waits_for_channel_reinstall_during_recovery() {
         resp2.status, 200,
         "Recovering 窗口内的 fetch 经新代通道成功"
     );
+    provider.abort();
+}
+
+// ---------------------------------------------------------------------------
+// r11 B1-B4：体完整性终态语义（abort→FIN 竞速 / 终止原因分类 / 聚合拒吞错 /
+// 阶段 A 取消活性）——ports spec「传输中断绝不允许伪装成功」的内核承接面。
+// ---------------------------------------------------------------------------
+
+/// h11（r11-B1 active FIN/RESET 交错）：provider 在全量供给刚写完即中止
+/// （不 finish）——修复前 dispatch 把 sender Drop 当正常 EOF 发 FIN，客户端
+/// 以干净 null 收尾出截断 200。修复后：终态必须 PeerReset（错误），绝无
+/// 干净 FIN EOF；聚合读取器（r11-B3）在 RESET 终止时必须 Err（前缀≠完整实体）。
+#[tokio::test]
+async fn http_provider_abort_midstream_never_clean_eof() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let h = handler(|req: HttpRequest| {
+        let shared = Arc::clone(req.body.shared());
+        let sid = req.stream_id;
+        Box::pin(async move {
+            let (tx, rx) = body_channel(8);
+            tokio::spawn(async move {
+                for i in 0..3u32 {
+                    if tx
+                        .send(Bytes::from(format!("chunk-{i:02};")))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                // 竞速形态：全量供给刚写完即中止（终态落位 → RESET → 才关 sender）
+                shared.abort_stream(sid).await;
+                drop(tx);
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+
+    // —— 请求 1：逐块读，终态分类必须是 PeerReset（错误），绝非干净 EOF ——
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/race-1")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    let mut got: Vec<u8> = Vec::new();
+    let term = loop {
+        match tokio::time::timeout(Duration::from_secs(10), resp.recv_body()).await {
+            Ok(Ok(c)) => got.extend_from_slice(&c),
+            Ok(Err(_)) => break client.shared().stream_term(resp.stream_id).await,
+            Err(_) => panic!("读超时（已收 {}B）", got.len()),
+        }
+    };
+    assert_eq!(
+        term,
+        Some(StreamTerm::PeerReset),
+        "abort 竞速必须以 RESET 终结（截断≠干净 EOF）；已收 {}B",
+        got.len()
+    );
+
+    // —— 请求 2（同形态）：聚合读取器不得把已有前缀当完整实体（r11-B3）——
+    let mut resp2 = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/race-2")),
+    )
+    .await
+    .expect("fetch 2 有界")
+    .expect("fetch 2 ok");
+    let agg = tokio::time::timeout(Duration::from_secs(10), resp2.read_all_body())
+        .await
+        .expect("聚合有界");
+    assert!(
+        agg.is_err(),
+        "read_all_body 在 RESET 终止时必须 Err（前缀≠完整实体）"
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h12（r11-B1 Recovering 下 RESET 失败后恢复）：通道死亡窗口内 provider 中止
+/// ——best-effort RESET 发送失败；终态（LocalAbort）跨恢复代保留，resume 后由
+/// 重放面补发 RESET。客户端终态必须是错误（PeerReset），绝无干净 EOF。
+#[tokio::test]
+async fn http_provider_abort_reset_survives_recovery() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let kill = Arc::new(tokio::sync::Notify::new());
+    let k = Arc::clone(&kill);
+    let h = handler(move |req: HttpRequest| {
+        let shared = Arc::clone(req.body.shared());
+        let sid = req.stream_id;
+        let k = Arc::clone(&k);
+        Box::pin(async move {
+            let (tx, rx) = body_channel(4);
+            tokio::spawn(async move {
+                if tx.send(Bytes::from_static(b"first-chunk;")).await.is_err() {
+                    return;
+                }
+                k.notified().await; // 主测通知：此时通道已死（RESET 必然发送失败）
+                shared.abort_stream(sid).await;
+                drop(tx);
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/recover-abort")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    let first = tokio::time::timeout(Duration::from_secs(10), resp.recv_body())
+        .await
+        .expect("首块有界")
+        .expect("首块");
+    assert_eq!(&first[..], b"first-chunk;");
+
+    // 注入死亡 → 通道 dead（会话 Recovering）→ 在死通道上中止（RESET 失败）
+    a.continuity_reset(&b_id).await.unwrap();
+    let dead_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !client.channel().is_dead() {
+        assert!(
+            tokio::time::Instant::now() < dead_deadline,
+            "通道死亡标记超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    kill.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(300)).await; // 让中止终态落位、失败的 RESET 返回
+
+    // 恢复：重放面补发 RESET——客户端必须以错误终结
+    client.resume(&a).await.expect("resume");
+    let mut got: Vec<u8> = Vec::new();
+    let term = loop {
+        match tokio::time::timeout(Duration::from_secs(15), resp.recv_body()).await {
+            Ok(Ok(c)) => got.extend_from_slice(&c),
+            Ok(Err(_)) => break client.shared().stream_term(resp.stream_id).await,
+            Err(_) => panic!("续读超时（已收 {}B）", got.len()),
+        }
+    };
+    assert_eq!(
+        term,
+        Some(StreamTerm::PeerReset),
+        "死通道上的中止经恢复补发 RESET 终结（绝无干净 EOF）；已收 {}B",
+        got.len()
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h13（r11-B2 协议错误终态）：已交付段重发不同内容 → RecvWindow overlap
+/// mismatch → 本地以 ProtocolError 终结（remote_final + 回 RESET），recv 报
+/// 错而非「stream ended」；回环 RESET 使发送侧同流 PeerReset（双端流死）。
+#[tokio::test]
+async fn session_overlap_mismatch_terminates_stream_as_protocol_error() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let provider = tokio::spawn(async move {
+        let session = session::accept_any(&b, &a_id, opts).await.expect("accept");
+        let Some(sid) = session.next_incoming().await else {
+            panic!("无入站流");
+        };
+        let first = session.recv(sid).await.expect("首段交付");
+        assert_eq!(&first[..], b"AAAA");
+        let second = session.recv(sid).await;
+        let term = session.shared().stream_term(sid).await;
+        (second, term)
+    });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let sid = client.open_stream("k-err").await.expect("open");
+    client
+        .send_data(sid, Bytes::from_static(b"AAAA"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await; // 交付窗口
+    // 冲突段：同 offset 不同内容（越过 journal 正常路径的裸帧注入）
+    client
+        .channel()
+        .send_frame(&Frame {
+            frame_type: FrameType::Data,
+            flags: 0,
+            session_id: client.shared().session_id,
+            stream_id: sid,
+            direction: Direction::ClientToProvider,
+            byte_offset: 0,
+            payload: Bytes::from_static(b"BBBB"),
+        })
+        .await
+        .unwrap();
+
+    let (second, term) = tokio::time::timeout(Duration::from_secs(10), provider)
+        .await
+        .expect("provider join 有界")
+        .expect("provider task");
+    assert!(second.is_err(), "协议错误后 recv 必须报错");
+    assert_eq!(
+        term,
+        Some(StreamTerm::ProtocolError),
+        "overlap mismatch 归类为协议错误（非干净 stream ended）"
+    );
+    // 回环 RESET：发送侧同流终结为 PeerReset（有界等待）
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.shared().stream_term(sid).await != Some(StreamTerm::PeerReset) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "回环 RESET 未到达发送侧"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    client.close().await;
+}
+
+/// h14（r11-B2 会话丢失终态 + r11-B3）：响应体在途时本端刻意 close——
+/// 会话终态后读取必须以错误终结（非悬挂、非干净成功），聚合读取器把已有
+/// 前缀的截断流按 Err 返回。
+#[tokio::test]
+async fn http_session_close_terminates_pending_body_as_error() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let h = handler(|_req: HttpRequest| {
+        Box::pin(async move {
+            let (tx, rx) = body_channel(2);
+            tokio::spawn(async move {
+                // 慢速长流：永不 finish（close 时流必在途）
+                for i in 0..1000u32 {
+                    if tx.send(Bytes::from(format!("slow-{i:04};"))).await.is_err() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/slow")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    let _first = tokio::time::timeout(Duration::from_secs(10), resp.recv_body())
+        .await
+        .expect("首块有界")
+        .expect("首块");
+    client.close().await;
+    let agg = tokio::time::timeout(Duration::from_secs(10), resp.read_all_body())
+        .await
+        .expect("聚合必须有限期终结（非悬挂）");
+    assert!(
+        agg.is_err(),
+        "会话丢失后 read_all_body 必须 Err（截断前缀≠完整实体）"
+    );
+    provider.abort();
+}
+
+/// h15（r11-B4 阶段 A 取消活性）：Recovering 闸门等待中外 部取消——fetch 必须
+/// 即时结算（远小于 head 预算）、provider handler 零启动（取消先于 OPEN）。
+#[tokio::test]
+async fn http_fetch_cancel_during_recovery_gate_settles_immediately() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let gated_execs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let exec = Arc::clone(&gated_execs);
+    let h = handler(move |req: HttpRequest| {
+        let exec = Arc::clone(&exec);
+        Box::pin(async move {
+            if req.path == "/gated" {
+                exec.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: None,
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    // 注入死亡并等泵退出（会话 Recovering、通道 dead）
+    a.continuity_reset(&b_id).await.unwrap();
+    let dead_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !client.channel().is_dead() {
+        assert!(
+            tokio::time::Instant::now() < dead_deadline,
+            "通道死亡标记超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let cancel = Arc::new(FetchCancel::default());
+    let t0 = std::time::Instant::now();
+    let fetcher = {
+        let client = client.clone();
+        let cancel = Arc::clone(&cancel);
+        tokio::spawn(async move {
+            let mut init = HttpRequestInit::get("/gated");
+            init.head_timeout = Some(Duration::from_secs(5));
+            init.cancel = Some(cancel);
+            tokio::time::timeout(Duration::from_secs(10), fetch_http(&client, init)).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await; // fetch 挂在活性闸门
+    cancel.fire();
+    let out = tokio::time::timeout(Duration::from_secs(5), fetcher)
+        .await
+        .expect("取消结算有界")
+        .expect("task join")
+        .expect("fetch 有界");
+    let err = match out {
+        Err(e) => e,
+        Ok(_) => panic!("闸门期取消必须失败"),
+    };
+    assert!(
+        err.to_string().contains("cancelled"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "取消必须即时结算（实际 {:?}，预算 5s）",
+        t0.elapsed()
+    );
+    assert_eq!(
+        gated_execs.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "provider handler 零启动（取消先于 OPEN）"
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h16（r11-B4 单一 head 预算）：活性闸门消耗预算的一部分后通道恢复——
+/// 头等待只能用**剩余**预算：整次 head 操作总时长 ≤ 单一配置预算（+调度
+/// 余量）。修复前两段各占满额预算（闸门 R + 头等待 T），总量 R+T 违约。
+#[tokio::test]
+async fn http_fetch_head_budget_is_single_shared_deadline() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+    let budget = Duration::from_secs(2);
+
+    // handler 挂起不响应（head 永不达——预算耗尽的确定性来源）
+    let h = handler(|_req: HttpRequest| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: None,
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    a.continuity_reset(&b_id).await.unwrap();
+    let dead_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !client.channel().is_dead() {
+        assert!(
+            tokio::time::Instant::now() < dead_deadline,
+            "通道死亡标记超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let t0 = std::time::Instant::now();
+    let fetcher = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut init = HttpRequestInit::get("/budget");
+            init.head_timeout = Some(budget);
+            tokio::time::timeout(budget * 5, fetch_http(&client, init)).await
+        })
+    };
+    // 闸门先消耗预算的 60%（判别力要求：修复前的双 deadline 形态——闸门满额
+    // R + 头等待再满额 T——在 R=1.2s 时总时长 ≈3.2s，必然击穿 budget+500ms；
+    // 单一 deadline 形态总时长恒 ≈budget）
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    client.resume(&a).await.expect("resume"); // 通道恢复（闸门退出、OPEN 发出）
+
+    let out = fetcher.await.expect("task join").expect("fetch 有界");
+    let err = match out {
+        Err(e) => e,
+        Ok(_) => panic!("挂起 handler 下 head 必然超时"),
+    };
+    assert!(
+        err.to_string().contains("head timeout"),
+        "unexpected error: {err}"
+    );
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed <= budget + Duration::from_millis(500),
+        "整次 head 操作总时长必须 ≤ 单一预算+调度余量（实际 {elapsed:?}，预算 {budget:?}）"
+    );
+    client.close().await;
     provider.abort();
 }

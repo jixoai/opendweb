@@ -28,7 +28,7 @@ pub use model::{
 };
 pub use session::{
     RequestState, Session, SessionChannel, SessionOptions, SessionPhase, SessionRegistry,
-    SessionShared,
+    SessionShared, StreamTerm,
 };
 pub use state::{ConnHandle, ConnectionPhase, ConnectionStateSnapshot, ContinuityState};
 pub use transport::{

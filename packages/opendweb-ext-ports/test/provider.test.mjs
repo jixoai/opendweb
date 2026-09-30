@@ -155,6 +155,7 @@ test("provider: consumer abort (request.signal) destroys upstream socket — con
     resolveFinish = r;
   });
   let streaming = false;
+  let aborted = false;
   /** @type {import("../src/provider.mjs").HttpHandlerRequestLike} */
   const req = {
     requestId: 7,
@@ -171,6 +172,11 @@ test("provider: consumer abort (request.signal) destroys upstream socket — con
       return {
         write: async (c) => writerChunks.push(c),
         finish: () => resolveFinish(),
+        // r11：取消传播走 abort()（显式 RESET）——stub 对齐当前 native ABI
+        abort: () => {
+          aborted = true;
+          resolveFinish();
+        },
         get finished() {
           return false;
         },
@@ -188,6 +194,8 @@ test("provider: consumer abort (request.signal) destroys upstream socket — con
   await new Promise((r) => setTimeout(r, 60));
   assert.ok(writerChunks.length >= 2, "SSE events flow through respondStreaming before cancel");
   controller.abort(); // 对端 RESET → provider request.signal
+  await Promise.race([finished, new Promise((r) => setTimeout(r, 2000))]);
+  assert.equal(aborted, true, "consumer cancel must surface as writer.abort() (explicit RESET), never a silent finish()");
   await Promise.race([finished, new Promise((r) => setTimeout(r, 2000))]);
   const result = await handlerPromise;
   assert.equal(result ?? null, null, "streaming path: handler resolves null after respondStreaming");

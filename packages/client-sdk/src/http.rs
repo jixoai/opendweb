@@ -22,7 +22,9 @@ use dweb_fabric::continuity::http::{
     HttpResponse as KernelHttpResponse, RequestBody, fetch_http as kernel_fetch_http,
     serve_http as kernel_serve_http,
 };
-use dweb_fabric::continuity::session::{Session, SessionOptions, SessionPhase, SessionShared};
+use dweb_fabric::continuity::session::{
+    Session, SessionOptions, SessionPhase, SessionShared, StreamTerm,
+};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
@@ -37,6 +39,32 @@ use crate::session::session_err;
 const BODY_RACE_SLICE: Duration = Duration::from_millis(500);
 /// serve 响应静态 chunks → 引擎 mpsc 容量（§3.4 有界水位；引擎侧背压/断线桥接）。
 const BODY_CHANNEL_CAP: usize = 16;
+
+/// r11-B2 终态分类：只有干净 FIN（对端半关且队列排空）→ Ok(None)；RESET/
+/// 协议错误/本端中止/会话丢失（term 未落位）一律类型化 Err——传输失败不得
+/// 以干净 EOF 外显（ports 体完整性承诺）。Bytes 形态与拉取闭包的 Ok(Some(c))
+/// 统一；Buffer 投影由调用侧 `r.map(...)` 完成。
+fn term_err(term: Option<StreamTerm>, what: &str) -> std::result::Result<Option<Bytes>, Error> {
+    match term {
+        Some(StreamTerm::Fin) => Ok(None),
+        Some(StreamTerm::PeerReset) => Err(Error::new(
+            Status::GenericFailure,
+            format!("[session] {what} stream reset by peer"),
+        )),
+        Some(StreamTerm::ProtocolError) => Err(Error::new(
+            Status::GenericFailure,
+            format!("[session] {what} stream terminated: protocol error"),
+        )),
+        Some(StreamTerm::LocalAbort) => Err(Error::new(
+            Status::GenericFailure,
+            format!("[session] {what} stream aborted locally"),
+        )),
+        None => Err(Error::new(
+            Status::GenericFailure,
+            format!("[session] {what} body ended: session dead/closed"),
+        )),
+    }
+}
 
 /// HTTP 头（数组形态保重复项，§3.4）。
 #[napi(object)]
@@ -124,18 +152,11 @@ impl HttpClientResponseJs {
                 match guard.recv_body().await {
                     Ok(c) => Ok(Some(c)),
                     Err(_) => {
-                        // EOF 终结面区分（真双机实证 2026-09-30：会话翻转/取消的
-                        // 在途流以 RESET 终结，内核收敛为「流结束」）——RESET/遗弃
-                        // 不得伪装干净 EOF：消费端（ports 等价性承诺）须拿到错误，
-                        // 否则截断/空体以 200 形态外显。干净 FIN 才是 null。
-                        if self.shared.peer_reset(self.stream_id).await {
-                            Err(Error::new(
-                                Status::GenericFailure,
-                                "[session] response stream reset by peer",
-                            ))
-                        } else {
-                            Ok(None) // 干净 EOF（对端 FIN，队列已排空）
-                        }
+                        // r11-B2 终态语义：终止原因透传——只有干净 FIN（对端半关
+                        // 且队列排空）才是 null；RESET/协议错误/本端中止/会话
+                        // 丢失一律 Err（ports 等价性承诺：传输失败不得以干净
+                        // EOF 外显——截断/空体以 200 形态泄漏即违约）。
+                        term_err(self.shared.stream_term(self.stream_id).await, "response")
                     }
                 }
             };
@@ -654,7 +675,11 @@ impl HttpServerJs {
             let pull = async {
                 match body.recv().await {
                     Ok(c) => Ok(Some(c)),
-                    Err(_) => Ok(None), // EOF（对端 FIN/RESET）
+                    // r11-B2：与 bodyNext 同一终态分类——只有干净 FIN 才是 null
+                    //（此前 FIN/RESET 一律折叠 null，请求体传输失败被吞）。
+                    Err(_) => {
+                        term_err(body.shared().stream_term(body.stream_id()).await, "request")
+                    }
                 }
             };
             match tokio::time::timeout(BODY_RACE_SLICE, pull).await {
@@ -760,18 +785,23 @@ impl StreamWriterJs {
         Ok(())
     }
 
-    /// 中止（幂等）：停止 body 供给并向对端发 RESET——「上游被取消/掐断」
-    /// 的截断响应不得伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性
-    /// 承诺：要么成功有体、要么明确失败）。通道已死时发送失败即中止目的已达。
+    /// 中止（幂等）：向对端发 RESET——「上游被取消/掐断」的截断响应不得
+    /// 伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性承诺：要么成功
+    /// 有体、要么明确失败）。
+    /// r11-B1：取消终态**先于供给面关闭**原子落位（`abort_stream` 在 streams
+    /// 域内落 LocalAbort，跨恢复代保留），此后才关 sender、best-effort RESET
+    /// ——dispatch 对已取消供给禁 FIN；RESET 发送失败由恢复重放补发（修复前
+    /// 的竞速：先关 sender → dispatch 当正常 EOF 发 FIN → 客户端以 null 收尾
+    /// 出空/截断 200）。
     #[napi]
     pub async fn abort(&self) -> Result<()> {
         if self.aborted.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
-        *self.tx.lock().unwrap() = None;
         if let Some((shared, stream_id)) = &self.abort_target {
-            shared.send_reset(*stream_id).await;
+            shared.abort_stream(*stream_id).await; // 终态落位 + best-effort RESET
         }
+        *self.tx.lock().unwrap() = None; // 此后才关供给面（顺序即不变式）
         Ok(())
     }
 }

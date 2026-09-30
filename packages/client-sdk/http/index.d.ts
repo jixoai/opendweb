@@ -49,6 +49,13 @@ export interface StreamWriterHandle {
   write(chunk: Uint8Array): Promise<void>;
   /** 半关（EOF；幂等） */
   finish(): void;
+  /**
+   * 中止（幂等）：向对端显式 RESET——「上游被取消/掐断」的截断响应不得
+   * 伪装成干净 EOF（对端 bodyNext 以错误暴露；取消终态先于供给面关闭原子
+   * 落位、跨恢复代保留，RESET 丢失由恢复重放补发）。缺 native abort() 即
+   * ABI 不匹配——明确失败，绝不回退 finish()。
+   */
+  abort(): void;
   /** 本地已调用 finish()（半关意图） */
   readonly finished: boolean;
   /** 对端取消事件已触发本请求（事件驱动观测；write 错误仍为真相面） */

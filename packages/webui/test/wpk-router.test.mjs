@@ -39,6 +39,7 @@ function typedRequest(over = {}) {
       return {
         write: async (chunk) => streamed.chunks.push(Buffer.from(chunk)),
         finish: () => {},
+        abort: () => {},
         finished: false,
         cancelled: false,
         closed: false,

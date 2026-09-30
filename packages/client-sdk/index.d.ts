@@ -300,9 +300,14 @@ export declare class StreamWriterJs {
   /** 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。 */
   finish(): void
   /**
-   * 中止（幂等）：停止 body 供给并向对端发 RESET——「上游被取消/掐断」
-   * 的截断响应不得伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性
-   * 承诺：要么成功有体、要么明确失败）。通道已死时发送失败即中止目的已达。
+   * 中止（幂等）：向对端发 RESET——「上游被取消/掐断」的截断响应不得
+   * 伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性承诺：要么成功
+   * 有体、要么明确失败）。
+   * r11-B1：取消终态**先于供给面关闭**原子落位（`abort_stream` 在 streams
+   * 域内落 LocalAbort，跨恢复代保留），此后才关 sender、best-effort RESET
+   * ——dispatch 对已取消供给禁 FIN；RESET 发送失败由恢复重放补发（修复前
+   * 的竞速：先关 sender → dispatch 当正常 EOF 发 FIN → 客户端以 null 收尾
+   * 出空/截断 200）。
    */
   abort(): Promise<void>
 }

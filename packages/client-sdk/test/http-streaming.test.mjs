@@ -192,3 +192,96 @@ maybeTest("fetch: headTimeoutMs configurable (tight timeout fails fast)", async 
     await b.shutdown();
   }
 });
+
+// r11 B1/B2 体完整性终态（N-API 集成面）：
+// - provider writer.abort()（active）→ 消费端 bodyNext 必须 reject（绝不
+//   resolve null——截断不得伪装干净 EOF；修复前 abort 与 dispatch FIN 竞速
+//   可让客户端以 null 收尾出空/截断 200）。
+// - Recovering 窗口内 abort（RESET best-effort 失败）→ 恢复后经重放面补发
+//   RESET，bodyNext 仍以 reject 终结（终态跨恢复代保留）。
+maybeTest("streaming: provider writer.abort() mid-stream → client bodyNext rejects (never clean null)", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        assert.equal(req.path, "/provider-abort");
+        const writer = req.respondStreaming(200, [{ name: "content-type", value: "text/plain" }]);
+        await writer.write(Buffer.from("prefix-chunk;"));
+        await sleep(100); // 让前缀先行交付（截断形态：部分体已到）
+        writer.abort();
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const resp = await withTimeout(
+      fetchHttp(session, { method: "GET", path: "/provider-abort" }),
+      20_000,
+      "fetchHttp head",
+    );
+    assert.equal(resp.status, 200);
+    const first = await withTimeout(resp.bodyNext(), 10_000, "first chunk");
+    assert.equal(first.toString(), "prefix-chunk;");
+    // 终态断言：必须以错误终结（reset by peer），绝不 resolve null
+    await assert.rejects(
+      () => withTimeout(resp.bodyNext(), 15_000, "terminal bodyNext"),
+      (err) => {
+        assert.match(err.message, /reset by peer|session/i, `terminal must be an error, got: ${err.message}`);
+        return true;
+      },
+    );
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});
+
+maybeTest("streaming: provider abort during recovery → RESET re-delivered after resume, bodyNext rejects", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    let abortNow;
+    const abortSignal = new Promise((resolve) => {
+      abortNow = resolve;
+    });
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        assert.equal(req.path, "/recover-abort");
+        const writer = req.respondStreaming(200, [{ name: "content-type", value: "text/plain" }]);
+        await writer.write(Buffer.from("first;"));
+        await abortSignal; // 主测在通道死亡后才放行（RESET 发送必然失败）
+        writer.abort();
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const resp = await withTimeout(
+      fetchHttp(session, { method: "GET", path: "/recover-abort" }),
+      20_000,
+      "fetchHttp head",
+    );
+    assert.equal(resp.status, 200);
+    const first = await withTimeout(resp.bodyNext(), 10_000, "first chunk");
+    assert.equal(first.toString(), "first;");
+    // 注入死亡（会话 Recovering）→ 在死通道上中止 → auto-resume 经重放补发 RESET
+    await a.continuityReset(b.endpointId);
+    abortNow();
+    // 终态断言（恢复补发后）：必须以错误终结，绝不 resolve null
+    await assert.rejects(
+      () => withTimeout(resp.bodyNext(), 30_000, "terminal bodyNext after recovery"),
+      (err) => {
+        assert.match(err.message, /reset by peer|session/i, `terminal must be an error, got: ${err.message}`);
+        return true;
+      },
+    );
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});

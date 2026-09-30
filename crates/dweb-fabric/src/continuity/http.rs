@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 use crate::fabric::{Fabric, FabricError};
 use crate::session::SessionError;
 
-use super::session::{RequestState, Session, SessionOptions, SessionShared, accept_any};
+use super::session::{
+    RequestState, Session, SessionOptions, SessionShared, StreamTerm, accept_any,
+};
 
 /// HTTP 头（数组形态保重复项，§3.4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +76,11 @@ impl RequestBody {
         &self.shared
     }
 
+    /// 逻辑流 id（r11-B2：N-API 桥终态分类查询面）。
+    pub fn stream_id(&self) -> u64 {
+        self.stream_id
+    }
+
     pub async fn recv(&self) -> Result<Bytes, FabricError> {
         self.shared
             .recv(self.stream_id)
@@ -81,13 +88,22 @@ impl RequestBody {
             .map_err(FabricError::Session)
     }
 
-    /// 读至 EOF 聚合（测试/非流式便利面）。
+    /// 读至 EOF 聚合（测试/非流式便利面）。r11-B3：异常终止（RESET/协议错误/
+    /// 本端中止/会话丢失）必须返回 Err——已有前缀不得伪装完整实体；只有干净
+    /// FIN（对端半关且队列排空）才是成功 EOF。
     pub async fn read_all(&self) -> Result<Vec<u8>, FabricError> {
         let mut out = Vec::new();
         loop {
             match self.recv().await {
                 Ok(c) => out.extend_from_slice(&c),
-                Err(_) => return Ok(out),
+                Err(_) => {
+                    return match self.shared.stream_term(self.stream_id).await {
+                        Some(StreamTerm::Fin) => Ok(out),
+                        _ => Err(FabricError::Session(SessionError::Connect(
+                            "request body terminated abnormally".into(),
+                        ))),
+                    };
+                }
             }
         }
     }
@@ -271,13 +287,21 @@ impl HttpClientResponse {
         self.session.channel().recv(self.stream_id).await
     }
 
-    /// 读至 EOF 聚合。
+    /// 读至 EOF 聚合。r11-B3：异常终止（RESET/协议错误/本端中止/会话丢失）
+    /// 必须返回 Err——已有前缀不得伪装完整实体；只有干净 FIN 才是成功 EOF。
     pub async fn read_all_body(&mut self) -> Result<Vec<u8>, FabricError> {
         let mut out = Vec::new();
         loop {
             match self.recv_body().await {
                 Ok(c) => out.extend_from_slice(&c),
-                Err(_) => return Ok(out),
+                Err(_) => {
+                    return match self.session.shared().stream_term(self.stream_id).await {
+                        Some(StreamTerm::Fin) => Ok(out),
+                        _ => Err(FabricError::Session(SessionError::Connect(
+                            "response body terminated abnormally".into(),
+                        ))),
+                    };
+                }
             }
         }
     }
@@ -288,24 +312,19 @@ impl HttpClientResponse {
     }
 
     /// per-request 取消：向对端发 RESET（serve 响应循环止付、流式供给面随
-    /// Drop 关闭——上游 handler 提前收敛）。失败仅意味着通道已死（取消目的
-    /// 已达成），故映射为 Ok。幂等语义由调用方（SDK）标志位保证。
+    /// Drop 关闭——上游 handler 提前收敛）。r11-B1：终态先于动作落位（跨恢复
+    /// 代保留）——RESET 发送失败由恢复重放补发，对端以错误而非干净 EOF 收敛。
+    /// 幂等语义由调用方（SDK）标志位保证。
     pub async fn abort(&self) {
-        let frame = crate::continuity::Frame {
-            frame_type: crate::continuity::FrameType::Reset,
-            flags: 0,
-            session_id: self.session.shared().session_id,
-            stream_id: self.stream_id,
-            direction: self.session.shared().send_direction(),
-            byte_offset: 0,
-            payload: Bytes::new(),
-        };
-        let _ = self.session.channel().send_frame(&frame).await;
+        self.session.shared().abort_stream(self.stream_id).await;
     }
 }
 
 /// 发起 HTTP 请求（请求方向默认 FIN；keep_open 隧道不关）。
 /// meta 行到达前有界等待（响应头即首块）。
+/// r11-B4：整次 head 操作（活性闸门 + OPEN + 请求体 + 头等待）共享**单一
+/// deadline**；外部取消在每一阶段线性化检查（活性等待 select 即时唤醒、
+/// OPEN 前零副作用拦截、体写逐块复查）。
 pub async fn fetch_http(
     session: &Session,
     init: HttpRequestInit,
@@ -313,34 +332,55 @@ pub async fn fetch_http(
     let head_timeout = init
         .head_timeout
         .unwrap_or(std::time::Duration::from_secs(30));
+    let head_deadline = tokio::time::Instant::now() + head_timeout;
+    let head_timeout_err =
+        || FabricError::Session(SessionError::Connect("response head timeout".into()));
+    let cancelled_err =
+        || FabricError::Session(SessionError::Connect("response head cancelled".into()));
+    // 外部取消（SDK AbortSignal）：flag 复查 + notify 唤醒双面（Notify 不保留
+    // 许可——注册窗口由各阶段的 fired() 线性化检查闭合）。无开关时恒挂起。
+    let cancel_fired = || init.cancel.as_ref().is_some_and(|c| c.fired());
+    let cancel_fut = async {
+        match &init.cancel {
+            Some(c) => c.notify.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancel_fut);
     // 活性通道闸门（真双机实证 2026-09-30：LAN 连接周期性颤动 → 会话 Recovering
     // → 死通道上 open_stream 立即失败 → 消费端 fetch 502/空响应抖动）。与
     // open_session 的 wait_for_existing_session 活性闸门同源：死通道按无通道
-    // 处理——Recovering 期间等 auto-resume 安装新代（有界=head 预算），终态
-    // （Dead/Closed）立即失败。请求一旦发出，断线续传由 journal 重放承接。
-    let channel = {
-        let deadline = tokio::time::Instant::now() + head_timeout;
-        loop {
-            let ch = session.channel();
-            if !ch.is_dead() {
-                break ch;
-            }
-            if matches!(
-                session.phase().await,
-                super::session::SessionPhase::Dead | super::session::SessionPhase::Closed
-            ) {
-                return Err(FabricError::Session(SessionError::Connect(
-                    "session dead/closed".into(),
-                )));
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(FabricError::Session(SessionError::Connect(
-                    "response head timeout".into(),
-                )));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    // 处理——Recovering 期间等 auto-resume 安装新代（有界=head 预算共享），
+    // 终态（Dead/Closed）立即失败；r11-B4：等待循环 select 外部取消。
+    let channel = loop {
+        let ch = session.channel();
+        if !ch.is_dead() {
+            break ch;
+        }
+        if matches!(
+            session.phase().await,
+            super::session::SessionPhase::Dead | super::session::SessionPhase::Closed
+        ) {
+            return Err(FabricError::Session(SessionError::Connect(
+                "session dead/closed".into(),
+            )));
+        }
+        if cancel_fired() {
+            return Err(cancelled_err());
+        }
+        if tokio::time::Instant::now() >= head_deadline {
+            return Err(head_timeout_err());
+        }
+        tokio::select! {
+            _ = &mut cancel_fut => return Err(cancelled_err()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => continue,
         }
     };
+    // r11-B4：OPEN 前线性化取消检查——取消必须先于任何请求副作用（对端
+    // handler 零启动；此时无流 id，无需 RESET）。
+    if cancel_fired() {
+        return Err(cancelled_err());
+    }
     let idem = hex16(
         &super::session::rand_16().ok_or_else(|| HttpEngineError("entropy unavailable".into()))?,
     );
@@ -362,61 +402,49 @@ pub async fn fetch_http(
     let stream_id = channel
         .open_stream_raw(&idem, Bytes::from(meta.to_string()))
         .await?;
+    // r11-B4：请求体逐块 + FIN 前取消复查——此时请求已可见于对端，取消须
+    // 走 abort_stream（终态落位 + RESET：provider 侧在途请求止付收敛）。
     for chunk in init.body {
+        if cancel_fired() {
+            session.shared().abort_stream(stream_id).await;
+            return Err(cancelled_err());
+        }
         channel.send_data(stream_id, chunk).await?;
+    }
+    if !init.keep_open && cancel_fired() {
+        session.shared().abort_stream(stream_id).await;
+        return Err(cancelled_err());
     }
     if !init.keep_open {
         channel.finish(stream_id).await?;
     }
-    // 等 meta 行（首块；有界——head_timeout 可配，默认 30s）。超时前发 RESET
-    // 清理 provider 侧在途请求（未清理则 handler 悬挂至其自身超时）。
-    // （head_timeout 已在入口活性闸门处解析——闸门等待与 head 等待共享同一预算。）
-    let head_timeout_err =
-        || FabricError::Session(SessionError::Connect("response head timeout".into()));
-    // RESET 为 best-effort 有界发送：通道已死时对端同样终结该流（取消目的已
-    // 达）；发送本身不得反过来悬挂超时路径。
-    let reset_stream = async {
-        let frame = crate::continuity::Frame {
-            frame_type: crate::continuity::FrameType::Reset,
-            flags: 0,
-            session_id: session.shared().session_id,
-            stream_id,
-            direction: session.shared().send_direction(),
-            byte_offset: 0,
-            payload: Bytes::new(),
-        };
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            channel.send_frame(&frame),
-        )
-        .await;
-    };
+    // 等 meta 行（首块；有界——head 预算的剩余部分）。超时/取消发 RESET 清理
+    // provider 侧在途请求（未清理则 handler 悬挂至其自身超时）。
+    // r11-B1：RESET 前终态落位（LocalAbort 跨恢复代保留）——发送失败由恢复
+    // 重放补发，对端以错误而非干净 EOF 收敛。
+    let reset_stream = session.shared().abort_stream(stream_id);
+    tokio::pin!(reset_stream);
     let mut buf: Vec<u8> = Vec::new();
-    let deadline = tokio::time::Instant::now() + head_timeout;
-    // 外部取消（SDK AbortSignal——与 head 超时同一 RESET 清理路径：对端
-    // 在途请求不得悬挂至其自身超时）。无开关时该分支恒挂起（零开销）。
-    let cancel_fut = async {
-        match &init.cancel {
-            Some(c) => c.notify.notified().await,
-            None => std::future::pending().await,
+    // head 预算剩余（零剩余 = 已超时；timeout(0) 首查 future，已排队数据仍交付）
+    let remaining = || {
+        let now = tokio::time::Instant::now();
+        if now >= head_deadline {
+            std::time::Duration::ZERO
+        } else {
+            head_deadline - now
         }
     };
-    tokio::pin!(cancel_fut);
     let (status, headers, rest) = loop {
-        if let Some(c) = &init.cancel
-            && c.fired()
-        {
+        if cancel_fired() {
             reset_stream.await;
-            return Err(FabricError::Session(SessionError::Connect(
-                "response head cancelled".into(),
-            )));
+            return Err(cancelled_err());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= head_deadline {
             reset_stream.await;
             return Err(head_timeout_err());
         }
         let chunk = tokio::select! {
-            r = tokio::time::timeout(head_timeout, channel.recv(stream_id)) => match r {
+            r = tokio::time::timeout(remaining(), channel.recv(stream_id)) => match r {
                 Ok(r) => r?,
                 Err(_) => {
                     reset_stream.await;
@@ -425,9 +453,7 @@ pub async fn fetch_http(
             },
             _ = &mut cancel_fut => {
                 reset_stream.await;
-                return Err(FabricError::Session(SessionError::Connect(
-                    "response head cancelled".into(),
-                )));
+                return Err(cancelled_err());
             }
         };
         buf.extend_from_slice(&chunk);
@@ -667,12 +693,12 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                     let chunk = tokio::select! {
                         c = body.recv() => match c {
                             Some(c) => c,
-                            None => break, // handler 正常 EOF
+                            None => break, // 供给关闭：正常 EOF 与本端中止在循环后分流
                         },
                         // 对端 RESET 即时唤醒（挂起中的响应流——handler 无后续
                         // write 时 body.recv() 永不返回，止付必须事件驱动）
                         _ = shared.reset_notify.notified() => {
-                            continue; // 回到循环头复查 peer_reset
+                            continue; // 回到循环头复查 peer_reset/本端中止
                         }
                     };
                     // 对端 RESET（per-request cancel）：止付并丢弃接收器——
@@ -680,13 +706,33 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                     if shared.peer_reset(stream_id).await {
                         return;
                     }
+                    // r11-B1：本端已中止供给（上游取消/掐断）：止付并丢弃接收器
+                    //——禁 FIN（终局 RESET 已由 abort_stream 落位，跨代补发由
+                    // 恢复重放承接）；终裁 Completed 收敛 watcher。
+                    if shared.stream_term(stream_id).await == Some(StreamTerm::LocalAbort) {
+                        shared.mark_completed(stream_id).await;
+                        return;
+                    }
                     if !send_resilient(&session, stream_id, chunk).await {
                         return;
                     }
                 }
             }
-            // 终局半关（幂等重发；失败时 final_sent 已记，恢复轮亦自动重发）
+            // r11-B1：供给关闭 ≠ 正常 EOF——已取消供给禁 FIN：截断不得伪装干净
+            // EOF（对端只能经 RESET/会话终态以错误收敛）。
+            if shared.stream_term(stream_id).await == Some(StreamTerm::LocalAbort) {
+                shared.mark_completed(stream_id).await;
+                return;
+            }
+            // 终局半关（幂等重发；失败时 final_sent 已记，恢复轮亦自动重发）。
+            // r11-B1：重试环内复查中止终态——finish 对已中止流恒 Err，而
+            // wait_active 在 Active 会话上立即返回 true；不复查即热自旋
+            // （窗口：循环外检查过后、finish 落锁前中止落位）。
             loop {
+                if shared.stream_term(stream_id).await == Some(StreamTerm::LocalAbort) {
+                    shared.mark_completed(stream_id).await;
+                    return;
+                }
                 match session.finish(stream_id).await {
                     Ok(()) => break,
                     Err(_) => {
