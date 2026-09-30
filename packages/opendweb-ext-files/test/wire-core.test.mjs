@@ -285,6 +285,56 @@ test("ignore: hidden from list; read/stat/upload/mkdir on ignored paths → 404 
 
 // ---- 授权矩阵（peer/mode/sessionId deny-by-default）--------------------------------
 
+test("authorization: peers ledger entry in hex64 authorizes a z32 wire peer (same key, different encoding)", async () => {
+  // 真双机验收 F1（2026-09-30）：fabric 会话 peer 是 z32 展示串，账本若登记
+  // hex64（server 租约冻结形态）——裸 includes 比对恒 mismatch（已授权仍 403）。
+  // SDK ground-truth 校准过的同钥对（iMac↔mini 验收实证）：
+  const HEX = "ec80ba47821deba5019c2fee2ecab2ccdca81885dd8d61f9d67907463e2a879a";
+  const Z32 = "71ymwthndzi4kychf9zn71i13uqkogrf5sgsd6qsxrdwcxtko6py";
+  const fixture = tempFixture();
+  const rt = await createFilesRuntime({
+    home: fixture.home,
+    log: () => {},
+    resolvePeer: async (sid) => (sid === "s1" ? Z32 : sid === "s2" ? "ep-b" : null),
+  });
+  await rt.onEnable({ home: fixture.home, dataDir: `${fixture.home}/plugins/files` });
+  try {
+    // 账本登记 hex 形态，wire peer 为 z32：归一后应授权成功
+    const share = await rt.shares.add({ name: "hex-ledger", root: fixture.rootDir, mode: "ro", peers: [HEX] });
+    const res = await rt.handler(
+      fakeRequest({ sessionId: "s1", method: "GET", path: `/wpk1/files/${share.id}/list?path=` }).request,
+    );
+    assert.equal(res.status, 200, "hex ledger entry must authorize the z32 wire peer (same key)");
+    // 反向：账本登记 z32，wire peer hex（归一对称）
+    await rt.shares.setPeers(share.id, [Z32]);
+    const rtHexPeer = await createFilesRuntime({
+      home: fixture.home,
+      log: () => {},
+      resolvePeer: async () => HEX,
+    });
+    const res2 = await rtHexPeer.handler(
+      fakeRequest({ sessionId: "s1", method: "GET", path: `/wpk1/files/${share.id}/list?path=` }).request,
+    );
+    assert.equal(res2.status, 200, "z32 ledger entry must authorize the hex wire peer (same key)");
+    await rtHexPeer.onDispose();
+    // 混合登记里含同钥任一形态即授权；异钥仍拒
+    await rt.shares.setPeers(share.id, ["ep-b", HEX]);
+    assert.equal(
+      (await rt.handler(fakeRequest({ sessionId: "s1", method: "GET", path: `/wpk1/files/${share.id}/list?path=` }).request)).status,
+      200,
+    );
+    await rt.shares.setPeers(share.id, ["0".repeat(64)]);
+    const denied = await rt.handler(
+      fakeRequest({ sessionId: "s1", method: "GET", path: `/wpk1/files/${share.id}/list?path=` }).request,
+    );
+    assert.equal(denied.status, 403);
+    assert.equal(JSON.parse(Buffer.from(denied.bodyChunks[0]).toString("utf8")).error, "peer-not-authorized");
+  } finally {
+    await rt.onDispose();
+    fixture.cleanup();
+  }
+});
+
 test("authorization matrix: unknown session / unauthorized peer / readonly gate / unknown share-op / method", async () => {
   const env = await setup({ mode: "ro" });
   const shareId = env.share.id;

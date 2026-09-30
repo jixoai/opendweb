@@ -352,8 +352,36 @@ export async function createFilesRuntime(opts = {}) {
 
   // ---- 授权 ------------------------------------------------------------------------
   /**
+   * peer id 归一（真双机验收 F1 修复，2026-09-30）：fabric 会话 peer 是 z-base-32
+   * 展示串，账本/控制面可能登记 hex64（server 租约冻结形态）——同钥异码先归一再
+   * 比，防「已授权仍 403」。实现与 ext-ports ledger.mjs 的 normalizePeerId 同源
+   * （包边界隔离，各自内联——第一轮验收 ④ 同族缺陷的 files 侧闭合）。
+   * @param {string} peer
+   * @returns {string} hex64 小写（z32 输入）；hex64 与未知形态原样返回
+   */
+  function normalizePeerId(peer) {
+    if (typeof peer !== "string") return peer;
+    if (/^[0-9a-f]{64}$/.test(peer)) return peer;
+    if (!/^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(peer)) return peer;
+    const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+    let bits = 0;
+    let value = 0n;
+    const bytes = [];
+    for (const ch of peer) {
+      value = value * 32n + BigInt(A.indexOf(ch));
+      bits += 5;
+      while (bits >= 8) {
+        bits -= 8;
+        bytes.push(Number((value >> BigInt(bits)) & 0xffn));
+        value = value % (1n << BigInt(bits));
+      }
+    }
+    return Buffer.from(bytes).toString("hex");
+  }
+
+  /**
    * deny-by-default：session → peer（现查，零缓存——同 peer 异 session 不继承
-   * 授权）→ peers 成员 →（写）mode=rw。
+   * 授权）→ peers 成员（编码归一比对——z32/hex 同钥等价）→（写）mode=rw。
    * @param {{ sessionId?: string }} request
    * @param {{ peers: string[], mode: "ro" | "rw" }} share
    * @param {boolean} needWrite
@@ -367,7 +395,8 @@ export async function createFilesRuntime(opts = {}) {
     if (peer === null || peer === undefined) {
       throw new WireError(403, "session-unknown", "the session is not bound to a known peer (deny by default)");
     }
-    if (!share.peers.includes(peer)) {
+    const wanted = normalizePeerId(peer);
+    if (!share.peers.some((p) => normalizePeerId(p) === wanted)) {
       throw new WireError(403, "peer-not-authorized", `peer ${peer} is not authorized for this share`);
     }
     if (needWrite && share.mode !== "rw") {
