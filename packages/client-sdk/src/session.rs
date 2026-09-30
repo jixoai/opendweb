@@ -134,8 +134,11 @@ pub struct SessionHandle {
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// head 等待中的外部取消开关（abortKey → FetchCancel；fetchHttp 完成/
     /// 失败即摘除——abortFetch 晚到为幂等 no-op）。
-    fetch_cancels:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<u64, Arc<dweb_fabric::continuity::http::FetchCancel>>>>,
+    fetch_cancels: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<u64, Arc<dweb_fabric::continuity::http::FetchCancel>>,
+        >,
+    >,
 }
 
 impl SessionHandle {
@@ -187,7 +190,9 @@ impl SessionHandle {
         let id = self
             .next_cb_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst) as u32;
-        self.state_callbacks.blocking_lock().push((id as u64, callback));
+        self.state_callbacks
+            .blocking_lock()
+            .push((id as u64, callback));
         id
     }
 
@@ -221,7 +226,11 @@ impl SessionHandle {
                 "streamId must be a non-negative integer",
             ));
         }
-        Ok(self.session.shared().journal_held_bytes(stream_id as u64).await as f64)
+        Ok(self
+            .session
+            .shared()
+            .journal_held_bytes(stream_id as u64)
+            .await as f64)
     }
 
     /// fetchHttp：发起 HTTP 请求（§3.4；本阶段静态 body 分块；响应 body 为
@@ -233,9 +242,8 @@ impl SessionHandle {
         init: FetchHttpInit,
     ) -> Result<crate::http::HttpClientResponseJs> {
         let key = init.abort_key.filter(|k| *k > 0.0).map(|k| k as u64);
-        let cancel = key.map(|_| {
-            std::sync::Arc::new(dweb_fabric::continuity::http::FetchCancel::default())
-        });
+        let cancel =
+            key.map(|_| std::sync::Arc::new(dweb_fabric::continuity::http::FetchCancel::default()));
         if let (Some(k), Some(c)) = (key, cancel.as_ref()) {
             self.fetch_cancels.lock().await.insert(k, c.clone());
         }
@@ -261,11 +269,7 @@ impl SessionHandle {
             return; // 无效 key：幂等 no-op（公共 N-API 边界不静默截断）
         }
         let key = abort_key as u64;
-        let cancel = self
-            .fetch_cancels
-            .blocking_lock()
-            .get(&key)
-            .cloned();
+        let cancel = self.fetch_cancels.blocking_lock().get(&key).cloned();
         if let Some(c) = cancel {
             c.fire();
         }
@@ -295,8 +299,8 @@ fn spawn_session_driver(
             let phase = session.phase().await;
             if phase != last_phase {
                 last_phase = phase;
-                recovering_since = (phase == SessionPhase::Recovering)
-                    .then(tokio::time::Instant::now);
+                recovering_since =
+                    (phase == SessionPhase::Recovering).then(tokio::time::Instant::now);
                 emit_state(&session, &callbacks).await;
             }
             match phase {

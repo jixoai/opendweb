@@ -322,11 +322,17 @@ impl HttpClientResponse {
     }
 }
 
-/// r12-B4：fetch 发送阶段（OPEN/DATA/FIN）超时/取消的流终止清理。异步承接
-/// ——不阻塞错误返回（预算承诺覆盖到结算时刻）：`abort_stream` 终态落位
-/// （LocalAbort 粘滞、跨恢复代保留）+ best-effort RESET（经发送互斥锁串行
-/// 于在途帧之后；发送失败由恢复重放补发）。provider 在途请求经 RESET 止
-/// 付收敛，不留 ghost OPEN。
+/// r12-B4：fetch 发送阶段（OPEN/DATA/FIN）超时/取消/失败的流终止清理。异步
+/// 承接——不阻塞错误返回（预算承诺覆盖到结算时刻）：`abort_stream` 终态
+/// 落位（LocalAbort 粘滞、跨恢复代保留）+ best-effort RESET（经发送互斥锁
+/// 串行于在途帧之后；发送失败由恢复重放补发）。provider 在途请求经 RESET
+/// 止付收敛，不留 ghost OPEN。
+/// r13-B4：清理路径从「超时/取消」扩展到 **Op/Join 失败**——DATA/FIN 的
+/// 发送错误（通道死亡/journal 上限）此前直接返回，既不落终态也不清账：
+/// journal 里已写未发的数据会在恢复轮重放、再次驱动对端。现在一律走
+/// abort 清理（终态落位 + journal 清账 + RESET），与超时路径同一语义。
+/// OPEN 的 Op 分支虽已有 rollback（send_open 内），Join 分支（task 崩溃
+/// 未回滚）与 reserve 内联失败仍可能留下已预占 entry——统一清理兜底。
 fn spawn_abort_cleanup(session: &Session, stream_id: u64) {
     let shared = Arc::clone(session.shared());
     tokio::spawn(async move {
@@ -451,8 +457,15 @@ pub async fn fetch_http(
             tokio::spawn(async move { chan.send_open(stream_id, &idem_key, open_payload).await });
         if let Some(f) = guard_send!(open_task) {
             return Err(match f {
-                PhaseFail::Op(e) => e,
+                // r13-B4：Op/Join 失败同样走 abort 清理（终态落位 + RESET——
+                // Join 分支的 task 未及回滚，预留 entry 必须终结；Op 分支的
+                // rollback 已撤 entry 时 abort 为静默无操作）。
+                PhaseFail::Op(e) => {
+                    spawn_abort_cleanup(session, stream_id);
+                    e
+                }
                 PhaseFail::Join(j) => {
+                    spawn_abort_cleanup(session, stream_id);
                     FabricError::Session(SessionError::Connect(format!("open task join: {j}")))
                 }
                 PhaseFail::Cancel => {
@@ -481,8 +494,15 @@ pub async fn fetch_http(
         };
         if let Some(f) = guard_send!(send_task) {
             return Err(match f {
-                PhaseFail::Op(e) => e,
+                // r13-B4：DATA 发送失败（Op）必须走 abort 清理——send_data 先写
+                // journal 再发送，失败后 journal 里的数据若不随终态清账，会在
+                // 恢复轮重放、再次驱动对端请求/副作用。
+                PhaseFail::Op(e) => {
+                    spawn_abort_cleanup(session, stream_id);
+                    e
+                }
                 PhaseFail::Join(j) => {
+                    spawn_abort_cleanup(session, stream_id);
                     FabricError::Session(SessionError::Connect(format!("send task join: {j}")))
                 }
                 PhaseFail::Cancel => {
@@ -507,8 +527,15 @@ pub async fn fetch_http(
         };
         if let Some(f) = guard_send!(fin_task) {
             return Err(match f {
-                PhaseFail::Op(e) => e,
+                // r13-B4：FIN 发送失败（Op——finish 已自撤 final_sent）同样落
+                // 终态 + RESET：调用方已拿到错误，该流不得以未终结形态残留
+                // 到恢复轮（FIN 重发/重放不再有调用方语义）。
+                PhaseFail::Op(e) => {
+                    spawn_abort_cleanup(session, stream_id);
+                    e
+                }
                 PhaseFail::Join(j) => {
+                    spawn_abort_cleanup(session, stream_id);
                     FabricError::Session(SessionError::Connect(format!("fin task join: {j}")))
                 }
                 PhaseFail::Cancel => {
@@ -699,11 +726,13 @@ async fn wait_active(session: &Arc<Session>) -> bool {
 
 /// record-once + 定 offset 裸帧重发：journal 恰好记一次，发送失败等恢复后
 /// 以同一 offset 重发（对端 RecvWindow 去重闭合；部分写入帧由帧边界丢弃）。
-/// 返回 false = 恢复失败（流留未完态）。
+/// 返回 false = 恢复失败（流留未完态由对端超时暴露）。
+/// r13-B4：错误终态（本端中止/对端取消/协议错误）即时退出——发送闸门对
+/// 终态流恒 Err，不复查会在 Active 会话上热自旋（wait_active 恒 true）。
 async fn send_resilient(session: &Arc<Session>, stream_id: u64, payload: Bytes) -> bool {
     let offset = match session.prepare_send(stream_id, &payload).await {
         Ok(o) => o,
-        Err(_) => return false, // journal 上限/关闭：背压终态
+        Err(_) => return false, // journal 上限/关闭/终态：背压或取消终态
     };
     loop {
         match session
@@ -712,6 +741,14 @@ async fn send_resilient(session: &Arc<Session>, stream_id: u64, payload: Bytes) 
         {
             Ok(()) => return true,
             Err(_) => {
+                if matches!(
+                    session.shared().stream_term(stream_id).await,
+                    Some(
+                        StreamTerm::LocalAbort | StreamTerm::PeerReset | StreamTerm::ProtocolError
+                    )
+                ) {
+                    return false; // 流已终结：停止重发（调用方失败后不得继续）
+                }
                 if !wait_active(session).await {
                     return false;
                 }
@@ -845,9 +882,16 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
             // 终局半关（幂等重发；失败时 final_sent 已记，恢复轮亦自动重发）。
             // r11-B1：重试环内复查中止终态——finish 对已中止流恒 Err，而
             // wait_active 在 Active 会话上立即返回 true；不复查即热自旋
-            // （窗口：循环外检查过后、finish 落锁前中止落位）。
+            //（窗口：循环外检查过后、finish 落锁前中止落位）。
+            // r13-B4：复查面扩展到全部错误终态——发送闸门（ensure_send_stream）
+            // 对 PeerReset/ProtocolError 同样恒 Err，只查 LocalAbort 会自旋。
             loop {
-                if shared.stream_term(stream_id).await == Some(StreamTerm::LocalAbort) {
+                if matches!(
+                    shared.stream_term(stream_id).await,
+                    Some(
+                        StreamTerm::LocalAbort | StreamTerm::PeerReset | StreamTerm::ProtocolError
+                    )
+                ) {
                     shared.mark_completed(stream_id).await;
                     return;
                 }
