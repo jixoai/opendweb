@@ -359,6 +359,15 @@ export async function gcStaging(gitdir, opts = {}) {
   for (const ent of entries) {
     if (!ent.isDirectory()) continue;
     const abs = path.join(root, ent.name);
+    // 空壳（0 对象）即时回收（cosmetic 2026-09-30：异常路径留下的空目录壳
+    // 无任何可恢复内容——等满 TTL 只是留垃圾）；有对象的目录按 TTL（崩溃
+    // 现场的对象可供续传/恢复验收，不得提前清）。
+    const inner = await readdir(abs).catch(() => null);
+    if (inner !== null && inner.length === 0) {
+      await rm(abs, { recursive: true, force: true }).catch(() => {});
+      removed.push(ent.name);
+      continue;
+    }
     const st = await stat(abs).catch(() => null);
     if (st !== null && now() - st.mtimeMs > ttlMs) {
       await rm(abs, { recursive: true, force: true }).catch(() => {});

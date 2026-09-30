@@ -20,8 +20,31 @@ import { createScheduler } from "./scheduler.mjs";
 import { readRef, GROUP_REF, deviceRef } from "./objects.mjs";
 
 /**
+ * 校验并归一 sync 配置（F5：intervalMs/debounceMs 接线——configSchema 声明
+ * 与运行时消费对齐）。非正/非有限数拒绝（宿主 configSchema 只查 type:number，
+ * 语义校验在此收口）。
+ * @param {unknown} config
+ * @returns {{ intervalMs?: number, debounceMs?: number }}
+ */
+function normalizeConfig(config) {
+  if (config === undefined || config === null) return {};
+  if (typeof config !== "object") throw new Error("createSyncRuntime: config must be an object");
+  /** @type {{ intervalMs?: number, debounceMs?: number }} */
+  const out = {};
+  for (const key of /** @type {("intervalMs" | "debounceMs")[]} */ (["intervalMs", "debounceMs"])) {
+    const v = /** @type {Record<string, unknown>} */ (config)[key];
+    if (v === undefined) continue;
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new Error(`createSyncRuntime: config.${key} must be a positive finite number (got ${String(v)})`);
+    }
+    out[key] = v;
+  }
+  return out;
+}
+
+/**
  * 创建 sync 插件运行时。
- * @param {{ home: string, endpointId: string, deviceName: string, now?: () => number, fetchImpl: (session: unknown, req: { method: string, path: string, body?: Uint8Array | null, signal?: AbortSignal }) => Promise<{ status: number, body: Uint8Array }>, sessionResolver: (peerEndpointId: string) => unknown, log?: { debug?: (m: string) => void, info?: (m: string) => void, warn?: (m: string) => void, error?: (m: string) => void } }} opts
+ * @param {{ home: string, endpointId: string, deviceName: string, now?: () => number, fetchImpl: (session: unknown, req: { method: string, path: string, body?: Uint8Array | null, signal?: AbortSignal }) => Promise<{ status: number, body: Uint8Array }>, sessionResolver: (peerEndpointId: string) => unknown, config?: { intervalMs?: number, debounceMs?: number }, log?: { debug?: (m: string) => void, info?: (m: string) => void, warn?: (m: string) => void, error?: (m: string) => void } }} opts
  */
 export function createSyncRuntime(opts) {
   const { home, endpointId, deviceName, fetchImpl, sessionResolver } = opts;
@@ -45,8 +68,13 @@ export function createSyncRuntime(opts) {
   const engine = createSyncEngine({ home, endpointId, deviceName, now, fetchImpl, sessionResolver, log, repoMutexFor });
   const handler = createSyncEndpointHandler({ home, now, log, repoMutexFor });
 
+  // F5（2026-09-30）：intervalMs/debounceMs 配置接线——构造期配置直入调度器
+  //（enable 前设置节律），运行中变更经 applyConfig（宿主 onConfigChange）。
+  const initialConfig = normalizeConfig(opts.config);
   const scheduler = createScheduler({
     run: (groupId, init) => runGroup(groupId, { trigger: init?.trigger }),
+    intervalMs: initialConfig.intervalMs,
+    debounceMs: initialConfig.debounceMs,
     log,
   });
 
@@ -147,6 +175,18 @@ export function createSyncRuntime(opts) {
 
     /** 调度器（宿主接线层持有；UI 通过 sidecar 动作转发 online/local-change）。 */
     scheduler,
+
+    /**
+     * 应用配置（F5：intervalMs/debounceMs 接线）。非法值抛错（宿主
+     * onConfigChange/enable 路径调用）；合法即重设调度节律——interval 对
+     * 活跃组立即重挂，debounce 对后续事件生效。
+     * @param {{ intervalMs?: number, debounceMs?: number }} config
+     */
+    applyConfig(config) {
+      const normalized = normalizeConfig(config);
+      scheduler.setTiming(normalized);
+      return scheduler.timing();
+    },
 
     /** 启动恢复（崩溃扫描；测试直调）。 */
     async recoverAll() {

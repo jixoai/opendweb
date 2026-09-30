@@ -3,6 +3,7 @@
 // 合并/dispose 清零/未 start 的组不触发。
 import test from "node:test";
 import assert from "node:assert/strict";
+import { rm } from "node:fs/promises";
 import { createScheduler } from "../src/scheduler.mjs";
 
 /**
@@ -126,4 +127,82 @@ test("unregistered group ignores online/local-change; stop halts interval; run e
   await t.advance(1_000);
   assert.ok(runs.includes("g2:interval"));
   s.dispose();
+});
+
+// ---- F5（2026-09-30）：intervalMs/debounceMs 配置接线 --------------------------------
+
+test("F5: setTiming re-arms active intervals immediately and applies debounce to future events", async () => {
+  const t = fakeTimers();
+  /** @type {string[]} */
+  const runs = [];
+  const s = createScheduler({ run: async (g, init) => runs.push(`${g}:${init?.trigger}`), intervalMs: 30_000, debounceMs: 2_000, timers: t });
+  s.start("g1");
+  await t.advance(0);
+  runs.length = 0;
+  // 30s 窗内重设为 5s：从当下起 5s 后首次 interval tick（而非等满旧 30s）
+  s.setTiming({ intervalMs: 5_000 });
+  assert.deepEqual(s.timing(), { intervalMs: 5_000, debounceMs: 2_000 });
+  await t.advance(5_000);
+  assert.deepEqual(runs, ["g1:interval"], "re-armed interval ticks at the new cadence from now");
+  // debounce 重设为 500ms：后续事件按新窗合并
+  s.setTiming({ debounceMs: 500 });
+  s.notifyLocalChange("g1");
+  await t.advance(600);
+  assert.deepEqual(runs, ["g1:interval", "g1:debounce"], "new debounce window applies to subsequent events");
+  // 非法值拒绝（不改变现值）
+  assert.throws(() => s.setTiming({ intervalMs: 0 }), /intervalMs/);
+  assert.throws(() => s.setTiming({ intervalMs: Number.POSITIVE_INFINITY }), /intervalMs/);
+  assert.throws(() => s.setTiming({ debounceMs: -1 }), /debounceMs/);
+  assert.deepEqual(s.timing(), { intervalMs: 5_000, debounceMs: 500 });
+  // 未 start 的组随后 start：新节律生效
+  s.start("g2");
+  await t.advance(0);
+  runs.length = 0;
+  await t.advance(5_000);
+  assert.ok(runs.includes("g2:interval"), "groups started after setTiming use the new cadence");
+  s.dispose();
+});
+
+test("F5: createSyncRuntime wires config into the scheduler; applyConfig updates; invalid config rejected", async () => {
+  const { makeHome } = await import("./helpers.mjs");
+  const { createSyncRuntime } = await import("../src/index.mjs");
+  const home = await makeHome("dweb-sync-f5-");
+  const runtime = createSyncRuntime({
+    home,
+    endpointId: "aa11aa22aa33aa44aa55aa66aa77aa88",
+    deviceName: "device-a",
+    fetchImpl: async () => ({ status: 404, body: new Uint8Array() }),
+    sessionResolver: () => null,
+    config: { intervalMs: 45_000, debounceMs: 1_500 },
+  });
+  assert.deepEqual(runtime.scheduler.timing(), { intervalMs: 45_000, debounceMs: 1_500 }, "构造期配置直入调度器");
+  // applyConfig：运行中变更（宿主 onConfigChange 路径）
+  assert.deepEqual(runtime.applyConfig({ intervalMs: 60_000 }), { intervalMs: 60_000, debounceMs: 1_500 });
+  assert.deepEqual(runtime.applyConfig({ debounceMs: 250 }), { intervalMs: 60_000, debounceMs: 250 });
+  // 非法配置：构造期与 applyConfig 一致拒绝
+  assert.throws(() => runtime.applyConfig({ intervalMs: 0 }), /intervalMs/);
+  assert.throws(
+    () =>
+      createSyncRuntime({
+        home,
+        endpointId: "aa11aa22aa33aa44aa55aa66aa77aa88",
+        deviceName: "device-a",
+        fetchImpl: async () => ({ status: 404, body: new Uint8Array() }),
+        sessionResolver: () => null,
+        config: { debounceMs: "fast" },
+      }),
+    /debounceMs/,
+  );
+  // 缺省：30s/2s（§7.5 冻结值——config 未提供时行为零变化）
+  const plain = createSyncRuntime({
+    home,
+    endpointId: "aa11aa22aa33aa44aa55aa66aa77aa88",
+    deviceName: "device-a",
+    fetchImpl: async () => ({ status: 404, body: new Uint8Array() }),
+    sessionResolver: () => null,
+  });
+  assert.deepEqual(plain.scheduler.timing(), { intervalMs: 30_000, debounceMs: 2_000 });
+  runtime.scheduler.dispose();
+  plain.scheduler.dispose();
+  await rm(home, { recursive: true, force: true }).catch(() => {});
 });

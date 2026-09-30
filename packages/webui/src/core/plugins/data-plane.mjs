@@ -126,12 +126,17 @@ export async function buildPluginRuntimes(opts) {
     ...(sync !== null
       ? {
           sync: {
-            /** enable 逆序装配：崩溃恢复（recoverAll）→ 全组调度启动。 */
+            /** enable 逆序装配：配置接线（F5：intervalMs/debounceMs → 调度节律）→ 崩溃恢复（recoverAll）→ 全组调度启动。 */
             onEnable: async (ctx) => {
+              if (ctx?.config !== undefined && ctx.config !== null) sync.applyConfig(ctx.config);
               await sync.runtimeHooks.onEnable(ctx);
               for (const g of await sync.listGroups()) sync.scheduler.start(g.id);
             },
             onDispose: sync.runtimeHooks.onDispose,
+            /** 配置写入即时生效（F5：宿主 setConfig 后通知——interval 重挂活跃组）。 */
+            onConfigChange: async (values) => {
+              sync.applyConfig(values);
+            },
           },
         }
       : {}),

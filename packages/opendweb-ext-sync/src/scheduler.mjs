@@ -22,8 +22,8 @@
  */
 export function createScheduler(opts) {
   const run = opts.run;
-  const intervalMs = opts.intervalMs ?? 30_000;
-  const debounceMs = opts.debounceMs ?? 2_000;
+  let intervalMs = opts.intervalMs ?? 30_000;
+  let debounceMs = opts.debounceMs ?? 2_000;
   /** @type {InjectedTimers} */
   const t = opts.timers ?? {
     setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -82,6 +82,35 @@ export function createScheduler(opts) {
     /** dispose（宿主 onDispose 钩子消费——全组 timer 清零）。 */
     dispose() {
       for (const groupId of [...groups.keys()]) this.stop(groupId);
+    },
+    /**
+     * 重设节律（F5 2026-09-30：intervalMs/debounceMs 配置接线——配置 PUT/
+     * enable 时宿主调用）。interval 立即生效（活跃组的 interval timer 重挂
+     * 新周期，从当下起算）；debounceMs 对后续 debounce 生效（在途 debounce
+     * 保持旧窗——窗口毫秒级，漂移无害）。
+     * @param {{ intervalMs?: number, debounceMs?: number }} timing
+     */
+    setTiming(timing) {
+      if (timing.intervalMs !== undefined) {
+        if (!Number.isFinite(timing.intervalMs) || timing.intervalMs <= 0) {
+          throw new Error(`scheduler: intervalMs must be a positive finite number (got ${timing.intervalMs})`);
+        }
+        intervalMs = timing.intervalMs;
+        for (const [groupId, g] of groups) {
+          t.clearInterval(g.interval);
+          g.interval = t.setInterval(() => schedule(groupId, "interval"), intervalMs);
+        }
+      }
+      if (timing.debounceMs !== undefined) {
+        if (!Number.isFinite(timing.debounceMs) || timing.debounceMs <= 0) {
+          throw new Error(`scheduler: debounceMs must be a positive finite number (got ${timing.debounceMs})`);
+        }
+        debounceMs = timing.debounceMs;
+      }
+    },
+    /** 当前节律（测试观测）。 */
+    timing() {
+      return { intervalMs, debounceMs };
     },
     /** 活跃组清单（测试观测）。 */
     activeGroups() {

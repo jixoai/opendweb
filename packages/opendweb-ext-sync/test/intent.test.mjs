@@ -204,3 +204,19 @@ test("intent files are 0600 and named per protocol (intent.json / intent.done.js
   assert.equal(path.basename(INTENT_DONE_FILE), "intent.done.json");
   await rm(f.base, { recursive: true, force: true });
 });
+
+// ---- cosmetic（2026-09-30）：完成档不留残 --------------------------------------------
+
+test("completed transaction leaves no intent/done residue (normal path clears both)", async () => {
+  const f = await fixture("cleanup");
+  await executeIntent(f.ctx, f.spec);
+  assert.equal(await readPendingIntent(f.repoDir), null, "no pending after completion");
+  for (const file of [INTENT_FILE, INTENT_DONE_FILE]) {
+    const exists = await readFile(path.join(f.repoDir, file), "utf8").then(
+      () => true,
+      () => false,
+    );
+    assert.equal(exists, false, `${file} must be cleared after a completed transaction`);
+  }
+  await rm(f.base, { recursive: true, force: true });
+});

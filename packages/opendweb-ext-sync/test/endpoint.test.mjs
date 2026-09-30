@@ -10,7 +10,7 @@
 //   文件的 TTL GC + 幂等重试 roll-forward。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createSyncEndpointHandler, MAX_OBJECT_BYTES, gcStaging, STAGING_TTL_MS } from "../src/endpoint.mjs";
@@ -543,4 +543,22 @@ test("r7-B3 case 4: simulated process crash -> real staging files persist, ref u
   assert.equal(await readRef(gd, GROUP_REF), c2);
   await rm(src, { recursive: true, force: true });
   await rm(home, { recursive: true, force: true });
+});
+
+// ---- cosmetic（2026-09-30）：staging 空壳即时回收 ------------------------------------
+
+test("gcStaging reclaims empty shells immediately; objectful dirs wait for TTL", async () => {
+  const base = await mkdtemp(path.join(tmpdir(), "dweb-gc-shell-"));
+  const gd = path.join(base, "git");
+  const staging = path.join(gd, "staging");
+  await mkdir(path.join(staging, "empty-shell"), { recursive: true });
+  await mkdir(path.join(staging, "crash-site"), { recursive: true });
+  await writeFile(path.join(staging, "crash-site", "00object"), "x");
+  const removed = await gcStaging(gd, { now: () => Date.now() });
+  assert.deepEqual(removed, ["empty-shell"], "0-object shells have nothing to recover — reclaim without waiting for TTL");
+  const left = await readdir(staging);
+  assert.deepEqual(left, ["crash-site"], "objectful crash sites survive until TTL");
+  const removedTtl = await gcStaging(gd, { now: () => Date.now() + STAGING_TTL_MS + 1000 });
+  assert.deepEqual(removedTtl, ["crash-site"], "TTL still governs objectful dirs");
+  await rm(base, { recursive: true, force: true });
 });

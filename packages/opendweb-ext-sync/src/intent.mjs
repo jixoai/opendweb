@@ -168,7 +168,10 @@ export async function executeIntent(ctx, spec, opts = {}) {
   await advanceRef(ctx, rec);
   if (crashAt) crashAt("ref-advanced");
   await markDone(ctx, rec, opts);
-  // done 已原子落盘——此后崩溃=readPendingIntent 返回 null（恢复幂等 clean）
+  // 完成档清理（cosmetic 2026-09-30：done 落盘后 intent/done 对已无 pending
+  // 语义——正常路径不再残留；崩溃恢复路径 recoverIntent 同构清理）。done
+  // 落盘与清理之间崩溃=done 对在场，readPendingIntent 返回 null（幂等 clean）。
+  await clearIntent(ctx.repoDir);
   return rec;
 }
 

@@ -372,3 +372,54 @@ test("config: validated against descriptor schema; status preserved for register
   assert.equal(host2.get("cfg").status, "enabled");
   await host2.close();
 });
+
+// ---- F5（2026-09-30）：配置接线钩子 --------------------------------------------------
+
+test("F5: onEnable receives current config; onConfigChange fires after setConfig persists (errors observed, not rolled back)", async (t) => {
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  /** @type {{ config: Record<string, string | number | boolean> | null }} */
+  const seen = { config: null };
+  /** @type {Array<Record<string, string | number | boolean>>} */
+  const changes = [];
+  /** @type {Array<[string, unknown]>} */
+  const errors = [];
+  const host = await createPluginHost({
+    home,
+    descriptors: [configurableDescriptor()],
+    runtimes: {
+      cfg: {
+        onEnable: async (ctx) => {
+          seen.config = ctx.config;
+        },
+        onConfigChange: async (values) => {
+          if (values.label === "炸") throw new Error("apply failed");
+          changes.push(values);
+        },
+      },
+    },
+  });
+  t.after(() => host.close());
+  const r0 = await host.setConfig("cfg", { label: "零号" });
+  assert.equal(r0.ok, true);
+  await host.enable("cfg");
+  assert.deepEqual(seen.config, { label: "零号" }, "onEnable ctx 携带当前落盘配置");
+  const r = await host.setConfig("cfg", { label: "壹号", limit: 3 });
+  assert.equal(r.ok, true);
+  assert.deepEqual(
+    changes,
+    [
+      { label: "零号" }, // registered 期的配置写入同样通知（无消费方时 no-op）
+      { label: "壹号", limit: 3 },
+    ],
+    "setConfig 持久化成功后通知运行时",
+  );
+  // 钩子抛错：配置不回滚、host 观测位收到错误
+  host.onConfigChangeError = (id, e) => errors.push([id, e]);
+  const r2 = await host.setConfig("cfg", { label: "炸" });
+  assert.equal(r2.ok, true, "onConfigChange 抛错不回滚已落盘配置");
+  assert.deepEqual(host.getConfig("cfg"), { label: "炸" });
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][0], "cfg");
+  await host.disable("cfg");
+});

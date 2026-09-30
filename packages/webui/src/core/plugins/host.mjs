@@ -101,7 +101,7 @@ export async function createPluginHost(opts = {}) {
       restoreRuntimeEffects.push(
         (async () => {
           try {
-            await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}` });
+            await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}`, config: { ...entry.config } });
           } catch (e) {
             entry.runtimeError = e instanceof Error ? e.message : String(e);
           }
@@ -217,7 +217,7 @@ export async function createPluginHost(opts = {}) {
         const p = await persist(id, "enabled", entry.config);
         if (!p.ok) return p;
         await ensurePluginDataDir(home, id);
-        await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}` });
+        await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}`, config: { ...entry.config } });
         entry.disposed = false;
         entry.status = "enabled";
         if (host.onTransition) host.onTransition(id, transition);
@@ -306,6 +306,17 @@ export async function createPluginHost(opts = {}) {
         const p = await persist(id, entry.status, v.value);
         if (!p.ok) return p;
         entry.config = v.value;
+        // F5（2026-09-30）：配置写入后通知运行时（可选钩子——sync 接线
+        // intervalMs/debounceMs 到调度器节律；无钩子的插件不受影响）。
+        // 钩子抛错不回滚配置（已落盘）：按 warn 记录——配置面语义上仍成功。
+        if (typeof entry.runtime?.onConfigChange === "function") {
+          try {
+            await entry.runtime.onConfigChange({ ...v.value });
+          } catch (e) {
+            /* host 无日志通道时静默；调用方（sidecar）经 onConfigChangeError 观测 */
+            host.onConfigChangeError?.(id, e);
+          }
+        }
         return { ok: true, config: { ...v.value } };
       } finally {
         entry.mutationInFlight = false;
@@ -355,8 +366,9 @@ export async function createPluginHost(opts = {}) {
  * 运行时钩子位（Phase 1+ 的 ports/files/sync 实现经 createPluginHost 的
  * runtimes 通道注入；契约 descriptor 不承载可调用物）。
  * @typedef {Object} PluginRuntime
- * @property {(ctx: { home: string, dataDir: string }) => Promise<void>} [onEnable] enable 逆序装配钩子
+ * @property {(ctx: { home: string, dataDir: string, config: Record<string, string | number | boolean> }) => Promise<void>} [onEnable] enable 逆序装配钩子（config=当前落盘配置——F5：运行时按需消费）
  * @property {() => Promise<void>} [onDispose] disable dispose 钩子（定时器/watcher/订阅/锁释放）
+ * @property {(values: Record<string, string | number | boolean>) => Promise<void>} [onConfigChange] 配置写入后的可选通知（F5；抛错不回滚已落盘配置）
  */
 
 /**
@@ -372,4 +384,5 @@ export async function createPluginHost(opts = {}) {
  * @property {(id: string) => string} dataDir
  * @property {() => Promise<void>} close
  * @property {((id: string, transition: string) => void) | null} onTransition
+ * @property {((id: string, error: unknown) => void) | null} [onConfigChangeError] onConfigChange 钩子抛错的观测位（配置已落盘不回滚——F5）
  */
