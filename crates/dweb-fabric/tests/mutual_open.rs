@@ -44,6 +44,34 @@ async fn open_bounded(fabric: &Fabric, peer: &str) -> session::Session {
     .expect("open_session 成功")
 }
 
+/// 翻覆后的重开（带界重试）。互开胜者两侧皆可能：胜者侧是 client campaign
+/// （is_client=true，死通道 tombstone + 新 INIT 直接收敛）；败者侧只有对端
+/// 发起会话的 provider 孪生（is_client=false——E1′ 语义不 tombstone，等对
+/// 端 client 重开驱动 admit 替换，旧 canonical 转 Dead 时本端 open 以
+/// 「owner terminated; retry to open」让位）。因此翻覆重开必须**双向并发**
+/// （败者侧先行 sequential 重开会永久拿不到活通道），并对替换轮的有界
+/// transient 重试——与互开阶段「winner 收敛到单会话或双会话并存皆合法」
+/// 同源的收敛容忍。
+async fn open_bounded_retry(fabric: &Fabric, peer: &str) -> session::Session {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(30),
+            session::open_session(fabric, peer, SessionOptions::default()),
+        )
+        .await
+        .expect("open_session 有界");
+        match attempt {
+            Ok(s) => return s,
+            Err(e) if tokio::time::Instant::now() < deadline => {
+                eprintln!("open retry after transient: {e}");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("open_session 重试预算耗尽: {e}"),
+        }
+    }
+}
+
 #[test]
 fn mutual_open_converges_and_survives_connection_flip() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -100,17 +128,16 @@ fn mutual_open_converges_and_survives_connection_flip() {
         let _ = (ra, rb);
         eprintln!("mutual open converged");
 
-        // ---- 注入连接死亡（双向）+ 翻覆后重开（双向各一次） ----
+        // ---- 注入连接死亡（双向）+ 翻覆后重开（双向并发，见 open_bounded_retry 注释） ----
         a.continuity_reset(&b_id).await.unwrap();
         b.continuity_reset(&a_id).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let s1 = open_bounded(&b, &a_id).await;
+        let (s1, s2) = tokio::join!(open_bounded_retry(&b, &a_id), open_bounded_retry(&a, &b_id));
         let st = s1.open_stream("flip-1").await.unwrap();
         s1.send_data(st, bytes::Bytes::from_static(b"after-flip"))
             .await
             .unwrap();
         s1.finish(st).await.unwrap();
-        let s2 = open_bounded(&a, &b_id).await;
         let st2 = s2.open_stream("flip-2").await.unwrap();
         s2.send_data(st2, bytes::Bytes::from_static(b"reverse-after-flip"))
             .await

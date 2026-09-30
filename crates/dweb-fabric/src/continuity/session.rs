@@ -3209,7 +3209,14 @@ const CONVERGENCE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_s
 async fn wait_for_existing_session(shared: Arc<SessionShared>) -> Result<Session, FabricError> {
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     loop {
-        if let Some(channel) = shared.current_channel() {
+        if let Some(channel) = shared.current_channel()
+            && !channel.is_dead()
+        {
+            // 活性闸门：pump 已退出（dead）的通道一帧都发不出，交付即
+            // 「open_stream 立即 connection lost」（互开翻覆现场实证
+            // 2026-09-29：provider 孪生侧经本路径拿到 dead 通道——Weak 仍可
+            // 被存活的 Session 句柄强锚升级）。死通道按无通道处理：继续等
+            // 新代安装（client 侧重开/resume 驱动 admit 替换）或终态/超时。
             return Ok(Session {
                 shared,
                 channel: std::sync::RwLock::new(channel),
