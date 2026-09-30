@@ -1055,9 +1055,19 @@ export async function createSidecar(opts = {}) {
       const r = action === "enable" ? await plugins.enable(id) : await plugins.disable(id);
       if (!r.ok) {
         // unknown-plugin=404；invalid-transition=409（registered 无可停用物）；
-        // busy=409（同插件并发启停）；lock=503（账本锁获取失败）
-        const status = r.code === "unknown-plugin" ? 404 : r.code === "lock" ? 503 : 409;
-        sendJson(res, status, { error: { code: r.code, message: pluginErrorMessage(r.code) } });
+        // busy=409（同插件并发启停）；lock=503（账本锁获取失败）；
+        // enable-failed=503（onEnable 钩子失败、账本已回滚——真浏览器走查 P1）
+        const status =
+          r.code === "unknown-plugin" ? 404 : r.code === "lock" || r.code === "enable-failed" ? 503 : 409;
+        sendJson(res, status, {
+          error: {
+            code: r.code,
+            message:
+              r.code === "enable-failed"
+                ? safeError(new Error(r.message ?? "plugin enable hook failed"))
+                : pluginErrorMessage(r.code),
+          },
+        });
         logAccess(req, status, startedAt);
         return;
       }

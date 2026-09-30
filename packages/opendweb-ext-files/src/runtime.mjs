@@ -699,7 +699,10 @@ export async function createFilesRuntime(opts = {}) {
    */
   async function onEnable(ctx) {
     void ctx;
-    if (disposed) throw new Error("files runtime: cannot enable a disposed runtime");
+    // dispose 可逆（§2.2「enabled⇄disabled 可往返」冻结承诺；真浏览器走查 P1
+    // 实证曾做成一次性终态）：onDispose 已停扫描/清缓存/关 fd，本钩子对其
+    // 全量重初始化（目录/staging/共享账本/扫描），重入安全。
+    disposed = false;
     await fsp.mkdir(path.join(home, "plugins/files"), { recursive: true, mode: 0o700 });
     await fsp.mkdir(staging.root, { recursive: true, mode: 0o700 });
     await loadShares(home); // 损坏 fail-closed（启用期暴露）

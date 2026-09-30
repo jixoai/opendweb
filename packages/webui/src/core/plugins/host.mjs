@@ -203,8 +203,10 @@ export async function createPluginHost(opts = {}) {
     /**
      * 启用（registered→enabled / disabled→enabled；enabled 幂等成功）。
      * 逆序装配：落盘 → 数据目录（惰性创建）→ onEnable 钩子 → 接受新活动。
+     * onEnable 失败=账本回滚 + 结构化 enable-failed（不留 ledger=enabled /
+     * 宿主=disabled 分裂态——真浏览器走查 P1：loadShares 损坏 fail-closed 等）。
      * @param {string} id
-     * @returns {Promise<{ ok: true, plugin: object } | { ok: false, code: "unknown-plugin" | "busy" | "lock" }>}
+     * @returns {Promise<{ ok: true, plugin: object } | { ok: false, code: "unknown-plugin" | "busy" | "lock" | "enable-failed", message?: string }>}
      */
     async enable(id) {
       const entry = find(id);
@@ -217,7 +219,14 @@ export async function createPluginHost(opts = {}) {
         const p = await persist(id, "enabled", entry.config);
         if (!p.ok) return p;
         await ensurePluginDataDir(home, id);
-        await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}`, config: { ...entry.config } });
+        try {
+          await entry.runtime?.onEnable?.({ home, dataDir: `${home}/plugins/${id}`, config: { ...entry.config } });
+        } catch (e) {
+          // 原子性回滚：onEnable 抛错时把账本恢复到转换前状态（best-effort——
+          // 回滚自身失败仅极 rare 的锁竞争，此时返回的错误仍如实指示失败）。
+          await persist(id, entry.status, entry.config);
+          return { ok: false, code: "enable-failed", message: String(/** @type {Error} */ (e)?.message ?? e) };
+        }
         entry.disposed = false;
         entry.status = "enabled";
         if (host.onTransition) host.onTransition(id, transition);

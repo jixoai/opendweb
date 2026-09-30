@@ -266,6 +266,48 @@ test("runtime hooks: onEnable/onDispose via the runtimes channel; dispose once p
   assert.equal(events[0][1], path.join(home, "plugins", "sample"), "onEnable 收到数据目录");
 });
 
+test("enable atomicity: onEnable failure rolls the ledger back and returns enable-failed (no split state)", async (t) => {
+  // 真浏览器走查 P1（docs/walkthrough-vision-…md F2-v）：onEnable 抛错曾留下
+  // ledger=enabled / 宿主=disabled 分裂态。回滚 + 结构化 enable-failed 后，
+  // 账本与宿主状态一致停在转换前，可重试。
+  const home = await tempHome();
+  t.after(() => rm(home, { recursive: true, force: true }));
+  let failEnable = true;
+  const host = await createPluginHost({
+    home,
+    descriptors: [sampleDescriptor()],
+    runtimes: {
+      sample: {
+        onEnable: async () => {
+          if (failEnable) throw new Error("boom: shares ledger corrupted");
+        },
+        onDispose: async () => {},
+      },
+    },
+  });
+  t.after(() => host.close());
+
+  const bad = await host.enable("sample");
+  assert.equal(bad.ok, false);
+  assert.equal(bad.code, "enable-failed");
+  assert.match(bad.message ?? "", /boom/);
+  assert.equal(host.list().plugins.find((p) => p.id === "sample").status, "registered", "host status unchanged");
+  const persisted = JSON.parse(await readFile(pluginStatePath(home), "utf8"));
+  assert.equal(persisted.plugins.sample.status, "registered", "ledger rolled back to the pre-transition status");
+
+  // 故障清除后同一入口可重试成功（可恢复性）
+  failEnable = false;
+  assert.equal((await host.enable("sample")).ok, true);
+  // 已 enabled 后的失败重挂场景：disable 成功 → onEnable 再失败 → 回滚到 disabled
+  assert.equal((await host.disable("sample")).ok, true);
+  failEnable = true;
+  const bad2 = await host.enable("sample");
+  assert.equal(bad2.code, "enable-failed");
+  assert.equal(host.list().plugins.find((p) => p.id === "sample").status, "disabled");
+  const persisted2 = JSON.parse(await readFile(pluginStatePath(home), "utf8"));
+  assert.equal(persisted2.plugins.sample.status, "disabled", "ledger rolled back to disabled");
+});
+
 // ---- 双账本：state.json 与安装账本分离 ---------------------------------------------
 
 test("dual ledger: state.json 0600 atomic persistence + restart rebuild; plugins.json untouched", async (t) => {
