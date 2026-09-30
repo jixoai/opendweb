@@ -218,7 +218,9 @@ export async function clearIntent(repoDir) {
  *   分支路径第三态；'postimage-mismatch'=targetCommit 分支非 postimage；
  *   'ref-moved'=ref 三态之其他）。
  * @param {{ repoDir: string, root: string, gitdir: string }} ctx
- * @param {{ now?: () => number }} [opts]
+ * @param {{ now?: () => number, readHook?: (phase: string, info: { abs: string, rel: string, size?: number }) => Promise<void> | void }} [opts]
+ *   readHook=测试专用确定性竞态注入（r9-B1：分诊期间替换——透传给
+ *   pathStateTuple 的受控读取；生产路径不传）
  * @returns {Promise<{ status: "clean" | "recovered" | "conflicted", paths?: string[], reason?: string, intent?: IntentRecord }>}
  */
 export async function recoverIntent(ctx, opts = {}) {
@@ -232,7 +234,7 @@ export async function recoverIntent(ctx, opts = {}) {
     /** @type {string[]} */
     const bad = [];
     for (const op of rec.ops) {
-      const actual = await pathStateTuple(ctx.root, op.path, ctx.gitdir);
+      const actual = await pathStateTuple(ctx.root, op.path, ctx.gitdir, { readHook: opts.readHook });
       const postTuple = op.post === null ? null : { oid: op.post.oid, type: op.post.type, mode: op.post.mode };
       if (!tupleEquals(actual, postTuple)) bad.push(op.path);
     }
@@ -250,7 +252,7 @@ export async function recoverIntent(ctx, opts = {}) {
     /** @type {string[]} */
     const userEdited = [];
     for (const op of rec.ops) {
-      const actual = await pathStateTuple(ctx.root, op.path, ctx.gitdir);
+      const actual = await pathStateTuple(ctx.root, op.path, ctx.gitdir, { readHook: opts.readHook });
       const preTuple = op.pre === null ? null : { oid: op.pre.oid, type: op.pre.type, mode: op.pre.mode };
       const postTuple = op.post === null ? null : { oid: op.post.oid, type: op.post.type, mode: op.post.mode };
       if (tupleEquals(actual, preTuple)) {
