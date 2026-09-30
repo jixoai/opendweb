@@ -50,7 +50,7 @@
 //!   幂等丢弃（§2.7 规则 4）；direction/奇偶校验（§2.2）；journal 段数上限
 //!   接线（session 4096 / 单流 512，design §2.6 表值）。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -96,13 +96,11 @@ const STOP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6)
 /// normal REQUEST_STATE_LOST path for an otherwise unknown id.
 const TOMBSTONE_CAP: usize = 1024;
 
-/// r13-P1：本端已中止（LocalAbort）流的 RESET 跨代补发旁路注册表容量上限。
-/// 每项仅 8 字节 stream_id；超限按插入序丢弃最旧（LRU 语义：近期取消优先
-/// 保留——恢复补发窗口内的迟到恢复仍命中，更早的取消随会话终态自然终结）。
+/// 本端未确认 RESET 的硬资源预算；新流预占时为每个活跃流预留一个义务槽，
+/// 因此取消不会因预算已满而丢失 RESET。
 const ABORTED_REGISTRY_CAP: usize = 4096;
-/// r13-B4③：未知流 RESET tombstone 容量上限（近期取消记录——覆盖「RESET
-/// 先到被丢、OPEN 后到触发 handler」的重排窗口）。stream id 单调分配永不
-/// 复用 → tombstone 不可能误伤新流；上限纯为内存有界。
+/// 未知流 RESET tombstone 硬上限；耗尽时整个 session fail-closed，不能丢弃
+/// 单项 tombstone 后继续接受可能对应它的迟到 OPEN。
 const RESET_TOMBSTONE_CAP: usize = 1024;
 
 /// RESUME_REJECT reason（design §2.3 冻结表）。
@@ -482,34 +480,6 @@ fn resume_giveup() -> std::time::Duration {
     }
 }
 
-/// r13-P1 有界淘汰的**鲜活度准则**：只淘汰项龄超过恢复放弃窗口
-///（`resume_giveup`）的最旧项；窗口内的新鲜项宁超软上限也不丢——
-/// 「RESET 跨代补发直至送达或会话终态」的承诺不因容量被截断。
-///
-/// 无损论证：项龄在每次补发发送成功时刷新（`note_aborted_reset_sent`），
-/// 因此「项龄 > giveup」意味着上一次发送机会之后经历了 ≥giveup 的窗口
-/// 而无任何成功恢复——当前胜者通道死亡后的 giveup 看门狗已把会话置
-/// Dead，任何后续重放都不再可能，淘汰等价于会话终态后的自然清账。
-/// 内存上界 = 软上限 + 单个 giveup 窗口内的本地写入量（registry/tombstone
-/// 只由本地行为写入，无对端放大面）。
-fn prune_freshness_bounded(map: &mut HashMap<u64, std::time::Instant>, cap: usize) {
-    if map.len() <= cap {
-        return;
-    }
-    let horizon = resume_giveup();
-    let excess = map.len() - cap;
-    let mut stale: Vec<(u64, std::time::Instant)> = map
-        .iter()
-        .filter(|(_, at)| at.elapsed() >= horizon)
-        .map(|(&id, &at)| (id, at))
-        .collect();
-    stale.sort_by_key(|&(_, at)| at);
-    for (id, _) in stale.into_iter().take(excess) {
-        map.remove(&id);
-    }
-    // 剩余超量项均为窗口内新鲜：保留（软上限，语义优先），由窗口滚动收敛。
-}
-
 /// 追踪开关（DWEB_SESSION_TRACE=1；默认零开销一条 env 检查）。
 fn trace_enabled() -> bool {
     std::env::var_os("DWEB_SESSION_TRACE").is_some()
@@ -540,17 +510,17 @@ pub struct SessionShared {
     frame_gate: tokio::sync::RwLock<()>,
     channel_transition: tokio::sync::Mutex<()>,
     streams: tokio::sync::Mutex<HashMap<u64, StreamCtx>>,
-    /// r13-P1：本端已中止流的旁路注册表（stream_id → 最近一次 RESET 发送/
-    /// 登记时刻）。RESET 跨代补发（恢复重放 `aborted_streams`）从此处取——
-    /// **独立于 streams 表 entry 的生命周期**（rollback/未来回收不撤走补发
-    /// 承诺）；中止流 entry 在 streams 表中按错误终态即时回收 128 配额，二者
-    /// 的职责由此拆分。写入侧持 streams 锁（锁序 streams → aborted_registry，
-    /// 读取侧仅单锁）。有界淘汰见 [`SessionShared::prune_freshness_bounded`]。
-    aborted_registry: tokio::sync::Mutex<HashMap<u64, std::time::Instant>>,
+    /// 本端未确认 RESET 的跨代补发义务。只有收到对端 RESET 确认或整个
+    /// SessionShared 释放后才清除；年龄与本地发送成功都不证明对端已收敛。
+    /// 活跃流预占与本集合共用 ABORTED_REGISTRY_CAP 预算；admission 与 abort
+    /// 登记统一按 aborted_registry -> streams 锁序，避免预算短暂下降。
+    aborted_registry: tokio::sync::Mutex<HashSet<u64>>,
     /// r13-B4③：近期「对未建流发来的 RESET」记录（取消先于 OPEN 到达——
     /// OPEN 发送排队/发送竞速窗口的取消重排）。OPEN 处理时命中即按已取消
     /// 收敛（不入 arrivals——handler 零启动）。stream id 单调不复用，无误伤面。
-    reset_tombstones: tokio::sync::Mutex<HashMap<u64, std::time::Instant>>,
+    reset_tombstones: tokio::sync::Mutex<HashSet<u64>>,
+    /// 未知 RESET tombstone 硬预算耗尽后，禁止该 session 再提交任何入站帧。
+    peer_state_exhausted: std::sync::atomic::AtomicBool,
     /// r12-B1 终态仲裁锁：`SessionChannel::finish`（FIN 决定+发送）、
     /// [`SessionShared::abort_stream`]（冻结契约裁决+LocalAbort 落位+RESET
     /// 发送）与恢复重放（`replay_fin_arbited` / `replay_data_arbited` /
@@ -633,8 +603,9 @@ impl SessionShared {
             frame_gate: tokio::sync::RwLock::new(()),
             channel_transition: tokio::sync::Mutex::new(()),
             streams: tokio::sync::Mutex::new(HashMap::new()),
-            aborted_registry: tokio::sync::Mutex::new(HashMap::new()),
-            reset_tombstones: tokio::sync::Mutex::new(HashMap::new()),
+            aborted_registry: tokio::sync::Mutex::new(HashSet::new()),
+            reset_tombstones: tokio::sync::Mutex::new(HashSet::new()),
+            peer_state_exhausted: std::sync::atomic::AtomicBool::new(false),
             terminal_arb: tokio::sync::Mutex::new(()),
             next_stream_id: std::sync::atomic::AtomicU64::new(if is_client { 1 } else { 2 }),
             requests: tokio::sync::Mutex::new(HashMap::new()),
@@ -717,20 +688,31 @@ impl SessionShared {
         ctl.active_epoch == epoch && ctl.channel_owner == owner
     }
 
+    fn abort_is_frozen(&self, ctx: &StreamCtx) -> bool {
+        if ctx.term == Some(StreamTerm::LocalAbort) {
+            return false;
+        }
+        ctx.final_sent.is_some() && (!self.is_client || ctx.remote_final.is_some())
+    }
+
     /// 刻意关闭前的在途流取消（P1-5）：逐流 best-effort RESET（整体 2s 有
     /// 界——close 不得悬挂）。对端 dispatch 循环头的 peer_reset 检查与
     /// RequestCancel watcher 即时命中——挂起 handler 秒停，不等待会话级
     /// 死亡/看门狗。
-    /// r13-B1 对齐：双向都已干净终局（remote_final + final_sent）的流跳过
-    /// ——交换已完成，对 null 已消费/必然消费的流补发 RESET 只会产生矛盾
-    /// 信号；在途/半开流保持既有取消语义。
+    /// r14-B4：逐流复用 `abort_stream` 的冻结裁决。provider 已发 FIN 的流
+    /// 即使仍等待请求方向 FIN 也不得被 close 补发 RESET；client 已发 FIN
+    /// 且响应未终局仍须完整取消。裁决、LocalAbort 清账和 RESET 写入共用
+    /// `terminal_arb`，close 不再有一套会漂移的筛选规则。
     async fn reset_open_streams(&self, chan: &Arc<SessionChannel>) {
+        // Snapshot only after taking the terminal arbitration lock. `send_open`
+        // uses the same lock, so a stream cannot be admitted between the
+        // snapshot and the freeze decision during close.
+        let _arb = self.terminal_arb.lock().await;
         let ids: Vec<u64> = self
             .streams
             .lock()
             .await
             .iter()
-            .filter(|(_, c)| !(c.remote_final.is_some() && c.final_sent.is_some()))
             .map(|(&id, _)| id)
             .collect();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -738,6 +720,16 @@ impl SessionShared {
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
+            let frozen = {
+                let streams = self.streams.lock().await;
+                streams
+                    .get(&id)
+                    .is_some_and(|ctx| self.abort_is_frozen(ctx))
+            };
+            if frozen {
+                continue;
+            }
+            self.mark_local_abort(id).await;
             let frame = super::frame::Frame {
                 frame_type: super::frame::FrameType::Reset,
                 flags: 0,
@@ -1192,6 +1184,9 @@ impl SessionShared {
     ///    否则 128 次取消即可耗尽 8MiB 会话 journal 预算，阻塞一切新发送）。
     /// 4. aborted_registry 登记（RESET 跨代补发承诺的旁路承载，r13-P1）。
     async fn mark_local_abort(&self, stream_id: u64) {
+        // Keep the same registry -> streams order as reserve_stream_slot. The
+        // active slot must stay charged until its RESET obligation is recorded.
+        let mut registry = self.aborted_registry.lock().await;
         let mut registry_entry = false;
         {
             let mut streams = self.streams.lock().await;
@@ -1207,9 +1202,7 @@ impl SessionShared {
             }
         }
         if registry_entry {
-            let mut reg = self.aborted_registry.lock().await;
-            reg.insert(stream_id, std::time::Instant::now());
-            prune_freshness_bounded(&mut reg, ABORTED_REGISTRY_CAP);
+            registry.insert(stream_id);
         }
         // 唤醒本端消费/止付等待面（recv 竞速循环与 dispatch select）
         self.delivered_notify.notify_waiters();
@@ -1257,28 +1250,34 @@ impl SessionShared {
     ///
     /// 已中止流（term=LocalAbort）的重复 abort 保持幂等重发（mark 幂等 +
     /// RESET best-effort 重发无害）。
-    pub async fn abort_stream(&self, stream_id: u64) {
+    async fn abort_stream_local(&self, stream_id: u64) -> bool {
         let _arb = self.terminal_arb.lock().await;
         // 冻结契约裁决（r13-B1）：仅本端 FIN 已完整发出的流可能进入无操作分支
         let frozen = {
             let streams = self.streams.lock().await;
-            match streams.get(&stream_id) {
-                Some(ctx) if ctx.term == Some(StreamTerm::LocalAbort) => false,
-                Some(ctx) if ctx.final_sent.is_some() => {
-                    !self.is_client || ctx.remote_final.is_some()
-                }
-                _ => false,
-            }
+            streams
+                .get(&stream_id)
+                .is_some_and(|ctx| self.abort_is_frozen(ctx))
         };
         if frozen {
             strace!(
                 "abort_stream frozen-noop stream={stream_id} (FIN already on wire; \
                  r13-B1 contract)"
             );
-            return;
+            return false;
         }
         self.mark_local_abort(stream_id).await;
-        self.send_reset(stream_id).await;
+        true
+    }
+
+    pub(crate) async fn settle_local_abort(&self, stream_id: u64) -> bool {
+        self.abort_stream_local(stream_id).await
+    }
+
+    pub async fn abort_stream(&self, stream_id: u64) {
+        if self.abort_stream_local(stream_id).await {
+            self.send_reset(stream_id).await;
+        }
     }
 
     /// 本端已中止（LocalAbort）流清单（r11-B1：恢复轮 RESET 补发面——
@@ -1287,18 +1286,9 @@ impl SessionShared {
     /// 按错误终态回收 128 配额，补发承诺不再依赖它的存续。升序输出（重放
     /// 顺序确定）。
     async fn aborted_streams(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.aborted_registry.lock().await.keys().copied().collect();
+        let mut ids: Vec<u64> = self.aborted_registry.lock().await.iter().copied().collect();
         ids.sort_unstable();
         ids
-    }
-
-    /// r13-P1：RESET 补发成功后刷新 registry 项龄——项龄 = 「最近一次发送
-    /// 机会」时刻，供 [`prune_freshness_bounded`] 的鲜活度淘汰判定。
-    async fn note_aborted_reset_sent(&self, stream_id: u64) {
-        let mut reg = self.aborted_registry.lock().await;
-        if let Some(at) = reg.get_mut(&stream_id) {
-            *at = std::time::Instant::now();
-        }
     }
 
     /// 主动向对端发本流的 RESET（SDK 中止面——provider 上游被取消/掐断时经
@@ -1636,31 +1626,16 @@ impl SessionShared {
         }
     }
 
-    /// OPEN 发送失败后的本地预占回滚。该流尚未被对端观察到，因此只需
-    /// 撤销发送侧的流上下文和 key 登记，后续 OPEN 仍可复用名额。
-    /// r13-B4：已中止（LocalAbort）的流不回滚——abort 清理与 OPEN 发送
-    /// 竞速时（head 超时先落终态、迟到的 OPEN 发送失败），保留终态与
-    /// registry 补发承诺（streams entry 按错误终态即时回收配额，无泄漏）。
-    async fn rollback_send_open(&self, stream_id: u64) {
-        {
-            let mut streams = self.streams.lock().await;
-            if streams
-                .get(&stream_id)
-                .is_some_and(|c| c.term == Some(StreamTerm::LocalAbort))
-            {
-                return;
-            }
-            streams.remove(&stream_id);
-        }
-        self.stream_keys.lock().await.remove(&stream_id);
-    }
-
     /// P0-3d：活跃流名额预占（OPEN 前置闸门——超限拒绝；名额在流完全终结
     /// （双向终局 + journal 排空）后自然回收）。
     /// r12-B4：pub(crate)——fetch 面在 OPEN 发送 spawn 前同步预占，使超时/
     /// 取消清理（abort_stream 终态落位）不与 OPEN 登记竞速（mark 先于登记
     /// 会静默丢失）。幂等（or-insert）。
     pub(crate) async fn reserve_stream_slot(&self, stream_id: u64) -> Result<(), FabricError> {
+        // Hold the pending-reset budget while admitting the stream. This makes
+        // `active + pending RESET` one atomic admission decision; a concurrent
+        // abort cannot create an obligation after the check and exceed the cap.
+        let pending_registry = self.aborted_registry.lock().await;
         let mut streams = self.streams.lock().await;
         // R3-P1c：closing 复查在登记锁内——与 close 的「先置旗再快照」构成
         // 全序（检查在旗前 → 登记完成于快照前；检查在旗后 → 拒绝）。
@@ -1669,10 +1644,19 @@ impl SessionShared {
                 "session closing".into(),
             )));
         }
+        if streams.contains_key(&stream_id) {
+            return Ok(());
+        }
         let active = streams.values().filter(|c| !c.quota_reapable()).count();
         if active >= MAX_ACTIVE_STREAMS {
             return Err(FabricError::Session(SessionError::Connect(format!(
                 "active stream cap exceeded: {active} >= {MAX_ACTIVE_STREAMS}"
+            ))));
+        }
+        let pending_resets = pending_registry.len();
+        if active + pending_resets >= ABORTED_REGISTRY_CAP {
+            return Err(FabricError::Session(SessionError::Connect(format!(
+                "pending RESET budget exhausted: {active} active + {pending_resets} pending >= {ABORTED_REGISTRY_CAP}"
             ))));
         }
         streams
@@ -1699,6 +1683,12 @@ impl SessionShared {
                 reply: None,
                 new_open: None,
             };
+        }
+        if self
+            .peer_state_exhausted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return FrameOutcome::drop();
         }
         // R3-4c direction 闸门（§2.2）：对端发来的数据面帧（OPEN/DATA/FIN/
         // RESET）direction 必须是对端的发送方向；ACK 的 direction 是被确认
@@ -1958,13 +1948,7 @@ impl SessionShared {
                     // 流终态按对端已取消落位（后续帧幂等丢弃），Completed 收敛
                     // watcher。与 dispatch 前的 peer_reset 复查（r12-B4）共同
                     // 覆盖「RESET 先于 OPEN / RESET 先于 dispatch」两个窗口。
-                    if self
-                        .reset_tombstones
-                        .lock()
-                        .await
-                        .remove(&canonical)
-                        .is_some()
-                    {
+                    if self.reset_tombstones.lock().await.remove(&canonical) {
                         {
                             let mut streams = self.streams.lock().await;
                             if let Some(ctx) = streams.get_mut(&canonical) {
@@ -2020,12 +2004,23 @@ impl SessionShared {
                     // 「取消先于 OPEN」的合法重排（OPEN 发送排队/竞速窗口内
                     // 调用方取消——RESET 经发送互斥锁先行上 wire，OPEN 迟到）。
                     // 记 tombstone：随后到达的同 id OPEN 按已取消收敛（handler
-                    // 零启动），不再违规计数。淘汰按鲜活度（giveup 窗口外的
-                    // 旧项才可丢——迟到的 OPEN 只在会话仍可处理帧时才有意义）。
+                    // 零启动），不再违规计数。条目不能按时间淘汰；硬预算耗尽
+                    // 时 fail-closed，防止迟到 OPEN 越过已丢弃的取消记录。
                     drop(streams);
                     let mut tombs = self.reset_tombstones.lock().await;
-                    tombs.insert(sid, std::time::Instant::now());
-                    prune_freshness_bounded(&mut tombs, RESET_TOMBSTONE_CAP);
+                    if !tombs.contains(&sid) {
+                        if tombs.len() >= RESET_TOMBSTONE_CAP {
+                            // We cannot represent this cancellation without dropping an
+                            // earlier promise. Stop committing all frames for the
+                            // session so no unrepresented late OPEN can run a handler.
+                            self.peer_state_exhausted
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            self.set_phase_sync(SessionPhase::Dead);
+                            self.count_violation();
+                        } else {
+                            tombs.insert(sid);
+                        }
+                    }
                 }
                 FrameOutcome {
                     reply: None,
@@ -2160,7 +2155,7 @@ impl SessionShared {
     /// 补发以错误收敛；若 RESET 曾先于 OPEN 到达，对端 tombstone 亦兜底）。
     async fn open_resend_list(&self) -> Vec<(u64, String)> {
         let aborted: std::collections::HashSet<u64> =
-            self.aborted_registry.lock().await.keys().copied().collect();
+            self.aborted_registry.lock().await.iter().copied().collect();
         let keys = self.stream_keys.lock().await;
         keys.iter()
             .filter(|&(&id, _)| !aborted.contains(&id))
@@ -2391,7 +2386,7 @@ impl SessionChannel {
         self.dead.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn request_stop(&self) {
+    pub(crate) fn request_stop(&self) {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.stop_notify.notify_waiters();
@@ -2444,18 +2439,30 @@ impl SessionChannel {
 
     /// 发送数据（journal 前置闸门 → DATA 帧）。
     pub async fn send_data(&self, stream_id: u64, payload: Bytes) -> Result<(), FabricError> {
+        let _arb = self.shared.terminal_arb.lock().await;
         self.shared.ensure_send_stream(stream_id).await?;
+        // Journal admission is backpressure, not a terminal wire failure. The
+        // caller may retry after the peer ACKs earlier segments, so preserve
+        // the stream state when this pre-send check rejects the payload.
         let offset = self.shared.record_send(stream_id, &payload).await?;
-        self.send_frame(&Frame {
-            frame_type: FrameType::Data,
-            flags: 0,
-            session_id: self.shared.session_id,
-            stream_id,
-            direction: self.shared.send_direction(),
-            byte_offset: offset,
-            payload,
-        })
-        .await
+        let result = self
+            .send_frame(&Frame {
+                frame_type: FrameType::Data,
+                flags: 0,
+                session_id: self.shared.session_id,
+                stream_id,
+                direction: self.shared.send_direction(),
+                byte_offset: offset,
+                payload,
+            })
+            .await;
+        if result.is_err() {
+            // record_send has already committed the segment. Keep the journal
+            // and the terminal decision in this same arbitration interval so
+            // recovery cannot snapshot a failed request in between them.
+            self.shared.mark_local_abort(stream_id).await;
+        }
+        result
     }
 
     /// 半关（FIN；final offset = 已发送水位——恢复轮可重发）。
@@ -2657,6 +2664,7 @@ impl SessionChannel {
         idem_key: &str,
         payload: Bytes,
     ) -> Result<(), FabricError> {
+        let _arb = self.shared.terminal_arb.lock().await;
         // R2-P1c：刻意关闭中拒绝新流（close 快照后新开的流不得逃过 RESET）
         if self
             .shared
@@ -2699,7 +2707,8 @@ impl SessionChannel {
             })
             .await;
         if result.is_err() {
-            self.shared.rollback_send_open(stream_id).await;
+            self.shared.mark_local_abort(stream_id).await;
+            self.shared.stream_keys.lock().await.remove(&stream_id);
         }
         result
     }
@@ -4593,8 +4602,7 @@ async fn accept_resume(
             }
             // r11-B1：本端已中止流的 RESET 补发（终态跨代保留——首轮 best-effort
             // 发送失败由恢复重放承接；发送失败保留状态，下轮恢复再发）。
-            // r13-P1：成功发送刷新 registry 项龄（有界淘汰的鲜活度依据——
-            // 超窗项只可能在会话已终态（giveup 后 Dead）后丢失）。
+            // RESET 写入成功不是对端确认；义务继续保留到会话终态。
             for stream_id in replay_shared.aborted_streams().await {
                 let frame = Frame {
                     frame_type: FrameType::Reset,
@@ -4608,7 +4616,6 @@ async fn accept_resume(
                 if replay_chan.send_frame(&frame).await.is_err() {
                     return;
                 }
-                replay_shared.note_aborted_reset_sent(stream_id).await;
             }
         });
     }
@@ -4789,8 +4796,8 @@ async fn resume_attempt(
                     .map_err(map_fabric_err_try)?;
             }
             // r11-B1：本端已中止流的 RESET 补发（终态跨代保留；失败保留状态，
-            // 下轮恢复再发——对端必须以错误而非干净 EOF 收敛）。r13-P1：成功
-            // 发送刷新 registry 项龄（有界淘汰的鲜活度依据）。
+            // 下轮恢复再发——对端必须以错误而非干净 EOF 收敛）。写入成功
+            // 不是对端确认，义务继续保留到会话终态。
             for stream_id in session.shared.aborted_streams().await {
                 chan.send_frame(&Frame {
                     frame_type: FrameType::Reset,
@@ -4803,7 +4810,6 @@ async fn resume_attempt(
                 })
                 .await
                 .map_err(map_fabric_err_try)?;
-                session.shared.note_aborted_reset_sent(stream_id).await;
             }
             Ok(())
         }
@@ -5277,6 +5283,83 @@ mod tests {
             !shared.stream_keys.lock().await.contains_key(&255),
             "failed OPEN key registration rolls back"
         );
+        link.close().await;
+    }
+
+    /// r14-B1：DATA 先成功写入 journal、随后 wire 发送失败时，调用方返回
+    /// 前必须已经完成 LocalAbort 与清账；恢复重放面不得再看到该段。
+    #[tokio::test]
+    async fn failed_data_send_after_journal_commit_settles_before_return() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xB1u8; 16],
+            [0xC1u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (send, recv) = link.transport(1).await.into_split();
+        let chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        let _pump = chan.spawn_pump();
+        shared.set_phase_sync(SessionPhase::Active);
+        let sid = chan.open_stream("b1-journal-commit").await.expect("open");
+
+        // Hold the wire lock so send_data can commit to the journal and then
+        // pause before transport failure. Recovery starts during that window.
+        let blocked_wire = chan.send.lock().await;
+        let sending = {
+            let chan = Arc::clone(&chan);
+            tokio::spawn(async move {
+                chan.send_data(sid, Bytes::from_static(b"already-accounted"))
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while shared.journal_held_bytes(sid).await == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DATA must be committed before transport send");
+        assert!(
+            shared.terminal_arb.try_lock().is_err(),
+            "send must keep recovery out until failed-write settlement"
+        );
+        let replay = {
+            let chan = Arc::clone(&chan);
+            tokio::spawn(async move {
+                chan.replay_data_arbited(sid, 0, Bytes::from_static(b"already-accounted"))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !replay.is_finished(),
+            "recovery replay must wait for settlement"
+        );
+
+        chan.request_stop();
+        drop(blocked_wire);
+
+        let err = sending
+            .await
+            .expect("send task joins")
+            .expect_err("stopped channel must fail after journal accounting");
+        assert!(err.to_string().contains("ended") || err.to_string().contains("transport"));
+        assert_eq!(shared.stream_term(sid).await, Some(StreamTerm::LocalAbort));
+        assert_eq!(shared.journal_held_bytes(sid).await, 0);
+        assert!(shared.replay_batches().await.is_empty());
+        assert!(
+            !replay
+                .await
+                .expect("replay task joins")
+                .expect("replay arbitration must complete"),
+            "a recovery sender must observe the settled LocalAbort"
+        );
+        assert_eq!(shared.aborted_streams().await, vec![sid]);
         link.close().await;
     }
 
@@ -6539,6 +6622,39 @@ mod tests {
         );
     }
 
+    /// r14-B4：close 的 RESET 枚举必须复用 provider-FIN 冻结规则。响应 FIN
+    /// 已完整发出但请求方向仍半开时，close 也不得凭空追加 RESET。
+    #[tokio::test]
+    async fn close_reset_enumeration_preserves_provider_fin_freeze() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xB4u8; 16],
+            [0xC4u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        let (send, recv) = link.transport(1).await.into_split();
+        let chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        let _pump = chan.spawn_pump();
+        shared.reserve_stream_slot(2).await.expect("stream slot");
+        {
+            let mut streams = shared.streams.lock().await;
+            streams.get_mut(&2).expect("stream").final_sent = Some(4);
+        }
+        shared.reset_open_streams(&chan).await;
+        let streams = shared.streams.lock().await;
+        assert_eq!(streams.get(&2).and_then(|ctx| ctx.term), None);
+        assert_eq!(streams.get(&2).and_then(|ctx| ctx.final_sent), Some(4));
+        drop(streams);
+        assert!(shared.aborted_streams().await.is_empty());
+        chan.request_stop();
+        link.close().await;
+    }
+
     /// r13-B4③（取消重排闸门）：RESET 先于 OPEN 到达（OPEN 发送排队/竞速窗口内
     /// 调用方取消）——修复前未知流的 RESET 被违规丢弃，随后到达的 OPEN 仍触发
     /// dispatch（副作用闸门 http.rs 的 peer_reset 复查覆盖不到「从未建流」的
@@ -6594,5 +6710,84 @@ mod tests {
         // 4) tombstone 已消耗：同 id 再 OPEN（幂等重发）走既有归并路径
         let dup = shared.handle_frame(&open_frame(sid, 9)).await;
         assert_eq!(dup.new_open, None, "重复 OPEN 幂等归并（不重复 dispatch）");
+    }
+
+    /// r14-B2：未知 RESET 的硬上限不能靠淘汰旧 tombstone 继续收帧。超过
+    /// 1024 个新鲜唯一 id 后会话 fail-closed，迟到 OPEN 不得启动 handler。
+    #[tokio::test]
+    async fn unknown_reset_flood_fails_closed_at_hard_tombstone_cap() {
+        let shared = SessionShared::new(
+            [0xB2u8; 16],
+            [0xC2u8; 16],
+            "peer".into(),
+            false,
+            JournalLimits::default(),
+        );
+        for i in 0..=RESET_TOMBSTONE_CAP {
+            let stream = 7 + (i as u64) * 2;
+            let out = shared
+                .handle_frame(&mk_reset(
+                    shared.session_id,
+                    stream,
+                    Direction::ClientToProvider,
+                ))
+                .await;
+            assert!(out.new_open.is_none());
+        }
+        assert_eq!(
+            shared.reset_tombstones.lock().await.len(),
+            RESET_TOMBSTONE_CAP
+        );
+        assert!(
+            shared
+                .peer_state_exhausted
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(shared.phase_sync(), SessionPhase::Dead);
+        let late = shared
+            .handle_frame(&open_frame(shared.session_id, 4097))
+            .await;
+        assert!(
+            late.new_open.is_none(),
+            "fail-closed session must not dispatch late OPEN"
+        );
+    }
+
+    /// r14-B3：RESET 义务的年龄不能证明 session 已 Dead。陈旧义务仍占用
+    /// 硬预算，预算耗尽时拒绝新流而不是静默丢弃最早的 RESET。
+    #[tokio::test]
+    async fn stale_aborted_reset_obligations_are_retained_and_bound_admission() {
+        let shared = SessionShared::new(
+            [0xB3u8; 16],
+            [0xC3u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        {
+            let mut registry = shared.aborted_registry.lock().await;
+            registry.extend(0..(ABORTED_REGISTRY_CAP as u64 - 2));
+        }
+        shared
+            .reserve_stream_slot(10_000)
+            .await
+            .expect("first budgeted stream");
+        shared.mark_local_abort(10_000).await;
+        shared
+            .reserve_stream_slot(10_002)
+            .await
+            .expect("second budgeted stream");
+        shared.mark_local_abort(10_002).await;
+        assert_eq!(
+            shared.aborted_registry.lock().await.len(),
+            ABORTED_REGISTRY_CAP
+        );
+        let err = shared
+            .reserve_stream_slot(1)
+            .await
+            .expect_err("hard RESET budget");
+        assert!(err.to_string().contains("pending RESET budget exhausted"));
+        assert!(shared.aborted_registry.lock().await.contains(&0));
+        assert_eq!(shared.aborted_streams().await.len(), ABORTED_REGISTRY_CAP);
     }
 }

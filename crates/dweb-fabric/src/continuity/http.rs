@@ -24,7 +24,7 @@ use crate::fabric::{Fabric, FabricError};
 use crate::session::SessionError;
 
 use super::session::{
-    RequestState, Session, SessionOptions, SessionShared, StreamTerm, accept_any,
+    RequestState, Session, SessionChannel, SessionOptions, SessionShared, StreamTerm, accept_any,
 };
 
 /// HTTP 头（数组形态保重复项，§3.4）。
@@ -322,22 +322,20 @@ impl HttpClientResponse {
     }
 }
 
-/// r12-B4：fetch 发送阶段（OPEN/DATA/FIN）超时/取消/失败的流终止清理。异步
-/// 承接——不阻塞错误返回（预算承诺覆盖到结算时刻）：`abort_stream` 终态
-/// 落位（LocalAbort 粘滞、跨恢复代保留）+ best-effort RESET（经发送互斥锁
-/// 串行于在途帧之后；发送失败由恢复重放补发）。provider 在途请求经 RESET
-/// 止付收敛，不留 ghost OPEN。
-/// r13-B4：清理路径从「超时/取消」扩展到 **Op/Join 失败**——DATA/FIN 的
-/// 发送错误（通道死亡/journal 上限）此前直接返回，既不落终态也不清账：
-/// journal 里已写未发的数据会在恢复轮重放、再次驱动对端。现在一律走
-/// abort 清理（终态落位 + journal 清账 + RESET），与超时路径同一语义。
-/// OPEN 的 Op 分支虽已有 rollback（send_open 内），Join 分支（task 崩溃
-/// 未回滚）与 reserve 内联失败仍可能留下已预占 entry——统一清理兜底。
-fn spawn_abort_cleanup(session: &Session, stream_id: u64) {
-    let shared = Arc::clone(session.shared());
-    tokio::spawn(async move {
-        shared.abort_stream(stream_id).await;
-    });
+/// fetch 发送阶段失败的本地结算。终态与 journal 清账必须在调用方看到 Err
+/// 前完成；RESET 的 wire 发送仍放到独立任务，避免关闭阶段把错误返回拖到
+/// 网络重试窗口。取消/预算打断会先退役当前通道，让在途帧停在完整帧边界。
+async fn settle_abort_cleanup(channel: &Arc<SessionChannel>, stream_id: u64, retire_channel: bool) {
+    if retire_channel {
+        channel.request_stop();
+    }
+    let shared = Arc::clone(channel.shared());
+    let needs_reset = shared.settle_local_abort(stream_id).await;
+    if needs_reset {
+        tokio::spawn(async move {
+            shared.send_reset(stream_id).await;
+        });
+    }
 }
 
 /// 发起 HTTP 请求（请求方向默认 FIN；keep_open 隧道不关）。
@@ -461,19 +459,19 @@ pub async fn fetch_http(
                 // Join 分支的 task 未及回滚，预留 entry 必须终结；Op 分支的
                 // rollback 已撤 entry 时 abort 为静默无操作）。
                 PhaseFail::Op(e) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, false).await;
                     e
                 }
                 PhaseFail::Join(j) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     FabricError::Session(SessionError::Connect(format!("open task join: {j}")))
                 }
                 PhaseFail::Cancel => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     cancelled_err()
                 }
                 PhaseFail::Deadline => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     head_timeout_err()
                 }
             });
@@ -485,7 +483,7 @@ pub async fn fetch_http(
     // 观察，见上方 OPEN 注释）。
     for chunk in init.body {
         if cancel_fired() {
-            spawn_abort_cleanup(session, stream_id);
+            settle_abort_cleanup(&channel, stream_id, true).await;
             return Err(cancelled_err());
         }
         let mut send_task = {
@@ -498,19 +496,19 @@ pub async fn fetch_http(
                 // journal 再发送，失败后 journal 里的数据若不随终态清账，会在
                 // 恢复轮重放、再次驱动对端请求/副作用。
                 PhaseFail::Op(e) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, false).await;
                     e
                 }
                 PhaseFail::Join(j) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     FabricError::Session(SessionError::Connect(format!("send task join: {j}")))
                 }
                 PhaseFail::Cancel => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     cancelled_err()
                 }
                 PhaseFail::Deadline => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     head_timeout_err()
                 }
             });
@@ -518,7 +516,7 @@ pub async fn fetch_http(
     }
     if !init.keep_open {
         if cancel_fired() {
-            spawn_abort_cleanup(session, stream_id);
+            settle_abort_cleanup(&channel, stream_id, true).await;
             return Err(cancelled_err());
         }
         let mut fin_task = {
@@ -531,19 +529,19 @@ pub async fn fetch_http(
                 // 终态 + RESET：调用方已拿到错误，该流不得以未终结形态残留
                 // 到恢复轮（FIN 重发/重放不再有调用方语义）。
                 PhaseFail::Op(e) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, false).await;
                     e
                 }
                 PhaseFail::Join(j) => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     FabricError::Session(SessionError::Connect(format!("fin task join: {j}")))
                 }
                 PhaseFail::Cancel => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     cancelled_err()
                 }
                 PhaseFail::Deadline => {
-                    spawn_abort_cleanup(session, stream_id);
+                    settle_abort_cleanup(&channel, stream_id, true).await;
                     head_timeout_err()
                 }
             });
