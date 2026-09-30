@@ -5,6 +5,9 @@
 // 独立子进程运行：装配自身不建 serveHttp/会话（原生句柄零沾染），自然退出。
 // 产出：sidecar enable 数据面插件后 fabric open/start → roster 预绑 serveHttp
 // （对端无需在线）——TERM 闩锁的充分条件。
+// 泄漏哨兵（2026-10-01）：打印 ok 后若 2s 仍存活，向 stderr 报告事件循环残留
+// 句柄指纹（unref 计时器不干扰退出判定本身；不 process.exit 糖盖——进程停泊
+// 即泄漏实证，指纹随 fixture 输出进入测试失败消息）。
 import dgram from "node:dgram";
 import fs from "node:fs";
 import path from "node:path";
@@ -78,3 +81,16 @@ fs.writeFileSync(
   }),
 );
 process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
+
+// 泄漏哨兵：ok 之后仍存活 = 自然退出语义被破坏（残留 ref 句柄）。每 2s 报告
+// 一次句柄指纹；unref 保证哨兵自身不构成驻留。
+const sentinelStartedAt = Date.now();
+const sentinel = setInterval(() => {
+  const t = Date.now() - sentinelStartedAt;
+  const resources = process.getActiveResourcesInfo();
+  const handles = (process._getActiveHandles?.() ?? []).map((h) => h?.constructor?.name);
+  process.stderr.write(
+    `LEAK-CANDIDATE alive=${t}ms resources=${JSON.stringify(resources)} handles=${JSON.stringify(handles)}\n`,
+  );
+}, 2_000);
+sentinel.unref();

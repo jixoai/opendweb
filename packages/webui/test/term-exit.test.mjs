@@ -166,6 +166,23 @@ try {
   drainLines(fixtureChild.stderr, fixtureLines);
   const fixture = new Child("fixture", fixtureChild, fixtureLines);
 
+  // 退出监听必须 spawn 后立即注册（2026-10-01 修复）：child 的 exit 事件只
+  // emit 一次——原实现注册晚于 `await spawnSidecar()`（负载下最长 10s），
+  // fixture 抢先退出时事件被错过，晚挂的 once 永不触发 → 超时误报
+  // "fixture did not finish"（复现形态：text 只有 {"ok":true}，负载窗口约
+  // 1/6 概率）。监听前移后 fixture 任意速度都能被正确等待——这同时是
+  // 「sidecar 启动期间 fixture 先退」合法时序的回归钉子。
+  // 预算 12s（由 30s 收紧）：正常 <0.8s、全量+重载实测 <3s（4 倍余量）；
+  // 超时消息携带 fixture 全部输出（含 LEAK-CANDIDATE 哨兵指纹，见
+  // fixtures/term-exit-fabric-home.mjs 尾注——真泄漏时进程停泊、哨兵可见）。
+  const fixtureExitPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`fixture did not finish:\n${fixture.text}`)), 12_000);
+    fixtureChild.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+
   const sidecar = await spawnSidecar(home, { name: "sidecar-fabric" });
   t.after(async () => {
     await sidecar.child.kill();
@@ -175,13 +192,7 @@ try {
     assert.equal(sidecar.child.exited === null, false, "sidecar child must be reaped");
     assert.equal(fixture.exited === null, false, "fixture child must be reaped");
   });
-  const fixtureExit = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`fixture did not finish:\n${fixture.text}`)), 30_000);
-    fixtureChild.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    });
-  });
+  const fixtureExit = await fixtureExitPromise;
   assert.deepEqual(
     { code: fixtureExit.code, signal: fixtureExit.signal },
     { code: 0, signal: null },
