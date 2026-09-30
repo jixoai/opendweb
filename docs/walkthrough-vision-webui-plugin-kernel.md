@@ -20,7 +20,7 @@
 
 | 级别 | 编号 | 内容 | 证据 |
 |---|---|---|---|
-| **P1（归档前必修）** | F2-v | **files 停用后 enable 确定性 500 不可往返**：`opendweb-ext-files/src/runtime.mjs:691` 的 `disposed` 为一次性终态，而 `webui/src/core/plugins/host.mjs` enable() 先落盘再调 onEnable、抛错后 entry 停 disabled——ledger=enabled / runtime=disposed / 宿主=disabled 三态分裂，仅重启 sidecar 可复原。违反 design §2.2「enable 与 disable 可往返」冻结承诺 | step05d-enable-failed.png；sidecar log `files runtime: cannot enable a disposed runtime` ×2 |
+| **P1（已修复 ad86588）** | F2-v | **files 停用后 enable 确定性 500 不可往返**：`opendweb-ext-files/src/runtime.mjs` 的 `disposed` 为一次性终态，而 `webui/src/core/plugins/host.mjs` enable() 先落盘再调 onEnable、抛错后 entry 停 disabled——ledger=enabled / runtime=disposed / 宿主=disabled 三态分裂，仅重启 sidecar 可复原。违反 design §2.2「enable 与 disable 可往返」冻结承诺。**修复**：dispose 可逆化（onEnable 全量重初始化）+ 宿主 onEnable 失败账本回滚+结构化 enable-failed（503）；回归 ext-files lifecycle 2 用例 + webui host 原子性 1 用例；活环境实测 disable→enable 双 200 | step05d-enable-failed.png；sidecar log `files runtime: cannot enable a disposed runtime` ×2 |
 | P2 建议 | F1-v | files listing 失败时错误横幅与「空目录」空态同屏（错误态应抑制空态） | step03-files-error-state.png |
 | P3 建议 | F3-v | disabled 深链不重写 hash（未知 hash 路径会重写 #/overview）——收敛语义差半步 | step05c |
 | P3 建议 | F4-v | sync 状态页相位「已完成」与冲突页待决议并存，无联动提示（状态机有 conflicted 相位） | step04-sync-status/conflicts.png |
