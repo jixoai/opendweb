@@ -724,6 +724,12 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
                 shared.mark_completed(stream_id).await;
                 return;
             }
+            // r11-B1 竞速收口（双机矩阵 cycle#19：干净 200 短体）：供给关闭
+            //（None）与对端 RESET 并发到达时，select 可能先观察到 None——FIN
+            // 前必须复查 peer_reset，否则截断以干净 EOF 外显（体完整性违约）。
+            if shared.peer_reset(stream_id).await {
+                return;
+            }
             // 终局半关（幂等重发；失败时 final_sent 已记，恢复轮亦自动重发）。
             // r11-B1：重试环内复查中止终态——finish 对已中止流恒 Err，而
             // wait_active 在 Active 会话上立即返回 true；不复查即热自旋

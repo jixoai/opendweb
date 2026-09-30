@@ -187,9 +187,18 @@ export function createPortsProxyHandler(opts) {
                 if (!done) upstreamRes.resume();
               },
               () => {
-                // write 错误=对端已弃的真相面：收敛上游
+                // write 错误=传输面已弃（对端 RESET/引擎丢弃）：r11 实证（矩阵
+                // cycle#19 干净 200 短体）——此分支若不显式 abort，writer 随 GC
+                // 落下 → dispatch 当正常 EOF 发 FIN → 截断以干净 200 外显
+                // （体完整性违约）。与 signal/上游错误分支同一取消语义：
+                // 上游 destroy + writer.abort()（显式 RESET——消费端按错误暴露）。
                 done = true;
                 upstreamReq.destroy();
+                try {
+                  writer?.abort();
+                } catch {
+                  /* 通道已死 */
+                }
               },
             );
           });
