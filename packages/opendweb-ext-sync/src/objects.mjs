@@ -15,6 +15,8 @@ import promisesFs from "node:fs/promises";
 import * as callbackFs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+import { deflateSync } from "node:zlib";
+import { atomicWrite0600 } from "./util.mjs";
 
 /** isomorphic-git fs 绑定（promises 优先） */
 export const gitFs = { ...callbackFs, promises: promisesFs };
@@ -129,6 +131,35 @@ export async function hasObject(gitdir, oid) {
  */
 export async function writeObject(gitdir, type, content) {
   return git.writeObject({ fs: gitFs, gitdir, type: /** @type {"blob" | "tree" | "commit"} */ (type), object: Buffer.from(content), format: "content" });
+}
+
+/**
+ * 原子导入松散对象（r7-B3：push 临界区导入路径）。落盘字节与 isomorphic-git
+ * writeObject 逐字节一致（wrap(`${type} ${len}\0`+content) 后 zlib deflate 到
+ * `objects/xx/yyyy`），但经 atomicWrite0600（O_EXCL tmp+fsync+rename）——
+ * 不用 git.writeObject 的原因：其 writeObjectLoose 是**非原子** fs.write，且对
+ * 已存在路径 exists-skip（「Don't overwrite existing git objects」）——崩溃
+ * 半写文件会在重试时被跳过而永不修复。本导入路径每个对象要么完整出现、要么
+ * 完全缺席，绝不留半写；已存在（前次完整导入）→ 幂等跳过。
+ * @param {string} gitdir
+ * @param {"blob" | "tree" | "commit"} type
+ * @param {Uint8Array} content 原始内容字节（调用方已做 OID 自证）
+ * @param {string} oid 内容寻址 OID（调用方复用，避免重算 sha1）
+ * @returns {Promise<string>} oid
+ */
+export async function importLooseObjectAtomic(gitdir, type, content, oid) {
+  const dir = path.join(gitdir, "objects", oid.slice(0, 2));
+  const file = path.join(dir, oid.slice(2));
+  try {
+    await promisesFs.stat(file);
+    return oid; // 幂等跳过（导入路径自身原子——本协议不会留下半写文件）
+  } catch {
+    /* 不存在 → 原子写入 */
+  }
+  await promisesFs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const wrapped = Buffer.concat([Buffer.from(`${type} ${content.byteLength}\0`, "utf8"), Buffer.from(content)]);
+  await atomicWrite0600(file, deflateSync(wrapped));
+  return oid;
 }
 
 /**

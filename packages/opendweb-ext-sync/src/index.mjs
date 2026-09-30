@@ -16,7 +16,7 @@ export {
   syncDataDir,
   emptyLedger,
 } from "./ledger.mjs";
-export { GROUP_REF, deviceRef, listRefsDirect, mergeBase, objectOid, readFlatTree, readObject, readRef, walkClosure, writeCommitOid, writeObject, writeRef, writeTreeFromFlat } from "./objects.mjs";
+export { GROUP_REF, deviceRef, listRefsDirect, mergeBase, objectOid, readFlatTree, readObject, readRef, walkClosure, writeCommitOid, writeObject, writeRef, writeTreeFromFlat, importLooseObjectAtomic } from "./objects.mjs";
 export { executeIntent, prepareIntent, recoverIntent, readPendingIntent, clearIntent, INTENT_FILE, INTENT_DONE_FILE } from "./intent.mjs";
 export {
   mergeTrees,

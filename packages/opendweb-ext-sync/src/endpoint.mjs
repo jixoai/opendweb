@@ -1,6 +1,6 @@
 // 对象同步端点（webui-plugin-kernel Phase 3 / design v2.3 §7.3——provider 侧
 // handler，`/wpk1/sync/<groupId>/<rootId>/<op>`，无 git smart HTTP）。
-// 意图（2026-09-29）：
+// 意图（2026-09-29；r7-B3 闭合：取消线性化+组级并发预算+真实持久 staging）：
 // 1. 四操作：GET refs（对端 refs 快照）/ POST want（期望 commit+已有 OID 排序
 //    列表分页比对 → 缺失对象清单）/ GET object/<oid>（单松散对象：类型+长度+
 //    OID 自证——EOF 不是完整性证据；>16MiB 拒绝 §4）/ POST push（ndjson 帧：
@@ -15,22 +15,33 @@
 //    由组账本锁+intent 协议兜底。
 // 4. 授权 deny-by-default：peer endpointId ∉ 组 members → 403（sessionId 为
 //    隔离键记录在日志——授权数据=组账本成员表，v1 形态）。
-// 5. staging：push 对象先入 `<gitdir>/staging/<pushId>/`；成功导入/失败/GC
-//    三路回收；TTL 回收（显式中止与会话断开后由 gcStaging 清扫——Scenario
-//    「显式中止与 staging 回收」）。并发流 ≤2/组（GET object 在飞计数——
-//    超限 busy 拒绝，429 语义）。
-// 6. 请求体有界（§4）：读体边累计边判，超限立即拒绝（body-too-large →
-//    状态 413）；push 帧行级+总长双上限。
+// 5. staging（r7-B3 真实持久语义）：每个通过校验和自证的对象**立即落真实
+//    staging 文件**（`<gitdir>/staging/<pushId>/<oid>`，0600 原子写——内存只
+//    留元数据）；闭包校验从 staging 读回复验 OID；导入=单写者临界区内逐对象
+//    原子松散写（objects.importLooseObjectAtomic）——崩溃/取消后 staging 可
+//    GC（finally 即时回收 + gcStaging TTL 兜底）、ref 不动、对象库无半写。
+//    CrashInjection（kill 模拟）透传不清理 staging——留现场供 GC/恢复验收。
+// 6. push 取消线性化（r7-B3，与 §7.3.1 intent 事务对齐）：读取器接受
+//    AbortSignal 边读边检、中断即停（util.readBoundedJsonLines）；解析完成后
+//    /进入 repo mutex 前/**提交线性化点**（临界区首句）三处裁决——线性化点前
+//    取消 → 零 ref 变化+staging 回收；通过线性化点后 → 作为已接受提交完成
+//    （200），绝不返回「取消但已推进」的模糊态（崩溃恢复路径=重试幂等
+//    roll-forward，同 §7.3.1 三态恢复语义）。
+// 7. 组级并发预算（§7.5 并发流 ≤2/组）：push 与 GET object 共享 streamsInFlight
+//    在飞计数（push 每个 body 可达 256MiB 级——必须占预算），超限稳定 busy
+//    429，finally 归还。
+// 8. 请求体有界（§4）：读体边累计边判，超限立即拒绝（body-too-large →
+//    状态 413）；push 帧行级+总长双上限、逐 chunk 流式（不整体入内存）。
 
 import path from "node:path";
-import { mkdir, rm, stat, readdir } from "node:fs/promises";
-import { fromBase64, jsonBody, readBoundedBody, readBoundedJsonLines, toBase64 } from "./util.mjs";
+import { mkdir, rm, stat, readdir, readFile } from "node:fs/promises";
+import { atomicWrite0600, fromBase64, jsonBody, readBoundedBody, readBoundedJsonLines, toBase64, CrashInjection } from "./util.mjs";
 import {
   gitdirFor,
   loadLedger,
   findGroup,
 } from "./ledger.mjs";
-import { GROUP_REF, listRefsDirect, objectOid, readObject, walkClosure, writeObject, writeRef, readRef } from "./objects.mjs";
+import { GROUP_REF, listRefsDirect, objectOid, readObject, walkClosure, writeRef, readRef, importLooseObjectAtomic } from "./objects.mjs";
 
 /** 单 blob 上限（§4：sync 对象单传 16MiB；超限对象 v1 拒绝并提示） */
 export const MAX_OBJECT_BYTES = 16 * 1024 * 1024;
@@ -50,19 +61,23 @@ export const WANT_HAVE_PAGE = 1000;
 export const STAGING_TTL_MS = 10 * 60 * 1000;
 
 /** @type {Record<string, number>} op→HTTP 状态的稳定映射（错误码即协议） */
-const ERROR_STATUS = { unauthorized: 403, "not-found": 404, "bad-request": 400, "body-too-large": 413, "line-too-large": 413, oversize: 413, budget: 429, busy: 429, "cas-mismatch": 409, "closure-missing": 409, integrity: 422, internal: 500 };
+const ERROR_STATUS = { unauthorized: 403, "not-found": 404, "bad-request": 400, aborted: 400, "body-too-large": 413, "line-too-large": 413, oversize: 413, budget: 429, busy: 429, "cas-mismatch": 409, "closure-missing": 409, integrity: 422, internal: 500 };
 
 /**
  * 创建对象同步端点 handler（provider 侧——宿主 serveHttp 的 /wpk1/sync/* 分派
  * 目标；测试以内存 loopback 直调）。
- * @param {{ home: string, now?: () => number, log?: { debug?: (m: string) => void, info?: (m: string) => void, warn?: (m: string) => void, error?: (m: string) => void }, repoMutexFor?: (gitdir: string) => { run: (label: string, fn: () => Promise<unknown>) => Promise<unknown> } }} opts
+ * @param {{ home: string, now?: () => number, log?: { debug?: (m: string) => void, info?: (m: string) => void, warn?: (m: string) => void, error?: (m: string) => void }, repoMutexFor?: (gitdir: string) => { run: (label: string, fn: () => Promise<unknown>) => Promise<unknown> }, crashAt?: (stage: string) => void }} opts
+ *   crashAt：测试崩溃注入钩子（intent.mjs 同款 kill 模拟语义）——stage ∈
+ *   {push:staged（全部对象已落 staging+闭包已过、临界区前）, push:imported
+ *   （对象已原子入库、writeRef 前）}；抛 CrashInjection=模拟 kill：staging
+ *   现场**不清理**（留待 TTL GC/恢复验收）。
  * @returns {(request: { method: string, path: string, body?: Uint8Array | AsyncIterable<Uint8Array> | null, sessionId?: string, peerEndpointId?: string, signal?: AbortSignal }) => Promise<{ status: number, body: Uint8Array }>}
  */
 export function createSyncEndpointHandler(opts) {
   const { home } = opts;
   const now = opts.now ?? (() => Date.now());
   const log = opts.log ?? {};
-  /** @type {Map<string, number>} 组级 GET object 在飞计数（并发流 ≤2） */
+  /** @type {Map<string, number>} 组级在飞流计数（push+GET object 共享；并发流 ≤2/组） */
   const streamsInFlight = new Map();
 
   /**
@@ -164,23 +179,38 @@ export function createSyncEndpointHandler(opts) {
   };
 
   /**
-   * push 处理（staging → 校验 → 闭包 → CAS → 入库 → 推进）。
+   * push 处理（r7-B3 闭合：流式解析 → 真实 staging 落盘 → 闭包 → 临界区 CAS
+   * +原子导入 → 推进）。取消线性化与组级预算见文件头注 6/7。
    * @param {{ request: { method: string, path: string, body?: Uint8Array | AsyncIterable<Uint8Array> | null, signal?: AbortSignal }, gitdir: string, groupId: string, rootId: string, repoMutex: { run: (label: string, fn: () => Promise<unknown>) => Promise<unknown> } | null, group: import("./ledger.mjs").SyncGroup }} args
    */
   async function handlePush(args) {
     const { request, gitdir, repoMutex, group } = args;
+    // ---- 组级流预算（r7-B3：push 与 GET object 同池；超限稳定 429；finally 归还） ----
+    const inflight = streamsInFlight.get(args.groupId) ?? 0;
+    if (inflight >= MAX_STREAMS_PER_GROUP) return fail("busy", { groupId: args.groupId, limit: MAX_STREAMS_PER_GROUP });
+    streamsInFlight.set(args.groupId, inflight + 1);
+    let budgetReleased = false;
+    const releaseBudget = () => {
+      if (budgetReleased) return;
+      budgetReleased = true;
+      streamsInFlight.set(args.groupId, Math.max(0, (streamsInFlight.get(args.groupId) ?? 1) - 1));
+    };
     const stagingRoot = path.join(gitdir, "staging");
     const pushId = `push-${now()}-${Math.random().toString(36).slice(2, 8)}`;
     const stagingDir = path.join(stagingRoot, pushId);
-    await mkdir(stagingDir, { recursive: true, mode: 0o700 });
     const cleanup = () => rm(stagingDir, { recursive: true, force: true }).catch(() => {});
+    /** kill 模拟（CrashInjection）透传时保留 staging 现场——TTL GC/恢复验收用 */
+    let killed = false;
     try {
-      // ---- 帧解析（ndjson：首行头+对象行；有界+行级上限） ----
+      await mkdir(stagingDir, { recursive: true, mode: 0o700 });
+      const stagingFile = (/** @type {string} */ oid) => path.join(stagingDir, oid);
+      // ---- 帧解析（ndjson 流式：首行头+对象行；AbortSignal 边读边检、中断即停） ----
+      // 每个对象行通过校验和自证（长度+类型+OID；blob>16MiB 整 push 拒绝）后
+      // **立即落真实 staging 文件**（0600 原子写）——内存只留元数据（r7-B3）。
       let header = null;
-      /** @type {Array<{ oid: string, type: string, length: number, bytes: Uint8Array }>} */
+      /** @type {Array<{ oid: string, type: string, length: number }>} */
       const objects = [];
-      for await (const line of readBoundedJsonLines(request.body, { maxTotal: MAX_PUSH_BODY_BYTES })) {
-        if (request.signal?.aborted) return fail("bad-request", { detail: "aborted" });
+      for await (const line of readBoundedJsonLines(request.body, { maxTotal: MAX_PUSH_BODY_BYTES, signal: request.signal })) {
         if (header === null) {
           header = /** @type {{ ref?: string, expectedOldRef?: string | null, targetCommit?: string }} */ (line);
           if (typeof header.ref !== "string" || typeof header.targetCommit !== "string" || !("expectedOldRef" in header)) {
@@ -203,13 +233,15 @@ export function createSyncEndpointHandler(opts) {
         if (rec.type === "blob" && bytes.byteLength > MAX_OBJECT_BYTES) {
           return fail("oversize", { oid: rec.oid, size: bytes.byteLength, limit: MAX_OBJECT_BYTES, hint: "the push referencing this blob is rejected as a whole; split the file or keep it out of the synced root (per-file skip = filtered-tree semantics, not v1)" });
         }
-        objects.push({ oid: rec.oid, type: rec.type, length: rec.length, bytes });
+        await atomicWrite0600(stagingFile(rec.oid), bytes);
+        objects.push({ oid: rec.oid, type: rec.type, length: rec.length });
         if (objects.length > MAX_OBJECTS_PER_SYNC) {
           return fail("budget", { count: objects.length, limit: MAX_OBJECTS_PER_SYNC, hint: "too many objects in one push; sync in smaller batches (smaller history increments)" });
         }
       }
+      // 取消裁决 #1（r7-B3）：解析完成后——任何落库动作前
+      if (request.signal?.aborted) return fail("aborted", { stage: "parsed" });
       if (header === null) return fail("bad-request", { detail: "empty push body" });
-      const staged = new Map(objects.map((o) => [o.oid, o]));
       // ref 目标白名单：组收敛 ref 或本组成员的 device ref（deny-by-default）
       if (header.ref !== GROUP_REF) {
         const dev = /^refs\/devices\/([0-9a-f]{8,64})\/main$/.exec(header.ref ?? "");
@@ -217,10 +249,16 @@ export function createSyncEndpointHandler(opts) {
           return fail("bad-request", { detail: `push target ref not allowed: ${header.ref}` });
         }
       }
-      // 闭包校验（staged ∪ store）
+      // 闭包校验（staged 真源=staging 文件，读回复验 OID ∪ store）
+      const staged = new Map(objects.map((o) => [o.oid, o.type]));
       const resolver = async (/** @type {string} */ oid) => {
-        const st = staged.get(oid);
-        if (st !== undefined) return { type: st.type, bytes: st.bytes };
+        const type = staged.get(oid);
+        if (type !== undefined) {
+          const bytes = new Uint8Array(await readFile(stagingFile(oid)));
+          const computed = objectOid(type, bytes);
+          if (computed !== oid) throw { code: "integrity", oid, computed, detail: "staging readback mismatch" };
+          return { type, bytes };
+        }
         try {
           return await readObject(gitdir, oid);
         } catch {
@@ -235,23 +273,36 @@ export function createSyncEndpointHandler(opts) {
         }
         throw e;
       }
-      // 入库+CAS（repo 互斥内——单写者；ref 零变化直到全对象入库）
-      const result = await new Promise((resolve) => {
-        const work = async () => {
-          const current = await readRef(gitdir, header.ref);
-          if (current !== (header.expectedOldRef ?? null)) {
-            return fail("cas-mismatch", { ref: header.ref, expectedOldRef: header.expectedOldRef ?? null, currentRef: current, hint: "peer advanced the ref; re-fetch and merge, then push again (no last-write-wins)" });
-          }
-          for (const o of objects) await writeObject(gitdir, o.type, o.bytes);
-          await writeRef(gitdir, header.ref, header.targetCommit);
-          return { status: 200, body: jsonBody({ ok: true, ref: header.ref, oid: header.targetCommit, imported: objects.length }) };
-        };
-        const p = repoMutex !== null ? repoMutex.run("push", work) : work();
-        resolve(/** @type {Promise<{status: number, body: Uint8Array}>} */ (p));
-      });
-      return result;
+      // 取消裁决 #2（r7-B3）：进入 repo mutex 前
+      if (request.signal?.aborted) return fail("aborted", { stage: "pre-commit" });
+      opts.crashAt?.("push:staged");
+      // ---- 提交线性化点（repo 互斥内——单写者；ref 零变化直到全对象入库） ----
+      const work = async () => {
+        // 取消裁决 #3（r7-B3）：线性化点首句——通过后本 push 作为已接受提交
+        // 完成（其后的 abort 不再回滚，返回 200——绝不出现「取消但已推进」）
+        if (request.signal?.aborted) return fail("aborted", { stage: "commit-point" });
+        const current = await readRef(gitdir, header.ref);
+        if (current !== (header.expectedOldRef ?? null)) {
+          return fail("cas-mismatch", { ref: header.ref, expectedOldRef: header.expectedOldRef ?? null, currentRef: current, hint: "peer advanced the ref; re-fetch and merge, then push again (no last-write-wins)" });
+        }
+        for (const meta of objects) {
+          const bytes = new Uint8Array(await readFile(stagingFile(meta.oid)));
+          const computed = objectOid(meta.type, bytes);
+          if (computed !== meta.oid) return fail("integrity", { oid: meta.oid, computed, detail: "staging readback mismatch" });
+          // 原子导入（O_EXCL tmp+fsync+rename——崩溃无半写；已存在幂等跳过）
+          await importLooseObjectAtomic(gitdir, meta.type, bytes, meta.oid);
+        }
+        opts.crashAt?.("push:imported");
+        await writeRef(gitdir, header.ref, header.targetCommit);
+        return { status: 200, body: jsonBody({ ok: true, ref: header.ref, oid: header.targetCommit, imported: objects.length }) };
+      };
+      return await (repoMutex !== null ? repoMutex.run("push", work) : work());
+    } catch (e) {
+      if (e instanceof CrashInjection) killed = true; // kill 模拟：保留 staging 现场
+      throw e;
     } finally {
-      await cleanup();
+      releaseBudget();
+      if (!killed) await cleanup();
     }
   }
 }

@@ -196,30 +196,107 @@ export async function readBoundedBody(body, maxBytes) {
 }
 
 /**
- * 逐行读有界请求体（ndjson 帧：每行一个 JSON 对象；行级+总长双上限——push 的
- * 边读边拒基础）。总上限由 readBoundedBody 强制（内存有界），行超限/解析失败
- * 立即抛。
+ * 逐行流式读有界请求体（ndjson 帧：每行一个 JSON 对象；行级+总长双上限）。
+ * r7-B3 修复：不再先经 readBoundedBody 整体入内存——逐 chunk 边读边切行、
+ * 边累计边判超限（内存上界=单行 maxLine，而非 maxTotal）。
+ * AbortSignal（r7-B3 取消线性化基础）：消费每个 chunk 前检查 + 与「等待下一
+ * chunk」竞速——signal 触发即抛 aborted 并**停止消费**（对 body 迭代器传播
+ * return，上游生成器 finally 得以执行；不再继续拉取后续 chunk）。
  * @param {Uint8Array | AsyncIterable<Uint8Array> | null | undefined} body
- * @param {{ maxTotal: number, maxLine?: number }} limits
+ * @param {{ maxTotal: number, maxLine?: number, signal?: AbortSignal }} limits
  * @returns {AsyncGenerator<unknown>}
+ * @throws {{ code: "aborted" }} signal 触发（含等待下一 chunk 途中）
+ * @throws {{ code: "body-too-large", maxBytes: number }} 总长超限（立即停止消费）
+ * @throws {{ code: "line-too-large", maxLine: number }} 单行超限
  */
 export async function* readBoundedJsonLines(body, limits) {
   const maxLine = limits.maxLine ?? 64 * 1024 * 1024;
-  const all = Buffer.from(await readBoundedBody(body, limits.maxTotal));
-  let start = 0;
-  while (true) {
-    const idx = all.indexOf(0x0a, start);
-    if (idx === -1) break;
-    const line = all.subarray(start, idx);
-    start = idx + 1;
-    if (line.length > maxLine) throw { code: "line-too-large", maxLine };
-    const text = line.toString("utf8").trim();
-    if (text !== "") yield JSON.parse(text);
+  const signal = limits.signal;
+  if (body == null) return;
+  if (body instanceof Uint8Array) {
+    // 同步体（调用方已整体持有——want/测试路径）：直接切行；signal 仅入口裁决。
+    // 注意 Uint8Array.toString(encoding) 不解码（与 Buffer 不同）——先取 Buffer
+    // 视图再按 utf8 解码。
+    if (signal?.aborted) throw { code: "aborted" };
+    const all = Buffer.isBuffer(body) ? body : Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    let start = 0;
+    while (true) {
+      const idx = all.indexOf(0x0a, start);
+      if (idx === -1) break;
+      const line = all.subarray(start, idx);
+      start = idx + 1;
+      if (line.length > maxLine) throw { code: "line-too-large", maxLine };
+      const text = line.toString("utf8").trim();
+      if (text !== "") yield JSON.parse(text);
+    }
+    const rest = all.subarray(start).toString("utf8").trim();
+    if (rest !== "") {
+      if (rest.length > maxLine) throw { code: "line-too-large", maxLine };
+      yield JSON.parse(rest);
+    }
+    return;
   }
-  const rest = all.subarray(start).toString("utf8").trim();
-  if (rest !== "") {
-    if (rest.length > maxLine) throw { code: "line-too-large", maxLine };
-    yield JSON.parse(rest);
+  // for-await 等价：同时接受 async iterable 与 sync iterable（无 asyncIterator
+  // 时以异步生成器包裹——与旧实现 for-await 语义一致）
+  const iterator =
+    typeof body[Symbol.asyncIterator] === "function"
+      ? body[Symbol.asyncIterator]()
+      : (async function* () {
+          yield* /** @type {Iterable<Uint8Array>} */ (body);
+        })();
+  if (signal?.aborted) throw { code: "aborted" };
+  // 中断即停的竞速哨兵（resolve 语义——无悬挂 rejection 风险）
+  const ABORTED = Symbol("aborted");
+  /** @type {(() => void) | null} */
+  let onAbort = null;
+  /** @type {Promise<typeof ABORTED> | null} */
+  let abortRace = null;
+  if (signal !== undefined) {
+    abortRace = new Promise((resolve) => {
+      onAbort = () => resolve(ABORTED);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+  /** @type {Buffer} */
+  let pending = Buffer.alloc(0);
+  let total = 0;
+  try {
+    while (true) {
+      if (signal?.aborted) throw { code: "aborted" };
+      const next =
+        abortRace !== null
+          ? await Promise.race([iterator.next(), abortRace])
+          : await iterator.next();
+      if (next === ABORTED) throw { code: "aborted" };
+      if (next.done) break;
+      const chunk = Buffer.from(next.value);
+      total += chunk.byteLength;
+      if (total > limits.maxTotal) throw { code: "body-too-large", maxBytes: limits.maxTotal };
+      const buf = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+      let start = 0;
+      while (true) {
+        const idx = buf.indexOf(0x0a, start);
+        if (idx === -1) break;
+        const line = buf.subarray(start, idx);
+        start = idx + 1;
+        if (line.length > maxLine) throw { code: "line-too-large", maxLine };
+        const text = line.toString("utf8").trim();
+        if (text !== "") yield JSON.parse(text);
+      }
+      // 行尾残段拷贝出独立缓冲（不钉住整 chunk 的底层内存）；上界=maxLine
+      pending = start >= buf.length ? Buffer.alloc(0) : Buffer.from(buf.subarray(start));
+      if (pending.length > maxLine) throw { code: "line-too-large", maxLine };
+    }
+    const restText = pending.toString("utf8").trim();
+    if (restText !== "") {
+      if (pending.length > maxLine) throw { code: "line-too-large", maxLine };
+      yield JSON.parse(restText);
+    }
+  } finally {
+    if (onAbort !== null && signal !== undefined) signal.removeEventListener("abort", onAbort);
+    // 停止消费：向 body 迭代器传播提前结束（生成器 finally 执行；已完成则无操作）
+    const fin = iterator.return?.();
+    if (fin !== undefined && typeof fin.then === "function") await fin.catch(() => {});
   }
 }
 

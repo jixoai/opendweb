@@ -4,17 +4,20 @@
 // - CAS 并发（Q5）：expectedOldRef 不匹配 → 拒+提示重 fetch/merge；
 // - 超限对象（r4-N3）：>16MiB blob → 引用它的整个 push 原子拒绝（部分对象
 //   成功不构成合法实现）+其他 root 不受影响；
-// - 显式中止与 staging 回收（r2-B7）。
+// - 显式中止与 staging 回收（r2-B7）；
+// - r7-B3 四用例：解析完成后 abort（裁决点 #1）/ CAS 前 abort（提交线性化点
+//   裁决 #3）/ 第三个并发 push 组级 429 / 进程崩溃（kill 模拟）后真实 staging
+//   文件的 TTL GC + 幂等重试 roll-forward。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createSyncEndpointHandler, MAX_OBJECT_BYTES, gcStaging, STAGING_TTL_MS } from "../src/endpoint.mjs";
 import { createGroup } from "../src/ledger.mjs";
 import { gitdirFor } from "../src/ledger.mjs";
-import { writeObject, writeTreeFromFlat, writeCommitOid, writeRef, readRef, readObject, GROUP_REF, deviceRef, listRefsDirect } from "../src/objects.mjs";
-import { toBase64 } from "../src/util.mjs";
+import { writeObject, writeTreeFromFlat, writeCommitOid, writeRef, readRef, readObject, hasObject, GROUP_REF, deviceRef, listRefsDirect } from "../src/objects.mjs";
+import { toBase64, createMutex, CrashInjection } from "../src/util.mjs";
 
 const EP_A = "aa11aa22aa33aa44aa55aa66aa77aa88";
 const EP_B = "bb11bb22bb33bb44bb55bb66bb77bb88";
@@ -289,5 +292,199 @@ test("push object count budget (>5000) rejected with explicit code", async () =>
   assert.equal(resp.status, 429);
   assert.equal(resp.body.code, "budget");
   assert.equal(await readRef(gd, GROUP_REF), null);
+  await rm(home, { recursive: true, force: true });
+});
+
+// ---- r7-B3 四用例（取消线性化 / 组级并发预算 / 持久 staging） ----
+
+/**
+ * 独立源库造链（端点对象库保持空——「store clean/import 生效」断言才有区分度；
+ * push 体须含全闭包 6 对象）。返回 { src, objects, c2 }；调用方负责 rm(src)。
+ * @param {string} home（仅用于命名 tmp）
+ */
+async function freshChain(home) {
+  const src = await mkdtemp(path.join(tmpdir(), `dweb-ep-${path.basename(home)}-src-`));
+  const ch = await chain(src);
+  const objects = await readAll(src, [ch.c2, ch.t2, ch.b2, ch.c1, ch.t1, ch.b1]);
+  return { src, objects, c2: ch.c2 };
+}
+
+/** 直调 handler（带 signal，绕过 call() 助手——它不传 signal）。 */
+async function callSignal(handler, p, { body, signal, peer = EP_B }) {
+  const resp = await handler({ method: "POST", path: p, body, signal, sessionId: "s-test", peerEndpointId: peer });
+  return { status: resp.status, body: JSON.parse(Buffer.from(resp.body).toString("utf8")) };
+}
+
+test("r7-B3 case 1: abort after body fully parsed -> aborted, zero ref/store change, staging reclaimed, budget released", async () => {
+  const { home, handler } = await setup("abort-parsed");
+  const gd = gitdirFor(home, "g1", "r1");
+  const { src, objects, c2 } = await freshChain(home); // 端点库空——store 断言有区分度
+  const body = pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects);
+  // 体完整送达后（全部行已产出=解析完成时点）、任何落库动作前触发 abort：
+  // 生成器在产出末 chunk 后的恢复点同步 abort——读取器在末次拉取/收尾时观察到
+  const controller = new AbortController();
+  const stream = (async function* () {
+    yield body;
+    controller.abort();
+  })();
+  const resp = await callSignal(handler, "/wpk1/sync/g1/r1/push", { body: stream, signal: controller.signal });
+  assert.equal(resp.status, 400);
+  assert.equal(resp.body.code, "aborted");
+  assert.equal(await readRef(gd, GROUP_REF), null, "ref zero change");
+  for (const o of objects) assert.equal(await hasObject(gd, o.oid), false, `store clean (import never ran): ${o.oid}`);
+  assert.equal((await readdir(path.join(gd, "staging")).catch(() => [])).length, 0, "staging reclaimed immediately (no TTL needed)");
+  // 预算已归还（finally）：随后完整 push 成功
+  const retry = await call(handler, "POST", "/wpk1/sync/g1/r1/push", { body: pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects) });
+  assert.equal(retry.status, 200, "budget released after abort (retry not busy)");
+  await rm(src, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
+});
+
+test("r7-B3 case 2: abort before CAS (queued at repo mutex) -> rejected at commit-point adjudication, zero ref/store change", async () => {
+  const { home } = await setup("abort-cas");
+  const gd = gitdirFor(home, "g1", "r1");
+  const { src, objects, c2 } = await freshChain(home);
+  const mutex = createMutex();
+  const handler = createSyncEndpointHandler({ home, now: () => 1, repoMutexFor: () => mutex });
+  // 占住临界区：push 完成解析/staging/闭包后在 mutex 排队（过裁决 #1/#2）
+  let release;
+  const gate = new Promise((r) => {
+    release = r;
+  });
+  const hold = mutex.run("hold", async () => {
+    await gate;
+  });
+  const controller = new AbortController();
+  const pushP = (async () => handler({ method: "POST", path: "/wpk1/sync/g1/r1/push", body: pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects), sessionId: "s", peerEndpointId: EP_B, signal: controller.signal }))();
+  await new Promise((r) => setTimeout(r, 150)); // 排队等锁（过 #1/#2，卡在临界区前）
+  controller.abort(); // 严格在放锁前 → 线性化点首句必然观察到 aborted
+  // 放锁前 push 不得先行返回（若被 #1/#2 提前拒绝，会在 abort 时立刻 settle——
+  // 仍属零变化；但本用例锁定的是「CAS 前排队窗口」的裁决 #3）
+  const settledEarly = await Promise.race([Promise.resolve(pushP).then(() => true), new Promise((r) => setTimeout(() => r(false), 30))]);
+  assert.equal(settledEarly, false, "push stays queued at mutex until lock release (abort lands in the pre-CAS window)");
+  release();
+  await hold;
+  const resp = await pushP;
+  const parsed = JSON.parse(Buffer.from(resp.body).toString("utf8"));
+  assert.equal(resp.status, 400);
+  assert.equal(parsed.code, "aborted");
+  assert.equal(parsed.stage, "commit-point", "rejected by the linearization-point adjudication");
+  assert.equal(await readRef(gd, GROUP_REF), null, "ref zero change");
+  for (const o of objects) assert.equal(await hasObject(gd, o.oid), false, "store clean (import never ran)");
+  assert.equal((await readdir(path.join(gd, "staging")).catch(() => [])).length, 0, "staging reclaimed");
+  await rm(src, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
+});
+
+test("r7-B3 case 3: group stream budget includes push — third concurrent push gets busy 429; budget returned in finally", async () => {
+  const { home, handler } = await setup("budget-push");
+  const gd = gitdirFor(home, "g1", "r1");
+  const { src, objects, c2 } = await freshChain(home);
+  // 两个门控 push：body 生成器挂起 → 两条在飞流占满组级预算（≤2）
+  let entered = 0;
+  let open;
+  const gate = new Promise((r) => {
+    open = r;
+  });
+  const gatedBody = (ref) =>
+    (async function* () {
+      entered += 1;
+      await gate;
+      yield pushBody({ ref, expectedOldRef: null, targetCommit: c2 }, objects);
+    })();
+  const req = (body) => ({ method: "POST", path: "/wpk1/sync/g1/r1/push", body, sessionId: "s", peerEndpointId: EP_B });
+  const p1 = handler(req(gatedBody(deviceRef(EP_A))));
+  const p2 = handler(req(gatedBody(deviceRef(EP_B))));
+  const deadline = Date.now() + 5000;
+  while (entered < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(entered, 2, "both gated pushes started consuming (budget acquired before body read)");
+  // 第三个并发 push：组级预算占满 → 稳定 429 busy（push 也占流预算）
+  const third = await handler(req(pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects)));
+  const thirdParsed = JSON.parse(Buffer.from(third.body).toString("utf8"));
+  assert.equal(third.status, 429);
+  assert.equal(thirdParsed.code, "busy");
+  assert.equal(thirdParsed.limit, 2);
+  assert.equal(await readRef(gd, GROUP_REF), null, "third push rejected before consuming anything");
+  open();
+  const [r1, r2] = [await p1, await p2];
+  const p1Parsed = JSON.parse(Buffer.from(r1.body).toString("utf8"));
+  const p2Parsed = JSON.parse(Buffer.from(r2.body).toString("utf8"));
+  assert.equal(p1Parsed.ok, true);
+  assert.equal(p2Parsed.ok, true);
+  assert.equal(await readRef(gd, deviceRef(EP_A)), c2);
+  assert.equal(await readRef(gd, deviceRef(EP_B)), c2);
+  // 预算已在 finally 归还：后续 push 不再 busy
+  const after = await call(handler, "POST", "/wpk1/sync/g1/r1/push", { body: pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects) });
+  assert.equal(after.status, 200, "budget fully released after both pushes complete");
+  await rm(src, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true });
+});
+
+test("r7-B3 case 4: simulated process crash -> real staging files persist, ref untouched, TTL GC reclaims, retry rolls forward idempotently", async () => {
+  const { home } = await setup("crash");
+  const gd = gitdirFor(home, "g1", "r1");
+  const { src, objects, c2 } = await freshChain(home);
+  const fullBody = () => pushBody({ ref: GROUP_REF, expectedOldRef: null, targetCommit: c2 }, objects);
+  const req = () => ({ method: "POST", path: "/wpk1/sync/g1/r1/push", body: fullBody(), sessionId: "s", peerEndpointId: EP_B });
+  const parse = (resp) => ({ status: resp.status, body: JSON.parse(Buffer.from(resp.body).toString("utf8")) });
+
+  // -- 边界 1：全部对象已落 staging、闭包已过、临界区导入前 kill（push:staged） --
+  let crashed1 = false;
+  const h1 = createSyncEndpointHandler({
+    home,
+    now: () => 1,
+    crashAt: (stage) => {
+      if (stage === "push:staged" && !crashed1) {
+        crashed1 = true;
+        throw new CrashInjection(stage);
+      }
+    },
+  });
+  const resp1 = parse(await h1(req()));
+  assert.equal(resp1.status, 500, "kill simulation surfaces as internal (process-death analogue)");
+  // staging 留下的是**真实对象文件**（非空壳）：每对象一个文件、字节可验
+  const stagingRoot = path.join(gd, "staging");
+  const entries1 = await readdir(stagingRoot).catch(() => []);
+  assert.equal(entries1.length, 1, "crash leaves exactly one staging scene");
+  const scene1 = path.join(stagingRoot, entries1[0]);
+  const stagedFiles = (await readdir(scene1)).sort();
+  assert.deepEqual(stagedFiles, objects.map((o) => o.oid).sort(), "every verified object staged as a real file");
+  for (const o of objects) {
+    const raw = await readFile(path.join(scene1, o.oid));
+    assert.ok(Buffer.compare(Buffer.from(raw), Buffer.from(o.bytes)) === 0, `staged bytes intact: ${o.oid}`);
+  }
+  assert.equal(await readRef(gd, GROUP_REF), null, "ref zero change after crash");
+  for (const o of objects) assert.equal(await hasObject(gd, o.oid), false, "object store clean (crash before import — no half-write)");
+  // TTL GC 回收崩溃现场
+  const removed1 = await gcStaging(gd, { now: () => Date.now() + STAGING_TTL_MS + 1000 });
+  assert.deepEqual(removed1, entries1, "GC reclaims the crashed staging scene");
+  assert.equal((await readdir(stagingRoot).catch(() => [])).length, 0, "staging root empty after GC");
+
+  // -- 边界 2：对象已原子入库、writeRef 前 kill（push:imported）——roll-forward 语义 --
+  let crashed2 = false;
+  const h2 = createSyncEndpointHandler({
+    home,
+    now: () => 2,
+    crashAt: (stage) => {
+      if (stage === "push:imported" && !crashed2) {
+        crashed2 = true;
+        throw new CrashInjection(stage);
+      }
+    },
+  });
+  const resp2 = parse(await h2(req()));
+  assert.equal(resp2.status, 500);
+  assert.equal(await readRef(gd, GROUP_REF), null, "ref still zero (crash before writeRef)");
+  for (const o of objects) {
+    assert.equal(await hasObject(gd, o.oid), true, `import completed atomically before crash: ${o.oid}`);
+    const back = await readObject(gd, o.oid);
+    assert.ok(Buffer.compare(Buffer.from(back.bytes), Buffer.from(o.bytes)) === 0, "imported object is complete and readable (no half-write)");
+  }
+  await gcStaging(gd, { now: () => Date.now() + STAGING_TTL_MS + 1000 });
+  // 重试（crashAt 一次性已消耗）：幂等 roll-forward——已导入对象跳过、CAS 过、ref 推进
+  const retry = parse(await h2(req()));
+  assert.equal(retry.status, 200, "retry rolls forward idempotently (no partial state)");
+  assert.equal(await readRef(gd, GROUP_REF), c2);
+  await rm(src, { recursive: true, force: true });
   await rm(home, { recursive: true, force: true });
 });
