@@ -2,11 +2,17 @@
 // 冻结五步时序）。SDK=注入替身（真实 Fabric 太重——原生二进制+网络面不可入
 // 仓内测试）；断言面=调用序/参数/缓存行为，不触网。
 // 覆盖：
-// 1. 惰性：构造零调用；ensureStarted 才走五步（open(deferStart+dataDir+
-//    CustomWithCaps relays)→root 判定→[root] ensure+覆盖断言→元组断言→start）；
+// 1. 惰性：构造零调用；ensureStarted 才走五步（open(deferStart+dataDir)→
+//    姿态/模式分流→[显式 relay 模式且 root] ensure+覆盖断言→元组断言→start）；
+//    [W12] direct-only 缺省：构造不携带 relay（租约 relay 不进数据面），
+//    root 与 member 一律跳过 ②③；
 // 1b. 姿态分流：member（配对加入的对方 fabric / joinWithToken 接管）跳过
-//    root-only ensure（NotRoot 根因回归面），capability 走 OK2 持久化+start 注入；
-// 2. fail-closed：无租约/覆盖缺口/元组不符 → 不 start；失败可重试；
+//    root-only ensure（NotRoot 根因回归面）；显式 relay opt-in 下 root 走
+//    ensure+覆盖（覆盖缺口=fail-closed）；
+// 1c. no-lease 边界（[W12]）：租约是身份元组源——relay_url 不可用不再阻断
+//    direct-only 数据面 start；
+// 2. fail-closed：无租约/（显式 relay 模式下）覆盖缺口/元组不符 → 不 start；
+//    失败可重试；
 // 3. single-flight：并发 ensureStarted 一次构造；
 // 4. 会话缓存：同 peer 一会话；peer-disconnected/onState disconnected 逐出；
 // 5. serveHttp 绑定：peer-connected→router 分发；router 未接线=503；
@@ -155,6 +161,7 @@ function makeFakeSdk(over = {}) {
     joined,
     sessions,
     serveHandlers,
+    over,
     emit(ev) {
       eventCb?.(ev);
     },
@@ -182,7 +189,7 @@ test.afterEach(() => {});
 
 // ---- 1. 惰性 + 五步时序 ---------------------------------------------------------------
 
-test("fabric host: lazy construction is zero-outbound; ensureStarted runs the frozen five-step sequence", async (t) => {
+test("fabric host: lazy construction is zero-outbound; ensureStarted runs the frozen five-step sequence (direct-only default)", async (t) => {
   const home = await homeWithLease();
   t.after(() => rm(home, { recursive: true, force: true }));
   const fake = makeFakeSdk();
@@ -195,18 +202,19 @@ test("fabric host: lazy construction is zero-outbound; ensureStarted runs the fr
 
   await host.ensureStarted();
   assert.equal(host.status().status, "started");
-  // ① open：dataDir=DWEB_HOME + deferStart + CustomWithCaps（租约 relay 装配）；
-  // 不携带 fabricId 期望（既有 roster 即权威——可能是配对加入的对方 fabric）
+  // ① open：dataDir=DWEB_HOME + deferStart；[W12] direct-only——构造不携带
+  // relay（租约 relay 不装配数据面）；不携带 fabricId 期望（既有 roster 即
+  // 权威——可能是配对加入的对方 fabric）
   const open = fake.calls.indexOf("open");
   assert.ok(open !== -1, "Fabric.open called");
   assert.deepEqual(fake.fabric.openOpts, {
     dataDir: home,
-    relay: { mode: "custom", relays: [{ url: LEASE.relay_url, serverId: LEASE.server_id }] },
     deferStart: true,
   });
-  // ② root 判定（root 册=rootEndpointId==本机）→ ensure → ⑤ start：顺序冻结
-  assert.ok(fake.calls.indexOf("ensure") > open, "ensureRelayCapabilities after open (root posture)");
-  assert.ok(fake.calls.indexOf("start") > fake.calls.indexOf("ensure"), "start after ensure");
+  // ② [W12] direct-only 缺省：root 也跳过 root-only ensure（无 relay 数据面
+  // 可覆盖）；⑤ start 直接执行
+  assert.ok(!fake.calls.includes("ensure"), "direct-only default MUST NOT call ensureRelayCapabilities ([W12])");
+  assert.ok(fake.calls.indexOf("start") > open, "start after open");
 });
 
 test("fabric host: started is idempotent and single-flight (one open for concurrent callers)", async (t) => {
@@ -237,17 +245,25 @@ test("fabric host: no lease on the device rejects with no-lease and never constr
   assert.equal(host.status().failureCode, "no-lease");
 });
 
-test("fabric host: relay coverage mismatch fails closed (no start) and can retry after the ledger heals", async (t) => {
+test("fabric host: explicit relay data-plane opt-in runs root ensure+coverage; mismatch fails closed and can retry after heal", async (t) => {
   const home = await homeWithLease();
   t.after(() => rm(home, { recursive: true, force: true }));
+  // [W12]：显式 relay 数据面（QUIC/TLS 形态——非 hub HTTP-only 租约 relay）
+  // 是唯一执行 root ②③ 的模式；覆盖对象=显式配置的 relay 集
+  const relayOpt = { mode: "custom", relays: [{ url: LEASE.relay_url, serverId: LEASE.server_id }] };
   const fake = makeFakeSdk({ caps: [{ url: "http://other-relay:1", token: "dwebr1.x" }] });
-  const host = await createFabricHost({ home, sdk: fake.sdk });
+  const host = await createFabricHost({ home, sdk: fake.sdk, relay: relayOpt });
   t.after(() => host.close());
 
-  await assert.rejects(host.ensureStarted(), /did not cover lease relays/);
+  await assert.rejects(host.ensureStarted(), /did not cover/);
+  assert.ok(fake.calls.includes("ensure"), "explicit relay mode MUST run root-only ensureRelayCapabilities");
   assert.ok(!fake.calls.includes("start"), "start MUST NOT run when coverage fails");
-  assert.ok(!fake.calls.includes("shutdown") === false || true, "fabric torn down on failure");
   assert.equal(host.status().status, "failed");
+  // 账本愈合（caps 覆盖显式 relay 集）后可重试
+  fake.over.caps = [{ url: LEASE.relay_url, token: "dwebr1.ok" }];
+  await host.ensureStarted();
+  assert.equal(host.status().status, "started");
+  assert.deepEqual(fake.fabric.openOpts.relay, relayOpt, "explicit relay config reaches the SDK ctor");
 });
 
 test("fabric host: tuple mismatch (fabric id / endpoint id) fails closed before start", async (t) => {
@@ -294,7 +310,7 @@ async function homeWithLoopbackLease() {
   return home;
 }
 
-test("fabric host: loopback lease relay is rewritten to the advertised LAN host", async (t) => {
+test("fabric host: loopback lease relay is rewritten to the advertised LAN host (management-plane projection only)", async (t) => {
   const home = await homeWithLoopbackLease();
   t.after(() => rm(home, { recursive: true, force: true }));
   const fake = makeFakeSdk({ caps: [{ url: "http://192.168.2.8:3340", token: "dwebr1.lan" }] });
@@ -302,7 +318,9 @@ test("fabric host: loopback lease relay is rewritten to the advertised LAN host"
   t.after(() => host.close());
 
   await host.ensureStarted();
-  assert.deepEqual(fake.fabric.openOpts.relay.relays, [{ url: "http://192.168.2.8:3340", serverId: LEASE.server_id }]);
+  // [W12] direct-only：构造不携带 relay——租约 relay 只活在 identity() 投影
+  //（管理面观测/显式 opt-in 材料），LAN 化改写语义保持
+  assert.ok(!("relay" in fake.fabric.openOpts), "lease relay MUST NOT be assembled into the data plane ([W12])");
   assert.deepEqual(fake.fabric.openOpts.advertiseAddrs, ["192.168.2.8:3341"]);
   // identity() 同源（joinWithToken 构造与此同一 readIdentity）
   const id = await host.identity();
@@ -317,7 +335,30 @@ test("fabric host: loopback lease relay is kept verbatim without advertised LAN 
   t.after(() => host.close());
 
   await host.ensureStarted();
-  assert.deepEqual(fake.fabric.openOpts.relay.relays, [{ url: "http://127.0.0.1:3340", serverId: LEASE.server_id }]);
+  assert.ok(!("relay" in fake.fabric.openOpts), "direct-only ctor carries no relay ([W12])");
+  const id = await host.identity();
+  assert.deepEqual(id.relays, [{ url: "http://127.0.0.1:3340", serverId: LEASE.server_id }]);
+});
+
+test("fabric host: lease without a usable relay no longer blocks direct-only start ([W12] no-lease boundary)", async (t) => {
+  // 边界修订：租约是身份元组来源（fabricId/endpointId/deviceName 派生不变），
+  // relay_url 不可用不再阻断 start——已有 roster+known_addrs 的设备照常进
+  // direct-only 数据面（此前 valid 过滤 relay 字段，无可用 relay 即 no-lease）。
+  const home = await mkdtemp(path.join(tmpdir(), "wpk-fabric-"));
+  const leaseNoRelay = { ...LEASE, relay_url: "", server_id: "" };
+  await writeFile(path.join(home, "leases.json"), JSON.stringify({ version: 1, leases: [leaseNoRelay] }, null, 2), "utf8");
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const fake = makeFakeSdk();
+  const host = await createFabricHost({ home, sdk: fake.sdk });
+  t.after(() => host.close());
+
+  const id = await host.identity();
+  assert.ok(id !== null, "identity tuple still derives from the lease");
+  assert.equal(id.endpointId, LEASE.root);
+  assert.deepEqual(id.relays, [], "no usable relay entries => empty projection, not no-lease");
+  await host.ensureStarted();
+  assert.equal(host.status().status, "started");
+  assert.ok(!("relay" in fake.fabric.openOpts), "direct-only ctor ([W12])");
 });
 
 test("fabric host: joinWithToken takes over as member (no root-only ensure; wires events; returns fabricId)", async (t) => {
@@ -332,6 +373,8 @@ test("fabric host: joinWithToken takes over as member (no root-only ensure; wire
   const out = await host.joinWithToken({ token: "dweb2.test-token" });
   assert.deepEqual(out, { fabricId: "77".repeat(32) });
   assert.ok(fake.calls.includes("joinWithToken:dweb2.test-token"), "SDK joinWithToken invoked");
+  // [W12] direct-only：join 构造不携带 relay（发现=令牌 advertiseAddrs+known_addrs）
+  assert.deepEqual(fake.joined.joinOpts, { dataDir: home, deferStart: true });
   assert.ok(!fake.calls.includes("joined-ensure"), "member MUST NOT call ensureRelayCapabilities after join");
   assert.ok(fake.calls.includes("joined-start"), "joined fabric started");
   assert.ok(fake.calls.includes("shutdown"), "old fabric torn down on takeover");

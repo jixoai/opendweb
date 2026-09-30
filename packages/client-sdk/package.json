@@ -42,7 +42,7 @@
     ]
   },
   "scripts": {
-    "build": "napi build --platform --release --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs && strip -Sx dweb.darwin-arm64.node && codesign -f -s - dweb.darwin-arm64.node",
+    "build": "napi build --platform --release --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs && strip -Sx dweb.darwin-arm64.node && codesign -f -s - dweb.darwin-arm64.node && node -e 'require(\"./dweb.darwin-arm64.node\")'",
     "build:debug": "napi build --platform --target aarch64-apple-darwin --no-js && node scripts/fix-dts.mjs",
     "test": "npm run test:types && node --test --test-force-exit test/*.test.mjs",
     "test:types": "tsc --noEmit -p test/tsconfig.fixture.json",

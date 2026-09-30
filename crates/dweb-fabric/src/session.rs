@@ -1489,7 +1489,9 @@ mod ok2_tests {
     }
 
     /// minter 签发语义（§7.2/§7.3）：默认仅 RELAY、绑 redeemer、
-    /// TTL = min(invite 剩余, 90d)、非 invite 命中的 restricted 条目跳过。
+    /// TTL = 90d 上限（不随 invite 剩余收缩——invite 过期是兑换防重放
+    /// 窗口、不是成员寿命；spec fabric/session「回执帧版本化」）、
+    /// 非 invite 命中的 restricted 条目跳过。
     #[test]
     fn minter_issues_minimal_member_caps() {
         let root = NodeIdentity::from_seed([7u8; 32]);

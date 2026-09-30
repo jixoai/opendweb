@@ -36,6 +36,55 @@ fn cfg_with(dir: &TempDir, join_timeout_ms: u64) -> FabricConfig {
     }
 }
 
+/// DER → PEM（relay_watch.rs 同款手写编码）。
+fn cert_der_to_pem(der: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    pem.push_str("-----END CERTIFICATE-----\n");
+    pem.into_bytes()
+}
+
+/// 真实 iroh relay server（自签证书；[W12] 显式 opt-in 形态：Custom +
+/// CustomPem）。relay 数据面路径的分类测试（探针/超时/detached）在 direct-only
+/// 缺省下必须显式配置 relay——joiner 侧经真实 relay 快速 online（无 10s 空等），
+/// 令牌侧 relay 仍由各用例自定（死条目/挂起 listener）。
+async fn spawn_test_relay() -> (String, Vec<u8>, iroh_relay::server::Server) {
+    let (certs, server_config) = iroh_relay::server::testing::self_signed_tls_certs_and_config();
+    let der = certs[0].as_ref().to_vec();
+    let tls = iroh_relay::server::TlsConfig::new(
+        (std::net::Ipv4Addr::LOCALHOST, 0),
+        iroh_relay::server::CertConfig::Manual { server_config },
+    );
+    let mut relay = iroh_relay::server::RelayConfig::new((std::net::Ipv4Addr::LOCALHOST, 0));
+    relay.tls = Some(tls);
+    relay.key_cache_capacity = Some(1024);
+    let mut config = iroh_relay::server::ServerConfig::default();
+    config.relay = Some(relay);
+    config.quic = None;
+    let server = iroh_relay::server::Server::spawn(config)
+        .await
+        .expect("spawn test relay");
+    let url = format!("https://{}", server.https_addr().expect("https bound"))
+        .parse::<iroh::RelayUrl>()
+        .unwrap()
+        .to_string();
+    (url, cert_der_to_pem(&der), server)
+}
+
+/// 显式 relay 数据面配置（[W12]：joiner 侧 Custom + 自签 CA）。
+fn cfg_relay(dir: &TempDir, join_timeout_ms: u64, relay_url: &str, pem: &[u8]) -> FabricConfig {
+    FabricConfig {
+        relay: RelayConfig::Custom(vec![relay_url.to_owned()]),
+        relay_tls_trust: RelayTlsTrust::CustomPem(pem.to_vec()),
+        ..cfg_with(dir, join_timeout_ms)
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -137,6 +186,79 @@ async fn no_reachable_path_fails_before_dialing() {
         err.to_string()
             .contains("no relay URL and no direct addresses")
     );
+}
+
+// ---- [W12] direct-only：relay-only 令牌 = 空路径 + 学习卫生 ----------------------
+
+#[tokio::test]
+async fn direct_only_join_relay_only_token_fails_before_dialing() {
+    let _g = TEST_LOCK.lock().await;
+    // [W12] Disabled 数据面：relay-only 令牌（无直连地址）对 direct-only joiner
+    // 是空路径——拨号前立即失败（HTTP-only relay 不进拨号地址），错误指向
+    // advertise_addrs（真双机实证：hub relay "已连接"→relay-first 吞没→停滞）。
+    let dir_j = TempDir::new().unwrap();
+    let identity = dweb_fabric::identity::NodeIdentity::load_or_create(dir_j.path()).unwrap();
+    let (_dir_t, fid_hex, token) =
+        issue_token_as(&identity, "http://192.168.2.8:3340", &[], 60_000, now_ms());
+    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
+        .await
+        .unwrap();
+    let start = std::time::Instant::now();
+    let err = j.join(&token).await.unwrap_err();
+    assert_eq!(
+        join_code(&err),
+        Some(JoinErrorCode::NoReachablePath),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("direct-only"),
+        "actionable direct-only message expected: {err}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(900),
+        "must fail before dialing (zero wait), took {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn join_learning_under_disabled_omits_relay_url_from_known_addrs() {
+    let _g = TEST_LOCK.lock().await;
+    // [W12] 学习源头卫生（真双机实证复现面）：join 曾把令牌携带的 hub relay
+    // URL（http://192.168.2.8:3340）学进 known_addrs——HTTP-only relay 被当
+    // 直连候选持久化，重启后经 connect 候选合并回流拨号地址。Disabled 数据面
+    // 只学直连地址；relay URL 不落 known_addrs.json。
+    let dir_j = TempDir::new().unwrap();
+    let identity = dweb_fabric::identity::NodeIdentity::load_or_create(dir_j.path()).unwrap();
+    let (_dir_t, fid_hex, token) = issue_token_as(
+        &identity,
+        "http://192.168.2.8:3340",
+        &["192.0.2.1:1"], // TEST-NET-1 直连（不可达——拨号失败即返回，学习已落盘）
+        60_000,
+        now_ms(),
+    );
+    let j = Fabric::attach(cfg_with(&dir_j, 1_000), &fid_hex)
+        .await
+        .unwrap();
+    let err = j.join(&token).await.unwrap_err();
+    assert!(
+        matches!(
+            join_code(&err),
+            Some(JoinErrorCode::DialFailed | JoinErrorCode::DialTimeout)
+        ),
+        "join must fail after the learning step (unroutable direct): {err:?}"
+    );
+    let path = dir_j.path().join("known_addrs.json");
+    let content = std::fs::read_to_string(&path).expect("known_addrs persisted on join");
+    assert!(
+        !content.contains("3340"),
+        "relay URL must not be learned as a direct address: {content}"
+    );
+    assert!(
+        content.contains("192.0.2.1:1"),
+        "direct addr must be learned: {content}"
+    );
+    j.shutdown().await.unwrap();
 }
 
 // ---- 2. TOKEN_EXPIRED：固定过去时间 ------------------------------------------
@@ -264,13 +386,19 @@ async fn wrong_fabric_dir_a_token_b() {
 
 /// 自连接令牌：issuer == joiner 自身 endpoint id → connect 立即错误
 ///（iroh 拒绝自连接，早于任何网络路径解析），驱动 7a 分类时点。
+/// [W12]：joiner 侧显式 Custom relay 配置（relay-only 令牌在 Disabled 数据面
+/// 下是空路径——relay 路径分类只能在显式 opt-in 的 fabric 上测）。
 async fn self_connect_join(relay: &str, addrs: &[&str], join_timeout_ms: u64) -> FabricError {
+    let (test_relay, pem, _server) = spawn_test_relay().await;
     let dir_j = TempDir::new().unwrap();
     let identity = dweb_fabric::identity::NodeIdentity::load_or_create(dir_j.path()).unwrap();
     let (_dir_t, fid_hex, token) = issue_token_as(&identity, relay, addrs, 60_000, now_ms());
-    let j = Fabric::attach(cfg_with(&dir_j, join_timeout_ms), &fid_hex)
-        .await
-        .unwrap();
+    let j = Fabric::attach(
+        cfg_relay(&dir_j, join_timeout_ms, &test_relay, &pem),
+        &fid_hex,
+    )
+    .await
+    .unwrap();
     j.join(&token).await.unwrap_err()
 }
 
@@ -358,6 +486,9 @@ async fn probe_not_applicable_with_direct_addr_is_dial_failed() {
 #[tokio::test]
 async fn probe_not_applicable_with_proxy_is_dial_failed() {
     let _g = TEST_LOCK.lock().await;
+    // [W12]：joiner 显式 Custom relay 配置（策略非 none 的探针负测需要
+    // relay 数据面在位——Disabled 下 relay-only 令牌是空路径）
+    let (test_relay, pem, _server) = spawn_test_relay().await;
     let dir_j = TempDir::new().unwrap();
     let identity = dweb_fabric::identity::NodeIdentity::load_or_create(dir_j.path()).unwrap();
     let (_dir_t, fid_hex, token) =
@@ -365,7 +496,7 @@ async fn probe_not_applicable_with_proxy_is_dial_failed() {
     let j = Fabric::attach(
         FabricConfig {
             http_proxy: HttpProxyConfig::FromEnv,
-            ..cfg_with(&dir_j, JOIN_TIMEOUT_MS_DEFAULT)
+            ..cfg_relay(&dir_j, JOIN_TIMEOUT_MS_DEFAULT, &test_relay, &pem)
         },
         &fid_hex,
     )
@@ -446,13 +577,19 @@ impl HoldListener {
 }
 
 /// joiner 拨号一个不存在于 relay 的 issuer（经挂起 listener 的 relay 路径）。
+/// [W12]：joiner 侧显式 Custom relay（真实 test relay 快速 online；挂起
+/// listener 只是令牌携带的死 relay 路径）。
 async fn join_missing_issuer(relay_url: &str, join_timeout_ms: u64) -> FabricError {
+    let (test_relay, pem, _server) = spawn_test_relay().await;
     let dir_j = TempDir::new().unwrap();
     let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xAB; 32]);
     let (_dir_t, fid_hex, token) = issue_token_as(&issuer, relay_url, &[], 60_000, now_ms());
-    let j = Fabric::attach(cfg_with(&dir_j, join_timeout_ms), &fid_hex)
-        .await
-        .unwrap();
+    let j = Fabric::attach(
+        cfg_relay(&dir_j, join_timeout_ms, &test_relay, &pem),
+        &fid_hex,
+    )
+    .await
+    .unwrap();
     j.join(&token).await.unwrap_err()
 }
 
@@ -486,8 +623,9 @@ async fn dial_timeout_without_probe_success_note() {
 async fn shutdown_joins_detached_connect_tasks() {
     let _g = TEST_LOCK.lock().await;
     // 挂起 relay 路径 + 最短 deadline：join 归类 DIAL_TIMEOUT，connect 任务按
-    // P1-10 语义不取消、在登记表中悬挂
+    // P1-10 语义不取消、在登记表中悬挂。[W12]：joiner 显式 Custom relay。
     let hold = HoldListener::spawn();
+    let (test_relay, pem, _server) = spawn_test_relay().await;
     let dir_j = TempDir::new().unwrap();
     let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xEE; 32]);
     let (_dir_t, fid_hex, token) = issue_token_as(
@@ -497,9 +635,12 @@ async fn shutdown_joins_detached_connect_tasks() {
         60_000,
         now_ms(),
     );
-    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
-        .await
-        .unwrap();
+    let j = Fabric::attach(
+        cfg_relay(&dir_j, JOIN_TIMEOUT_MS_MIN, &test_relay, &pem),
+        &fid_hex,
+    )
+    .await
+    .unwrap();
     let err = j.join(&token).await.unwrap_err();
     assert_eq!(join_code(&err), Some(JoinErrorCode::DialTimeout), "{err:?}");
     assert!(
@@ -523,7 +664,9 @@ async fn concurrent_shutdown_calls_share_completion() {
     let _g = TEST_LOCK.lock().await;
     // R3 P1-1：并发 shutdown 共享完成门——晚到调用必须等首次 drain 完成后
     // 返回，不得在 drain 进行中就提前 Ok（残留任务/后续事件违例）。
+    // [W12]：joiner 显式 Custom relay。
     let hold = HoldListener::spawn();
+    let (test_relay, pem, _server) = spawn_test_relay().await;
     let dir_j = TempDir::new().unwrap();
     let issuer = dweb_fabric::identity::NodeIdentity::from_seed([0xE1; 32]);
     let (_dir_t, fid_hex, token) = issue_token_as(
@@ -533,9 +676,12 @@ async fn concurrent_shutdown_calls_share_completion() {
         60_000,
         now_ms(),
     );
-    let j = Fabric::attach(cfg_with(&dir_j, JOIN_TIMEOUT_MS_MIN), &fid_hex)
-        .await
-        .unwrap();
+    let j = Fabric::attach(
+        cfg_relay(&dir_j, JOIN_TIMEOUT_MS_MIN, &test_relay, &pem),
+        &fid_hex,
+    )
+    .await
+    .unwrap();
     // 制造一个悬挂的 detached connect（归类超时后任务仍在登记表）
     let _ = j.join(&token).await;
     assert!(j.detached_connect_pending() >= 1);

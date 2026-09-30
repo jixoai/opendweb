@@ -41,15 +41,19 @@ pub struct RelayEntryOptions {
 }
 
 /// relay 配置（判别联合的 napi 投影）：
-/// - `{}` / `{ mode: "n0" }`：n0 官方默认（不接受 urls/relays）
-/// - `{ mode: "disabled" }`：禁用（不接受 urls/relays）
+/// - `{}`（缺省）：**禁用**（[W12] direct-only 缺省——HTTP-only relay 不能
+///   承载端点间 QUIC 数据面，配进数据面即持续投毒；直连 + advertiseAddrs +
+///   known_addrs 是默认发现形态）
+/// - `{ mode: "disabled" }`：同缺省（不接受 urls/relays）
+/// - `{ mode: "n0" }`：n0 官方默认 relay（**显式 opt-in**；不接受 urls/relays）
 /// - `{ mode: "custom", urls: [..] }`：自托管列表（至少一个；空数组构造 reject）
 /// - `{ mode: "custom", relays: [..] }`：条目级 capability 列表（至少一个；
 ///   与 urls 互斥——同时提供构造 reject，spec scenario 冻结）
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct RelayOptions {
-    /// "disabled" | "custom" | "n0"（缺省 "n0"）
+    /// "disabled" | "custom" | "n0"（缺省 "disabled"——[W12] direct-only；
+    /// "n0" 只能显式 opt-in）
     pub mode: Option<String>,
     /// mode = "custom" 时的 relay URL 列表（自托管 docker 或其它 iroh relay）
     pub urls: Option<Vec<String>>,
@@ -215,14 +219,17 @@ fn to_relay_entries(relays: Vec<RelayEntryOptions>) -> Result<Vec<dweb_fabric::R
 fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
     let bad = |msg: String| Err(Error::new(Status::GenericFailure, msg));
     match relay {
-        None => Ok(RelayConfig::N0Default),
+        // [W12] 缺省 direct-only：未提供 relay 配置不再转 n0——HTTP-only relay
+        // 只能注册不能转发端点间 QUIC 数据（真双机实证 relay-first 停滞）；
+        // n0/custom 一律显式 opt-in。
+        None => Ok(RelayConfig::Disabled),
         Some(r) => {
             let has_urls = r.urls.as_ref().is_some_and(|u| !u.is_empty());
             let urls_empty_array = r.urls.as_ref().is_some_and(|u| u.is_empty());
             let has_relays = r.relays.as_ref().is_some_and(|v| !v.is_empty());
             let relays_empty_array = r.relays.as_ref().is_some_and(|v| v.is_empty());
-            match r.mode.as_deref().unwrap_or("n0") {
-                "n0" | "" => {
+            match r.mode.as_deref().unwrap_or("disabled") {
+                "n0" => {
                     if has_urls || urls_empty_array {
                         bad("relay.urls is only valid with mode 'custom'".into())
                     } else if has_relays || relays_empty_array {
@@ -231,7 +238,7 @@ fn to_relay_config(relay: Option<RelayOptions>) -> Result<RelayConfig> {
                         Ok(RelayConfig::N0Default)
                     }
                 }
-                "disabled" => {
+                "" | "disabled" => {
                     if has_urls || urls_empty_array {
                         bad("relay.urls is not accepted with mode 'disabled'".into())
                     } else if has_relays || relays_empty_array {

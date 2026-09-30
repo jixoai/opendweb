@@ -376,6 +376,57 @@ RelayMode::Disabled（直连 + invite/known_addrs 发现）；hub 租约的 rela
 墓地（专用端点随机端口累积死地址，root 侧实证 16 条——需 TTL/活性修剪）；
 mihomo conntrack 单端口 UDP 黑洞（环境级，DELETE /connections 可清）。
 
+**[W12] 落地记录（Codex r7 终审 B1 approve 后实现，2026-09-30）**：
+direct-only 缺省已进入运行时事实——① 内核 `FabricConfig::new` 缺省
+`RelayConfig::Disabled`（N0/custom 仅显式 opt-in）；② SDK 未提供 relay
+配置时转 Disabled（`mode` 缺省同步改 disabled，`"n0"` 显式 opt-in 保留）；
+③ Disabled 数据面的地址卫生：join/connect 候选合并过滤 invite 与
+learned（known_addrs）中的一切 relay URL（`merge_dial_candidates` /
+`endpoint_addr_from_invite(_v2)` 拨号前剥离），学习源头同步收口——
+join 学习不再把 relay URL 写进 known_addrs（真双机实证：mini 的
+known_addrs.json 曾混进 "http://192.168.2.8:3340"——HTTP-only hub relay
+被当直连候选持久化后经 connect 候选合并回流拨号地址）；relay-only 令牌
+（无直连地址）在 direct-only 数据面按 no-reachable-path 拨号前立即失败，
+错误指向签发侧补 advertiseAddrs；④ webui fabric 宿主不再把租约 relay
+装配为 `mode:"custom"` 数据面（构造不携带 relay）；**管理面租约存在与
+数据面 relay 候选解耦**：租约仍是身份元组来源（fabricId/endpointId/
+deviceName 派生不变），但 relay_url 不可用不再阻断 start（no-lease 门只看
+租约存在）；root 五步的 ②ensureRelayCapabilities+③覆盖断言仅在显式
+relay 数据面模式（宿主 `relay` 选项——QUIC/TLS 形态，当前无消费方）执行，
+direct-only（缺省）与 member 一律跳过；⑤ issuer 为 Disabled 时不签 relay
+条目（既有 InviteWithoutRelay 守卫依赖 advertiseAddrs 在场——LAN 形态
+成立），v2 bootstrap/OK2 capability 段自然为空。**边界声明（spec 冻结）**：
+HTTP-only hub relay 不是数据面 relay；QUIC/TLS 数据面 relay 由后续独立
+change 显式 opt-in 开放（需同时冻结 UDP/QUIC 监听与地址发现、证书信任链、
+restricted capability 的 QUIC 握手准入、部署防火墙与双机 failover 矩阵）。
+**B2 同轮落地**：shutdown 收尾改为单一全局 5s deadline（drain 入口起算，
+endpoint/accept/inflight/detached/child 全阶段共享 `timeout_at`——此前
+各阶段独立 5s 的最坏路径 ~26s）；截止后确定性 abort+有界 join
+（`abort_join_bounded`——abort 后 join 不再无条件等待，不可取消任务丢弃
+句柄记 incomplete-drain 稳定错误）；注入测试证明四类任务同时阻塞时整体
+≤5s+余量返回。顺带：N3（mint_for 旧语义注释清理——TTL=90d 上限，不随
+invite 剩余收缩）、N5（client-sdk build 尾部追加真实 dlopen 验证）。
+
+**第四轮实录（W12 落地后的双机验证，2026-09-30 上午）**：direct-only 缺省
+下 connect 的两步拨号计划补齐**独立 endpoint 回落**——空闲断线后主
+endpoint 上该 NodeId 的死选中路径/尸体/abandoned pending 同样把直连重拨
+整体饿死（A-反向同族机制，与 relay 无关；实证：仅重启对端救不回，本端
+fresh endpoint 即恢复），Disabled 计划改为 [MainDirect 主择 → 停滞换
+ScratchDirect]，常态仍主 endpoint（continuity_session 幂等语义保持）。
+双机验收：(a) 既有 roster 直连恢复——双端新二进制+JS 重启后 mini
+19090→200（python 目录列表），静置 ≥10 分钟再 curl 3/3 → 200（<0.12s/
+次）且日志零 stalled 循环；(b) sidecar 在位配对——invite 路由 200（令牌
+仅携带 advertiseAddrs 直连、零 relay 条目，W12 签发面实证），iMac 本地
+sidecar join 路由 0.45s 返回 `{fabricId:"473dbc0c…"}`；mini 侧同构 SDK
+join（直入 sidecar home）108ms 配对成功后 enable ports→19090→200。
+遗留实测发现（环境级，非 W12 回归，待独立跟进）：① mini 上 sidecar
+**进程内**的 fabric 拨号（join/connect 两路径）间歇性零出站停滞
+（nettop bytes_out=0；同机同时刻任何独立 node 进程的相同 SDK 调用 ~70-
+110ms 即达 redeem；mihomo TUN 关闭；重启 sidecar 进程即恢复）——进程
+级 UDP 出站被门控的机制未定位；② TERM 进程退出在「有活跃 fabric 会话」
+状态下存在 Node 句柄闩锁（fabric drain 本身 ≤5s 已收尾、主线程空闲于
+kevent，进程不退出；无会话/空载状态 TERM 0.02-0.2s 退出）。
+
 **验收方法论沉淀**（全局 AGENTS.md）：cdylib 重建门禁必须含真实 dlopen；
 Fake-IP 环境下网络假设测试需环境感知；kill 后必须验证死亡（TERM 被 drain
 挂死吞掉真实存在，僵尸同身份端点是"新进程网络全断"的首要嫌疑）。

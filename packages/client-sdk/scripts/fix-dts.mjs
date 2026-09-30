@@ -93,11 +93,15 @@ export interface RelayStatusJs {
  *  server-access-policy task 2.5：新增 relays 判别分支（per-relay
  *  capability 条目；与 urls 互斥由 native 构造期拒绝）。条目类型
  *  RelayEntryOptions 以 napi 生成的 interface 为契约（同 InviteOptions/
- *  Member 先例），由 relay-options-union 从回收区间携带保留。 */
-const RELAY_OPTIONS_UNION = `/** relay 配置（判别联合：非法组合构造期拒绝） */
+ *  Member 先例），由 relay-options-union 从回收区间携带保留。
+ *  [W12] direct-only 缺省：不提供 relay（或 mode 缺省）= 禁用——HTTP-only
+ *  relay 不能承载端点间 QUIC 数据面；n0/custom 一律显式 opt-in。 */
+const RELAY_OPTIONS_UNION = `/** relay 配置（判别联合：非法组合构造期拒绝）。[W12] direct-only 缺省：
+ *  不提供 relay（或 mode 缺省）= 禁用（HTTP-only relay 不能承载端点间
+ *  QUIC 数据面）；n0/custom 一律显式 opt-in。 */
 export type RelayOptions =
-  | { mode?: 'n0' }
-  | { mode: 'disabled' }
+  | { mode?: 'disabled' }
+  | { mode: 'n0' }
   | { mode: 'custom'; urls: [string, ...string[]] }
   | { mode: 'custom'; relays: [RelayEntryOptions, ...RelayEntryOptions[]] }
 `;

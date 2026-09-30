@@ -35,3 +35,22 @@ webui SHALL 内置进程内插件宿主：独立于 CLI `./opendweb-plugin` 契�
 
 - **WHEN** 插件宿主接入后运行既有 webui 全套测试（三视角/五行分流/接入卡片/数据面）
 - **THEN** 全部通过；sidecar 既有路由（/api/*、/sidecar/*）行为不变
+
+### Requirement: sidecar fabric 宿主数据面 direct-only（[W12]）
+
+sidecar 的 fabric 宿主（数据面底座）SHALL 以 direct-only 数据面运行：构造 Fabric 时不携带 relay 配置（SDK 缺省 disabled）——**hub 租约的 relay URL MUST NOT 装配进数据面**（HTTP-only hub relay 只能承载注册/租约/rendezvous 管理面，不能转发端点间 QUIC 数据；配进数据面即 relay-first 吞没停滞，真双机三轮实录定论）。对端发现 = invite 令牌携带的 advertiseAddrs 直连地址 + 持久 known_addrs。root 五步时序中的 ②ensureRelayCapabilities+③覆盖断言 SHALL 仅在**显式 relay 数据面模式**（宿主 `relay` 选项在场——QUIC/TLS relay 形态，当前无消费方，server 补齐后由独立 change 开放）且 root 姿态时执行；direct-only（缺省）与 member 姿态一律跳过。租约 SHALL 仍是身份元组来源（fabricId/endpointId/deviceName 派生不变），但 `relay_url` 不可用 MUST NOT 阻断数据面 start——no-lease 门只看租约存在（无任何租约 = 无身份元组 = 明示 no-lease 稳定错误），已有 roster+known_addrs 的设备照常进 direct-only 数据面。
+
+#### Scenario: 缺省 direct-only（租约 relay 不进数据面）
+
+- **WHEN** 有租约的设备启用任一数据面插件触发 fabric 惰性启动
+- **THEN** Fabric 构造不携带 relay 选项；relay 覆盖 ensure/断言被跳过（root 与 member 同）；start 正常完成，identity() 的 relays 投影仅供管理面观测
+
+#### Scenario: 无可用 relay 的租约不阻断启动（no-lease 边界）
+
+- **WHEN** 租约存在但 relay_url/server_id 为空，设备已有 roster 与 known_addrs
+- **THEN** startSequence 不因 relay 字段缺失报 no-lease；direct-only 数据面正常启动（identity 元组照常派生，relays 投影为空数组）
+
+#### Scenario: 显式 relay 数据面 opt-in 仍走 root ②③
+
+- **WHEN** 宿主以显式 `relay` 选项（QUIC/TLS 形态）构造且姿态为 root
+- **THEN** ensureRelayCapabilities+覆盖断言照常执行，覆盖缺口 fail-closed 不 start

@@ -1,20 +1,29 @@
 // sidecar 进程内 Fabric 宿主生命周期（webui-plugin-kernel 收官接线 / design v2.3
 // §1「薄核含互联=sidecar 宿主 fabric」+ §3.2 数据面经 serveHttp/fetchHttp）。
-// 意图（2026-09-29）：
+// 意图（2026-09-29；[W12] direct-only 修订 2026-09-30）：
 // 1. 凭证链权威=openspec/changes/archive/2026-09-24-home-hub/design.md §2（冻结）：
 //    - dataDir 恒=DWEB_HOME（identity.key 与 join 同源——resolve_identity(Default)
 //      读 <dataDir>/identity.key；dataDir != DWEB_HOME 的构造在本消费路径禁止）；
-//    - relay 凭证从租约装配 CustomWithCaps：relays=[{url: lease.relay_url,
-//      serverId: lease.server_id}]（无凭证 urls 形态在 restricted 中枢被拒——
-//      relay.rs 事实，不采用）；
+//    - [W12] 数据面 direct-only（design §9.1 架构定论 + Codex r7 终审 approve）：
+//      hub 的 HTTP-only relay 只能注册不能转发端点间 QUIC 数据——**租约 relay
+//      不再装配进数据面**（此前 `mode:"custom", relays` 装配即持续投毒：relay
+//      "已连接"→relay-first 吞没→停滞）。数据面构造不携带 relay（SDK 缺省
+//      disabled）；发现 = invite advertiseAddrs + 持久 known_addrs。显式 QUIC/TLS
+//      relay 数据面由宿主 opts.relay 显式 opt-in（当前无消费方——server 补齐
+//      QUIC/TLS 后由独立 change 开放），租约 relay 只服务管理面
+//      （leases/rendezvous）与 identity() 观测投影；
+//    - 租约仍是身份元组来源（fabricId/endpointId/deviceName 派生不变），
+//      **relay_url 不可用不再阻断数据面 start**——已有 roster+known_addrs 的
+//      设备照常进 direct-only 数据面（no-lease 门只看租约存在，不看 relay 字段）；
 //    - deferStart 五步时序（root 姿态）：①Fabric.open(deferStart=true——构造期
 //      零网络出站；不携带 fabricId 期望——dataDir 单 fabric 语义下既有 roster 即
-//      权威，可能是设备配对加入的对方 fabric）→ ②root 姿态判定
-//      （rootEndpointId==本机 endpointId）：root 走 ensureRelayCapabilities+
-//      ③断言返回条目覆盖租约 (relay_url)；member（对方 fabric）跳过 ②③——
-//      ensure 是 root-only（member 调用即 RosterError::NotRoot），其 capability
-//      由 v2 兑换 OK2 附发并持久化、start() 同源注入 → ④endpointId 元组断言
-//      （fabricId 断言只在 createRoot 采纳路径）→ ⑤fabric.start()。
+//      权威，可能是设备配对加入的对方 fabric）→ ②姿态判定（rootEndpointId==
+//      本机 endpointId）：root 走 ensureRelayCapabilities+③断言返回条目覆盖租约
+//      (relay_url)——**仅显式 relay 数据面模式**（opts.relay 在场）执行；
+//      direct-only（缺省）与 member（对方 fabric）一律跳过 ②③——ensure 是
+//      root-only 自签 own capability（member 调用即 RosterError::NotRoot），
+//      direct-only 下无 relay 数据面可覆盖 → ④endpointId 元组断言（fabricId
+//      断言只在 createRoot 采纳路径）→ ⑤fabric.start()。
 //      ②③④任一不符=fail-closed（不 start、明确报错、不静默降级）。
 // 2. 惰性启动：构造本模块零 Fabric 构造、零网络——ensureStarted() 才走五步
 //    （single-flight）。触发源=任一数据面插件 enable（sidecar 组装处 onTransition）
@@ -37,7 +46,7 @@
 //    @jixo/opendweb-client-sdk + /http 胶水——动态 import，模块加载期不触碰
 //    原生二进制）；leasesLoader 可注入（缺省 opendweb/src/leases.mjs loadLeases）。
 // 零凭证：本模块不读 argv/env 凭证；身份经 <DWEB_HOME>/identity.key（SDK
-// resolve_identity 语义）与租约（relays/元组断言材料）。
+// resolve_identity 语义）与租约（身份元组/观测材料）。
 
 import os from "node:os";
 import { loadLeases } from "opendweb/src/leases.mjs";
@@ -121,7 +130,13 @@ function jsonResp(status, code, message) {
  *   log?: (line: string) => void,
  *   now?: () => number,
  *   deviceName?: string,
+ *   advertiseAddrs?: string[],
+ *   bindAddr?: string,
+ *   relay?: { mode: "custom", urls?: string[], relays?: Array<{ url: string, serverId?: string, token?: string }> } | { mode: "n0" },
  * }} opts
+ *   relay = [W12] 显式数据面 relay opt-in（QUIC/TLS relay 形态；当前无
+ *   消费方——hub 的 HTTP-only relay 是管理面，不得配进数据面）。缺省
+ *   undefined = direct-only（构造不携带 relay，SDK 缺省 disabled）。
  * @returns {Promise<import("./fabric.mjs").FabricHost>}
  */
 export async function createFabricHost(opts = {}) {
@@ -130,6 +145,8 @@ export async function createFabricHost(opts = {}) {
   const leasesLoader = opts.leasesLoader ?? loadLeases;
   const log = opts.log ?? (() => {});
   const now = opts.now ?? (() => Date.now());
+  /** [W12] 显式 relay 数据面（null = direct-only 缺省）：root ②③ 仅在此模式执行 */
+  const relayDataPlane = opts.relay ?? null;
 
   /** @type {{ Fabric: object, fetchHttp: Function, serveHttp: Function } | null} */
   let sdk = opts.sdk ?? null;
@@ -173,18 +190,21 @@ export async function createFabricHost(opts = {}) {
   let startPromise = null;
 
   /**
-   * 读租约并推导身份/relays（home-hub §2：单 fabric 约束——leases 的 fabric 维度
-   * 恒 1，取首条为元组断言期望）。无租约/无可用 relay 条目 → null（本设备未加入
-   * 任何中枢——数据面不可用是明示事实，不是错误）。
+   * 读租约并推导身份（home-hub §2：单 fabric 约束——leases 的 fabric 维度
+   * 恒 1，取首条为元组断言期望）。无租约 → null（本设备未加入任何中枢——
+   * 身份元组缺失是明示事实，不是错误）。
+   *
+   * [W12] 边界修订（Codex r7 approve）：租约仍是身份元组来源（fabricId/
+   * endpointId/deviceName 派生不变），但 **relay_url 不可用不再阻断数据面
+   * start**——已有 roster+known_addrs 的设备照常进 direct-only 数据面。
+   * relays 投影仅供管理面观测/未来显式 opt-in 消费（不再装配数据面）；无
+   * 可用 relay 条目时 relays=[]（不是 null——租约身份仍在）。
    *
    * 回环 relay LAN 化（真双机验收实证）：中枢机自 join 的租约 relay_url 是
-   * issuer 本机回环形态（http://127.0.0.1:3340）——对本机 relay 连接无碍，但
-   * 以此装配 fabric 后签出的 invite 会把回环 relay 交给对端（跨机恒不可达；
-   * 内核侧已按「直连在场剔回环」过滤，令牌将退化为纯直连——对端拿不到
-   * bootstrap capability，redeem 后也没有 OK2 member capability 可持久化，
-   * 会话期 relay 发现无路径）。宣告了 LAN 直连地址（advertiseAddrs）时把
-   * 回环 host 改写为宣告地址的 host——relay 服务监听通配（*:3340），LAN
-   * 形态对 issuer 本机与对端同等可用；无宣告则保留原样（单机部署语义）。
+   * issuer 本机回环形态（http://127.0.0.1:3340）。宣告了 LAN 直连地址
+   * （advertiseAddrs）时把回环 host 改写为宣告地址的 host——relay 服务监听
+   * 通配（*:3340），LAN 形态对 issuer 本机与对端同等可用；无宣告则保留原样
+   * （单机部署语义）。
    */
   function lanRelayUrl(url) {
     if (advertiseAddrs.length === 0) return url;
@@ -206,14 +226,19 @@ export async function createFabricHost(opts = {}) {
 
   async function readIdentity() {
     const ledger = await leasesLoader(home);
-    const valid = ledger.leases.filter(
+    // 身份元组源：fabric_id + root 可用的首条租约（[W12]：不看 relay 字段）
+    const withTuple = ledger.leases.filter(
+      (l) => typeof l.fabric_id === "string" && l.fabric_id !== "" && typeof l.root === "string" && l.root !== "",
+    );
+    if (withTuple.length === 0) return null;
+    const lease = withTuple[0];
+    // relay 投影（管理面观测/显式 opt-in 材料）：仅收 relay 凭证齐备的租约
+    const relayValid = ledger.leases.filter(
       (l) => typeof l.relay_url === "string" && l.relay_url !== "" && typeof l.server_id === "string" && l.server_id !== "",
     );
-    if (valid.length === 0) return null;
-    const lease = valid[0];
     return {
       lease,
-      relays: valid.map((l) => ({ url: lanRelayUrl(l.relay_url), serverId: l.server_id })),
+      relays: relayValid.map((l) => ({ url: lanRelayUrl(l.relay_url), serverId: l.server_id })),
       fabricId: lease.fabric_id,
       endpointId: lease.root,
       deviceName: opts.deviceName ?? lease.alias ?? os.hostname(),
@@ -314,7 +339,7 @@ export async function createFabricHost(opts = {}) {
     status = "starting";
     const identity = await readIdentity();
     if (identity === null) {
-      throw Object.assign(new Error("no lease with a usable relay on this device; join a hub first (opendweb hub join)"), {
+      throw Object.assign(new Error("no lease on this device; join a hub first (opendweb hub join)"), {
         code: "no-lease",
       });
     }
@@ -324,10 +349,13 @@ export async function createFabricHost(opts = {}) {
     // 已 join 设备没有 roster.facts**，open() 会 "no persisted roster"。正确次序：
     // 先 open（既有 roster 复用）；无 roster 错误 → createRoot 采纳租约 fabricId
     // 建册（真双机验收抓出的集成缺陷）。
+    // [W12] direct-only：构造不携带 relay（SDK 缺省 disabled）——租约 relay 不
+    // 装配数据面（HTTP-only relay 持续投毒源）；发现 = advertiseAddrs（进
+    // invite）+ known_addrs。显式 relay 数据面仅 opts.relay（QUIC/TLS 形态）。
     const ctorArgs = {
       dataDir: home,
-      relay: { mode: "custom", relays: identity.relays },
       deferStart: true,
+      ...(relayDataPlane !== null ? { relay: relayDataPlane } : {}),
       // LAN 直连宣告（真双机验收定论：本地 relay 为 HTTP-only——QUIC 数据面需
       // TLS 证书未启用，P2P 唯一路径=直连；invite 令牌携带 issuer 直连地址，
       // 未宣告时对端无路可拨=dial-timeout）。来源：组装层 env 注入。
@@ -356,20 +384,31 @@ export async function createFabricHost(opts = {}) {
     }
     fabric = f;
     try {
-      // ② 姿态判定（root vs member）：ensureRelayCapabilities 是 root-only 的
-      // 自签 own capability——member（设备配对加入的对方 fabric）调用即
-      // RosterError::NotRoot（真双机验收实证：caller=本机、root=邀请方）。
-      // member 的 relay capability 由 v2 兑换 OK2 附发（join 内核已持久化
-      // relay.caps.json），start() 同源注入；③的租约覆盖断言对 member 同样
-      // 不适用——member 覆盖由邀请方 relay 集定义，非本机租约。
+      // ② 姿态判定（root vs member）+ relay 数据面模式分流（[W12]）：
+      // ensureRelayCapabilities 是 root-only 的自签 own capability，且只有
+      // **显式 relay 数据面模式**（opts.relay 在场）才有覆盖对象——
+      // - member（设备配对加入的对方 fabric）：调用即 RosterError::NotRoot
+      //   （真双机验收实证：caller=本机、root=邀请方），跳过；member
+      //   capability 由 v2 兑换 OK2 附发（join 内核已持久化 relay.caps.json），
+      //   start() 同源注入；
+      // - direct-only（缺省）：无 relay 数据面可 ensure/覆盖（租约 relay 是
+      //   管理面），root 与 member 一律跳过 ②③。
       const rootId = await f.rootEndpointId();
       const amRoot = rootId !== null && rootId === f.endpointId;
-      if (amRoot) {
-        const caps = await f.ensureRelayCapabilities();
-        // ③ 覆盖断言（不匹配=fail-closed 不 start）
-        assertRelayCoverage(caps, identity.relays);
+      if (relayDataPlane !== null) {
+        if (amRoot) {
+          const caps = await f.ensureRelayCapabilities();
+          // ③ 覆盖断言（不匹配=fail-closed 不 start）——仅显式 relay 数据面，
+          // 覆盖对象 = 显式配置的 relay 集（relays 条目或 urls）
+          const expect = relayDataPlane.relays ?? (relayDataPlane.urls ?? []).map((u) => ({ url: u }));
+          assertRelayCoverage(caps, expect);
+        } else {
+          log(`fabric: member posture (roster root ${rootId ?? "unset"} != local ${f.endpointId}); skipping root-only capability ensure`);
+        }
       } else {
-        log(`fabric: member posture (roster root ${rootId ?? "unset"} != local ${f.endpointId}); skipping root-only capability ensure`);
+        log(
+          `fabric: direct-only data plane ([W12]); skipping relay capability ensure/coverage (${amRoot ? "root" : "member"} posture, lease relay is management-plane only)`,
+        );
       }
       // ④ 元组断言（endpointId 连续性恒断言；fabricId 连续性只在 createRoot
       // 采纳路径断言——open 到的既有 roster 可能是设备配对（/sidecar/fabric/
@@ -399,7 +438,9 @@ export async function createFabricHost(opts = {}) {
     // peer-disconnected 拆线+逐出会话
     unsubscribeEvents = wireFabricEvents(f);
     status = "started";
-    log(`fabric: started (endpoint ${f.endpointId}, relays ${identity.relays.length}${adoptedOwnFabric ? "" : ", existing roster"})`);
+    log(
+      `fabric: started (endpoint ${f.endpointId}, ${relayDataPlane !== null ? `explicit relay data plane (${(relayDataPlane.relays ?? relayDataPlane.urls ?? []).length} relays)` : "direct-only [W12]"}${adoptedOwnFabric ? "" : ", existing roster"})`,
+    );
     return f;
   }
 
@@ -573,13 +614,14 @@ export async function createFabricHost(opts = {}) {
       }
       const identity = await readIdentity();
       if (identity === null) {
-        throw Object.assign(new Error("no lease with a usable relay on this device; join a hub first"), { code: "no-lease" });
+        throw Object.assign(new Error("no lease on this device; join a hub first"), { code: "no-lease" });
       }
       const s = await loadSdk();
+      // [W12] direct-only：join 构造不携带 relay（租约 relay 是管理面；发现 =
+      // 令牌 advertiseAddrs + 兑换后持久化的 known_addrs）。
       const joined = await s.Fabric.joinWithToken(
         {
           dataDir: home,
-          relay: { mode: "custom", relays: identity.relays },
           deferStart: true,
         },
         opts.token,

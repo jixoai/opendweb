@@ -426,10 +426,12 @@ export interface RelayEntryOptions {
   token?: string
 }
 
-/** relay 配置（判别联合：非法组合构造期拒绝） */
+/** relay 配置（判别联合：非法组合构造期拒绝）。[W12] direct-only 缺省：
+ *  不提供 relay（或 mode 缺省）= 禁用（HTTP-only relay 不能承载端点间
+ *  QUIC 数据面）；n0/custom 一律显式 opt-in。 */
 export type RelayOptions =
-  | { mode?: 'n0' }
-  | { mode: 'disabled' }
+  | { mode?: 'disabled' }
+  | { mode: 'n0' }
   | { mode: 'custom'; urls: [string, ...string[]] }
   | { mode: 'custom'; relays: [RelayEntryOptions, ...RelayEntryOptions[]] }
 

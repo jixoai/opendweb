@@ -15,20 +15,21 @@
 //! 禁止项（§3.4 评审冻结）：无界队列、ThreadsafeFunctionCallMode::Blocking。
 
 use bytes::Bytes;
+use dweb_fabric::Fabric as RustFabric;
 use dweb_fabric::continuity::http::{
-    fetch_http as kernel_fetch_http, serve_http as kernel_serve_http, CancelOutcome, FetchCancel,
-    Header, HttpEngineError, HttpHandler, HttpRequest as KernelHttpRequest,
-    HttpRequestInit as KernelHttpRequestInit, HttpResponse as KernelHttpResponse, RequestBody,
+    CancelOutcome, FetchCancel, Header, HttpEngineError, HttpHandler,
+    HttpRequest as KernelHttpRequest, HttpRequestInit as KernelHttpRequestInit,
+    HttpResponse as KernelHttpResponse, RequestBody, fetch_http as kernel_fetch_http,
+    serve_http as kernel_serve_http,
 };
 use dweb_fabric::continuity::session::{Session, SessionOptions, SessionPhase, SessionShared};
-use dweb_fabric::Fabric as RustFabric;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
 use crate::session::session_err;
 
@@ -253,9 +254,12 @@ pub(crate) struct RequestFlags {
     pub closed: std::sync::atomic::AtomicBool,
 }
 
+/// dispatch 结算的 oneshot 回流句柄（requestId 关联）。
+type PendingHandlerOutcome = oneshot::Sender<std::result::Result<HandlerOutcome, String>>;
+
 pub(crate) struct HandlerBridge {
     tsfn: Arc<ThreadsafeFunction<String>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<HandlerOutcome, String>>>>>,
+    pending: Arc<Mutex<HashMap<u64, PendingHandlerOutcome>>>,
     bodies: Arc<Mutex<HashMap<u64, RequestBody>>>,
     /// per-request 生命周期旗（watcher 置位；StreamWriterJs 观测用）。
     cancels: Arc<Mutex<HashMap<u64, Arc<RequestFlags>>>>,
@@ -352,10 +356,8 @@ impl HttpHandler for HandlerBridge {
                         });
                         // NonBlocking 信号语义：队列满/运行时关闭即丢弃
                         // （返回状态检查——不悬挂 watcher 出口）
-                        let _ = tsfn.call(
-                            Ok(ev.to_string()),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
+                        let _ =
+                            tsfn.call(Ok(ev.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
                     }
                     cancels.lock().await.remove(&rid);
                 })

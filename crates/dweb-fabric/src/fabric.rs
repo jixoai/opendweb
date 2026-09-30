@@ -285,7 +285,13 @@ impl FabricConfig {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
-            relay: RelayConfig::N0Default,
+            // [W12]（design §9.1 架构定论 + Codex r7 终审 B1 approve）：数据面
+            // 缺省 direct-only。HTTP-only relay（hub 形态）只能注册不能转发
+            // 端点间 QUIC 数据——配进 relay 位即持续投毒（relay "已连接"→
+            // relay-first 吞没→停滞；实证 disabled 2.3s vs relay 115s 超时）。
+            // N0/custom 由调用方显式 opt-in；QUIC/TLS 数据面 relay 由后续
+            // 独立 change 显式开放。
+            relay: RelayConfig::Disabled,
             advertise_addrs: Vec::new(),
             secret: SecretInjection::Default,
             http_proxy: HttpProxyConfig::None,
@@ -916,34 +922,86 @@ fn invite_v2_relay_order<'a>(
 /// 挂起 4 分钟以上且 relay TCP 已断——传输层无进展排干）。有界等待：超时
 /// 即放弃排干继续收尾（Endpoint 句柄随 FabricInner 释放，进程退出面无资源
 /// 滞留），close 的幂等性保证并发调用安全。
-async fn close_endpoint_bounded(inner: &Arc<FabricInner>) {
+/// [B2/Codex r7] deadline 由调用方传入：shutdown 路径传全局 5s deadline
+/// （direct endpoint 与主 endpoint 共享同一预算，不再各起 1s/5s 独立计时）。
+async fn close_endpoint_bounded(inner: &Arc<FabricInner>, deadline: tokio::time::Instant) {
     // 直连拨号专用 endpoint 一并有界收尾（可能持有活跃 direct 会话）
-    Fabric::close_direct_dial_endpoint_bounded(inner).await;
+    Fabric::close_direct_dial_endpoint_bounded(inner, deadline).await;
     let Some(endpoint) = inner.endpoint.get() else {
         return;
     };
-    const ENDPOINT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    if tokio::time::timeout(ENDPOINT_CLOSE_TIMEOUT, endpoint.close())
+    if tokio::time::timeout_at(deadline, endpoint.close())
         .await
         .is_err()
     {
         tracing::warn!(
-            timeout_secs = ENDPOINT_CLOSE_TIMEOUT.as_secs(),
-            "endpoint close did not finish draining; continuing shutdown"
+            "endpoint close did not finish draining before the shutdown deadline; \
+             continuing shutdown"
         );
+    }
+}
+
+/// shutdown 全局总预算（[B2]/Codex r7 终审）：单一 deadline 从 drain 入口
+/// 起算，所有收尾阶段（endpoint 关闭/accept loop/connect inflight/detached
+/// connect/accept children/watcher/manager）共享——任何阶段不得重起算。
+/// 截止后确定性 abort + 有界 join（见 [`abort_join_bounded`]），返回稳定
+/// incomplete-drain 错误。此前各阶段独立 5s 的最坏路径约 26s（direct 1s +
+/// 主 endpoint 5s + 四段各 5s）。
+const SHUTDOWN_DRAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// abort 后的有界 join（[B2]）：先发 abort 请求，再在同一 deadline 内等待
+/// 句柄真正结束（tokio Timeout 先 poll 内层 future 一次——已 abort 的异步
+/// 任务首个 poll 即收敛，deadline 已过也有这一次机会）。join 不在预算内
+/// 完成（任务处于不可取消的同步/不让出路径）时返回 false：句柄丢弃
+/// （detached），调用方记录 incomplete-drain 错误。绝不无条件 `task.await`
+/// ——那是预算外的无限等待（r7 指出的越界面）。
+async fn abort_join_bounded(
+    task: &mut tokio::task::JoinHandle<()>,
+    deadline: tokio::time::Instant,
+    phase: &str,
+) -> bool {
+    task.abort();
+    match tokio::time::timeout_at(deadline, &mut *task).await {
+        Ok(_) => true,
+        Err(_) => {
+            tracing::error!(
+                phase,
+                "task did not terminate after abort within the shutdown deadline; detaching"
+            );
+            false
+        }
     }
 }
 
 /// shutdown drain 主体（R4 P1-1：由后台任务持有，调用方 Future 取消不中断）。
 /// 全部收尾完成后 `send_replace(true)`——无订阅者也落值，顺序晚到调用即见 true。
+/// [B2] 单一全局 deadline：入口起算 [`SHUTDOWN_DRAIN_TOTAL_TIMEOUT`]，全部
+/// 阶段 `timeout_at(deadline, …)`；截止后 abort + 有界 join + incomplete-drain
+/// 错误，整体返回时间 ≤ 总预算（不再随阶段数线性叠加）。
 async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
+    let shutdown_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TOTAL_TIMEOUT;
+    let mut drain_error: Option<FabricError> = None;
+    /// 截止后统一记录 incomplete-drain（首调用显式感知未收敛）。
+    macro_rules! note_incomplete {
+        ($phase:expr) => {{
+            tracing::error!(
+                phase = $phase,
+                timeout_secs = SHUTDOWN_DRAIN_TOTAL_TIMEOUT.as_secs(),
+                "shutdown deadline exceeded; phase did not converge"
+            );
+            if drain_error.is_none() {
+                drain_error = Some(FabricError::Session(SessionError::Connect(
+                    "shutdown incomplete: drain deadline exceeded".into(),
+                )));
+            }
+        }};
+    }
     // [R8-1] 名册提交锁先于主门：等待已经开始的提交完成，再切换门状态。
     // 提交路径持有同一锁直到 roster 写入结束，因此门置位后不会再有名册写入。
     {
         let _commit = inner.roster_commit.lock().await;
         *inner.lifecycle_gate.lock().unwrap() = true;
     }
-    let mut drain_error: Option<FabricError> = None;
     // R5-R7：置 draining 并唤醒 single-flight 等待者（**不清空**航班表——
     // owner 条目由 FlightGuard 自清理，随后的空表等待观测真实 owner 收敛；
     // 准入与登记同锁，此后 connect 原子拒绝）
@@ -963,87 +1021,84 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
     }
     drop(peers);
     // watcher 先于 endpoint 释放退出（关闭后无任务残留、无后续事件）；
-    // guard 在显式作用域内释放，绝不跨 await。
+    // guard 在显式作用域内释放，绝不跨 await。[B2] abort + 有界 join。
     let watcher_task = { inner.relay_watcher_task.lock().unwrap().take() };
-    if let Some(task) = watcher_task {
-        task.abort();
-        let _ = task.await;
+    if let Some(mut task) = watcher_task
+        && !abort_join_bounded(&mut task, shutdown_deadline, "relay-watcher").await
+    {
+        note_incomplete!("relay-watcher");
     }
     // c2：会话自动重连 manager 先于 endpoint 释放退出（此后不再派发新的
     // 重拨 worker；已在途的 worker 由 accept_children 登记表统一收割）
     let reconnect_manager = { inner.reconnect_manager_task.lock().unwrap().take() };
-    if let Some(task) = reconnect_manager {
-        task.abort();
-        let _ = task.await;
+    if let Some(mut task) = reconnect_manager
+        && !abort_join_bounded(&mut task, shutdown_deadline, "reconnect-manager").await
+    {
+        note_incomplete!("reconnect-manager");
     }
     // continuity 连接全部 deliberate 关闭（supervisor 不触发重连；watch 置
-    // Closing——快照订阅者可观测收尾态）
-    inner
-        .continuity
-        .close_all(
+    // Closing——快照订阅者可观测收尾态）。[B2] 同一 deadline 有界。
+    if tokio::time::timeout_at(
+        shutdown_deadline,
+        inner.continuity.close_all(
             crate::continuity::state::ConnectionPhase::Closing,
             "shutdown",
-        )
-        .await;
+        ),
+    )
+    .await
+    .is_err()
+    {
+        note_incomplete!("continuity-close");
+    }
     // [H8] deferred 未启动即 shutdown：endpoint 从未 bind，无网络面可关。
-    close_endpoint_bounded(&inner).await;
+    close_endpoint_bounded(&inner, shutdown_deadline).await;
     // [R8-2] 先收割外层 accept loop，再关闭 child registry；loop 退出后不再有
     // 生产者可以把晚到 child push 到已 take 的表中。
     let accept_loop = { inner.accept_loop_task.lock().unwrap().take() };
-    if let Some(mut task) = accept_loop {
-        let deadline = tokio::time::Instant::now() + DETACHED_CONNECT_SHUTDOWN_TIMEOUT;
-        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-            tracing::warn!("accept loop did not finish after endpoint close; aborting (R8-2)");
-            task.abort();
-            // [R8-2] abort 只是请求；无条件 join 才能证明外层 loop 已退出，
-            // 随后关闭 child registry 不会再遇到晚到生产者。
-            let _ = task.await;
+    if let Some(mut task) = accept_loop
+        && tokio::time::timeout_at(shutdown_deadline, &mut task)
+            .await
+            .is_err()
+    {
+        tracing::warn!("accept loop did not finish before the shutdown deadline; aborting (R8-2)");
+        if !abort_join_bounded(&mut task, shutdown_deadline, "accept-loop").await {
+            note_incomplete!("accept-loop");
         }
     }
     // R5 重排：endpoint 先关——存量 owner 的挂起拨号随即失败退出，随后的
     // 空表等待才是有意义的收敛（关闭中的 endpoint 使拨号必然失败）
-    let inflight_deadline = tokio::time::Instant::now() + DETACHED_CONNECT_SHUTDOWN_TIMEOUT;
     while !inner.connect_inflight.lock().await.map.is_empty() {
-        if tokio::time::Instant::now() >= inflight_deadline {
-            tracing::error!(
-                timeout_secs = DETACHED_CONNECT_SHUTDOWN_TIMEOUT.as_secs(),
-                "connect inflight not empty after endpoint close; reporting incomplete drain"
-            );
+        if tokio::time::Instant::now() >= shutdown_deadline {
             // [R8-3] 记录错误但继续收割 accept/detached 子任务；完成通知只能
             // 在所有可登记任务处理完后发出，首调用仍显式感知未收敛。
-            drain_error = Some(FabricError::Session(SessionError::Connect(
-                "shutdown incomplete: connect owner did not drain in time".into(),
-            )));
+            note_incomplete!("connect-inflight");
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     // HB 4.1：detached connect 任务收尾——endpoint 已关闭，在途 connect
-    // 大多随即自然失败；对仍未结束者共享一个 deadline 等待（不取消，
+    // 大多随即自然失败；对仍未结束者共享同一 deadline 等待（不取消，
     // 保 P1-10 半开连接规避），超上限 abort 并记 warning。
     // R2 P0-2：置 flag 与 drain 同一临界区——此后到达的登记会被登记侧
-    // 本地 abort+await，不再进表；abort 后 join 确认真正退出。
+    // 本地 abort+await，不再进表；abort 后有界 join（B2）。
     {
         let tasks: Vec<_> = {
             let mut reg = inner.detached_connects.lock().unwrap();
             reg.shutting_down = true;
             std::mem::take(&mut reg.tasks)
         };
-        if !tasks.is_empty() {
-            let deadline = tokio::time::Instant::now() + DETACHED_CONNECT_SHUTDOWN_TIMEOUT;
-            for mut task in tasks {
-                // 经 &mut 借听 timeout：Elapsed 时句柄仍存活，abort 后可再 join
-                let abort_handle = task.abort_handle();
-                if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-                    tracing::warn!(
-                        timeout_secs = DETACHED_CONNECT_SHUTDOWN_TIMEOUT.as_secs(),
-                        "detached connect task did not finish after endpoint close; \
-                         aborting to guarantee clean shutdown (HB 4.1)"
-                    );
-                    abort_handle.abort();
-                    // [R8-2] 不丢弃句柄：取消请求后必须消费 join 结果，避免
-                    // detached 任务在完成门之后继续持有 endpoint。
-                    let _ = task.await;
+        for mut task in tasks {
+            // 经 &mut 借听 timeout：Elapsed 时句柄仍存活，abort 后可再 join
+            if tokio::time::timeout_at(shutdown_deadline, &mut task)
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    "detached connect task did not finish before the shutdown deadline; \
+                     aborting to guarantee clean shutdown (HB 4.1)"
+                );
+                if !abort_join_bounded(&mut task, shutdown_deadline, "detached-connect").await {
+                    note_incomplete!("detached-connect");
                 }
             }
         }
@@ -1055,16 +1110,17 @@ async fn shutdown_drain(inner: Arc<FabricInner>) -> Result<(), FabricError> {
             reg.closing = true;
             std::mem::take(&mut reg.tasks)
         };
-        let deadline = tokio::time::Instant::now() + DETACHED_CONNECT_SHUTDOWN_TIMEOUT;
         for mut child in children {
-            let abort_handle = child.abort_handle();
-            if tokio::time::timeout_at(deadline, &mut child).await.is_err() {
+            if tokio::time::timeout_at(shutdown_deadline, &mut child)
+                .await
+                .is_err()
+            {
                 tracing::warn!(
-                    "accept child did not finish after endpoint close; aborting (R7 P1-3)"
+                    "accept child did not finish before the shutdown deadline; aborting (R7 P1-3)"
                 );
-                abort_handle.abort();
-                // [R8-2] abort 后仍等待句柄真正结束，再宣告生命周期完成。
-                let _ = child.await;
+                if !abort_join_bounded(&mut child, shutdown_deadline, "accept-child").await {
+                    note_incomplete!("accept-child");
+                }
             }
         }
     }
@@ -1661,9 +1717,9 @@ pub struct FabricInner {
     /// home relay watcher 任务（Disabled 模式不启动；shutdown 显式 abort + join）。
     relay_watcher_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// detached connect 任务登记（HB 4.1）：join deadline 到期后 connect
-    /// wrapper 任务在后台自然跑完（P1-10 不取消语义）；shutdown 收尾时等待
-    /// 其退出（上限 [`DETACHED_CONNECT_SHUTDOWN_TIMEOUT`]，超时 abort +
-    /// warning）。已自然结束的句柄在下次登记时惰性清理。
+    /// wrapper 任务在后台自然跑完（P1-10 不取消语义）；shutdown 收尾时在
+    /// 全局 drain deadline（[`SHUTDOWN_DRAIN_TOTAL_TIMEOUT`]，[B2]）内等待
+    /// 其退出，超时 abort + warning。已自然结束的句柄在下次登记时惰性清理。
     /// R2 P0-2：`shutting_down` 与任务表同锁——登记侧见 flag 即本地 abort+await，
     /// 关闭侧置 flag 与 drain 在同一临界区完成，消灭"spawn 后、登记前"的
     /// 关闭后残留窗口。
@@ -1927,9 +1983,6 @@ enum JoinPhaseError {
     Other(String),
 }
 
-/// detached connect 任务 shutdown 等待上限（HB 4.1）：endpoint 关闭后残留
-/// 的后台 connect 最多再等 5s 自然结束，超时 abort（保证进程退出无悬挂）。
-const DETACHED_CONNECT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// relay 相位拨号罚期（真双机验收实证 2026-09-30）：全量候选拨号被硬上界
 /// 放弃后的观察期——期内拨号偏好强制直连（有 IP 候选时），不再发起注定
 /// 挂起的 relay 相位拨号；期满或 relay 恢复后自然解除。
@@ -2420,7 +2473,9 @@ impl Fabric {
                 }
                 // bind 已完成但未到 spawn 段的 endpoint：显式关闭——
                 // shutdown 返回后无晚到网络事件（watcher 从未启动）。
-                close_endpoint_bounded(inner).await;
+                // [B2] 启动取消路径独立起算同一 5s 总预算（非 drain 全局面）。
+                let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TOTAL_TIMEOUT;
+                close_endpoint_bounded(inner, deadline).await;
                 Ok(StartOutcome::CancelledByShutdown)
             }
             // 正常完成：同步尾部 spawn（序列内无 await——取消只能落在 work
@@ -2444,7 +2499,8 @@ impl Fabric {
                     // 极端竞态：work 完成与 shutdown 裁判同时就绪且 shutdown
                     // 先落 Closed——撤销刚 spawn 的常驻任务 + 关 endpoint，
                     // 保持「shutdown 返回后无晚到网络事件」。
-                    close_endpoint_bounded(inner).await;
+                    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TOTAL_TIMEOUT;
+                    close_endpoint_bounded(inner, deadline).await;
                     for abort in aborts {
                         abort.abort();
                     }
@@ -2471,7 +2527,8 @@ impl Fabric {
                     }
                 };
                 if won_shutdown {
-                    close_endpoint_bounded(inner).await;
+                    let deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TOTAL_TIMEOUT;
+                    close_endpoint_bounded(inner, deadline).await;
                     Ok(StartOutcome::CancelledByShutdown)
                 } else {
                     Err(FabricError::StartFailedShared(shared))
@@ -3217,10 +3274,15 @@ impl Fabric {
         }
         // 4：本地数据面——本 Fabric 构造时已加载（attach/open 的豁免错误已在彼处
         //    透出）；此处的数据面错误只剩 merge/持久化 IO（roster-io 豁免，末尾透出）。
-        // 学习 issuer 可达信息，供后续常规连接使用（有界，HB 3.1）
+        // 学习 issuer 可达信息，供后续常规连接使用（有界，HB 3.1）。
+        // [W12] direct-only 地址卫生：Disabled 数据面不把 relay URL 学进
+        // known_addrs（真双机实证：mini 的 known_addrs.json 曾混进
+        // "http://192.168.2.8:3340"——HTTP-only hub relay 被当直连候选
+        // 持久化，重启后经 connect 的候选合并回流拨号地址）；只学直连。
+        let relay_paths_enabled = !matches!(self.inner.relay, RelayConfig::Disabled);
         {
             let mut learned: Vec<String> = Vec::new();
-            if !token.invite.issuer_relay_url.is_empty() {
+            if relay_paths_enabled && !token.invite.issuer_relay_url.is_empty() {
                 learned.push(token.invite.issuer_relay_url.clone());
             }
             learned.extend(token.invite.issuer_direct_addrs.iter().cloned());
@@ -3248,9 +3310,11 @@ impl Fabric {
             }
         }
         // 6：空路径——拨号前立即失败，零等待、不消耗时限。
-        let has_relay = !token.invite.issuer_relay_url.is_empty();
+        // [W12]：Disabled 数据面只有直连一相——relay-only 令牌（无直连地址）
+        // 对 direct-only joiner 同样是空路径，报错指向 advertise_addrs。
+        let token_has_relay = !token.invite.issuer_relay_url.is_empty();
         let has_direct = !token.invite.issuer_direct_addrs.is_empty();
-        if !has_relay && !has_direct {
+        if !token_has_relay && !has_direct {
             return Err(FabricError::Join {
                 code: JoinErrorCode::NoReachablePath,
                 message: "the token carries no relay URL and no direct addresses (likely \
@@ -3259,15 +3323,32 @@ impl Fabric {
                     .to_owned(),
             });
         }
+        if !relay_paths_enabled && !has_direct {
+            return Err(FabricError::Join {
+                code: JoinErrorCode::NoReachablePath,
+                message: "the fabric runs direct-only (relay disabled) and the token \
+                          carries no direct addresses; ask the inviter to re-sign with \
+                          advertised direct addresses"
+                    .to_owned(),
+            });
+        }
         // c1：本地 relay 配置作为补充拨号候选（与 connect 的合并语义一致，
         // known-addrs-boundary 冻结“custom relay 候选始终参与，learned 是
         // 补充”）。令牌携带的 issuer relay 在前、配置候选在后（EndpointAddr
         // 内部去重）；issuer 配置的首条 relay（令牌来源）死亡时，同列表中的
         // 其余 relay 兜底承接，join 不再被单死条目阻断。
+        // [W12]：Disabled 数据面剥掉 invite 携带的全部 relay 候选（endpoint_
+        // addr_from_invite 的产物含 relay URL——HTTP-only relay 进拨号地址
+        // 即 relay-first 停滞源）；空路径门已保证此形态下直连地址在场。
         let addr = Self::with_local_relay_candidates(
             session::endpoint_addr_from_invite(&token)?,
             &self.inner.relay,
         );
+        let addr = if relay_paths_enabled {
+            addr
+        } else {
+            Self::strip_relay_candidates(&addr)
+        };
         // 7：deadline 包住 connect + redeem（到期取消等待并关闭已建立的连接）。
         // token 克隆进 deadline 工作流（错误归因探针仍需原令牌字段）
         // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
@@ -3362,10 +3443,15 @@ impl Fabric {
         if self.inner.lifecycle_closing() {
             return Err(FabricInner::shutting_down_error());
         }
-        // 4：学习 issuer 可达信息（relay 列表 + 直连地址，有界 HB 3.1）
+        // 4：学习 issuer 可达信息（relay 列表 + 直连地址，有界 HB 3.1）。
+        // [W12] 同 v1：Disabled 数据面只学直连（relay URL 不进 known_addrs）。
+        let relay_paths_enabled = !matches!(self.inner.relay, RelayConfig::Disabled);
         {
-            let mut learned: Vec<String> =
-                token.invite.relays.iter().map(|r| r.url.clone()).collect();
+            let mut learned: Vec<String> = if relay_paths_enabled {
+                token.invite.relays.iter().map(|r| r.url.clone()).collect()
+            } else {
+                Vec::new()
+            };
             learned.extend(token.invite.direct_addrs.iter().map(|a| a.to_string()));
             let snapshot = {
                 let mut ka = self.inner.known_addrs.lock().await;
@@ -3389,7 +3475,8 @@ impl Fabric {
                 ));
             }
         }
-        // 6：空路径
+        // 6：空路径。[W12]：Disabled 数据面下 relay 列表不构成可达路径——
+        // relay-only 令牌（无直连地址）按空路径立即失败（同 v1 分支语义）。
         if token.invite.relays.is_empty() && token.invite.direct_addrs.is_empty() {
             return Err(FabricError::Join {
                 code: JoinErrorCode::NoReachablePath,
@@ -3399,14 +3486,28 @@ impl Fabric {
                     .to_owned(),
             });
         }
-        // bootstrap capability 注入（热更新共享句柄；N0/Disabled 模式无注入面，
-        // 候选合并仍携带 relay URL——受限部署的 joiner 应以 Custom 形态配置）
-        let bootstrap: Vec<(String, String)> = token
-            .invite
-            .relays
-            .iter()
-            .filter_map(|r| r.capability.as_ref().map(|c| (r.url.clone(), c.clone())))
-            .collect();
+        if !relay_paths_enabled && token.invite.direct_addrs.is_empty() {
+            return Err(FabricError::Join {
+                code: JoinErrorCode::NoReachablePath,
+                message: "the fabric runs direct-only (relay disabled) and the token \
+                          carries no direct addresses; ask the inviter to re-sign with \
+                          advertised direct addresses"
+                    .to_owned(),
+            });
+        }
+        // bootstrap capability 注入（热更新共享句柄；N0/Disabled 模式无注入面
+        // ——受限部署的 joiner 应以 Custom 形态配置；[W12] Disabled 下 relay
+        // 候选整体剥离，bootstrap 票无消费面，不再注入/清 deny 记录）
+        let bootstrap: Vec<(String, String)> = if relay_paths_enabled {
+            token
+                .invite
+                .relays
+                .iter()
+                .filter_map(|r| r.capability.as_ref().map(|c| (r.url.clone(), c.clone())))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if let Some(map) = &self.inner.relay_map {
             inject_relay_tokens(map, &bootstrap);
         }
@@ -3416,11 +3517,17 @@ impl Fabric {
             // join 之前的 deny（deny 只在 join 窗口内由 watcher 重新记录）。
             clear_stale_deny_note(&self.inner.relay_snapshot);
         }
-        // c1 同款：本地 relay 配置追加为拨号候选
+        // c1 同款：本地 relay 配置追加为拨号候选（[W12] Disabled 剥掉 invite
+        // relay 候选，同 v1 路径）
         let addr = Self::with_local_relay_candidates(
             session::endpoint_addr_from_invite_v2(&token)?,
             &self.inner.relay,
         );
+        let addr = if relay_paths_enabled {
+            addr
+        } else {
+            Self::strip_relay_candidates(&addr)
+        };
         // 7：deadline 包住 connect + redeem（token 克隆进工作流；后续错误
         // 归因仍需原令牌的 relay 列表）
         // [H8] deferred 未 start：明确 NotStarted 错误（网络操作前置）。
@@ -3707,9 +3814,14 @@ impl Fabric {
         // 第一步主 endpoint 全量、第二步直连回落。直连步骤的载体按 relay
         // 配置分流：**配置了 relay 的 fabric 用独立 endpoint**（主 endpoint 上
         // 该 NodeId 的 relay 选中路径/尸体连接/abandoned pending 拨号会把
-        // 直连候选也饿死——A-反向实证）；**Disabled fabric 用主 endpoint
-        // direct-only**（无 relay 状态可逃，独立 endpoint 反而制造双连接
-        // displacement 抖动——continuity_session 幂等用例实证）。
+        // 直连候选也饿死——A-反向实证）。
+        // [W12] direct-only（真双机实证 2026-09-30 第四轮）：主 endpoint 直连
+        // 优先（continuity_session 幂等语义保持），**停滞即换独立 endpoint
+        // 直连**——空闲断线后主 endpoint 上该 NodeId 的死选中路径/尸体连接/
+        // 被 abandon 的 pending 拨号同样把直连重拨整体饿死（对端重启也救不
+        // 回，本端 fresh endpoint 即恢复；A-反向同族机制，与 relay 无关）。
+        // 独立 endpoint 只作停滞回落（非常规首择），双连接 displacement 抖动
+        // 不进常态路径。
         #[derive(Clone, Copy)]
         enum DialStep {
             ScratchDirect,
@@ -3724,6 +3836,8 @@ impl Fabric {
         };
         let steps: [DialStep; 2] = if direct_only.addrs.is_empty() {
             [DialStep::MainFull, DialStep::MainFull]
+        } else if relay_disabled {
+            [DialStep::MainDirect, DialStep::ScratchDirect]
         } else if prefer_direct {
             [direct_step, DialStep::MainFull]
         } else {
@@ -3768,8 +3882,8 @@ impl Fabric {
                             // 直连不受主 endpoint 上被 abandon 的 pending 拨号
                             // 卡死（A-反向修复点：redial 在主 endpoint 上无限
                             // 重演 relay-first 停滞 = 150s 全 500 活锁）。
-                            // Disabled 面：维持「停滞即返回」旧语义（主 endpoint
-                            // 二次拨号同停的实证约束）。
+                            // Disabled 面仅在无直连候选（[MainFull, MainFull]
+                            // 计划）时落此分支：无候选可换，停滞即返回。
                             Self::enter_relay_dial_penalty(&self.inner).await;
                             if attempt == 1 || relay_disabled || direct_only.addrs.is_empty() {
                                 return Err(FabricError::Session(SessionError::Connect(format!(
@@ -3804,7 +3918,20 @@ impl Fabric {
                             return Err(e.into());
                         }
                         Err(_) => {
+                            // [W12] attempt 0 停滞不就此返回：主 endpoint 直连停滞
+                            // 说明该 NodeId 的 per-remote 状态已卡死（死选中路径/
+                            // 尸体连接/abandoned pending——对端重启也救不回），
+                            // 下一步独立 endpoint 直连是唯一逃逸面（真双机实证
+                            // 2026-09-30 第四轮：主 endpoint 重拨恒停滞，fresh
+                            // endpoint 即恢复）。
                             Self::enter_relay_dial_penalty(&self.inner).await;
+                            if attempt == 0 {
+                                tracing::debug!(
+                                    peer = %endpoint_id_display(id),
+                                    "direct dial on main endpoint stalled; retrying on a fresh endpoint"
+                                );
+                                continue;
+                            }
                             return Err(FabricError::Session(SessionError::Connect(format!(
                                 "connect dial exceeded {}s bound (direct candidates stalled)",
                                 CONNECT_DIAL_BOUND.as_secs()
@@ -4001,16 +4128,18 @@ impl Fabric {
     }
 
     /// 直连拨号专用 endpoint 的有界收尾（随主 endpoint 关闭路径调用）。
-    pub(crate) async fn close_direct_dial_endpoint_bounded(inner: &Arc<FabricInner>) {
+    /// [B2] 与主 endpoint 共享调用方传入的同一 deadline（不再独立 1s 预算）。
+    pub(crate) async fn close_direct_dial_endpoint_bounded(
+        inner: &Arc<FabricInner>,
+        deadline: tokio::time::Instant,
+    ) {
         let endpoint = inner.direct_dial_endpoint.lock().await.take();
-        if let Some(ep) = endpoint {
-            const CLOSE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
-            if tokio::time::timeout(CLOSE_BOUND, ep.close()).await.is_err() {
-                tracing::warn!(
-                    timeout_secs = CLOSE_BOUND.as_secs(),
-                    "direct-dial endpoint close did not finish; continuing"
-                );
-            }
+        if let Some(ep) = endpoint
+            && tokio::time::timeout_at(deadline, ep.close()).await.is_err()
+        {
+            tracing::warn!(
+                "direct-dial endpoint close did not finish before the deadline; continuing"
+            );
         }
     }
 
@@ -4220,15 +4349,22 @@ impl Fabric {
     /// EndpointAddr 内部为去重集合（P1-6：多 relay 全量进入，不截断故障
     /// 切换能力）。不可解析的 learned 条目跳过（令牌侧已在 precheck 拒绝，
     /// 此处防御 add_known_addr 的手工注入）。
+    /// [W12] direct-only 地址卫生：`Disabled` 数据面不消费任何 relay URL
+    /// 候选——learned/known_addrs 里的 relay 形态串（历史持久化文件或手工
+    /// 注入混入的 http://relay 条目）解析为 RelayUrl 的一律跳过，只保留
+    /// IP 直连候选（否则 HTTP-only relay 仍会经 learned 进入拨号地址）。
     pub(crate) fn merge_dial_candidates(
         id: &EndpointId,
         learned: &[String],
         relay: &RelayConfig,
     ) -> EndpointAddr {
         let mut addr = EndpointAddr::new(*id);
+        let relay_paths_enabled = !matches!(relay, RelayConfig::Disabled);
         for hint in learned {
             if let Ok(url) = hint.parse::<iroh::RelayUrl>() {
-                addr = addr.with_relay_url(url);
+                if relay_paths_enabled {
+                    addr = addr.with_relay_url(url);
+                }
             } else if let Ok(ip) = hint.parse::<std::net::SocketAddr>() {
                 addr = addr.with_ip_addr(ip);
             }
@@ -5490,6 +5626,83 @@ mod tests {
         assert!(addr.addrs.is_empty());
     }
 
+    #[test]
+    fn merge_learned_relay_urls_filtered_under_disabled() {
+        // [W12] direct-only 地址卫生：Disabled 数据面不消费 learned 里的 relay
+        // URL（历史 known_addrs 持久化文件或手工注入混入的 http://relay 条目
+        // ——真双机实证 mini 的 known_addrs.json 混进 hub relay）；直连 IP
+        // 候选保留。
+        let addr = Fabric::merge_dial_candidates(
+            &any_id(6),
+            &[
+                "http://192.168.2.8:3340".to_owned(), // hub HTTP-only relay（毒源）
+                "192.168.2.8:3341".to_owned(),        // 真直连
+            ],
+            &RelayConfig::Disabled,
+        );
+        assert!(
+            relay_urls_of(&addr).is_empty(),
+            "relay hints must not enter dial candidates under Disabled"
+        );
+        assert!(
+            addr.ip_addrs()
+                .any(|ip| ip.to_string() == "192.168.2.8:3341")
+        );
+        // 对照：Custom 模式 relay hint 照常参与（HB 3.1 冻结语义不变）
+        let addr = Fabric::merge_dial_candidates(
+            &any_id(7),
+            &["http://192.168.2.8:3340".to_owned()],
+            &RelayConfig::Custom(vec!["https://r.example".to_owned()]),
+        );
+        assert_eq!(
+            relay_urls_of(&addr),
+            vec![
+                norm_url("http://192.168.2.8:3340"),
+                norm_url("https://r.example"),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_config_is_direct_only() {
+        // [W12]：缺省数据面 direct-only——FabricConfig::new 不再落入 n0 默认
+        // relay；n0/custom 只能显式 opt-in（显式构造各形态仍可用）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = FabricConfig::new(dir.path());
+        assert!(matches!(cfg.relay, RelayConfig::Disabled));
+        // 显式 opt-in 路径不受缺省变化影响
+        let mut custom = FabricConfig::new(dir.path());
+        custom.relay = RelayConfig::Custom(vec!["https://r.example".to_owned()]);
+        assert!(custom.validate().is_ok());
+        let mut n0 = FabricConfig::new(dir.path());
+        n0.relay = RelayConfig::N0Default;
+        assert!(n0.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_constructed_fabric_has_zero_relay_data_plane_contact() {
+        // [W12] 缺省零接触：FabricConfig::new 构造的 root——relay 快照 disabled/
+        // 空 urls/online null、无 watcher、invite 在无 advertise_addrs 时拒签
+        //（HTTP-only relay 永不进入数据面）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let fabric = Fabric::create_root(FabricConfig::new(dir.path()))
+            .await
+            .unwrap();
+        let status = fabric.relay_status();
+        assert_eq!(status.mode, "disabled");
+        assert!(status.urls.is_empty(), "no RelayMap entries");
+        assert_eq!(status.online, None);
+        assert!(
+            fabric.relay_watcher_exited(),
+            "no watcher task under default config"
+        );
+        assert!(matches!(
+            fabric.invite(60_000, None).await,
+            Err(FabricError::InviteWithoutRelay)
+        ));
+        fabric.shutdown().await.unwrap();
+    }
+
     // ---- c1/c2 relay failover ------------------------------------------------------
 
     fn snapshot(online: Option<bool>, active_url: Option<String>) -> RelayStatusSnapshot {
@@ -5889,6 +6102,74 @@ mod tests {
         assert!(
             children.tasks.is_empty(),
             "accept children must be collected"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_deadline_is_single_and_global() {
+        // [B2/Codex r7] 注入测试：accept loop / connect inflight / detached
+        // connect / accept child 四类同时永不收敛（真实 endpoint 在位）——
+        // 全部阶段必须共享 drain 入口起算的单一 5s deadline。旧实现各阶段
+        // 独立 5s 预算下此 fixture 至少 4×5s=20s；新实现断言：
+        // 1) 整体 ≤ 总预算+测试余量；2) 返回稳定 incomplete-drain 错误；
+        // 3) 完成门可观察（后续调用立即放行）；4) 完成后无后续事件。
+        let dir = tempfile::TempDir::new().unwrap();
+        let fabric = Fabric::create_root(cfg(&dir)).await.unwrap();
+        let inner = fabric.inner.clone();
+
+        // 阻塞 accept loop：登记位换成永不结束任务
+        *inner.accept_loop_task.lock().unwrap() =
+            Some(tokio::spawn(async { std::future::pending::<()>().await }));
+        // 阻塞 inflight：无 owner guard 的航班条目（无人清理 → 空表等待永不满足）
+        {
+            let mut inflight = inner.connect_inflight.lock().await;
+            let (tx, _rx) = tokio::sync::watch::channel(false);
+            inflight.map.insert(any_id(0x21), Arc::new((0, tx)));
+        }
+        // 阻塞 detached connect（登记表 + 永不结束任务）
+        inner
+            .detached_connects
+            .lock()
+            .unwrap()
+            .tasks
+            .push(tokio::spawn(async { std::future::pending::<()>().await }));
+        // 阻塞 accept child
+        inner
+            .accept_children
+            .lock()
+            .unwrap()
+            .tasks
+            .push(tokio::spawn(async { std::future::pending::<()>().await }));
+
+        let mut events = fabric.subscribe();
+        while events.try_recv().is_ok() {} // 清空构造期事件，只观测 shutdown 后
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            SHUTDOWN_DRAIN_TOTAL_TIMEOUT + std::time::Duration::from_secs(2),
+            fabric.shutdown(),
+        )
+        .await
+        .expect("shutdown must respect the single global drain deadline");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= SHUTDOWN_DRAIN_TOTAL_TIMEOUT + std::time::Duration::from_secs(2),
+            "total drain must stay within the single global deadline (+test margin), \
+             took {elapsed:?}"
+        );
+        let err = result.expect_err("blocked phases must surface an incomplete-drain error");
+        assert!(
+            err.to_string().contains("shutdown incomplete"),
+            "stable incomplete-drain error expected: {err}"
+        );
+        // 完成门可观察：后续 shutdown 立即放行
+        tokio::time::timeout(std::time::Duration::from_secs(2), fabric.shutdown())
+            .await
+            .expect("completion gate must be observable after deadline drain")
+            .unwrap();
+        // 完成后无后续事件
+        assert!(
+            events.try_recv().is_err(),
+            "no events after completion gate"
         );
     }
 

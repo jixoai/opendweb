@@ -140,12 +140,14 @@ maybeTest("relays entry without token/serverId (credential-free entry)", async (
 // ---- 构造期校验矩阵 ---------------------------------------------------------------
 
 maybeTest("relays rejected outside mode custom", async () => {
+  // [W12]：mode 缺省 = disabled（direct-only）——无 mode 的 relays 按被拒
+  // （此前缺省 n0 时的拒绝消息是 "only valid with mode 'custom'"）
   await rejects(
     Fabric.createRoot({
       dataDir: tmpdir("dweb-rl-n0-"),
       relay: { relays: [{ url: DEAD_RELAY }] },
     }),
-    /relay\.relays is only valid with mode 'custom'/,
+    /relay\.relays is (not accepted with mode 'disabled'|only valid with mode 'custom')/,
   );
   await rejects(
     Fabric.createRoot({

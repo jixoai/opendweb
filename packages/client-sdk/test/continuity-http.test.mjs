@@ -240,8 +240,15 @@ maybeTest("sse e2e: transparent auto-resume across continuityReset, byte-exact, 
     await session.close();
     await server.close();
   } finally {
-    await a.shutdown();
-    await b.shutdown();
+    // [B2] shutdown 单一全局 5s deadline：负载下 endpoint 排干可能不收敛——
+    // 返回稳定 incomplete-drain 错误是有界收尾的正确形态（非回归），本用例
+    // 关注 SSE 续传语义，teardown 容忍该错误；其它 shutdown 错误仍 fail。
+    const tolerateBoundedDrain = (e) => {
+      if (/shutdown incomplete/.test(String(e?.message ?? e))) return;
+      throw e;
+    };
+    await a.shutdown().catch(tolerateBoundedDrain);
+    await b.shutdown().catch(tolerateBoundedDrain);
   }
 });
 

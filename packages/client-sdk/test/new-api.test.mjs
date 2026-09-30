@@ -103,6 +103,18 @@ maybeTest("joinWithToken with foreign fabric dir rejects with [wrong-fabric] pre
 
 // ---- relayStatus 三态 ------------------------------------------------------------
 
+maybeTest("relayStatus: omitted relay config defaults to direct-only disabled ([W12])", async () => {
+  // [W12] 缺省 direct-only：不提供 relay 配置不再落入 n0——HTTP-only relay
+  // 不能承载端点间 QUIC 数据面（真双机实证 relay-first 停滞）；n0 只能显式
+  // opt-in（`relay: { mode: "n0" }`）。缺省快照 = disabled/空 urls/online null。
+  const a = await Fabric.createRoot({ dataDir: tmpdir("dweb-rs-def-") });
+  const s = await a.relayStatus();
+  assert.equal(s.mode, "disabled", "omitted relay config => direct-only default");
+  assert.deepEqual(s.urls, [], "no relay candidates under the default config");
+  assert.equal(s.online, null);
+  await a.shutdown();
+});
+
 maybeTest("relayStatus: disabled => online null, no relay events", async () => {
   const a = await Fabric.createRoot({ dataDir: tmpdir("dweb-rs-d-"), relay: { mode: "disabled" } });
   const events = [];
