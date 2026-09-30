@@ -17,7 +17,7 @@ Codex 共同架构师轮全裁定）收敛为可冻结设计。[W7]-[W11] 为讨
 | [W4] | 刚需：多台设备同步 agents-skills/prompt/wiki/configs | Owner 原话 |
 | [W5] | webui 薄核（服务启动/设备发现/认证/互联/管理）+ 插件系统 | Owner 原话 |
 | [W6] | 首发=三件套；vpn/clash/AI/ssh/屏幕共享「即将推出」占位 | Owner 原话 |
-| [W7] | 端口共享 v1 请求体有界（默认 8MiB 可配）+ 超限 413；流式请求体 ABI 扩展为后续 change（不动 app-protocol-layer 边界） | 推荐，待追认 |
+| [W7] | 端口共享 v1 请求体有界（r8-B4 收窄：默认 1MiB 可配，配置域 64KiB–1MiB——transport 可容纳域，必然失败配置拒绝）+ 超限 413；流式请求体 ABI 扩展为后续 change（不动 app-protocol-layer 边界） | 推荐，待追认 |
 | [W8] | 同步组账本/ref 命名自 v1 记录 N 成员（每设备一 ref）；**v1 同步执行与收敛只保证双机**（pairwise），第三成员加入/多端 fan-in 收敛为后续 change 显式义务（r2-B4 收窄） | 推荐（W4「多台」导出），待追认 |
 | [W9] | 首次建组：UI 显式选择一端为初始权威（seed authority），不做首次自动合并 | 推荐，待追认 |
 | [W10] | 插件包安装仅 CLI（opendweb plugin add 家族）；webui 面板只管启停/配置，不触发 npm 安装 | 推荐，待追认 |
@@ -112,11 +112,19 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
   按 (peer endpointId, plugin, share/port, operation) **deny-by-default** 判定；
   授权数据落各插件的共享/映射账本（§5/§6），会话密码学身份=第一道门。
 
-## 4. SDK 传输事实与使用边界（r1 地基事实 1-3 + r2-B1 修订）
+## 4. SDK 传输事实与使用边界（r1 地基事实 1-3 + r2-B1 修订 + r8-B4 包络冻结）
 
-- 请求体=静态分块（Array<Uint8Array>）——**v1 一切上行按 [W7] 有界**：
-  ports 代理 8MiB 默认（可配范围 1MiB–64MiB 硬上限，超范围配置拒绝）；files 分片
-  chunk 默认 4MiB；sync 对象单传默认 16MiB（超限对象 v1 拒绝并提示，pack 化后置）。
+- **v1 有效包络（r8-B4 冻结）＝min(插件预算, transport 实况)＝1MiB 单帧**：
+  请求体=静态分块（Array<Uint8Array>）——fetch_http 把每个元素作为单个 DATA
+  帧发送（无自动拆分；fabric session `MAX_FRAME=1MiB` session.rs:19）、journal
+  单流 ≤2MiB、会话在飞（未 ACK）≤8MiB（第六/七批真双机三层实测）。一切上行
+  按帧 ≤1MiB、单请求流账 ≤2MiB 有界 [W7 r8-B4]：
+  ports 代理默认 1MiB（可配域 **64KiB–1MiB**、64KiB 粒度——transport 可容纳
+  域；超出=必然失败配置，配置期拒绝；超限 413 语义保留）；files 分片 chunk
+  默认与**有效硬上限** 1MiB（真双机实证仅 1MiB chunk 稳定通过；chunk/read
+  单请求上限 >1MiB 的工厂配置拒绝）；sync 单对象 ≤1MiB、push 闭包序列化
+  总量（wire）≤2MiB 流账（发送前预检，超限稳定拒绝 `closure-exceeds-transport`
+  ——分批/pack 化 push 与流式请求 body ABI 为后续 change）。
   未知 Content-Length 的入站请求 MUST 边读边累计、达到上限立即断开拒绝（不得先
   缓冲后判）；**跨请求并发累计内存预算 MUST 强制且额度冻结**：ports 并发代理
   ≤16 请求、files 并发传输（上传 chunk+读流合计）≤4、sync ≤2 流/组（既有），
@@ -211,10 +219,12 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 
 - `GET refs`（对端 refs 快照）；`POST want`（body：期望 commit + 已有 OID 摘要集
   （ Bloom/区间摘要——v1 用排序 OID 列表分页比对））→ 返回缺失对象清单；
-  `GET object/<oid>`（单松散对象，带类型+长度+OID；>16MiB 拒绝 §4——引用该
+  `GET object/<oid>`（单松散对象，带类型+长度+OID；>1MiB 拒绝 §4 r8-B4——引用该
   blob 的整个 push 拒绝且 ref/工作树不变，其他独立 root 或不含该 blob 的后续
   commit 不受影响；文件级跳过大对象=过滤树/commit 语义，非 v1）；
-  `POST push`（commit DAG **parent 闭包** + 新对象集，staging 校验后 ref CAS）。
+  `POST push`（commit DAG **parent 闭包** + 新对象集，staging 校验后 ref CAS；
+  r8-B4：闭包单对象 ≤1MiB 且 wire 总量 ≤2MiB 流账——引擎发送前预检+端点读体
+  同限，超限稳定拒绝 `closure-exceeds-transport`，分批/pack 化后置）。
 - **CAS**：push/ref 更新带 expectedOldRef；不匹配=拒绝+提示重 fetch/merge
   （r1 Q5：无 last-write-wins）。**单写者**：每 repo 同时只允许一个本地
   merge/ref writer（插件内互斥+账本锁）。
@@ -274,9 +284,12 @@ dispose（定时器/watcher/事件订阅/锁释放）→ 状态落盘。enable �
 - 触发：会话在线事件 + 间隔兜底（默认 30s，节律纪律沿用 F1 家族）；本地变更
   扫描 debounce 2s。同步任务状态机：idle→scanning→fetching→merging→(conflicted)→
   pushing→done|error（UI 状态页+错误+重试+进度）。
-- 预算（r1 遗漏维度 5）：单 blob ≤16MiB、单次同步对象数 ≤5000、总传输 ≤256MiB、
-  并发会话流 ≤2/组；超预算明示拒绝与分批建议。GC：对象去重靠内容寻址；
-  reflog 式清理=非首发。
+- 预算（r1 遗漏维度 5；r8-B4 包络对齐）：单 blob ≤1MiB（commitLocal 入史前
+  扫描预检——超限稳定 `oversize-history`+迁移提示，不写史；既有毒化历史不自动
+  重写/不静默删除，用户显式 reset/re-seed/历史重写）、push 闭包 wire ≤2MiB
+  （流账）、单次同步对象数 ≤5000、单轮累计传输 ≤256MiB（跨多个 ≤1MiB 请求的
+  聚合预算）、并发会话流 ≤2/组；超预算明示拒绝与分批建议。GC：对象去重靠内容
+  寻址；reflog 式清理=非首发。
 
 ### 7.6 实现期首批验收义务（探针未证路径，r1 Q5 补充证据边界）
 
@@ -310,7 +323,7 @@ packages/*/test 用例），并纳入 §9 双机验收矩阵。
   非重叠双方变更自动合并 / 重叠冲突→选版本→收敛 / 同步中断→恢复→两端 OID 与
   工作树一致 / [W9] 首次建组非空对端阻断；**协议边界（r2-B7 补入矩阵）**：
   push 缺 parent/树/blob 闭包→拒绝且 ref 不动 / 显式 abort→零 ref 与工作树
-  变化+staging TTL 回收 / type 与 mode 冲突→文件级决议 UI / >16MiB 对象拒绝且
+  变化+staging TTL 回收 / type 与 mode 冲突→文件级决议 UI / >1MiB（r8-B4）对象 commitLocal 预检 oversize-history 不写史+push 整体拒绝且
   ref 不动 / §7.3.1 四边界崩溃注入→roll-forward 收敛。
 - 每 Phase 绿门：对应包 node --test + 既有套件全绿 + strict 校验；
   最终 Codex 实现终验 + Owner 双机实走。
@@ -474,6 +487,58 @@ only 连接形态下 legacy 连接可能永不建立）。F5 落地（intervalMs
 client-sdk 96、strict 通过。E1′ 遗留①（进程内拨号停滞/iroh 同 NodeAddr
 新握手抑制面）续档。详见 docs/acceptance-webui-plugin-kernel-dualmachine.md
 第七批。
+
+**第八轮实录（r8-B4/F2 v1 包络冻结落地，2026-09-30 下午）**：Codex r8 终审
+B4/F2（NOT-READY 主因：规范/客户端默认/服务端上限/transport wire 形态四方
+不一致，默认上传同步在真实网络上确定性失败+超限 blob 毒化历史）按裁定
+**逐条实装**（非文档取最小值）——v1 有效包络=min(插件预算, transport 实况)
+=**1MiB**（帧 session.rs MAX_FRAME=1MiB、journal 流 2MiB、会话在飞 8MiB、
+fetch_http 静态 Array<Uint8Array> 无流式 ABI）：
+
+1. **ports**：默认 8→1MiB；配置域 1-64MiB → **64KiB–1MiB/64KiB 粒度**
+   （resolveLimitBytes 重写——必然失败配置在配置期拒绝；413 超限语义保留）；
+   代理转发前逐元素 ≤1MiB 帧再分块（proxy.mjs rechunkForFrames）。
+2. **files**：chunk 默认与有效硬上限 4→1MiB（client/staging/runtime 三处）；
+   readMaxBytes 同档；chunk/read >1MiB 工厂期拒绝（MAX_TRANSFER_ENVELOPE_BYTES）；
+   UI FileBrowserPage.CHUNK 4→1MiB+dist 重建；sidecar files bridge 转发前
+   ≤1MiB 帧分块。
+3. **sync 入史前拒绝+毒化迁移**：MAX_OBJECT_BYTES 16MiB→1MiB；commitLocal
+   扫描预检（scanWorktree lstat 尺寸在读内容/写 blob **之前**）→ 超限稳定
+   `oversize-history`+迁移提示（不写史：device ref/tree/commit 零变化）；
+   端点 GET object/push 同上限原子拒绝；fetch 侧 413 oversize → 稳定映射
+   `oversize-history`；**既有毒化历史不自动重写/不静默删除**（pushToPeer
+   闭包遍历检出——对象保留在库、用户显式 reset/re-seed/历史重写；不含该
+   历史的独立 root 继续可用）。
+4. **sync closure 包络（严格收窄+拒绝语义）**：pushToPeer 发送前预检——
+   闭包单对象 ≤1MiB 且序列化总量（ndjson+base64 wire）≤**2MiB 流账**
+   （MAX_PUSH_WIRE_BYTES，engine 预检与端点读体上限同拍）；超限稳定
+   `closure-exceeds-transport`（消息注明分批/pack 化 push 与流式请求 body
+   ABI 为后续 change）——不再一次性发送任意 closure；util.readBoundedJsonLines
+   同步体路径补 maxTotal 强制（loopback 不再绕过服务端读体边界）。
+5. **宿主传输适配**：webui data-plane toSyncFetch 请求体 ≤1MiB 帧分块
+   （fetch_http 逐元素单帧——2MiB wire push 体分块进入流账，单帧发送形态
+   必败的隐患消除）。
+6. **分层 transport 替身**（最小清单第 3 项）：packages/webui/test/
+   plugin-transport-double.mjs——真实执行 1MiB 帧/2MiB 流/8MiB 会话（响应
+   读尽释放——journal ACK 语义）三层账；三插件电池各接超包络用例
+   （ext-sync 6 条：1MiB 端到端/closure 预检/commitLocal 预检/毒化 push+fetch
+   检出/替身单元×2；ext-ports 3 条：旧单 Buffer 形态帧层拦下+边界通过+9×1MiB
+   并发会话层；ext-files 4 条：1.5MiB 分片上传闭环/工厂期拒绝/2MiB 单 chunk
+   帧层拦下零 staging 残留/多元素超流账）。
+7. **真双机边界回归**（docs/acceptance-webui-plugin-kernel-dualmachine.md
+   第八批）：HEAD+B4 变更树（排除并行 TERM 任务 WIP）双端部署+16 文件 md5
+   审计全一致；files 恰 1MiB PUT 200+commit 201（md5 双端一致）/1MiB+1B
+   **413 chunk-too-large 零残留**；sync 1MiB 对象 push 615ms 收敛（md5
+   `c3cda277…` 双端一致）/超限对象 `oversize-history`（mini ref 零变化）/
+   超限 closure `closure-exceeds-transport`（wire 2796700>2097152；mini ref
+   None 零变化）；移除超限文件后同组恢复收敛（迁移路径实证）。结束态：双端
+   sidecar 运行（iMac 86233/mini 71785）、三插件 enabled、8080/hub 未动。
+   绿门：ext-ports **38/38**（35+3）、ext-files **57/57**（53+4）、ext-sync
+   **67/67**（61+6）、webui 261、strict 通过；cargo 未触碰（纯 JS+docs）。
+   **r8 最小清单对照**：①包络统一（本条 1-3+§4/delta/W7 同步）✅；
+   ②closure 收窄+拒绝语义+入史前拒绝+毒化迁移 ✅；③分层替身+真双机
+   >1MiB 边界完整回归 ✅；④TERM 闩锁（B5）非本批范围（并行任务处理中）。
+   B5 之外的 B4/F2 阻塞面全部闭合。
 
 ## 10. 评审处置表
 

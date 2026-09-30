@@ -7,14 +7,16 @@
 //   {status, headers(小写 record), readBody()}`；body 为静态分块
 //   （Array<Uint8Array>——SDK fetchHttp 形状）。错误面：非 2xx →
 //   WireClientError{status, code, message}（JSON 错误体）。
-// 3. 上传：分片循环（默认 4MiB；chunkHash=sha256(bytes)）→ commit（整文件
+// 3. 上传：分片循环（默认 1MiB——r8-B4 v1 有效包络：transport 帧上限 1MiB，
+//   真双机实证仅 1MiB chunk 稳定通过；chunkHash=sha256(bytes)）→ commit（整文件
 //   sha256 增量累计——与服务端重算比对）。下载：offset/len Range 循环+
 //   整体 sha256 校验（x-opendweb-oid 对账——传输层 EOF 不作完整性证据）。
 
 import { createHash } from "node:crypto";
 
-/** 默认分片（4MiB——与服务端 chunkMaxBytes 默认同拍） */
-export const CLIENT_CHUNK_BYTES = 4 * 1024 * 1024;
+/** 默认分片（1MiB——与服务端 chunkMaxBytes 默认同拍；r8-B4：v1 transport 有效
+ * 包络=1MiB 帧（fabric session MAX_FRAME）——更大分片在真实网络上必然失败） */
+export const CLIENT_CHUNK_BYTES = 1024 * 1024;
 
 /**
  * wire 客户端错误。

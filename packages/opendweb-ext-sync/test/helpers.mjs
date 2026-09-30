@@ -31,15 +31,21 @@ export async function makeRoot(files = {}, prefix = "dweb-sync-root-") {
  * 双端 loopback 装配：两台设备的 runtime 互相以内存 fetchImpl 直调对端
  * handleSyncRequest（无真实 Fabric 会话——契约同形：fetchHttp/serveHttp 的
  * JS 投影）。
- * @param {{ aId: string, bId: string, aName?: string, bName?: string, now?: () => number, log?: object, asyncSessionResolver?: boolean }} opts
+ * opts.transportDouble=true 时（r8-B4）：fetchImpl 经分层 transport 替身包裹
+ * （packages/webui/test/plugin-transport-double.mjs——1MiB 帧/2MiB 流/8MiB
+ * 会话三层账，与生产 toSyncFetch 同款 ≤1MiB 帧分块），单机 loopback 不再
+ * 绕过真实 transport 包络；共享 ledger 暴露为返回值 transportLedger。
+ * @param {{ aId: string, bId: string, aName?: string, bName?: string, now?: () => number, log?: object, asyncSessionResolver?: boolean, transportDouble?: boolean }} opts
  */
 export async function makePair(opts) {
   const { createSyncRuntime } = await import("../src/index.mjs");
   const { jsonBody } = await import("../src/util.mjs");
+  const { createSessionLedger, wrapSyncFetchImpl } = await import("../../webui/test/plugin-transport-double.mjs");
   const aHome = await makeHome("dweb-sync-a-");
   const bHome = await makeHome("dweb-sync-b-");
   /** @type {Map<string, { runtime: any, home: string }>} */
   const endpoints = new Map();
+  const transportLedger = opts.transportDouble === true ? createSessionLedger() : null;
 
   /**
    * @param {string} selfId
@@ -47,7 +53,7 @@ export async function makePair(opts) {
    * @param {string} home
    */
   function register(selfId, selfName, home) {
-    const fetchImpl = async (session, req) => {
+    const loopbackFetch = async (session, req) => {
       // 生产保真防线（真双机验收 F4 回归网）：真实宿主 fabric.sessionResolver
       // 是异步的——引擎若不 await，fetchImpl 会收到 Promise（生产报
       // session.fetchHttp is not a function）。loopback 在此如实拒绝。
@@ -65,6 +71,7 @@ export async function makePair(opts) {
         signal: req.signal,
       });
     };
+    const fetchImpl = transportLedger !== null ? wrapSyncFetchImpl(loopbackFetch, { ledger: transportLedger }) : loopbackFetch;
     const sessionObj = (peerEndpointId) => ({ peerEndpointId, selfEndpointId: selfId, sessionId: "loopback" });
     // asyncSessionResolver：真实宿主形态（Promise 返回——webui fabric.mjs
     // sessionResolver 是 async 函数；同步 loopback 形态曾掩盖 F4）
@@ -84,6 +91,7 @@ export async function makePair(opts) {
     aHome,
     bHome,
     endpoints,
+    transportLedger,
     /** @param {string} id */
     registerMore: (id, name) => register(id, name, undefined),
     async cleanup() {

@@ -15,7 +15,7 @@ export {
   openRootFd,
   resetCapabilityCacheForTest,
 } from "./fdchain.mjs";
-export { createFilesRuntime, DEFAULT_MAX_CONCURRENT_TRANSFERS } from "./runtime.mjs";
+export { createFilesRuntime, DEFAULT_MAX_CONCURRENT_TRANSFERS, MAX_TRANSFER_ENVELOPE_BYTES } from "./runtime.mjs";
 export {
   createWireFilesController,
   createHandlerTransport,

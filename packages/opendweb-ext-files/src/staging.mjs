@@ -23,8 +23,10 @@ import { atomicWrite0600 } from "./fslock.mjs";
 export const STAGING_DIR = "staging";
 /** 默认 TTL（15min；design §6「staging 带 TTL 回收」默认值） */
 export const DEFAULT_STAGING_TTL_MS = 15 * 60 * 1000;
-/** 单 chunk 上限（4MiB；design §4 [W7] files 分片默认） */
-export const DEFAULT_CHUNK_MAX_BYTES = 4 * 1024 * 1024;
+/** 单 chunk 上限（1MiB；design §4 [W7] files 分片默认——r8-B4 收窄：v1 有效
+ * 包络=min(插件预算, transport 实况)=1MiB 帧（fabric session MAX_FRAME），真双机
+ * 实证仅 1MiB chunk 稳定通过；运行时对超过此上限的 chunkMaxBytes 配置拒绝） */
+export const DEFAULT_CHUNK_MAX_BYTES = 1024 * 1024;
 
 /** uploadId 白名单 */
 const UPLOAD_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;

@@ -4,7 +4,7 @@
 
 ### Requirement: 文件同步插件（虚拟 git：单向/双向/冲突）
 
-sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对象同步端点（`/wpk1/sync/<groupId>/<rootId>/<op>`：`GET refs`/`POST want`/`GET object/<oid>`/`POST push`，不实现 git smart HTTP）+ 自持三方树合并（分类 add/modify/delete/type/mode；文本 blob 走 node-diff3 `stringSeparator:"\n"` 非重叠自动合并）实现 [W3] 全语义。同步组账本 `<DWEB_HOME>/plugins/sync/groups.json`（members/roots/seedAuthority）；gitdir 独立于用户目录（`<DWEB_HOME>/plugins/sync/<groupId>/<rootId>/git`），工作树=用户目录本体；组模型账本/ref 命名 MUST 支持 N 成员记录（每设备 ref `refs/devices/<endpointId>/main` + 组收敛 ref），但 v1 同步执行与收敛 MUST 只保证双机 pairwise 语义（第三成员加入/多端 fan-in 收敛为后续 change 义务）[W8]。**push/对象传输 MUST 含 commit DAG parent 闭包**；ref 更新 MUST 带 expectedOldRef 做 compare-and-swap（不匹配=拒绝并提示重新 fetch/merge，无 last-write-wins）；每 repo 同时 MUST 只有一个本地 merge/ref writer。对象落盘前 MUST 校验类型+长度+OID（传输 EOF 不得作为完整性证据）；传输先入 staging，取消/校验失败 MUST NOT 移动 ref。冲突 MUST 分级：UTF-8 文本重叠区=hunk 级（逐块选 ours/theirs 或编辑；ours/theirs 按 endpointId 稳定排序）；binary/超限/非 UTF-8/delete-modify/type/mode=文件级选择。冲突记录 MUST 持久化 base/ours/theirs OID+diff3 算法版本+用户决议（两端可复现）；merge driver 钩子 MUST 预留（结构化 a/b/o hunk 输入；AI merge 为未来 driver，v1 不自动写回）。单向同步=只读镜像（fetch+fast-forward 跟随）；双向=fetch+merge+push。[W9] 首次建组 MUST 由 UI 显式选择 seed authority，对端首拉前工作树非空 MUST 阻断并给三方对照（不自动合并不覆盖）。调度=会话在线事件+间隔兜底（默认 30s）+本地变更 debounce 2s；预算 MUST 强制（单 blob ≤16MiB、单次对象 ≤5000、单次传输 ≤256MiB、并发流 ≤2/组，超限明示拒绝）。
+sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对象同步端点（`/wpk1/sync/<groupId>/<rootId>/<op>`：`GET refs`/`POST want`/`GET object/<oid>`/`POST push`，不实现 git smart HTTP）+ 自持三方树合并（分类 add/modify/delete/type/mode；文本 blob 走 node-diff3 `stringSeparator:"\n"` 非重叠自动合并）实现 [W3] 全语义。同步组账本 `<DWEB_HOME>/plugins/sync/groups.json`（members/roots/seedAuthority）；gitdir 独立于用户目录（`<DWEB_HOME>/plugins/sync/<groupId>/<rootId>/git`），工作树=用户目录本体；组模型账本/ref 命名 MUST 支持 N 成员记录（每设备 ref `refs/devices/<endpointId>/main` + 组收敛 ref），但 v1 同步执行与收敛 MUST 只保证双机 pairwise 语义（第三成员加入/多端 fan-in 收敛为后续 change 义务）[W8]。**push/对象传输 MUST 含 commit DAG parent 闭包**；ref 更新 MUST 带 expectedOldRef 做 compare-and-swap（不匹配=拒绝并提示重新 fetch/merge，无 last-write-wins）；每 repo 同时 MUST 只有一个本地 merge/ref writer。对象落盘前 MUST 校验类型+长度+OID（传输 EOF 不得作为完整性证据）；传输先入 staging，取消/校验失败 MUST NOT 移动 ref。冲突 MUST 分级：UTF-8 文本重叠区=hunk 级（逐块选 ours/theirs 或编辑；ours/theirs 按 endpointId 稳定排序）；binary/超限/非 UTF-8/delete-modify/type/mode=文件级选择。冲突记录 MUST 持久化 base/ours/theirs OID+diff3 算法版本+用户决议（两端可复现）；merge driver 钩子 MUST 预留（结构化 a/b/o hunk 输入；AI merge 为未来 driver，v1 不自动写回）。单向同步=只读镜像（fetch+fast-forward 跟随）；双向=fetch+merge+push。[W9] 首次建组 MUST 由 UI 显式选择 seed authority，对端首拉前工作树非空 MUST 阻断并给三方对照（不自动合并不覆盖）。调度=会话在线事件+间隔兜底（默认 30s）+本地变更 debounce 2s；预算 MUST 强制（单 blob ≤1MiB、单次对象 ≤5000、单轮累计传输 ≤256MiB（跨多个 ≤1MiB 请求的聚合预算）、并发流 ≤2/组，超限明示拒绝）。r8-B4 v1 有效包络=min(插件预算, transport 实况)=1MiB 单帧/2MiB 单流：`commitLocal` 在写入 device ref 前 MUST 扫描预检（读内容/写 blob 之前），超限文件返回稳定 `oversize-history` 错误+迁移提示（不写史）；远端端点对 >1MiB blob 同上限原子拒绝（GET object/push 整体 413 oversize，fetch 侧映射为稳定 `oversize-history`）。既有超限（毒化）历史 MUST NOT 自动重写、MUST NOT 静默删除——检测到时返回稳定错误+迁移提示（用户显式 reset/re-seed/历史重写），不含该历史的独立 root 继续可用。push 闭包 MUST 满足单对象 ≤1MiB 且序列化总量（ndjson+base64 wire 字节）≤2MiB（流账）——发送前预检，超限稳定拒绝（`closure-exceeds-transport`，错误信息注明分批/pack 化 push 与流式请求 body ABI 为后续 change；v1 静态请求不得一次性发送任意 closure）。
 
 #### Scenario: 单向跟随（A 改 B 跟）
 
@@ -46,10 +46,10 @@ sync 插件 SHALL 以 isomorphic-git 为对象/refs/commit 底座 + 自定义对
 - **WHEN** base=非可执行文件（内容 V0）；ours=设了可执行位（内容仍 V0）；theirs=修改内容为 V1（mode 未变）——双方对同一路径竞争性变更（mode 变化 vs 内容变化）
 - **THEN** 判为文件级冲突（mode 与内容竞争变更不做自动组合——保守规则：mode 变化与另一端内容变化一律文件级冲突，单侧 mode 变化才按三方合并自动传播）；UI 呈现 ours/theirs 整体条目选择（内容+mode 一体，不可拆开选）；决议后最终 git tree mode 与工作树执行位一致
 
-#### Scenario: 超限对象拒绝（r4-N3 统一：整 push 原子拒绝）
+#### Scenario: 超限对象拒绝（r4-N3 统一 + r8-B4：入史预检/毒化检出/闭包包络）
 
-- **WHEN** 同步根的某 commit 树引用了 >16MiB 的单 blob
-- **THEN** 引用该 blob 的整个 push 被拒绝并明示（含排除/拆分建议）——部分对象成功不构成合法实现；ref 与工作树零变化；不含该 blob 的其他同步根与后续 commit 不受影响（文件级跳过大对象=过滤树语义，非 v1）
+- **WHEN** 同步根工作树出现 >1MiB 的文件（commitLocal 扫描）；或既有历史的 commit 闭包含 >1MiB 的单 blob（push 闭包遍历/对端 GET object）；或 push 闭包序列化总量 >2MiB wire（流账预检）
+- **THEN** 入史前：`commitLocal` 返回稳定 `oversize-history`（含迁移提示），device ref/tree/commit 零变化（不写史）；push 检出：引用该 blob 的整个 push 被拒绝并明示——部分对象成功不构成合法实现，对端 ref 与工作树零变化；毒化历史不自动重写/不静默删除（用户显式 reset/re-seed/历史重写；不含该历史的独立 root 继续可用）；closure 超流账：发送前稳定拒绝 `closure-exceeds-transport`（注明分批/pack 化 push 为后续 change），对端 ref 零变化
 
 #### Scenario: 崩溃边界注入与路径级三态恢复（r4-N2：含引擎半写区分）
 

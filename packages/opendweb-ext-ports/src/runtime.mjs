@@ -5,13 +5,13 @@
 //    冻结的 PluginRuntime 形状：onEnable/onDispose 钩子；本模块不改宿主）。
 //    宿主无 back-reference 通道——在途 drain/强制取消在 onDispose 内自持（有界
 //    超时，与宿主 DRAIN_TIMEOUT_MS 同拍量级）。
-// 2. 配置（configSchema: maxBodyMiB，默认 8）：每次启动映射时重解析——工厂
-//    config 覆盖 > 宿主运行账本 <home>/plugins/state.json 的 plugins.ports.config
-//    （PUT /sidecar/plugins/ports/config 的落盘面——只读消费，不写宿主账本；
-//    改配经 disable→enable 生效）> 默认 8。配置域 1-64MiB 硬范围（[W7]）：
-//    超范围拒绝启动映射（每条启用映射 listener=failed+明确错误，spec「并发
-//    预算与配置硬域」Scenario）——configSchema 子集无 min/max 表达，域校验在
-//    本层执行。
+// 2. 配置（configSchema: maxBodyMiB，默认 1MiB——r8-B4 v1 有效包络）：每次启动
+//    映射时重解析——工厂 config 覆盖 > 宿主运行账本 <home>/plugins/state.json 的
+//    plugins.ports.config（PUT /sidecar/plugins/ports/config 的落盘面——只读消费，
+//    不写宿主账本；改配经 disable→enable 生效）> 默认 1MiB。配置域 64KiB–1MiB、
+//    64KiB 粒度（[W7] r8-B4 收窄；transport 帧上限 1MiB）：超范围/非粒度拒绝启动
+//    映射（每条启用映射 listener=failed+明确错误，spec「并发预算与配置硬域」
+//    Scenario）——configSchema 子集无 min/max 表达，域校验在本层执行。
 // 3. 消费侧生命周期：enable=startEnabledMappings（每条启用映射独立起监听，
 //    EADDRINUSE 等失败=该映射 failed+明确错误、其余映射不受牵连）；disable=
 //    拒新→在途有界 drain→强制取消（两阶段取消原语）→socket 拆除。

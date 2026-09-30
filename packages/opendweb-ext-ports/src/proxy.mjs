@@ -16,7 +16,9 @@
 //      本机下游断开 MUST 调响应句柄 abort()（HttpClientResponse.abort → RESET
 //      → provider signal + 上游 socket 收敛）；
 //    - 取消路径一律静默收敛（客户端已断，无响应面）。
-// 4. 限额（[W7] 硬域）：默认 8MiB，配置域 1-64MiB（超范围由 runtime 拒启映射）；
+// 4. 限额（[W7] 硬域，r8-B4 收窄）：默认 1MiB，配置域 64KiB–1MiB、64KiB 粒度
+//    （超范围由 runtime 拒启映射——v1 有效包络=min(插件预算, transport 实况)
+//    =1MiB 帧（session.rs MAX_FRAME）；不得允许必然失败的配置）；
 //    已知 Content-Length 超限 → 413 零转发；未知长度边读边累计、达上限立即断开
 //    （不先缓冲后判）；并发 ≤16 在飞（429 拒新直至回落），在飞字节预算=16×上限
 //    （已知长度入场检查+未知长度逐请求上限联立保证 ≤16×上限）。
@@ -25,11 +27,15 @@
 import http from "node:http";
 import { forwardRequestHeaders, forwardResponseHeaders, nodeHeadersToArray, arrayHeadersToNode } from "./headers.mjs";
 
-/** 默认请求体上限（MiB）——[W7] */
-export const DEFAULT_MAX_BODY_MIB = 8;
-/** 配置域硬边界（MiB）：[1, 64] */
-export const MIN_CONFIG_MIB = 1;
-export const MAX_CONFIG_MIB = 64;
+/** 默认请求体上限（MiB）——[W7]；r8-B4：v1 有效包络=min(插件预算, transport
+ * 实况)=1MiB（fabric session MAX_FRAME=1MiB——更大默认在真实网络上必然失败） */
+export const DEFAULT_MAX_BODY_MIB = 1;
+/** 配置域硬边界（MiB）：[0.0625, 1]＝64KiB–1MiB（transport 可容纳域；超出=必然
+ * 失败配置，配置期拒绝——r8-B4 裁定，替代旧 [1,64] 域） */
+export const MIN_CONFIG_MIB = 0.0625;
+export const MAX_CONFIG_MIB = 1;
+/** 配置粒度（字节）：64KiB 整数倍（0.0625 MiB 步进） */
+export const CONFIG_GRANULARITY_BYTES = 64 * 1024;
 /** 并发代理上限（在飞请求数）——design §4 冻结 */
 export const MAX_CONCURRENT_PROXIES = 16;
 /** 映射级停用/进程 dispose 的在途 drain 默认超时（宿主 DRAIN_TIMEOUT_MS 同拍） */
@@ -39,15 +45,18 @@ const DRAIN_POLL_MS = 10;
 const MIB = 1024 * 1024;
 
 /**
- * 配置域校验：maxBodyMiB ∈ [1,64] 整数（超范围拒绝——由 runtime 拒启映射）。
+ * 配置域校验（r8-B4 收窄）：maxBodyMiB 解析为字节后须落在 [64KiB, 1MiB] 且为
+ * 64KiB 整数倍（超范围/非粒度=必然失败配置，拒绝——由 runtime 拒启映射）。
  * @param {number} maxBodyMiB
  * @returns {{ ok: true, bytes: number } | { ok: false, error: string }}
  */
 export function resolveLimitBytes(maxBodyMiB) {
-  if (!Number.isInteger(maxBodyMiB) || maxBodyMiB < MIN_CONFIG_MIB || maxBodyMiB > MAX_CONFIG_MIB) {
-    return { ok: false, error: `maxBodyMiB must be an integer in [${MIN_CONFIG_MIB}, ${MAX_CONFIG_MIB}] MiB (got ${JSON.stringify(maxBodyMiB)}); mappings are not started` };
-  }
-  return { ok: true, bytes: maxBodyMiB * MIB };
+  const bad = (why) => ({ ok: false, error: `maxBodyMiB ${why}; the v1 transport envelope admits 64KiB–1MiB in 64KiB steps (fabric session MAX_FRAME = 1MiB — larger limits deterministically fail on the real transport); mappings are not started (got ${JSON.stringify(maxBodyMiB)})` });
+  if (typeof maxBodyMiB !== "number" || !Number.isFinite(maxBodyMiB)) return bad("must be a finite number");
+  const bytes = maxBodyMiB * MIB;
+  if (bytes < MIN_CONFIG_MIB * MIB || bytes > MAX_CONFIG_MIB * MIB) return bad("is outside the [0.0625, 1] MiB (64KiB–1MiB) hard range");
+  if (bytes % CONFIG_GRANULARITY_BYTES !== 0) return bad("must be a multiple of 64KiB (0.0625 MiB)");
+  return { ok: true, bytes };
 }
 
 /** @param {number} ms @returns {Promise<void>} */
@@ -168,6 +177,30 @@ function parseContentLength(v) {
  * @returns {Promise<{ chunks: Uint8Array[], total: number }>} 超限抛
  *   code="EBODYLIMIT"（socket 已销毁）；客户端中断抛 code="ECLIENTGONE"
  */
+/** 单帧 payload 上限（transport 事实：fabric session.rs MAX_FRAME=1MiB——r8-B4） */
+const TRANSPORT_MAX_FRAME_BYTES = MIB;
+
+/**
+ * 请求体分块再切：保证每个元素 ≤1MiB（fetch_http 逐元素单帧发送；超限帧在
+ * 真实 transport 上确定性失败）。总量已由 limitBytes 有界——此为逐元素防线。
+ * @param {Uint8Array[]} chunks
+ * @returns {Uint8Array[]}
+ */
+function rechunkForFrames(chunks) {
+  /** @type {Uint8Array[]} */
+  const out = [];
+  for (const c of chunks) {
+    if (c.byteLength <= TRANSPORT_MAX_FRAME_BYTES) {
+      out.push(c);
+      continue;
+    }
+    for (let off = 0; off < c.byteLength; off += TRANSPORT_MAX_FRAME_BYTES) {
+      out.push(c.subarray(off, Math.min(off + TRANSPORT_MAX_FRAME_BYTES, c.byteLength)));
+    }
+  }
+  return out;
+}
+
 function readBoundedBody(req, limitBytes) {
   return new Promise((resolve, reject) => {
     /** @type {Uint8Array[]} */
@@ -365,6 +398,10 @@ export function createMappingServer(opts) {
         return;
       }
       if (clientGone || res.writableEnded || res.destroyed) return; // 读体期间客户端已断：零转发
+      // r8-B4 帧包络防线：fetch_http 把每个 Uint8Array 元素作为单个 DATA 帧发送
+      // （fabric session MAX_FRAME=1MiB）——Node 读体 chunk 通常 ≤64KiB，但此处
+      // 对逐元素做确定性 ≤1MiB 再分块（总量已被 limitBytes ≤1MiB 有界）。
+      chunks = rechunkForFrames(chunks);
       // 会话解析（fabric 会话不可得 → 502 明确错误）
       const session = await sessionResolver(mapping.peer);
       if (session == null) {

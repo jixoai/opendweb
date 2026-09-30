@@ -1,12 +1,13 @@
 // 对象同步端点（webui-plugin-kernel Phase 3 / design v2.3 §7.3——provider 侧
 // handler，`/wpk1/sync/<groupId>/<rootId>/<op>`，无 git smart HTTP）。
-// 意图（2026-09-29；r7-B3 闭合：取消线性化+组级并发预算+真实持久 staging）：
+// 意图（2026-09-29；r7-B3 闭合：取消线性化+组级并发预算+真实持久 staging；
+// r8-B4 包络收窄：v1 有效包络=min(插件预算, transport 实况)）：
 // 1. 四操作：GET refs（对端 refs 快照）/ POST want（期望 commit+已有 OID 排序
 //    列表分页比对 → 缺失对象清单）/ GET object/<oid>（单松散对象：类型+长度+
-//    OID 自证——EOF 不是完整性证据；>16MiB 拒绝 §4）/ POST push（ndjson 帧：
-//    首行头 {ref, expectedOldRef, targetCommit}+逐对象行）。
+//    OID 自证——EOF 不是完整性证据；>1MiB 拒绝 §4——r8-B4 收窄）/ POST push
+//    （ndjson 帧：首行头 {ref, expectedOldRef, targetCommit}+逐对象行）。
 // 2. push 闭包校验（r2-B7）：**parent+树+blob 全闭包**——staging 校验（每对象
-//    sha1 类型+长度自证；>16MiB blob=引用该 blob 的整个 push 原子拒绝——部分
+//    sha1 类型+长度自证；>1MiB blob=引用该 blob 的整个 push 原子拒绝——部分
 //    对象成功不构成合法实现；对象数>5000 预算拒绝）后走闭包遍历，缺任一引用
 //    对象 → 整个 push 拒绝（明确缺项清单）且 **零 ref 变化**、store 零写入；
 //    闭包全 → repo 互斥内 ref CAS（expectedOldRef 不匹配=拒绝+提示重
@@ -28,8 +29,8 @@
 //    （200），绝不返回「取消但已推进」的模糊态（崩溃恢复路径=重试幂等
 //    roll-forward，同 §7.3.1 三态恢复语义）。
 // 7. 组级并发预算（§7.5 并发流 ≤2/组）：push 与 GET object 共享 streamsInFlight
-//    在飞计数（push 每个 body 可达 256MiB 级——必须占预算），超限稳定 busy
-//    429，finally 归还。
+//    在飞计数（push 单请求体 ≤2MiB wire——r8-B4 流账；仍必须占预算），超限稳定
+//    busy 429，finally 归还。
 // 8. 请求体有界（§4）：读体边累计边判，超限立即拒绝（body-too-large →
 //    状态 413）；push 帧行级+总长双上限、逐 chunk 流式（不整体入内存）。
 
@@ -43,16 +44,21 @@ import {
 } from "./ledger.mjs";
 import { GROUP_REF, listRefsDirect, objectOid, readObject, walkClosure, writeRef, readRef, importLooseObjectAtomic } from "./objects.mjs";
 
-/** 单 blob 上限（§4：sync 对象单传 16MiB；超限对象 v1 拒绝并提示） */
-export const MAX_OBJECT_BYTES = 16 * 1024 * 1024;
+/** 单 blob 上限（§4 r8-B4 收窄：v1 有效包络=min(插件预算, transport 实况)
+ * =1MiB——fabric session MAX_FRAME=1MiB；超限对象 v1 拒绝并提示，pack 化后置） */
+export const MAX_OBJECT_BYTES = 1024 * 1024;
 /** 单次同步对象数上限（§7.5 预算） */
 export const MAX_OBJECTS_PER_SYNC = 5000;
-/** 单次传输总字节上限（§7.5） */
+/** 单轮同步累计传输字节上限（§7.5；跨多个 ≤1MiB 请求的聚合预算——非单请求包络） */
 export const MAX_TRANSFER_BYTES = 256 * 1024 * 1024;
 /** 并发流上限/组（§7.5） */
 export const MAX_STREAMS_PER_GROUP = 2;
-/** push 请求体总上限（base64 膨胀 4/3+JSON 开销+余量） */
-export const MAX_PUSH_BODY_BYTES = Math.ceil((MAX_TRANSFER_BYTES * 4) / 3) + 1024 * 1024;
+/** push 请求 wire 包络（r8-B4）：ndjson+base64 序列化总量 ≤2MiB＝journal 单流
+ * 账（engine 发送前预检同一常量；超限=closure-exceeds-transport 稳定拒绝，
+ * 分批/pack 化 push 为后续 change） */
+export const MAX_PUSH_WIRE_BYTES = 2 * 1024 * 1024;
+/** push 请求体总上限（=wire 包络；服务端读体边界与客户端预检同拍） */
+export const MAX_PUSH_BODY_BYTES = MAX_PUSH_WIRE_BYTES;
 /** want/其他 JSON 体上限（have 列表分页 ≤1000 OID×65B） */
 export const MAX_JSON_BODY_BYTES = 8 * 1024 * 1024;
 /** want have 分页建议值（客户端分页基准——v1 排序 OID 列表分页比对） */
@@ -179,7 +185,7 @@ export function createSyncEndpointHandler(opts) {
           return fail("not-found", { oid });
         }
         if (obj.bytes.byteLength > MAX_OBJECT_BYTES) {
-          return fail("oversize", { oid, size: obj.bytes.byteLength, limit: MAX_OBJECT_BYTES, hint: "object exceeds the 16MiB per-blob limit; split or exclude it (per-file skip is a filtered-tree feature, not v1)" });
+          return fail("oversize", { oid, size: obj.bytes.byteLength, limit: MAX_OBJECT_BYTES, hint: "object exceeds the 1MiB per-blob transport envelope (r8-B4); split or exclude it (per-file skip is a filtered-tree feature, not v1)" });
         }
         // 并发流 ≤2/组：在飞计数（finally 归还）
         const inflight = streamsInFlight.get(groupId) ?? 0;
@@ -236,7 +242,7 @@ export function createSyncEndpointHandler(opts) {
       await mkdir(stagingDir, { recursive: true, mode: 0o700 });
       const stagingFile = (/** @type {string} */ oid) => path.join(stagingDir, oid);
       // ---- 帧解析（ndjson 流式：首行头+对象行；AbortSignal 边读边检、中断即停） ----
-      // 每个对象行通过校验和自证（长度+类型+OID；blob>16MiB 整 push 拒绝）后
+      // 每个对象行通过校验和自证（长度+类型+OID；blob>1MiB 整 push 拒绝）后
       // **立即落真实 staging 文件**（0600 原子写）——内存只留元数据（r7-B3）。
       let header = null;
       /** @type {Array<{ oid: string, type: string, length: number }>} */
@@ -259,10 +265,10 @@ export function createSyncEndpointHandler(opts) {
         if (rec.type !== "blob" && rec.type !== "tree" && rec.type !== "commit") return fail("bad-request", { detail: `object type invalid: ${rec.type}` });
         const computed = objectOid(rec.type, bytes);
         if (computed !== rec.oid) return fail("integrity", { oid: rec.oid, computed });
-        // >16MiB blob：引用该 blob 的整个 push 原子拒绝（客户端按闭包整集上传，
-        // 服务端对集内任一超限对象拒绝整个 push——ref/工作树零变化）
+        // >1MiB blob（r8-B4 包络）：引用该 blob 的整个 push 原子拒绝（客户端按
+        // 闭包整集上传，服务端对集内任一超限对象拒绝整个 push——ref/工作树零变化）
         if (rec.type === "blob" && bytes.byteLength > MAX_OBJECT_BYTES) {
-          return fail("oversize", { oid: rec.oid, size: bytes.byteLength, limit: MAX_OBJECT_BYTES, hint: "the push referencing this blob is rejected as a whole; split the file or keep it out of the synced root (per-file skip = filtered-tree semantics, not v1)" });
+          return fail("oversize", { oid: rec.oid, size: bytes.byteLength, limit: MAX_OBJECT_BYTES, hint: "the push referencing this blob is rejected as a whole (1MiB per-blob transport envelope, r8-B4); split the file or keep it out of the synced root (per-file skip = filtered-tree semantics, not v1)" });
         }
         await atomicWrite0600(stagingFile(rec.oid), bytes);
         objects.push({ oid: rec.oid, type: rec.type, length: rec.length });

@@ -116,14 +116,17 @@ test("proxy: budget invariants — 16-slot cap, byte budget, unknown-size backfi
   assert.equal(unknown.tryAcquire(1), null, "beyond 16×limit is over budget");
 });
 
-test("proxy: config hard range 1-64MiB with default 8", () => {
-  assert.equal(DEFAULT_MAX_BODY_MIB, 8);
+test("proxy: config hard range 64KiB-1MiB (r8-B4 v1 transport envelope) with default 1", () => {
+  assert.equal(DEFAULT_MAX_BODY_MIB, 1);
   assert.equal(MAX_CONCURRENT_PROXIES, 16);
-  for (const ok of [1, 8, 64]) assert.deepEqual(resolveLimitBytes(ok), { ok: true, bytes: ok * MIB });
-  for (const bad of [0, 65, 128, 8.5, -1, "8"]) {
+  // 界内：1MiB（默认）、0.5MiB、64KiB（下界）
+  for (const ok of [1, 0.5, 0.0625]) assert.deepEqual(resolveLimitBytes(ok), { ok: true, bytes: ok * MIB });
+  // 界外/非粒度：0、2（旧上界内值——现超 transport 包络必拒）、64、128、8.5
+  // （非 64KiB 步进）、-1、"8"
+  for (const bad of [0, 2, 64, 128, 8.5, 0.07, -1, "8"]) {
     const r = resolveLimitBytes(bad);
     assert.equal(r.ok, false, `${JSON.stringify(bad)} MiB is out of the hard range`);
-    assert.match(/** @type {any} */ (r).error, /\[1, 64\]/);
+    assert.match(/** @type {any} */ (r).error, /64KiB.1MiB/);
   }
 });
 

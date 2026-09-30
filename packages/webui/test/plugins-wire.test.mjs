@@ -193,7 +193,7 @@ test("wire: enabling a non-data-plane action (config PUT) does not start the fab
     method: "PUT",
     path: "/sidecar/plugins/ports/config",
     headers: { ...sameOrigin, ...jsonHeaders },
-    body: JSON.stringify({ maxBodyMiB: 4 }),
+    body: JSON.stringify({ maxBodyMiB: 0.5 }), // r8-B4 配置域 64KiB-1MiB
   });
   assert.equal(put.status, 200);
   await flushAsync();

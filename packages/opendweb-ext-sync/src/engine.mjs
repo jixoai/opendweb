@@ -3,10 +3,12 @@
 // 1. 任务状态机（§7.5）：idle→scanning→fetching→merging→(conflicted)→pushing→
 //    done|error——单 root 单任务；UI 状态页经 runtime 投影消费。
 // 2. 双向流程：scanning（工作树→device ref 提交——「物化前本地改动 MUST 已被
-//    commit」）→ fetching（GET refs+want 分页+GET object，fetch-staging 暂存，
-//    全量校验后入库；预算强制：≤5000 对象/≤256MiB/≤2 流）→ merging（自持
-//    三方树合并；fast-forward 或 merge commit）→ pushing（闭包整集 push +
-//    expectedOldRef CAS；cas-mismatch→重取收敛一轮）。
+//    commit」；r8-B4：扫描预检单文件 ≤1MiB，超限 oversize-history 不写史）→
+//    fetching（GET refs+want 分页+GET object，fetch-staging 暂存，
+//    全量校验后入库；预算强制：≤5000 对象/单轮累计 ≤256MiB/≤2 流）→ merging
+//    （自持三方树合并；fast-forward 或 merge commit）→ pushing（闭包整集 push +
+//    expectedOldRef CAS；cas-mismatch→重取收敛一轮；r8-B4：单对象 ≤1MiB+
+//    closure wire ≤2MiB 发送前预检，超限稳定拒绝）。
 // 3. 单向流程（oneway=只读镜像）：不提交本地改动（不回传）；fetch+fast-forward
 //    跟随；对端组 ref 非前推 → mirror-diverged 明示。
 // 4. 工作树物化+组 ref 推进一律经 intent 事务（§7.3.1）；扫描后新改动由路径
@@ -43,7 +45,7 @@ import {
 import { scanToFlatEntries, scanWorktree, pathStateTuple } from "./worktree.mjs";
 import { executeIntent, readPendingIntent, recoverIntent } from "./intent.mjs";
 import { applyHunkDecisions, conflictRecordId, consultMergeDrivers, diff3TextMerge, DIFF3_ALGO_VERSION, mergeTrees } from "./merge.mjs";
-import { gcStaging, MAX_OBJECTS_PER_SYNC, MAX_STREAMS_PER_GROUP, MAX_TRANSFER_BYTES, WANT_HAVE_PAGE } from "./endpoint.mjs";
+import { gcStaging, MAX_OBJECT_BYTES, MAX_OBJECTS_PER_SYNC, MAX_PUSH_WIRE_BYTES, MAX_STREAMS_PER_GROUP, MAX_TRANSFER_BYTES, WANT_HAVE_PAGE } from "./endpoint.mjs";
 
 /** fetch 暂存目录（repoDir 下——与端点服务端 staging 分立；TTL 回收共用纪律） */
 export const FETCH_STAGING = "fetch-staging";
@@ -154,6 +156,8 @@ export function createSyncEngine(opts) {
 
   /**
    * commitLocal：扫描→device ref 提交（scanning 阶段——本地改动先入 device ref）。
+   * r8-B4 毒化防线：扫描期 maxFileBytes=1MiB 预检（读内容/写 blob 前）——超限文件
+   * 返回稳定 oversize-history+迁移提示，**不写史**（tree/commit/device ref 零变化）。
    * @param {{ repoDir: string, gitdir: string, rootPath: string, groupId: string, rootId: string, group: import("./ledger.mjs").SyncGroup, root: import("./ledger.mjs").SyncRoot }} ctx
    */
   async function commitLocal(ctx) {
@@ -161,7 +165,7 @@ export function createSyncEngine(opts) {
     return mutex.run("commit-local", async () => {
       const devRef = deviceRef(endpointId);
       const head = await readRef(ctx.gitdir, devRef);
-      const entries = await scanWorktree(ctx.rootPath, ctx.gitdir);
+      const entries = await scanWorktree(ctx.rootPath, ctx.gitdir, { maxFileBytes: MAX_OBJECT_BYTES });
       const flat = scanToFlatEntries(entries);
       const headTree = head === null ? null : (await readCommitParsed(ctx.gitdir, head)).tree;
       const treeOid = await writeTreeFromFlat(ctx.gitdir, flat.map((e) => ({ path: e.path, oid: e.oid, mode: /** @type {"100644" | "100755"} */ (e.mode) })));
@@ -261,7 +265,19 @@ export function createSyncEngine(opts) {
             if (resp.body?.code !== "busy") break;
             await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
           }
-          if (resp === null || !resp.ok || resp.body?.ok !== true) throw httpError("fetch-object", resp, { oid });
+          if (resp === null || !resp.ok || resp.body?.ok !== true) {
+            // 对端毒化历史（r8-B4）：GET object 命中 >1MiB blob 的 413 oversize →
+            // 稳定 oversize-history+迁移提示（不自动重写/不静默删除对端历史）
+            if (resp !== null && resp.body?.code === "oversize") {
+              throw {
+                code: "oversize-history",
+                message: `peer history contains blob ${oid} over the 1MiB transport envelope (size ${resp.body.size}, limit ${resp.body.limit ?? MAX_OBJECT_BYTES}) — poisoned history`,
+                hint: "the peer must explicitly reset/re-seed the root or rewrite history to exclude the oversized blob; v1 never auto-rewrites or deletes history; roots without it keep syncing",
+                detail: resp.body,
+              };
+            }
+            throw httpError("fetch-object", resp, { oid });
+          }
           const { type, length, contentBase64 } = resp.body;
           const raw = fromBase64(contentBase64);
           if (raw.byteLength !== length || objectOid(type, raw) !== oid) {
@@ -300,6 +316,12 @@ export function createSyncEngine(opts) {
 
   /**
    * push 到对端（闭包整集；expectedOldRef CAS；cas → 上层重取）。
+   * r8-B4 包络（严格收窄+拒绝语义）：
+   * - 单对象 ≤1MiB（closure 内任一超限 blob=毒化历史——稳定 oversize-history
+   *   +迁移提示，不自动重写/不静默删除；不含该历史的独立 root 继续可用）；
+   * - closure 序列化总量（ndjson+base64 wire 字节）≤2MiB＝journal 单流账，
+   *   发送前预检，超限=closure-exceeds-transport 稳定拒绝（分批/pack 化 push
+   *   为后续 change——v1 静态请求无流式 body ABI，不得一次性发送任意 closure）。
    * @param {ReturnType<typeof ctxFor>} ctx
    * @param {string} peer
    * @param {Record<string, string>} peerRefs 快照（expectedOldRef 来源）
@@ -321,14 +343,34 @@ export function createSyncEngine(opts) {
       if (closure.length > MAX_OBJECTS_PER_SYNC) {
         throw { code: "budget", message: `push closure is ${closure.length} objects (limit ${MAX_OBJECTS_PER_SYNC})`, hint: "reduce the history increment" };
       }
-      let bytes = 0;
+      // 毒化历史检测（r8-B4）：closure 内超限 blob 只可能来自旧历史
+      // （commitLocal 预检已挡新入）——稳定错误+显式迁移路径，绝不静默重写。
+      const poisoned = closure.find((o) => o.type === "blob" && o.size > MAX_OBJECT_BYTES);
+      if (poisoned !== undefined) {
+        throw {
+          code: "oversize-history",
+          message: `push closure contains blob ${poisoned.oid} of ${poisoned.size} bytes (limit ${MAX_OBJECT_BYTES} = 1MiB transport envelope) — poisoned history`,
+          hint: "existing oversize history is not auto-rewritten or deleted; explicitly reset/re-seed the root or rewrite history to exclude the oversized blob; roots without it keep syncing",
+        };
+      }
+      // closure wire 预检（r8-B4）：序列化总量（首行头+逐对象行，base64 膨胀后）
+      // ≤2MiB 流账——构建行时累计，超限在 POST 之前稳定拒绝。
+      let wireBytes = 0;
       /** @type {Buffer[]} */
       const lines = [Buffer.from(`${JSON.stringify({ ref, expectedOldRef: peerRefs[ref] ?? null, targetCommit: oid })}\n`)];
+      wireBytes += lines[0].length;
       for (const o of closure) {
         const { type, bytes: raw } = await readObject(ctx.gitdir, o.oid);
-        bytes += raw.byteLength;
-        if (bytes > MAX_TRANSFER_BYTES) throw { code: "budget", message: `push exceeded ${MAX_TRANSFER_BYTES} bytes`, hint: "sync a smaller root" };
-        lines.push(Buffer.from(`${JSON.stringify({ oid: o.oid, type, length: raw.byteLength, contentBase64: toBase64(raw) })}\n`));
+        const line = Buffer.from(`${JSON.stringify({ oid: o.oid, type, length: raw.byteLength, contentBase64: toBase64(raw) })}\n`);
+        wireBytes += line.length;
+        if (wireBytes > MAX_PUSH_WIRE_BYTES) {
+          throw {
+            code: "closure-exceeds-transport",
+            message: `push closure serializes to ${wireBytes} wire bytes (limit ${MAX_PUSH_WIRE_BYTES} = 2MiB journal stream budget; ${closure.length} objects so far)`,
+            hint: "v1 static request bodies fit at most one 2MiB stream; reduce the history increment or re-seed the root — batched/pack-format push and a streaming request ABI are a later change (post-v1)",
+          };
+        }
+        lines.push(line);
       }
       const body = new Uint8Array(Buffer.concat(lines));
       const resp = await call(`${wire}/push`, { method: "POST", rawBody: body, signal: opts.signal });

@@ -203,7 +203,7 @@ test("scenario 4: >16 concurrent in-flight → 429 until budget settles; recover
   assert.equal(after.status, 200);
 });
 
-test("scenario 4: 128MiB config is out of the 1-64MiB hard range → mapping refuses to start with a clear error", async (t) => {
+test("scenario 4: 128MiB config is out of the 64KiB-1MiB hard range (r8-B4 envelope) → mapping refuses to start with a clear error", async (t) => {
   const homeB = await tempHome("wpk-scenario-cfg-");
   t.after(() => rm(homeB, { recursive: true, force: true }));
   const bridge = createFabricBridge(async () => ({ status: 200, bodyChunks: [] }));
@@ -219,7 +219,7 @@ test("scenario 4: 128MiB config is out of the 1-64MiB hard range → mapping ref
   await rt.start();
   t.after(() => rt.stop());
   assert.notEqual(rt.config.configError, null);
-  assert.match(rt.config.configError ?? "", /\[1, 64\]/);
+  assert.match(rt.config.configError ?? "", /64KiB.1MiB/); // r8-B4 收窄后的硬域文案
   const rows = await rt.listMappings();
   assert.equal(rows.length, 1);
   assert.equal(rows[0].listener, "failed", "out-of-range config refuses to start the mapping");

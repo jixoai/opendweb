@@ -1110,7 +1110,9 @@ export async function createSidecar(opts = {}) {
 
   // ---- /sidecar/plugins/<id>/<mgmt> 三插件管理面（webui-plugin-kernel 收官接线） ----
 
-  /** files bridge 请求体上限（JSON envelope + base64 分片：4MiB chunk → ~5.4MiB base64）。 */
+  /** files bridge 请求体上限（本机 loopback JSON envelope 上限，非 fabric 包络；
+   * base64 分片 ≤1MiB chunk → ~1.4MiB JSON；r8-B4 后合法 body 远小于此——
+   * 8MiB 保留为防御性读体边界，fabric 侧另有 ≤1MiB 帧分块） */
   const PLUGIN_BRIDGE_BODY_MAX = 8 * 1024 * 1024;
 
   /** 管理面统一读 body（默认 64KiB；bridge 路由放宽到 8MiB）。 */
@@ -1378,11 +1380,21 @@ export async function createSidecar(opts = {}) {
       }
       try {
         const session = await fabricHost.sessionResolver(peer);
+        // r8-B4：请求体按 ≤1MiB 帧分块（fabric session MAX_FRAME=1MiB——
+        // fetch_http 逐元素单帧发送；files chunk ≤1MiB 通常单块，防御任意
+        // bridge 调用方传入更大 bodyBase64）
+        /** @type {Uint8Array[]} */
+        const frameBody = [];
+        if (body !== null) {
+          for (let off = 0; off < body.byteLength; off += 1024 * 1024) {
+            frameBody.push(body.subarray(off, Math.min(off + 1024 * 1024, body.byteLength)));
+          }
+        }
         const resp = await fabricHost.fetchHttpImpl(session, {
           method,
           path: wirePath,
           ...(headers !== undefined ? { headers } : {}),
-          ...(body !== null ? { body: [body] } : {}),
+          ...(body !== null ? { body: frameBody } : {}),
         });
         /** @type {Buffer[]} */
         const parts = [];

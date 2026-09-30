@@ -12,7 +12,8 @@
 //   plugin-pages.ts 绑定；本包不含 Svelte 代码，component 位留 null 由宿主装配）。
 // - dataEndpoints：提供侧 wire 端点声明（/wpk1/ports/proxy/<port>，§3.2 版本化
 //   前缀 wpk1）——声明性元数据（serveHttp 接线由编排者完成）。
-// - configSchema.maxBodyMiB：请求体上限（MiB）。默认 8、配置域 [1,64] 硬范围
+// - configSchema.maxBodyMiB：请求体上限（MiB）。默认 1、配置域 64KiB–1MiB
+//   （[0.0625,1] MiB、64KiB 粒度——r8-B4 v1 有效包络=transport 帧上限 1MiB）
 //   ——configSchema 子集（属性仅 type 字段）无 min/max 表达，域校验在
 //   createPortsRuntime 启动映射时执行（超范围拒绝启动映射并给明确错误）。
 

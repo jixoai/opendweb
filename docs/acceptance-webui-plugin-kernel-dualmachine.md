@@ -388,3 +388,43 @@ mini 代码副本（/tmp/wpk-mini/repo）随修同步（md5 审计 53 文件 JS 
 | 8080（pid 1749）/hub（pid 19232） | 全程未动，200 |
 | 探针回收 | mini：/tmp/wpk-probe.mjs、/tmp/wpk-connect-probe.mjs、/tmp/wpk-bind-probe.mjs、/tmp/wpk-mini-home-probe（身份副本）已删；iMac：误建的本地 /tmp/wpk-mini（rsync 目标误写本地路径产物）已删 |
 | 验收数据 | /tmp/wpk-sync-{imac,mini}/agents-skills 保留（37 文件收敛态） |
+
+---
+
+# webui-plugin-kernel 真双机验收实录——第八批（r8-B4/F2 v1 包络冻结落地：1MiB 统一+入史前拒绝+毒化迁移+closure 流账）
+
+**日期**：2026-09-30 15:55–16:05（iMac 192.168.2.8 ↔ Mac mini 192.168.2.10；直连数据面 UDP 3341/3342）。
+**输入**：Codex r8 终审 B4/F2 裁定（docs/webui-plugin-kernel-review-r8.md）——v1 有效包络=min(插件预算, transport 实况)=**1MiB**（帧 session.rs MAX_FRAME=1MiB/流 2MiB/会话在飞 8MiB）；逐条实装非文档取最小值。
+
+## 1. 部署与代码核对
+
+- 回归树=HEAD `7050b51`+B4 变更集（排除并行 TERM 任务的 WIP cli.mjs——用 HEAD 版 cli.mjs）；iMac `/tmp/wpk-r8b4-repo`、mini `/tmp/wpk-mini/r8b4-repo`（rsync，含 node_modules——@jixo 相对符号链接在树内重锚定）。
+- **md5 审计 16 个运行时文件全一致**（proxy/runtime/index×2、client/staging/runtime/index、endpoint/engine/util/worktree、data-plane、sidecar、cli、dist/index.html+bundle）+ `dweb.darwin-arm64.node` `bf34bc0f…` 双端一致。
+- 双端 sidecar 重启（kill -9 验死后拉起）：iMac pid `86233`（18801/3341，advertise 192.168.2.8:3341）、mini pid `71785`（18801/3342）；DWEB_HOME 沿用 `/tmp/wpk-hub` / `/tmp/wpk-mini-home`；三插件 enabled ×2。
+- 环境插曲：重启后首轮 fabric 双向 `response head timeout` → mini 侧重启一次后 `session init rejected: reason=1`（kill 残留 zombie canonical）——**~35s 后经第七批双信号 canonical 替换自愈**，19090 → 200（0.47s；期间 mini mihomo `DELETE :9090/connections` 204 一次）。8080/hub 全程未动。
+
+## 2. files 边界（mini 浏览器等价 bridge → iMac 真 fabric）
+
+| 用例 | 请求 | 结果 |
+|---|---|---|
+| 恰 1MiB chunk | `PUT …/chunk?path=r8b4-1m.bin&uploadId=r8b4a&seq=0&offset=0&hash=sha256`（bodyBase64 1048576B，经 bridge ≤1MiB 帧分块+fetchHttp） | **200** `{"ok":true,"idempotent":false,"received":1048576}`；`POST commit` **201** oid `4e29ad18…`；落盘 1048576B，md5 `e6065c4a…`==源；staging 全回收 |
+| 1MiB+1B chunk | 同上（1048577B，uploadId r8b4b） | **413** `{"error":"chunk-too-large","message":"chunk exceeds the 1048576-byte limit"}`；正式目录零残留、staging 零残留 |
+
+## 3. sync 边界（iMac seed → mini 首拉；组 r8b4a/r8b4c 双端同 id 建组）
+
+| 用例 | 结果 |
+|---|---|
+| **1MiB 对象 push**（big.bin 1048576B） | iMac `seed baseline pushed`（3 对象，615ms；closure wire≈1.4MiB 经 toSyncFetch ≤1MiB 帧分块入 2MiB 流账）；mini `baseline adopted (empty worktree)`；**md5 `c3cda277…` 双端一致** |
+| **超限对象**（huge.bin 1048577B 入同步根） | iMac sync-now → 稳定错误 **`oversize-history`**：`file huge.bin is 1048577 bytes (limit 1048576 = 1MiB per-blob transport envelope); device history was not written`+迁移提示（reset/re-seed；独立 root 继续可用）；**mini groupRef 保持 `66397463…` 零变化**、huge.bin 未落地（commitLocal 预检在读内容/写 blob 前拒绝） |
+| **超限 closure**（组 r8b4c：x.bin+y.bin 各 1048576B） | iMac sync-now → 稳定错误 **`closure-exceeds-transport`**：`push closure serializes to 2796700 wire bytes (limit 2097152 = 2MiB journal stream budget)`+hint（分批/pack 化 push 与流式请求 ABI=后续 change）；**mini r8b4c groupRef=None、工作树空**（发送前预检，零 POST） |
+| 迁移路径+独立 root | 移除 huge.bin 后 r8b4a `local ahead (pushed)` → mini `fast-forward`，followup.txt 双端逐字节一致（`clean after oversize removal`）——**超限拒绝不污染无关历史，恢复无需重置** |
+
+## 4. 结束态
+
+| 项 | 状态 |
+|---|---|
+| iMac sidecar | pid `86233` 运行（/tmp/wpk-r8b4-repo，18801=200） |
+| mini sidecar | pid `71785` 运行（/tmp/wpk-mini/r8b4-repo，18801=200；19090=200） |
+| 插件 | ports/files/sync **enabled ×2** |
+| 验收数据 | /tmp/wpk-r8b4-sync-{a,b}（1MiB 收敛态+followup.txt）、/tmp/wpk-r8b4-closure-{a,b}（拒绝证据态）、/tmp/wpk-files-share/r8b4-1m.bin 保留；huge.bin 已按迁移路径移除 |
+| 8080/hub | 全程未动 |

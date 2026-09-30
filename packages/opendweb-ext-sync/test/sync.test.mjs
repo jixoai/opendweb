@@ -229,7 +229,7 @@ test("Scenario 6: explicit abort mid-transfer -> ref/worktree zero change, stagi
   }
 });
 
-test("Scenario 9 e2e: >16MiB blob -> whole push rejected, explicit error, ref/worktree zero change on peer; sibling root fine", async () => {
+test("Scenario 9 e2e: >1MiB blob -> commitLocal precheck rejects with oversize-history (r8-B4), history not written, ref/worktree zero change on peer; sibling root fine", async () => {
   const p = await makePair({ aId: ID_A, bId: ID_B });
   try {
     const aRoot = await makeRoot({ "ok.txt": "ok\n" });
@@ -238,18 +238,17 @@ test("Scenario 9 e2e: >16MiB blob -> whole push rejected, explicit error, ref/wo
     await p.a.syncNow("big");
     await p.b.syncNow("big");
     const bGroupBefore = (await p.b.listGroups())[0].roots[0].groupRef;
-    // A 造超限 blob 并同步
+    // A 造超限文件（>1MiB transport 包络）并同步——commitLocal 扫描预检在
+    // 读内容/写 blob 前拒绝（r8-B4：超限 blob 不得进 device 历史）
     await write(aRoot, "huge.bin", Buffer.alloc(MAX_OBJECT_BYTES + 1, 0x42));
     await p.a.syncNow("big");
     const job = p.a.status().find((j) => j.groupId === "big");
     assert.equal(job.phase, "error");
-    assert.equal(job.error.code, "http-413");
-    assert.match(JSON.stringify(job.error.detail), /rejected as a whole/);
+    assert.equal(job.error.code, "oversize-history", JSON.stringify(job.error));
+    assert.match(job.error.hint ?? "", /reset\/re-seed/);
     assert.equal((await p.b.listGroups())[0].roots[0].groupRef, bGroupBefore, "peer ref zero change");
     assert.equal(await readOrNull(bRoot, "huge.bin"), null, "peer worktree zero change");
-    // 历史含超限 blob 的 root：其后续 commit 的闭包仍含该 blob——按 spec 引用
-    // 该 blob 的 push 一律整体拒绝（文件级跳过=过滤树语义，非 v1）。改用**历史
-    // 干净的其他同步根**验证「不受影响」。
+    // 历史干净的独立 root 不受影响（不含超限历史的 root 继续可用——裁定第 5 条）
     const aRoot2 = await makeRoot({ "ok2.txt": "v2\n" });
     const bRoot2 = await makeRoot(); // 空根起步（首拉采纳基线）
     await createPairGroup(p.a, p.b, { id: "big2", aRoot: aRoot2, bRoot: bRoot2, seedAuthority: ID_A });

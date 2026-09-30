@@ -12,13 +12,34 @@
 //    onEnable（recoverAll+全组 scheduler.start）与 onDispose（scheduler.dispose）；
 //    会话在线事件（fabric peer-connected）→ 各组 scheduler.notifyOnline。
 // 4. sync fetchImpl 适配：client-sdk fetchHttp（分块请求体/pull-first 响应）→
-//    sync 契约 {method, path, body: Uint8Array, signal} → {status, body}。
+//    sync 契约 {method, path, body: Uint8Array, signal} → {status, body}；
+//    r8-B4：请求体按 ≤1MiB 帧分块（fabric session MAX_FRAME=1MiB——fetch_http
+//    把每个 Uint8Array 元素作为单个 DATA 帧发送，超限帧确定性失败；sync push
+//    的 ndjson body 可达 2MiB wire，必须分块进入 2MiB 流账）。
 // 5. 运行时工厂=惰性动态 import（buildPluginRuntimes 首次调用才加载）：CLI 的
 //    --help 零执行路径与 target 校验失败路径保持零 ext 依赖加载（dispatch-fold
 //    e2e 语义不变）；真实安装按 package.json dependencies 解析。
 // 零凭证：本模块不读 argv/env；一切会话经注入的 fabric 宿主。
 
 import { z32ToHex } from "../fabric.mjs";
+
+/** fabric session 单帧 payload 上限（transport 事实：session.rs MAX_FRAME=1MiB） */
+const TRANSPORT_MAX_FRAME_BYTES = 1024 * 1024;
+
+/**
+ * 静态请求体 → ≤1MiB 分块数组（fetch_http 逐元素单帧发送——r8-B4 包络）。
+ * @param {Uint8Array} body
+ * @returns {Uint8Array[]}
+ */
+function frameChunks(body) {
+  if (body.byteLength <= TRANSPORT_MAX_FRAME_BYTES) return [body];
+  /** @type {Uint8Array[]} */
+  const out = [];
+  for (let off = 0; off < body.byteLength; off += TRANSPORT_MAX_FRAME_BYTES) {
+    out.push(body.subarray(off, Math.min(off + TRANSPORT_MAX_FRAME_BYTES, body.byteLength)));
+  }
+  return out;
+}
 
 /**
  * sync fetchImpl 适配（client-sdk fetchHttp → sync 契约）。
@@ -29,7 +50,7 @@ function toSyncFetch(fetchHttp) {
     const resp = await fetchHttp(session, {
       method: req.method,
       path: req.path,
-      ...(req.body != null ? { body: [req.body] } : {}),
+      ...(req.body != null ? { body: frameChunks(req.body) } : {}),
       ...(req.signal !== undefined ? { signal: req.signal } : {}),
     });
     /** @type {Buffer[]} */

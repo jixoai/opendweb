@@ -216,9 +216,11 @@ export async function* readBoundedJsonLines(body, limits) {
   if (body instanceof Uint8Array) {
     // 同步体（调用方已整体持有——want/测试路径）：直接切行；signal 仅入口裁决。
     // 注意 Uint8Array.toString(encoding) 不解码（与 Buffer 不同）——先取 Buffer
-    // 视图再按 utf8 解码。
+    // 视图再按 utf8 解码。maxTotal 同样强制（r8-B4：同步体路径不得绕过 push
+    // wire 包络——与流式路径同拍，防 loopback 形态掩盖超包络）。
     if (signal?.aborted) throw { code: "aborted" };
     const all = Buffer.isBuffer(body) ? body : Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+    if (all.byteLength > limits.maxTotal) throw { code: "body-too-large", maxBytes: limits.maxTotal };
     let start = 0;
     while (true) {
       const idx = all.indexOf(0x0a, start);

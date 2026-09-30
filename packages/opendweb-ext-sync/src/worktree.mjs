@@ -19,11 +19,16 @@ import { writeBlob } from "./objects.mjs";
 /**
  * 扫描工作树（ignore 语义过滤；symlink 条目标记 type:'symlink'——不读内容、
  * 不入对象库，由合并层按文件级冲突/保守处理）。
+ * r8-B4：opts.maxFileBytes 在读取文件内容/写 blob **之前**按 lstat 尺寸预检
+ * （commitLocal 防「超限 blob 进 device 历史」的毒化防线——超限即抛
+ * oversize-history 稳定错误，零史写入）。
  * @param {string} root
  * @param {string} gitdir
+ * @param {{ maxFileBytes?: number }} [opts] maxFileBytes：单文件尺寸上限（字节；超限抛 {code:"oversize-history"}）
  * @returns {Promise<Array<{ path: string, kind: "file" | "dir" | "symlink", oid: string | null, mode: number | null }>>}
  */
-export async function scanWorktree(root, gitdir) {
+export async function scanWorktree(root, gitdir, opts = {}) {
+  const maxFileBytes = opts.maxFileBytes;
   const ignored = await loadRootIgnore(root);
   /** @type {Array<{ path: string, kind: "file" | "dir" | "symlink", oid: string | null, mode: number | null }>} */
   const out = [];
@@ -52,6 +57,18 @@ export async function scanWorktree(root, gitdir) {
         if (st.isSymbolicLink()) {
           out.push({ path: childRel, kind: "symlink", oid: null, mode: null });
         } else if (st.isFile()) {
+          // r8-B4 毒化防线：读内容/写 blob 前按 lstat 尺寸预检——超限文件不得
+          // 进入 device 历史（稳定 oversize-history+迁移提示；不自动重写/删除）
+          if (maxFileBytes !== undefined && st.size > maxFileBytes) {
+            throw {
+              code: "oversize-history",
+              path: childRel,
+              size: st.size,
+              limit: maxFileBytes,
+              message: `file ${childRel} is ${st.size} bytes (limit ${maxFileBytes} = 1MiB per-blob transport envelope); device history was not written`,
+              hint: "move the file out of the synced root or split it (per-file skip = filtered-tree semantics, not v1); existing oversize history is never auto-rewritten — explicitly reset/re-seed the root to migrate; other roots without it keep syncing",
+            };
+          }
           const bytes = new Uint8Array(await readFile(childAbs));
           const oid = await writeBlob(gitdir, bytes);
           const exec = (st.mode & 0o111) !== 0;

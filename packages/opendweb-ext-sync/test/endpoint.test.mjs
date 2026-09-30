@@ -2,7 +2,7 @@
 // 校验+CAS+超限+staging TTL+有界体+授权）。对应 Scenario：
 // - 闭包缺失拒绝（r2-B7）：缺 parent/树/blob → 整 push 拒+缺项清单+ref 零变化；
 // - CAS 并发（Q5）：expectedOldRef 不匹配 → 拒+提示重 fetch/merge；
-// - 超限对象（r4-N3）：>16MiB blob → 引用它的整个 push 原子拒绝（部分对象
+// - 超限对象（r4-N3；r8-B4 收窄 1MiB）：>1MiB blob → 引用它的整个 push 原子拒绝（部分对象
 //   成功不构成合法实现）+其他 root 不受影响；
 // - 显式中止与 staging 回收（r2-B7）；
 // - r7-B3 四用例：解析完成后 abort（裁决点 #1）/ CAS 前 abort（提交线性化点
@@ -173,7 +173,7 @@ test("Scenario: CAS mismatch rejects push and prompts refetch; correct expectedO
   await rm(home, { recursive: true, force: true });
 });
 
-test("Scenario: oversize blob (>16MiB) -> whole push rejected atomically; other root unaffected; later clean push works", async () => {
+test("Scenario: oversize blob (>1MiB, r8-B4 envelope) -> whole push rejected atomically; other root unaffected; later clean push works", async () => {
   const { home, handler } = await setup("oversize", true);
   const gd = gitdirFor(home, "g1", "r1");
   const gd2 = gitdirFor(home, "g1", "r2");

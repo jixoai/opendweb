@@ -9,10 +9,11 @@
 //    request.sessionId 为隔离键（design §3.2——同 peer 异 session 不继承授权：
 //    每次 resolvePeer(sessionId) 现查，零授权缓存）→ peer endpointId →
 //    share.peers 成员判定；写操作另过 mode=rw 门。
-// 3. 预算（design §4）：files 并发传输（chunk+read 流）≤ maxConcurrentTransfers
-//    （默认 4），超预算 429；单 chunk ≤ chunkMaxBytes（默认 4MiB，超限 413、
-//    未知长度边读边累计立即拒）；单 read ≤ readMaxBytes（默认 4MiB——客户端
-//    Range 循环续读）。
+// 3. 预算（design §4；r8-B4 v1 有效包络收窄）：files 并发传输（chunk+read 流）
+//    ≤ maxConcurrentTransfers（默认 4），超预算 429；单 chunk ≤ chunkMaxBytes
+//    （默认 1MiB，超限 413、未知长度边读边累计立即拒；上限不得配置超过 1MiB
+//    ——transport 帧上限，必然失败配置在工厂期拒绝）；单 read ≤ readMaxBytes
+//    （默认 1MiB——客户端 Range 循环续读；同为帧上限约束）。
 // 4. 序列化：**全部 share 树操作（list/stat/read 打开段/commit/mkdir/rename/
 //    delete）经单 async 互斥**——verified-walk 模式的竞态免疫按构造成立
 //    （wire 对端的一切变更同闸串行）；fd-chain 模式该闸只是公平性措施。
@@ -48,8 +49,11 @@ import * as ops from "./ops.mjs";
 export const DEFAULT_SWEEP_INTERVAL_MS = 60_000;
 /** 默认并发传输上限（design §4：files ≤4） */
 export const DEFAULT_MAX_CONCURRENT_TRANSFERS = 4;
-/** 单 read 默认上限（4MiB——与 chunk 同档；客户端 offset/len 循环） */
+/** 单 read 默认上限（1MiB——与 chunk 同档；客户端 offset/len 循环） */
 export const DEFAULT_READ_MAX_BYTES = DEFAULT_CHUNK_MAX_BYTES;
+/** v1 有效硬上限（r8-B4）：chunk/read 单请求字节 ≤1MiB（fabric session
+ * MAX_FRAME=1MiB——更大的单帧在真实 transport 上必然失败，配置期拒绝） */
+export const MAX_TRANSFER_ENVELOPE_BYTES = 1024 * 1024;
 /** JSON body 上限（commit/mkdir/rename/delete 的小 JSON） */
 const JSON_BODY_MAX = 64 * 1024;
 
@@ -179,6 +183,13 @@ export async function createFilesRuntime(opts = {}) {
   const resolvePeer = opts.resolvePeer;
   const chunkMaxBytes = opts.chunkMaxBytes ?? DEFAULT_CHUNK_MAX_BYTES;
   const readMaxBytes = opts.readMaxBytes ?? DEFAULT_READ_MAX_BYTES;
+  // r8-B4 必然失败配置防线：chunk/read 单请求上限不得超过 1MiB transport 有效
+  // 包络（更大值=单帧超 fabric MAX_FRAME，真实网络上确定性失败）——工厂期拒绝。
+  for (const [name, value] of /** @type {[string, number][]} */ ([["chunkMaxBytes", chunkMaxBytes], ["readMaxBytes", readMaxBytes]])) {
+    if (value > MAX_TRANSFER_ENVELOPE_BYTES) {
+      throw new Error(`createFilesRuntime: ${name}=${value} exceeds the v1 transport envelope of ${MAX_TRANSFER_ENVELOPE_BYTES} bytes (fabric session MAX_FRAME = 1MiB); larger per-request caps deterministically fail on the real transport`);
+    }
+  }
   const maxConcurrentTransfers = opts.maxConcurrentTransfers ?? DEFAULT_MAX_CONCURRENT_TRANSFERS;
   const lockCtx = { now, ...(opts.isPidAlive !== undefined ? { isPidAlive: opts.isPidAlive } : {}) };
 

@@ -47,7 +47,7 @@
       signal+上游 socket 收敛）、SSE 流式透传
 - [ ] 提供侧：allowlist.json（(peer,remotePort) 默认 deny）+ `/wpk1/ports/
       proxy/<remotePort>` 端点（sessionId 隔离键+peer 授权）
-- [ ] 限额：默认 8MiB 配置域 1-64MiB（超范围配置拒绝启动映射）、未知
+- [ ] 限额：默认 1MiB 配置域 64KiB–1MiB/64KiB 粒度（r8-B4 包络收窄；超范围配置拒绝启动映射）、未知
       Content-Length 边读边累计拒绝、并发 ≤16+在飞预算 429
 - [ ] UI：映射管理页（列表/新增/启停/删除）
 - [ ] 测试：六 Scenario 全落（双机两阶段取消/已知超限 413/未知长度断开/
@@ -78,7 +78,7 @@
       （refs/devices/<endpointId>/main+组收敛 ref）；[W9] seed authority UI
       （非空对端阻断+三方对照）
 - [ ] 对象端点：GET refs/POST want/GET object/POST push；闭包校验（parent/
-      tree/blob 全闭包，缺项拒绝+清单，ref 零变化）；超限 >16MiB 整 push
+      tree/blob 全闭包，缺项拒绝+清单，ref 零变化）；超限 >1MiB（r8-B4 包络）commitLocal 预检 oversize-history 不写史+整 push
       原子拒绝
 - [ ] ref CAS（expectedOldRef；不匹配拒绝提示重 fetch）+每 repo 单写者
 - [ ] 自持三方树合并：分类 add/modify/delete/type/mode；文本 diff3
@@ -91,8 +91,8 @@
       恢复=ref 三态分诊（==targetCommit 逐路径只接受 postimage 否则不补 done
       保留 intent conflicted；==oldRef 路径三态分诊+物化+CAS；其他冲突停止）
       +路径三态（preimage 应用/postimage 已完成/其他=用户新改动保留转冲突）
-- [ ] 调度：会话在线事件+30s 兜底+本地 debounce 2s；预算（16MiB/5000 对象/
-      256MiB/2 流）；任务状态机+UI 状态页
+- [ ] 调度：会话在线事件+30s 兜底+本地 debounce 2s；预算（1MiB/5000 对象/
+      256MiB/2 流；closure wire ≤2MiB 流账预检）；任务状态机+UI 状态页
 - [ ] UI：同步组管理/状态/冲突决议页（hunk 并排+选块+文件级选择）
 - [ ] 测试：全部 sync Scenario（单向跟随/非重叠自动合并/重叠 hunk 决议/
       CAS 并发/闭包缺失/显式中止 staging/type 冲突/mode 三方竞争/超限整

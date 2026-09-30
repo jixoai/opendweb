@@ -24,7 +24,9 @@
 
 	let { share, controller }: { share: FilesShareInfo; controller: Controller } = $props();
 
-	const CHUNK = 4 * 1024 * 1024;
+	// r8-B4：v1 transport 有效包络=1MiB 帧（fabric session MAX_FRAME）——上传/下载
+	// 分片与服务端 chunkMaxBytes 默认同拍（更大分片在真实网络上必然失败）。
+	const CHUNK = 1024 * 1024;
 
 	let segments = $state<string[]>([]);
 	let entries = $state<FilesBrowserEntry[] | null>(null);

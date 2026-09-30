@@ -4,7 +4,7 @@
 
 ### Requirement: 端口共享插件（HTTP 语义映射）
 
-ports 插件 SHALL 在消费侧（B 机）维护映射账本 `<DWEB_HOME>/plugins/ports/mappings.json`（id/name/peer(endpointId)/remotePort/localPort/enabled，0600 原子写+锁家族），并对每条启用映射在本机起 HTTP listener（默认 127.0.0.1；0.0.0.0 v1 不提供）逐请求经 `fetchHttp(session)` 到提供侧端点 `/wpk1/ports/proxy/<remotePort>`，提供侧转发 `localhost:<remotePort>`，实现 B 机访问 `localhost:<localPort>` 等同 A 机服务（[W1]，HTTP 语义面）。提供侧 MUST 维护 allowlist `(peer, remotePort)` 显式授权（默认 deny）。请求体 MUST 有界（默认 8MiB，配置域 1MiB–64MiB 硬范围，超范围配置拒绝启动该映射 [W7]）；未知 Content-Length 的入站请求 MUST 边读边累计、达上限立即断开拒绝；并发预算 MUST 冻结（并发代理 ≤16 请求，在飞字节=16×上限，超预算 429 拒新请求直至回落）；超限 413；hop-by-hop 头（connection/keep-alive/transfer-encoding/upgrade/proxy-*）MUST 剥除，敏感回显头重写；取消 MUST 双向传播（本地连接断→fetchHttp abort→对端 handler signal）；SSE MUST 经流式响应透传。本机端口冲突 MUST 明确报错不静默换端口。WebSocket/raw TCP 透传 v1 MUST NOT 宣称支持（面板列「即将推出」）。
+ports 插件 SHALL 在消费侧（B 机）维护映射账本 `<DWEB_HOME>/plugins/ports/mappings.json`（id/name/peer(endpointId)/remotePort/localPort/enabled，0600 原子写+锁家族），并对每条启用映射在本机起 HTTP listener（默认 127.0.0.1；0.0.0.0 v1 不提供）逐请求经 `fetchHttp(session)` 到提供侧端点 `/wpk1/ports/proxy/<remotePort>`，提供侧转发 `localhost:<remotePort>`，实现 B 机访问 `localhost:<localPort>` 等同 A 机服务（[W1]，HTTP 语义面）。提供侧 MUST 维护 allowlist `(peer, remotePort)` 显式授权（默认 deny）。请求体 MUST 有界（默认 1MiB，配置域 64KiB–1MiB（0.0625–1 MiB、64KiB 粒度）硬范围——r8-B4：v1 有效包络=min(插件预算, transport 实况)=1MiB 单帧（fabric session MAX_FRAME），更大上限=必然失败配置，超范围/非粒度配置拒绝启动该映射 [W7]）；未知 Content-Length 的入站请求 MUST 边读边累计、达上限立即断开拒绝；并发预算 MUST 冻结（并发代理 ≤16 请求，在飞字节=16×上限，超预算 429 拒新请求直至回落）；超限 413；请求体经 fetchHttp 发送时 MUST 按 ≤1MiB 帧分块（静态分块逐元素单帧）；hop-by-hop 头（connection/keep-alive/transfer-encoding/upgrade/proxy-*）MUST 剥除，敏感回显头重写；取消 MUST 双向传播（本地连接断→fetchHttp abort→对端 handler signal）；SSE MUST 经流式响应透传。本机端口冲突 MUST 明确报错不静默换端口。WebSocket/raw TCP 透传 v1 MUST NOT 宣称支持（面板列「即将推出」）。
 
 #### Scenario: 双机端口映射与两阶段取消传播（r2-B1）
 
@@ -23,8 +23,8 @@ ports 插件 SHALL 在消费侧（B 机）维护映射账本 `<DWEB_HOME>/plugin
 
 #### Scenario: 并发预算与配置硬域
 
-- **WHEN** 并发发起 >16 个在飞代理请求；或配置映射上限为 128MiB
-- **THEN** 超额请求收到 429 直至在飞回落；超范围配置被拒绝（1-64MiB 硬域外，映射不启动）
+- **WHEN** 并发发起 >16 个在飞代理请求；或配置映射上限为 2MiB/128MiB
+- **THEN** 超额请求收到 429 直至在飞回落；超范围配置被拒绝（64KiB–1MiB 硬域外——r8-B4：v1 有效包络=transport 帧上限 1MiB，必然失败配置不得存在；映射不启动）
 
 #### Scenario: 授权默认拒绝
 

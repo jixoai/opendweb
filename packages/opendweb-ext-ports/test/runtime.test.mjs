@@ -5,7 +5,7 @@
 // 2. 宿主 runtimes 通道：createPluginHost({runtimes:{ports}}) 的
 //    enable→onEnable 起 listener、disable→onDispose 停 listener（drain 收敛）；
 // 3. 配置通道：host.setConfig("ports",{maxBodyMiB}) → disable→enable 生效
-//    （2MiB 生效 + 128MiB 拒启）；
+//    （0.5MiB 生效 + 128MiB 拒启——r8-B4 后配置域=64KiB–1MiB）；
 // 4. 映射管理 API：addMapping（运行中起监听/未运行仅落账）/setMappingEnabled/
 //    removeMapping 的 listener 联动。
 
@@ -111,7 +111,8 @@ test("runtime: config channel via host state ledger — setConfig then disable�
   t.after(() => host.close());
 
   // 越界配置：host.setConfig 按类型面接受（schema 子集无 min/max），运行时在
-  // 启动映射时按 1-64MiB 硬域裁决——enable 后映射不启动
+  // 启动映射时按 64KiB–1MiB 硬域裁决（r8-B4 v1 transport 包络）——enable 后
+  // 映射不启动
   const set128 = await host.setConfig("ports", { maxBodyMiB: 128 });
   assert.equal(set128.ok, true, "schema-level validation passes (number)");
   const enabled = await host.enable("ports");
@@ -119,17 +120,17 @@ test("runtime: config channel via host state ledger — setConfig then disable�
   assert.equal(await probePort(localPort), false, "out-of-range config refuses to start the mapping");
   const rows = await rt.listMappings();
   assert.equal(rows[0].listener, "failed");
-  assert.match(rows[0].error ?? "", /\[1, 64\]/);
+  assert.match(rows[0].error ?? "", /64KiB.1MiB/);
   assert.equal(host.get("ports").config.maxBodyMiB, 128, "host projection carries the config");
 
-  // 回到界内（2MiB）→ disable→enable 生效（启动时重解析）
-  const set2 = await host.setConfig("ports", { maxBodyMiB: 2 });
-  assert.equal(set2.ok, true);
+  // 回到界内（0.5MiB=512KiB，64KiB 粒度）→ disable→enable 生效（启动时重解析）
+  const setHalf = await host.setConfig("ports", { maxBodyMiB: 0.5 });
+  assert.equal(setHalf.ok, true);
   await host.disable("ports");
   const reEnabled = await host.enable("ports");
   assert.equal(reEnabled.ok, true);
   assert.equal(await probePort(localPort), true, "in-range config starts the mapping after re-enable");
-  assert.equal(rt.config.maxBodyMiB, 2);
+  assert.equal(rt.config.maxBodyMiB, 0.5);
   assert.equal(rt.config.configError, null);
   await host.disable("ports");
 });
