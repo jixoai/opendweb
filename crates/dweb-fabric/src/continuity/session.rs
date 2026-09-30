@@ -468,6 +468,16 @@ pub struct SessionShared {
     frame_gate: tokio::sync::RwLock<()>,
     channel_transition: tokio::sync::Mutex<()>,
     streams: tokio::sync::Mutex<HashMap<u64, StreamCtx>>,
+    /// r12-B1 终态仲裁锁：`SessionChannel::finish`（FIN 决定+发送）与
+    /// [`SessionShared::abort_stream`]（LocalAbort 落位+RESET 发送）的公共
+    /// 线性化点——first-terminal-wins。先到者完整完成其终态发送，后到者在
+    /// 锁内复查终态（finish 对已中止流拒绝；abort 取消 FIN 重放面）。修复前
+    /// finish 在 streams 锁内检查 LocalAbort 后释放锁、之后才发 FIN——该间隙
+    /// 到达的 abort 先记终态，已排队 FIN 仍可能先于 RESET 上 wire。
+    /// 会话级单锁（非 per-stream）：终态操作低频，且通道发送本就经单一
+    /// send 互斥锁串行——不引入新的串行化面。锁序：terminal_arb →
+    /// streams / chan.send（不得反向嵌套）。
+    terminal_arb: tokio::sync::Mutex<()>,
     next_stream_id: std::sync::atomic::AtomicU64,
     /// 副作用状态机：stream_id → (state, 幂等键)。
     requests: tokio::sync::Mutex<HashMap<u64, (RequestState, String)>>,
@@ -537,6 +547,7 @@ impl SessionShared {
             frame_gate: tokio::sync::RwLock::new(()),
             channel_transition: tokio::sync::Mutex::new(()),
             streams: tokio::sync::Mutex::new(HashMap::new()),
+            terminal_arb: tokio::sync::Mutex::new(()),
             next_stream_id: std::sync::atomic::AtomicU64::new(if is_client { 1 } else { 2 }),
             requests: tokio::sync::Mutex::new(HashMap::new()),
             idem_index: tokio::sync::Mutex::new(HashMap::new()),
@@ -1050,6 +1061,17 @@ impl SessionShared {
             .and_then(|c| c.term)
     }
 
+    /// 测试观测面：本端 FIN 登记水位（r12-B1 断言「中止原子清除 FIN 重放
+    /// 面——恢复轮不重放已中止流的 FIN」用）。
+    #[doc(hidden)]
+    pub async fn debug_final_sent(&self, stream_id: u64) -> Option<u64> {
+        self.streams
+            .lock()
+            .await
+            .get(&stream_id)
+            .and_then(|c| c.final_sent)
+    }
+
     /// 本端主动中止的终态落位（r11-B1）：**必须在供给面（sender）关闭之前
     /// 调用**——落位与 journal/final_sent 同在 streams 域内原子完成，跨恢复
     /// 代保留（StreamCtx 挂 SessionShared，不随通道更替丢失）。此后：
@@ -1058,10 +1080,19 @@ impl SessionShared {
     /// - 恢复重放面补发 RESET（[`SessionShared::aborted_streams`]）。
     ///
     /// 幂等；流不存在时静默（对端从未观察到的流无需终结面）。
-    pub async fn mark_local_abort(&self, stream_id: u64) {
+    /// r12-B1：仅经 [`SessionShared::abort_stream`]（terminal_arb 临界区内）
+    /// 调用——直接裸调会绕过与 FIN 发送的线性化仲裁，故为私有。
+    async fn mark_local_abort(&self, stream_id: u64) {
         let mut streams = self.streams.lock().await;
         if let Some(ctx) = streams.get_mut(&stream_id) {
             ctx.set_term(StreamTerm::LocalAbort);
+            // r12-B1：取消已登记的 FIN 面（final_sent 清除）——中止流不得在
+            // 恢复轮重放 FIN（消费端只能经 RESET/会话终态以错误收敛）。原子
+            // 于终态落位（同 streams 锁）：重放面不可能观察到「LocalAbort 已
+            // 落位但 FIN 仍可重放」的中间态；RESUME 摘要同报 final_sent=None
+            //（对端不为本端已中止的流等待 FIN）。代价：该流不再
+            // quota_reapable（名额占位至会话终结，受 MAX_ACTIVE_STREAMS 有界）。
+            ctx.final_sent = None;
         }
         drop(streams);
         // 唤醒本端消费/止付等待面（recv 竞速循环与 dispatch select）
@@ -1071,7 +1102,12 @@ impl SessionShared {
 
     /// 本端中止流统一面（r11-B1）：终态先落位（跨代保留）→ best-effort
     /// RESET（当前代通道；失败由恢复重放补发）。调用方此后关闭供给面 sender。
+    /// r12-B1：与 [`SessionChannel::finish`] 共享 [`SessionShared::terminal_arb`]
+    /// ——abort 请求与 FIN 发送在此线性化（first-terminal-wins）：abort 先入
+    /// 锁则 FIN 拒绝（FIN 永不上 wire）；FIN 先入锁则其发送完整完成后 abort
+    /// 才落位（RESET 随后，消费端终态粘滞升级为错误）。
     pub async fn abort_stream(&self, stream_id: u64) {
+        let _arb = self.terminal_arb.lock().await;
         self.mark_local_abort(stream_id).await;
         self.send_reset(stream_id).await;
     }
@@ -1284,7 +1320,13 @@ impl SessionShared {
                 let streams = self.streams.lock().await;
                 match streams.get(&stream_id) {
                     Some(ctx) => (
-                        matches!(ctx.remote_final, Some(f) if f == ctx.recv.expected_offset()),
+                        // r12-B3：本端中止（LocalAbort）是独立的终止条件——
+                        // `mark_local_abort` 不设 remote_final（中止不依赖对端
+                        // 声明终局水位），不并入此条件则 Active 会话上本地
+                        // abort 后消费端永远悬挂。已排队前缀由循环头先行交付，
+                        // 队列排空后按下方 q_empty 复查以 Err 终结。
+                        matches!(ctx.remote_final, Some(f) if f == ctx.recv.expected_offset())
+                            || ctx.term == Some(StreamTerm::LocalAbort),
                         ctx.term,
                     ),
                     None => (false, None),
@@ -1401,7 +1443,10 @@ impl SessionShared {
 
     /// P0-3d：活跃流名额预占（OPEN 前置闸门——超限拒绝；名额在流完全终结
     /// （双向终局 + journal 排空）后自然回收）。
-    async fn reserve_stream_slot(&self, stream_id: u64) -> Result<(), FabricError> {
+    /// r12-B4：pub(crate)——fetch 面在 OPEN 发送 spawn 前同步预占，使超时/
+    /// 取消清理（abort_stream 终态落位）不与 OPEN 登记竞速（mark 先于登记
+    /// 会静默丢失）。幂等（or-insert）。
+    pub(crate) async fn reserve_stream_slot(&self, stream_id: u64) -> Result<(), FabricError> {
         let mut streams = self.streams.lock().await;
         // R3-P1c：closing 复查在登记锁内——与 close 的「先置旗再快照」构成
         // 全序（检查在旗前 → 登记完成于快照前；检查在旗后 → 拒绝）。
@@ -1795,10 +1840,15 @@ impl SessionShared {
     }
 
     /// 待重发 FIN 的流（终局已宣告但可能未被对端收到）。
+    /// r12-B1：本端已中止（LocalAbort 粘滞终态）的流**跳过 FIN 重放**——
+    /// 恢复轮若重放 FIN，消费端可能在 RESET 补发处理前把 Fin 映射为干净
+    /// EOF（截断伪装完整实体）。中止流的终结面由 aborted_streams 的 RESET
+    /// 补发承接（终态跨代保留 → 恢复后中止仍胜出）。
     async fn fin_resent_streams(&self) -> Vec<(u64, u64)> {
         let streams = self.streams.lock().await;
         streams
             .iter()
+            .filter(|(_, c)| c.term != Some(StreamTerm::LocalAbort))
             .filter_map(|(&id, ctx)| ctx.final_sent.map(|f| (id, f)))
             .collect()
     }
@@ -2148,7 +2198,13 @@ impl SessionChannel {
     /// 半关（FIN；final offset = 已发送水位——恢复轮可重发）。
     /// r11-B1：本端已中止的流禁 FIN——取消终态不得伪装干净 EOF（对端只能经
     /// RESET/会话终态以错误收敛）。
+    /// r12-B1：FIN 决定与发送全程持有 [`SessionShared::terminal_arb`]——与
+    /// [`SessionShared::abort_stream`] 的（终态落位+RESET）构成原子终态仲裁
+    ///（first-terminal-wins）。修复前锁内检查 LocalAbort 后释放锁、之后才
+    /// 发送 FIN：间隙内到达的 abort 先记终态，已排队 FIN 仍可能先于 RESET
+    /// 上 wire。锁序：terminal_arb → streams（不得反向）。
     pub async fn finish(&self, stream_id: u64) -> Result<(), FabricError> {
+        let _arb = self.shared.terminal_arb.lock().await;
         self.shared.ensure_send_stream(stream_id).await?;
         let final_offset = {
             let mut streams = self.shared.streams.lock().await;
@@ -2185,7 +2241,7 @@ impl SessionChannel {
 
     /// 开新逻辑流（OPEN 帧；幂等键供对端副作用归并）。
     pub async fn open_stream(&self, idem_key: &str) -> Result<u64, FabricError> {
-        let stream_id = self.shared.alloc_stream_id();
+        let stream_id = self.alloc_stream();
         let open_json =
             format!("{{\"requestId\":\"{stream_id}\",\"idempotencyKey\":\"{idem_key}\"}}");
         self.send_open(stream_id, idem_key, Bytes::from(open_json))
@@ -2200,12 +2256,23 @@ impl SessionChannel {
         idem_key: &str,
         payload: Bytes,
     ) -> Result<u64, FabricError> {
-        let stream_id = self.shared.alloc_stream_id();
+        let stream_id = self.alloc_stream();
         self.send_open(stream_id, idem_key, payload).await?;
         Ok(stream_id)
     }
 
-    async fn send_open(
+    /// r12-B4：预分配逻辑流 id（与 [`SessionChannel::open_stream_raw`] 同源，
+    /// 但把「分配」与「OPEN 发送」拆开）——发送 await 受调用方 deadline 竞速
+    /// 约束（fetch head 预算）时，超时/取消路径仍持有 id 可走 abort_stream
+    /// 清理，不留失去句柄的 ghost 流。
+    pub fn alloc_stream(&self) -> u64 {
+        self.shared.alloc_stream_id()
+    }
+
+    /// r12-B4：OPEN 发送拆分面（与 [`SessionChannel::alloc_stream`] 配对——
+    /// 发送 await 受调用方 deadline/取消竞速约束时用）。幂等：流名额预占
+    /// or-insert，重复调用不重建状态。
+    pub(crate) async fn send_open(
         &self,
         stream_id: u64,
         idem_key: &str,
@@ -5747,5 +5814,124 @@ mod tests {
         fn drop(&mut self) {
             set_frame_silence_for_tests(None);
         }
+    }
+
+    /// r12-B4：fetch 发送阶段（DATA）受单一 head 预算约束。raw_link 对端刻意
+    /// 不读 bidi 流——请求体写入达 QUIC 流控窗口后阻塞（受控发送阻塞）。
+    /// 修复前：阻塞的 send_data 只受内部 SEND_FRAME_TIMEOUT（5s/帧）约束，
+    /// 1s 预算的 fetch 在体写上等近 5s（多块按块数放大）；修复后：head
+    /// deadline 到点即时结算 + abort_stream 异步清理（终态 LocalAbort 落位
+    /// ——不留已登记而未终止的 ghost 流）。
+    /// （置于 session.rs 测试模块：raw_link 停滞注入 harness 在此；断言面是
+    /// http.rs 的 fetch_http。）
+    #[tokio::test]
+    async fn fetch_head_budget_bounds_stalled_body_send() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA5u8; 16],
+            [0xB5u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (send, recv) = link.transport(1).await.into_split();
+        let chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        let _pump = chan.spawn_pump();
+        shared.set_phase_sync(SessionPhase::Active);
+        let session = Session {
+            shared: std::sync::Arc::clone(&shared),
+            channel: std::sync::RwLock::new(std::sync::Arc::clone(&chan)),
+            pump: std::sync::Mutex::new(None),
+        };
+        // 多块大体量请求体（4MiB ≫ QUIC 流控窗口）：中途必然阻塞在体写上
+        let mut init =
+            crate::continuity::http::HttpRequestInit::post("/stall", Bytes::from_static(b"seed"));
+        init.body = (0..8)
+            .map(|_| Bytes::from(vec![0x41u8; 512 * 1024]))
+            .collect();
+        init.head_timeout = Some(std::time::Duration::from_secs(1));
+
+        let t0 = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::continuity::http::fetch_http(&session, init),
+        )
+        .await
+        .expect("fetch 必须有限期结算（修复前体写吃满 SEND_FRAME_TIMEOUT）");
+        let err = match out {
+            Err(e) => e,
+            Ok(_) => panic!("停滞体写下 head 预算必然耗尽"),
+        };
+        assert!(
+            err.to_string().contains("head timeout"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(2500),
+            "整次 fetch 总时长必须受单一预算约束（实际 {:?}，预算 1s）",
+            t0.elapsed()
+        );
+        // 清理断言：超时路径必须落 LocalAbort 终态（abort_stream 异步承接，
+        // mark 先于 RESET；流不再是无终止的 ghost）
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            shared.stream_term(1).await,
+            Some(StreamTerm::LocalAbort),
+            "超时清理必须落终态（client 首个流 id = 1）"
+        );
+        chan.request_stop();
+        link.close().await;
+    }
+
+    /// r12-B1（恢复重放面）：本端已中止（LocalAbort）的流不得重放 FIN——
+    /// final_sent 已登记后 abort 落位的流，恢复轮若重放 FIN，消费端可能在
+    /// RESET 处理前把 Fin 映射为干净 EOF。修复前 fin_resent_streams 无条件
+    /// 收集 final_sent。RESET 补发面（aborted_streams）保持覆盖。
+    #[tokio::test]
+    async fn fin_resent_streams_skips_locally_aborted_streams() {
+        let link = raw_link().await;
+        let shared = SessionShared::new(
+            [0xA6u8; 16],
+            [0xB6u8; 16],
+            "peer".into(),
+            true,
+            JournalLimits::default(),
+        );
+        let (send, recv) = link.transport(1).await.into_split();
+        let chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installs");
+        let _pump = chan.spawn_pump();
+        shared.set_phase_sync(SessionPhase::Active);
+
+        let sid = chan.open_stream("k-fin-abort").await.expect("open");
+        chan.send_data(sid, Bytes::from_static(b"prefix;"))
+            .await
+            .expect("data");
+        chan.finish(sid)
+            .await
+            .expect("finish（FIN 写入流控窗口内成功）");
+        assert_eq!(
+            shared.fin_resent_streams().await,
+            vec![(sid, 7)],
+            "未中止流的 FIN 仍在重放面"
+        );
+        // FIN 已登记（final_sent=Some）后本地中止——粘滞终态落位
+        shared.abort_stream(sid).await;
+        assert!(
+            shared.fin_resent_streams().await.is_empty(),
+            "LocalAbort 流不得重放 FIN（修复前无条件收集 final_sent）"
+        );
+        assert_eq!(
+            shared.aborted_streams().await,
+            vec![sid],
+            "RESET 补发面保持覆盖"
+        );
+        chan.request_stop();
+        link.close().await;
     }
 }

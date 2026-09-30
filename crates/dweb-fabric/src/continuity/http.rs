@@ -212,7 +212,9 @@ pub struct HttpRequestInit {
     pub body: Vec<Bytes>,
     /// WS 隧道模式：不半关请求方向（101 后双向持续）。
     pub keep_open: bool,
-    /// 响应头等待上限（默认 30s；长轮询场景按需放宽/收紧）。
+    /// head 操作单一预算（毫秒；默认 30s——长轮询/慢上游按需放宽）。预算
+    /// 覆盖整次 head 操作：活性闸门 + OPEN + 请求体逐块发送 + FIN + 响应头
+    /// 等待（r12-B4 冻结语义——非仅「响应头等待上限」）。
     pub head_timeout: Option<std::time::Duration>,
     /// 外部取消开关（SDK 注入：JS AbortSignal → fire；head 等待期即时
     /// RESET——消费端取消的对称面，provider 侧为 req.signal）。
@@ -320,11 +322,24 @@ impl HttpClientResponse {
     }
 }
 
+/// r12-B4：fetch 发送阶段（OPEN/DATA/FIN）超时/取消的流终止清理。异步承接
+/// ——不阻塞错误返回（预算承诺覆盖到结算时刻）：`abort_stream` 终态落位
+/// （LocalAbort 粘滞、跨恢复代保留）+ best-effort RESET（经发送互斥锁串行
+/// 于在途帧之后；发送失败由恢复重放补发）。provider 在途请求经 RESET 止
+/// 付收敛，不留 ghost OPEN。
+fn spawn_abort_cleanup(session: &Session, stream_id: u64) {
+    let shared = Arc::clone(session.shared());
+    tokio::spawn(async move {
+        shared.abort_stream(stream_id).await;
+    });
+}
+
 /// 发起 HTTP 请求（请求方向默认 FIN；keep_open 隧道不关）。
 /// meta 行到达前有界等待（响应头即首块）。
-/// r11-B4：整次 head 操作（活性闸门 + OPEN + 请求体 + 头等待）共享**单一
-/// deadline**；外部取消在每一阶段线性化检查（活性等待 select 即时唤醒、
-/// OPEN 前零副作用拦截、体写逐块复查）。
+/// r11-B4 + r12-B4：整次 head 操作（活性闸门 + OPEN + 每个 DATA + FIN +
+/// 头等待）共享**单一 deadline**——发送 await 同受预算约束（spawn 后有界
+/// 观察，不丢弃在途发送）；外部取消在每一阶段线性化检查（活性等待 select
+/// 即时唤醒、OPEN 前零副作用拦截、体写逐块复查）。
 pub async fn fetch_http(
     session: &Session,
     init: HttpRequestInit,
@@ -399,24 +414,113 @@ pub async fn fetch_http(
             .map(|h| h.value.clone())
             .unwrap_or_default(),
     });
-    let stream_id = channel
-        .open_stream_raw(&idem, Bytes::from(meta.to_string()))
-        .await?;
+    // r12-B4：OPEN/每个 DATA/FIN 的 await 全部纳入同一 head 预算 + 外部取消
+    // 竞速。发送 future **不得在 select 中丢弃**——中途丢弃 write_all 会把半
+    // 帧留上 wire（撕裂帧边界 = 杀死健康通道，仅通道退役路径可承受）；改为
+    // spawn 后有界观察：超时/取消即时结算返回，在途帧继续完整写出（内部
+    // SEND_FRAME_TIMEOUT 自界），随后 abort_stream 的 RESET 经发送互斥锁
+    // 串行于在途帧之后——provider 在途请求止付，不留 ghost OPEN。
+    enum PhaseFail {
+        Cancel,
+        Deadline,
+        Op(FabricError),
+        Join(tokio::task::JoinError),
+    }
+    macro_rules! guard_send {
+        ($task:expr) => {
+            tokio::select! {
+                r = &mut $task => match r {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(PhaseFail::Op(e)),
+                    Err(j) => Some(PhaseFail::Join(j)),
+                },
+                _ = &mut cancel_fut => Some(PhaseFail::Cancel),
+                _ = tokio::time::sleep_until(head_deadline) => Some(PhaseFail::Deadline),
+            }
+        };
+    }
+    let stream_id = channel.alloc_stream();
+    // 名额预占先于 OPEN 发送：超时/取消清理的终态落位（mark_local_abort）
+    // 不与 OPEN 登记竞速（mark 先于登记会静默丢失）。
+    channel.shared().reserve_stream_slot(stream_id).await?;
+    {
+        let chan = Arc::clone(&channel);
+        let idem_key = idem.clone();
+        let open_payload = Bytes::from(meta.to_string());
+        let mut open_task =
+            tokio::spawn(async move { chan.send_open(stream_id, &idem_key, open_payload).await });
+        if let Some(f) = guard_send!(open_task) {
+            return Err(match f {
+                PhaseFail::Op(e) => e,
+                PhaseFail::Join(j) => {
+                    FabricError::Session(SessionError::Connect(format!("open task join: {j}")))
+                }
+                PhaseFail::Cancel => {
+                    spawn_abort_cleanup(session, stream_id);
+                    cancelled_err()
+                }
+                PhaseFail::Deadline => {
+                    spawn_abort_cleanup(session, stream_id);
+                    head_timeout_err()
+                }
+            });
+        }
+    }
     // r11-B4：请求体逐块 + FIN 前取消复查——此时请求已可见于对端，取消须
     // 走 abort_stream（终态落位 + RESET：provider 侧在途请求止付收敛）。
+    // r12-B4：每个 DATA/FIN 的 await 同受单一 head 预算约束（spawn + 有界
+    // 观察，见上方 OPEN 注释）。
     for chunk in init.body {
         if cancel_fired() {
-            session.shared().abort_stream(stream_id).await;
+            spawn_abort_cleanup(session, stream_id);
             return Err(cancelled_err());
         }
-        channel.send_data(stream_id, chunk).await?;
-    }
-    if !init.keep_open && cancel_fired() {
-        session.shared().abort_stream(stream_id).await;
-        return Err(cancelled_err());
+        let mut send_task = {
+            let chan = Arc::clone(&channel);
+            tokio::spawn(async move { chan.send_data(stream_id, chunk).await })
+        };
+        if let Some(f) = guard_send!(send_task) {
+            return Err(match f {
+                PhaseFail::Op(e) => e,
+                PhaseFail::Join(j) => {
+                    FabricError::Session(SessionError::Connect(format!("send task join: {j}")))
+                }
+                PhaseFail::Cancel => {
+                    spawn_abort_cleanup(session, stream_id);
+                    cancelled_err()
+                }
+                PhaseFail::Deadline => {
+                    spawn_abort_cleanup(session, stream_id);
+                    head_timeout_err()
+                }
+            });
+        }
     }
     if !init.keep_open {
-        channel.finish(stream_id).await?;
+        if cancel_fired() {
+            spawn_abort_cleanup(session, stream_id);
+            return Err(cancelled_err());
+        }
+        let mut fin_task = {
+            let chan = Arc::clone(&channel);
+            tokio::spawn(async move { chan.finish(stream_id).await })
+        };
+        if let Some(f) = guard_send!(fin_task) {
+            return Err(match f {
+                PhaseFail::Op(e) => e,
+                PhaseFail::Join(j) => {
+                    FabricError::Session(SessionError::Connect(format!("fin task join: {j}")))
+                }
+                PhaseFail::Cancel => {
+                    spawn_abort_cleanup(session, stream_id);
+                    cancelled_err()
+                }
+                PhaseFail::Deadline => {
+                    spawn_abort_cleanup(session, stream_id);
+                    head_timeout_err()
+                }
+            });
+        }
     }
     // 等 meta 行（首块；有界——head 预算的剩余部分）。超时/取消发 RESET 清理
     // provider 侧在途请求（未清理则 handler 悬挂至其自身超时）。
@@ -625,6 +729,14 @@ async fn dispatch_stream(session: Arc<Session>, stream_id: u64, handler: Arc<dyn
     match shared.request_state(stream_id).await {
         Some(RequestState::Started) | Some(RequestState::Completed) => return,
         _ => {}
+    }
+    // r12-B4：对端取消先于 dispatch 到达（OPEN 后立即 RESET——客户端 head
+    // 超时/取消清理的竞速窗口）：副作用闸门之前止付，不触发上游请求（对端
+    // 已明确取消，执行上游只会留下无人消费的副作用）。终裁标记 Completed
+    // 让 watcher/RequestCancel 有界收敛（peer_reset 优先复查 → Cancelled）。
+    if shared.peer_reset(stream_id).await {
+        shared.mark_completed(stream_id).await;
+        return;
     }
     let Some(meta_raw) = shared.open_meta(stream_id).await else {
         return; // 无元数据（非 HTTP 流）——引擎不管

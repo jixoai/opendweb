@@ -9,14 +9,14 @@
 //! 运行：`--test-threads=1`。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dweb_fabric::continuity::http::{
     FetchCancel, Header, HttpEngineError, HttpHandler, HttpRequest, HttpRequestInit, HttpResponse,
     fetch_http, serve_http,
 };
-use dweb_fabric::continuity::session::{self, SessionOptions, StreamTerm};
+use dweb_fabric::continuity::session::{self, SessionOptions, SessionPhase, StreamTerm};
 use dweb_fabric::continuity::{Direction, Frame, FrameType};
 use dweb_fabric::{
     Fabric, FabricConfig, HttpProxyConfig, JOIN_TIMEOUT_MS_DEFAULT, RelayConfig, RelayTlsTrust,
@@ -1269,7 +1269,387 @@ async fn http_fetch_head_budget_is_single_shared_deadline() {
     let elapsed = t0.elapsed();
     assert!(
         elapsed <= budget + Duration::from_millis(500),
-        "整次 head 操作总时长必须 ≤ 单一预算+调度余量（实际 {elapsed:?}，预算 {budget:?}）"
+        "整次 head 操作总时长必须 ≤ 单一预算+调度余量（实际{elapsed:?}，预算 {budget:?}）"
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h17（r12-B3 活动 LocalAbort 终结）：客户端在 **Active** 会话上本地中止
+/// 响应流（`resp.abort()`）后，聚合读取必须以 Err 有限期终结。修复前
+/// `mark_local_abort` 只设 term 不设 `remote_final`，`recv()` 等不到「远端
+/// 终局水位到达」→ `read_all_body` 悬挂（h14 靠 close 后 Dead/Closed 收敛、
+/// h11 是对端 RESET，均不覆盖此路径）。已排队前缀仍可读，随后 Err。
+#[tokio::test]
+async fn http_client_abort_on_active_session_terminates_read_all() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    // 慢速长流：持续供给、永不结束——中止时对端流必须仍未终局
+    let h = handler(|_req: HttpRequest| {
+        Box::pin(async move {
+            let (tx, rx) = body_channel(2);
+            tokio::spawn(async move {
+                for i in 0..100_000u32 {
+                    if tx
+                        .send(Bytes::from(format!("prefix-{i:04};")))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/abort-active")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    let first = tokio::time::timeout(Duration::from_secs(10), resp.recv_body())
+        .await
+        .expect("首块有界")
+        .expect("首块");
+    assert!(!first.is_empty(), "中止前前缀必须可读");
+
+    // Active 会话上的本地中止（终态落位 + best-effort RESET）
+    assert_eq!(
+        client.shared().phase().await,
+        SessionPhase::Active,
+        "中止时会话必须 Active（区别于 h14 的 close 后聚合）"
+    );
+    resp.abort().await;
+
+    let t0 = Instant::now();
+    let agg = tokio::time::timeout(Duration::from_secs(5), resp.read_all_body())
+        .await
+        .expect("read_all_body 必须有限期终结（修复前悬挂）");
+    assert!(
+        agg.is_err(),
+        "本地中止后 read_all_body 必须 Err（前缀≠完整实体）"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        client.shared().stream_term(resp.stream_id).await,
+        Some(StreamTerm::LocalAbort),
+        "终态分类必须 LocalAbort（粘滞）"
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h18（r12-B3 供给面中止的请求体读终结）：provider 在 Active 会话上对请求
+/// 流本地中止（StreamWriter abort 的内核等价路径：`abort_stream` 终态落位）
+/// 后，handler 侧 `RequestBody::read_all()` 必须以 Err 有限期终结——请求体
+/// 传输失败以错误暴露，绝不悬挂。
+#[tokio::test]
+async fn http_provider_local_abort_terminates_request_body_read_all() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    // (read_all 是否 Err, 是否外层超时)——handler 返回响应头即已结算完成
+    let outcome: Arc<std::sync::Mutex<Option<(bool, bool)>>> = Arc::default();
+    let o = Arc::clone(&outcome);
+    let h = handler(move |req: HttpRequest| {
+        let shared = Arc::clone(req.body.shared());
+        let sid = req.stream_id;
+        let o = Arc::clone(&o);
+        Box::pin(async move {
+            let first = req.body.recv().await.expect("首块请求体交付");
+            assert!(!first.is_empty());
+            // Active 会话上本地中止（终态落位 + best-effort RESET）
+            shared.abort_stream(sid).await;
+            let agg = tokio::time::timeout(Duration::from_secs(5), req.body.read_all()).await;
+            let (is_err, timed_out) = match agg {
+                Ok(r) => (r.is_err(), false),
+                Err(_) => (false, true),
+            };
+            *o.lock().unwrap() = Some((is_err, timed_out));
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: None,
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    // keep_open：请求方向不 FIN——中止时请求流必须仍未终局。
+    // fetch 不作结算断言：中止后响应 meta 按终态流幂等丢弃属预期（消费端
+    // 以错误收敛）；本用例的断言面是 handler 侧 read_all 的终结性。
+    let fetcher = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut init =
+                HttpRequestInit::post("/req-abort", Bytes::from_static(b"req-prefix-0;"));
+            init.keep_open = true;
+            let _ = fetch_http(&client, init).await;
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (is_err, timed_out) = loop {
+        if let Some(o) = *outcome.lock().unwrap() {
+            break o;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "handler 未结算（read_all 悬挂 = 回归）"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!timed_out, "read_all 不得悬挂（修复前外层超时）");
+    assert!(
+        is_err,
+        "本地中止后 RequestBody::read_all 必须 Err（前缀≠完整实体）"
+    );
+    fetcher.abort();
+    client.close().await;
+    provider.abort();
+}
+
+/// h19（r12-B1 路径 b「FIN 已登记后 abort」）：provider 干净半关（FIN 已上
+/// wire、final_sent 已登记）之后本地中止——消费端绝不以干净 null 收尾：
+/// RESET 随后到达把终态粘滞升级为错误，`read_all_body` 必须 Err。barrier 控制
+/// 读取时机（消费端在 provider 中止完成前不读——钉发送侧 first-terminal
+/// 仲裁后的消费端终态，规避两帧处理间隙的读取窗口）。修复前
+/// `fin_resent_streams` 无条件收集 final_sent 流、abort 不清除 FIN 面——
+/// 恢复/竞速形态下 FIN 可先于 RESET 成为可观察 EOF。
+#[tokio::test]
+async fn http_fin_registered_then_abort_never_clean_eof() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let abort_now = Arc::new(tokio::sync::Notify::new());
+    let ab = Arc::clone(&abort_now);
+    let h = handler(move |req: HttpRequest| {
+        let shared = Arc::clone(req.body.shared());
+        let sid = req.stream_id;
+        let ab = Arc::clone(&ab);
+        Box::pin(async move {
+            let (tx, rx) = body_channel(4);
+            // feeder：prefix → 关供给（dispatch 走正常 FIN、final_sent 登记）
+            // → 等主测确认 FIN 已被对端处理 → 中止（RESET 随 FIN 之后）
+            tokio::spawn(async move {
+                if tx
+                    .send(Bytes::from_static(b"fin-then-abort-prefix;"))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                drop(tx); // 供给关闭 → dispatch 走正常 FIN（final_sent 登记）
+                ab.notified().await; // 主测确认 FIN 送达后才放行（后到终态）
+                shared.abort_stream(sid).await;
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/fin-then-abort")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+
+    // barrier 1（轮询观察）：provider 的 FIN 实际送达并被客户端 pump 处理
+    //（term=Fin = final_sent 已登记且 FIN 已上 wire 的可观察证据）
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.shared().stream_term(resp.stream_id).await != Some(StreamTerm::Fin) {
+            assert!(
+                Instant::now() < deadline,
+                "FIN 未送达（term 未落 Fin——前置条件不满足）"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // barrier 2：FIN 已登记（客户端已处理）后释放中止——RESET 随 FIN 之后
+    abort_now.notify_waiters();
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.shared().stream_term(resp.stream_id).await != Some(StreamTerm::PeerReset) {
+            assert!(
+                Instant::now() < deadline,
+                "abort 后 RESET 未把终态升级为 PeerReset（截断不得停留干净 Fin）"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // 消费端聚合：前缀可读但绝不以干净 EOF 收尾（read_all_body 必须 Err）
+    let agg = tokio::time::timeout(Duration::from_secs(10), resp.read_all_body())
+        .await
+        .expect("聚合有界");
+    assert!(
+        agg.is_err(),
+        "FIN 后 abort 的流必须以错误终结（read_all_body 绝不干净成功）"
+    );
+    assert_eq!(
+        client.shared().stream_term(resp.stream_id).await,
+        Some(StreamTerm::PeerReset),
+        "终态粘滞：RESET 升级后不得回落 Fin"
+    );
+    client.close().await;
+    provider.abort();
+}
+
+/// h20（r12-B1 路径 c「恢复期 active 与 Recovering 竞速」）：provider 已干净
+/// 半关（FIN 送达）、连接死亡窗口内本地中止（RESET 发送失败）→ 恢复重放面
+/// **不得重放该流的 FIN**（final_sent 在中止落位时原子清除——直接断言面），
+/// RESET 补发后消费端以错误终结。修复前 final_sent 保留 + 重放顺序
+/// FIN-then-RESET：消费端可在 RESET 处理前把 FIN 映射为干净 EOF（null）。
+#[tokio::test]
+async fn http_abort_after_fin_survives_recovery_without_fin_replay() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let abort_now = Arc::new(tokio::sync::Notify::new());
+    // provider 侧终态快照（中止后、恢复前）：(term, final_sent)
+    type TermSnap = Arc<std::sync::Mutex<Option<(Option<StreamTerm>, Option<u64>)>>>;
+    let provider_snap: TermSnap = Arc::default();
+    let ab = Arc::clone(&abort_now);
+    let snap = Arc::clone(&provider_snap);
+    let h = handler(move |req: HttpRequest| {
+        let shared = Arc::clone(req.body.shared());
+        let sid = req.stream_id;
+        let ab = Arc::clone(&ab);
+        let snap = Arc::clone(&snap);
+        Box::pin(async move {
+            let (tx, rx) = body_channel(4);
+            tokio::spawn(async move {
+                if tx
+                    .send(Bytes::from_static(b"recover-no-fin-replay;"))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                drop(tx); // 正常半关 → FIN 上 wire
+                ab.notified().await; // 主测在通道死亡后才放行（RESET 必然失败）
+                shared.abort_stream(sid).await;
+                // provider 侧快照：中止后 final_sent 必须已清除（r12-B1 修复面）
+                let term = shared.stream_term(sid).await;
+                let final_sent = shared.debug_final_sent(sid).await;
+                *snap.lock().unwrap() = Some((term, final_sent));
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: Some(rx),
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let mut resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/recover-no-fin-replay")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200);
+    let first = tokio::time::timeout(Duration::from_secs(10), resp.recv_body())
+        .await
+        .expect("首块有界")
+        .expect("首块");
+    assert_eq!(&first[..], b"recover-no-fin-replay;");
+    // FIN 实际送达并被客户端 pump 处理（term=Fin——final_sent 已登记证据）
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.shared().stream_term(resp.stream_id).await != Some(StreamTerm::Fin) {
+            assert!(Instant::now() < deadline, "FIN 未送达（前置条件不满足）");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // 连接死亡 → Recovering 窗口内中止（RESET best-effort 失败，终态跨代保留）
+    a.continuity_reset(&b_id).await.unwrap();
+    let dead_deadline = Instant::now() + Duration::from_secs(10);
+    while !client.channel().is_dead() {
+        assert!(Instant::now() < dead_deadline, "通道死亡标记超时");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    abort_now.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(300)).await; // 中止终态落位、失败的 RESET 返回
+
+    // 直接断言面（r12-B1）：provider 侧中止原子清除 FIN 重放面——恢复轮
+    // 不重放该流的 FIN（修复前 final_sent 保留 → FIN 先于 RESET 可观察）
+    let (provider_term, provider_final_sent) = provider_snap
+        .lock()
+        .unwrap()
+        .expect("provider 快照已落（中止路径已执行）");
+    assert_eq!(
+        provider_term,
+        Some(StreamTerm::LocalAbort),
+        "中止终态跨死亡窗口保留"
+    );
+    assert_eq!(
+        provider_final_sent, None,
+        "中止必须原子清除 final_sent（恢复重放面不得再含该 FIN）"
+    );
+
+    // 恢复：重放面只补发 RESET（FIN 面已清除）——先轮询终态升级为 PeerReset
+    //（终态停留干净 Fin = 重放面违约/RESET 未补发），聚合面随后断言。
+    client.resume(&a).await.expect("resume");
+    {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while client.shared().stream_term(resp.stream_id).await != Some(StreamTerm::PeerReset) {
+            assert!(
+                Instant::now() < deadline,
+                "恢复后 RESET 未补发（终态停留干净 Fin = 体完整性违约）"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    let agg = tokio::time::timeout(Duration::from_secs(10), resp.read_all_body())
+        .await
+        .expect("聚合有界");
+    assert!(
+        agg.is_err(),
+        "恢复竞速后的流必须以错误终结（read_all_body 绝不干净成功）"
     );
     client.close().await;
     provider.abort();
