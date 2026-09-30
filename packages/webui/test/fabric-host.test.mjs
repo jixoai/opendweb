@@ -400,7 +400,7 @@ test("fabric host: joinWithToken fails closed when the joined roster lacks a for
 
 // ---- 3. 会话缓存/失效 -----------------------------------------------------------------
 
-test("fabric host: sessionResolver caches per peer and evicts on peer-disconnected / session state", async (t) => {
+test("fabric host: sessionResolver caches per peer; survives peer-disconnected; evicts on terminal phases only", async (t) => {
   const home = await homeWithLease();
   t.after(() => rm(home, { recursive: true, force: true }));
   const fake = makeFakeSdk();
@@ -415,18 +415,28 @@ test("fabric host: sessionResolver caches per peer and evicts on peer-disconnect
   assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 1);
   assert.equal(await host.resolvePeerBySession(s1.sessionId), PEER, "opened sessions resolve back to the peer");
 
-  // peer-disconnected → 逐出+关闭
+  // peer-disconnected → **不逐出**（真双机实证 2026-09-30：内核会话层以
+  // Recovering+auto-resume 承接瞬断，逐出+close 会把在途流截断成 200+空/截断体）
   fake.emit({ type: "peer-disconnected", endpointId: PEER });
-  assert.equal(s1.closed, true, "session closed on eviction");
+  assert.equal(s1.closed, false, "session survives transient disconnect");
+  assert.ok(!fake.calls.includes(`serveClose:${PEER}`), "serve binding survives disconnect");
   const s3 = await host.sessionResolver(PEER);
-  assert.notEqual(s3, s1, "next call re-opens after eviction");
-  assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 2);
+  assert.equal(s3, s1, "cached session reused after transient disconnect");
+  assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 1);
 
-  // 会话态 disconnected → 逐出（onState 订阅）
+  // 会话相位 disconnected/closing（连接相位词——会话侧永不出现）→ 不逐出
   fake.sessions.at(-1).emitState({ phase: "disconnected" });
+  fake.sessions.at(-1).emitState({ phase: "closing" });
   const s4 = await host.sessionResolver(PEER);
-  assert.notEqual(s4, s3);
-  assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 3);
+  assert.equal(s4, s1, "non-terminal phase words never evict");
+  assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 1);
+
+  // 终态 dead → 逐出+关闭（onState 订阅——SDK 冻结相位名 dead/closed）
+  fake.sessions.at(-1).emitState({ phase: "dead" });
+  assert.equal(s1.closed, true, "terminal phase closes the cached session");
+  const s5 = await host.sessionResolver(PEER);
+  assert.notEqual(s5, s1, "next call re-opens after terminal eviction");
+  assert.equal(fake.calls.filter((c) => c === `openSession:${PEER}`).length, 2);
 });
 
 test("fabric host: noteSession maps inbound serveHttp sessions for resolvePeerBySession", async (t) => {

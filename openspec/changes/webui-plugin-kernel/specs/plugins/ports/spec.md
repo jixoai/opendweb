@@ -35,3 +35,8 @@ ports 插件 SHALL 在消费侧（B 机）维护映射账本 `<DWEB_HOME>/plugin
 
 - **WHEN** A:8080 提供 text/event-stream 服务经映射访问；或 B 添加映射时 localPort 已被占用
 - **THEN** SSE 事件流持续透传不缓冲至断开；端口冲突报明确错误且不绑定任何替代端口
+
+#### Scenario: 体完整性——传输中断绝不允许伪装成功（真双机实证 2026-09-30）
+
+- **WHEN** 代理响应体传输中途失败（会话翻转/对端取消/上游掐断——bodyNext 以错误而非干净 EOF 终结）
+- **THEN** 响应头未外显（首块未达）时 MUST 以 502 `upstream-body-lost` 明确失败——空/截断响应绝不允许以 200 形态外显；响应头已外显时 MUST 销毁本地连接（客户端见到传输失败而非伪完整 200）。响应头延迟至首个 body 块或干净 EOF 才提交（SSE 首事件随首块透传不受缓冲）；干净 EOF 零体（上游真实空响应）照常 200+空体。provider 侧上游取消掐断 MUST 经 writer.abort()（显式 RESET——消费端按错误暴露）而非 finish()（伪装干净 EOF）

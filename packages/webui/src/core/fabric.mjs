@@ -30,15 +30,17 @@
 //    或消费侧 sessionResolver 首用（数据面需求）。无数据面插件的 sidecar 不付出
 //    fabric 连接代价（bind/relay 接触/会话保活全为零）。
 // 3. 会话解析器 sessionResolver(peer)→SessionHandle：per-peer 缓存
-//    （SessionHandle 内建 auto-resume——长缓存即设计）；失效=peer-disconnected
-//    事件 / 会话 onState 投影 disconnected/closing（订阅解绑+缓存逐出，下次
-//    调用重开）。resolvePeerBySession(sessionId)→peer 反查（files 授权与
-//    sync/serveHttp 请求同一张 sessionId→peer 表——noteSession 由聚合路由
-//    在每个入站请求上登记）。
+//    （SessionHandle 内建 auto-resume——长缓存即设计；连接级 peer-disconnected
+//    事件**不**逐出——内核 Recovering+journal 重放跨瞬断续传在途流，逐出+close
+//    会制造截断，真双机实证 2026-09-30）；失效=终态相位（每查询快照复核 +
+//    onState dead/closed——早年的 disconnected/closing 是永不触发的潜伏死码，
+//    已修正）→ 订阅解绑+缓存逐出+close，下次调用重开。resolvePeerBySession
+//    (sessionId)→peer 反查（files 授权与 sync/serveHttp 请求同一张
+//    sessionId→peer 表——noteSession 由聚合路由在每个入站请求上登记）。
 // 4. 提供侧：peer-connected → serveHttp(fabric, peer, router(peer, req))
-//    （per-peer 绑定；peer-disconnected → server.close()）。router 由组装处
-//    setRouter 注入（createWpkRouter 聚合路由——/wpk1/<plugin>/<...> 分发，
-//    未启用 deny/未知插件 404）。
+//    （per-peer 绑定；内核 serve 循环跨连接颤动存活——断连不拆绑）。router
+//    由组装处 setRouter 注入（createWpkRouter 聚合路由——/wpk1/<plugin>/<...>
+//    分发，未启用 deny/未知插件 404）。
 // 5. close 顺序：serveHttp servers 关闭 → 缓存会话 close → 事件退订 →
 //    fabric.shutdown()（幂等；sidecar close 路径在 plugins.close() 之后调用
 //    ——插件先 drain 在途数据面活动，再拆 fabric）。
@@ -276,20 +278,12 @@ export async function createFabricHost(opts = {}) {
     servers.set(peer, s);
   }
 
-  function unbindPeer(peer) {
-    const s = servers.get(peer);
-    if (s !== undefined) {
-      try {
-        s.close?.();
-      } catch {
-        /* close 异常不阻塞拆线 */
-      }
-      servers.delete(peer);
-    }
-    evictSession(peer);
-  }
-
-  /** 逐出（并关闭）peer 的缓存会话。 */
+  /**
+   * 逐出（并关闭）peer 的缓存会话。仅用于**终态**会话（snapshot dead/closed
+   * 或 host 关闭）——连接级事件（peer-disconnected）绝不逐出：内核会话层
+   * 以 Recovering+auto-resume 承接瞬断（journal 重放续传在途流），逐出+close
+   * 会把可恢复瞬断变成在途流截断（真双机实证 2026-09-30：200+空/截断体）。
+   */
   function evictSession(peer) {
     const hit = sessions.get(peer);
     if (hit === undefined) return;
@@ -308,7 +302,11 @@ export async function createFabricHost(opts = {}) {
 
   /**
    * Fabric 事件接线（startSequence 与 joinWithToken 接管两路共用）：
-   * peer-connected 绑 serveHttp + 在线回调；peer-disconnected 拆线+逐出会话。
+   * peer-connected 绑 serveHttp + 在线回调；peer-disconnected 只摘在线登记
+   * （connectedPeers）——不拆 serve、不逐出会话：内核 serve 循环与会话层
+   * （Recovering→auto-resume→journal 重放）跨连接颤动存活，逐出+close 会把
+   * 瞬断变成在途流截断（真双机实证 2026-09-30）；会话缓存由 sessionResolver
+   * 的终态快照复核逐出（dead/closed）。
    * @param {object} f Fabric 实例
    * @returns {() => void} 退订函数
    */
@@ -326,7 +324,6 @@ export async function createFabricHost(opts = {}) {
         }
       } else if (ev?.type === "peer-disconnected" && typeof ev.endpointId === "string") {
         connectedPeers.delete(ev.endpointId);
-        unbindPeer(ev.endpointId);
       }
     });
   }
@@ -558,7 +555,10 @@ export async function createFabricHost(opts = {}) {
         unsubscribe:
           typeof session.onState === "function"
             ? session.onState((st) => {
-                if (st?.phase === "disconnected" || st?.phase === "closing") evictSession(peer);
+                // SDK 会话相位冻结名：negotiating/active/recovering/dead/closed
+                //（早年的 disconnected/closing 是连接相位词——会话侧永不出现，
+                // 该订阅从未触发过，属潜伏死码；真双机实证 2026-09-30 修正）。
+                if (st?.phase === "dead" || st?.phase === "closed") evictSession(peer);
               })
             : () => {},
       };

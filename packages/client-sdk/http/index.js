@@ -173,6 +173,13 @@ async function serveHttp(fabric, peerId, handler) {
                 writer.finish();
                 finalizeRequest(rid); // 本地半关：后续 cancel 无意义
               },
+              // 中止（上游被取消/掐断）：向对端显式 RESET——截断不得伪装干净
+              // EOF（消费端按错误暴露）；旧 native 无此面时回落 finish
+              abort: () => {
+                if (typeof writer.abort === "function") writer.abort();
+                else writer.finish();
+                finalizeRequest(rid);
+              },
               get finished() {
                 return writer.finished;
               },

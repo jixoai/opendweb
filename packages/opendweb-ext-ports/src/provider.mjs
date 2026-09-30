@@ -13,7 +13,9 @@
 //    请求体有界（§4 [W7] 纵深防御：已知长度超限 413；未知长度边拉边累计、
 //    超限停拉 413——消费侧已限，双保险）；零转发=上游 socket 从未建立。
 // 4. 取消传播：request.signal（对端 RESET/会话终态遗弃）→ 上游请求 destroy
-//    （上游 socket 收敛——spec 断言面）；流式 write 错误（对端已弃）同样收敛。
+//    （上游 socket 收敛——spec 断言面）+ 下游 writer.abort()（显式 RESET——
+//    上游被取消掐断的截断响应不得伪装干净 EOF）；流式 write 错误（对端已弃）
+//    同样收敛。
 // 5. 响应流式：上游响应头一到即 respondStreaming（SSE 首包早发），body 逐块
 //    write（有界背压：上游 pause/resume 传导消费速度）；hop-by-hop 剥除+敏感
 //    回显重写（headers.mjs 冻结清单；content-length 剥除——fabric 体无可靠长度）。
@@ -131,12 +133,21 @@ export function createPortsProxyHandler(opts) {
        * 对后注册的 listener 重放事件——注册前必须显式检查（防「abort 发生在
        * http.request 建立前」的窗口漏取消）。
        */
+      /**
+       * 取消传播唯一入口（对端 RESET/遗弃 → request.signal）：上游 destroy
+       * （socket 收敛）+ 已开流时下游 abort（向对端显式 RESET——上游被取消
+       * 掐断的截断响应不得伪装干净 EOF，真双机实证 2026-09-30；无 abort 面
+       * 的旧 writer 回落 finish）。注意：已 aborted 的 signal 不会对后注册的
+       * listener 重放事件——注册前必须显式检查（防「abort 发生在 http.request
+       * 建立前」的窗口漏取消）。
+       */
       const abortUpstream = () => {
         upstreamReq.destroy(); // 上游 socket 收敛（取消传播断言面）
         if (streaming && !done) {
           done = true;
           try {
-            writer?.finish();
+            if (typeof writer?.abort === "function") writer.abort();
+            else writer?.finish();
           } catch {
             /* 通道已死 */
           }
@@ -217,7 +228,7 @@ export function createPortsProxyHandler(opts) {
  * @property {string} path
  * @property {Array<{name: string, value: string}>} headers
  * @property {() => Promise<Buffer | null>} bodyNext
- * @property {(status: number, headers?: Array<{name: string, value: string}>) => { write: (chunk: Uint8Array) => Promise<void>, finish: () => void, finished: boolean, cancelled: boolean, closed: boolean } | null} respondStreaming
+ * @property {(status: number, headers?: Array<{name: string, value: string}>) => { write: (chunk: Uint8Array) => Promise<void>, finish: () => void, abort?: () => void, finished: boolean, cancelled: boolean, closed: boolean } | null} respondStreaming
  *
  * @typedef {Object} HttpHandlerResponseLike
  * @property {number} status

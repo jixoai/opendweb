@@ -527,7 +527,8 @@ async fn http_lifecycle_session_id_and_cancel_outcomes() {
         .expect("watcher 汇报");
     assert_eq!(out1, CancelOutcome::Cancelled, "abort → Cancelled");
     assert_eq!(
-        sid1, client.shared().session_id,
+        sid1,
+        client.shared().session_id,
         "HttpRequest.session_id == 会话 id"
     );
 
@@ -574,9 +575,8 @@ async fn http_lifecycle_session_id_and_cancel_outcomes() {
             })
         })
     });
-    let provider2 = tokio::spawn(async move {
-        serve_http(&d, &c_id, SessionOptions::default(), h2).await
-    });
+    let provider2 =
+        tokio::spawn(async move { serve_http(&d, &c_id, SessionOptions::default(), h2).await });
     let client2 = session::open_session(&c, &d_id, SessionOptions::default())
         .await
         .expect("open 2 (fresh pair)");
@@ -751,6 +751,73 @@ async fn http_session_close_cancels_hanging_handler() {
         t0.elapsed() < Duration::from_secs(10),
         "close 取消应有界即时（实际 {:?}）",
         t0.elapsed()
+    );
+    provider.abort();
+}
+
+/// h10（真双机实证 2026-09-30）：fetch 活性通道闸门——通道死亡（会话
+/// Recovering 窗口）内发起的新 fetch 不再立即失败，等待新代通道安装后
+/// 发出（LAN 连接周期性颤动场景：消费端 fetch 不得因瞬断抖成 502/空响应）。
+#[tokio::test]
+async fn http_fetch_gate_waits_for_channel_reinstall_during_recovery() {
+    let (a, b, _da, _db) = pair().await;
+    let b_id = b.endpoint_id();
+    let a_id = a.endpoint_id();
+    let opts = SessionOptions::default();
+
+    let h = handler(|_req: HttpRequest| {
+        Box::pin(async move {
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![Header::new("content-type", "text/plain")],
+                body: None,
+            })
+        })
+    });
+    let provider = tokio::spawn(async move { serve_http(&b, &a_id, opts, h).await });
+
+    let client = session::open_session(&a, &b_id, SessionOptions::default())
+        .await
+        .expect("open");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(20),
+        fetch_http(&client, HttpRequestInit::get("/one")),
+    )
+    .await
+    .expect("fetch 有界")
+    .expect("fetch ok");
+    assert_eq!(resp.status, 200, "基准 fetch 正常");
+
+    // 注入死亡并等待泵退出（通道 is_dead 置位、phase → Recovering）
+    a.continuity_reset(&b_id).await.unwrap();
+    let dead_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !client.channel().is_dead() {
+        assert!(
+            tokio::time::Instant::now() < dead_deadline,
+            "通道死亡标记超时"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // 通道已死（会话 Recovering）：并发驱动 resume + 立刻发起新 fetch——
+    // 活性闸门让 fetch 等新代安装后发出，而非死通道上 open_stream 快败
+    let fetcher = {
+        let client = client.clone();
+        tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_secs(25),
+                fetch_http(&client, HttpRequestInit::get("/two")),
+            )
+            .await
+            .expect("fetch 有界")
+            .expect("fetch 在新代通道上成功")
+        })
+    };
+    client.resume(&a).await.expect("resume");
+    let resp2 = fetcher.await.expect("task join");
+    assert_eq!(
+        resp2.status, 200,
+        "Recovering 窗口内的 fetch 经新代通道成功"
     );
     provider.abort();
 }

@@ -1008,6 +1008,26 @@ impl SessionShared {
             .is_some_and(|c| c.peer_reset)
     }
 
+    /// 主动向对端发本流的 RESET（SDK 中止面——provider 上游被取消/掐断时经
+    /// StreamWriterJs.abort 调用）。best-effort 有界：通道已死时发送失败即
+    /// 中止目的已达（对端经会话终态/自身超时收敛）。
+    pub async fn send_reset(&self, stream_id: u64) {
+        if let Some(chan) = self.current_channel() {
+            let frame = super::frame::Frame {
+                frame_type: super::frame::FrameType::Reset,
+                flags: 0,
+                session_id: self.session_id,
+                stream_id,
+                direction: self.send_direction(),
+                byte_offset: 0,
+                payload: Bytes::new(),
+            };
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), chan.send_frame(&frame))
+                    .await;
+        }
+    }
+
     /// 测试观测面：当前恢复凭据（集成测试注入合法 RESUME 用）。
     #[doc(hidden)]
     pub fn debug_current_token(&self) -> (u64, [u8; 16]) {

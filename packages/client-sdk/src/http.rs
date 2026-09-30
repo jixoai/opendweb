@@ -123,7 +123,20 @@ impl HttpClientResponseJs {
                 let mut guard = self.resp.lock().await;
                 match guard.recv_body().await {
                     Ok(c) => Ok(Some(c)),
-                    Err(_) => Ok(None), // EOF（对端 FIN/RESET——内核收敛为流结束）
+                    Err(_) => {
+                        // EOF 终结面区分（真双机实证 2026-09-30：会话翻转/取消的
+                        // 在途流以 RESET 终结，内核收敛为「流结束」）——RESET/遗弃
+                        // 不得伪装干净 EOF：消费端（ports 等价性承诺）须拿到错误，
+                        // 否则截断/空体以 200 形态外显。干净 FIN 才是 null。
+                        if self.shared.peer_reset(self.stream_id).await {
+                            Err(Error::new(
+                                Status::GenericFailure,
+                                "[session] response stream reset by peer",
+                            ))
+                        } else {
+                            Ok(None) // 干净 EOF（对端 FIN，队列已排空）
+                        }
+                    }
                 }
             };
             match tokio::time::timeout(BODY_RACE_SLICE, pull).await {
@@ -257,10 +270,16 @@ pub(crate) struct RequestFlags {
 /// dispatch 结算的 oneshot 回流句柄（requestId 关联）。
 type PendingHandlerOutcome = oneshot::Sender<std::result::Result<HandlerOutcome, String>>;
 
+/// 入站请求体登记（RequestBody + 逻辑流 id——中止面直接向内核通道发 RESET 用）。
+struct InboundBody {
+    body: RequestBody,
+    stream_id: u64,
+}
+
 pub(crate) struct HandlerBridge {
     tsfn: Arc<ThreadsafeFunction<String>>,
     pending: Arc<Mutex<HashMap<u64, PendingHandlerOutcome>>>,
-    bodies: Arc<Mutex<HashMap<u64, RequestBody>>>,
+    bodies: Arc<Mutex<HashMap<u64, InboundBody>>>,
     /// per-request 生命周期旗（watcher 置位；StreamWriterJs 观测用）。
     cancels: Arc<Mutex<HashMap<u64, Arc<RequestFlags>>>>,
     /// server.close 唤醒面（R2-P1d：未 finish 的流式请求不在 pending——
@@ -301,7 +320,13 @@ impl HttpHandler for HandlerBridge {
             }
             let (tx, rx) = oneshot::channel();
             pending.lock().await.insert(request_id, tx);
-            bodies.lock().await.insert(request_id, request.body.clone());
+            bodies.lock().await.insert(
+                request_id,
+                InboundBody {
+                    body: request.body.clone(),
+                    stream_id: request.stream_id,
+                },
+            );
             // R3-P1d：插入后复查 closed——close 的 drain 可能刚好错过本批
             // 插入（检查在前、drain 在后的交错）：自摘除并以 server closed
             // 拒绝（不留无人结算的 pending/bodies/cancels）。
@@ -568,9 +593,20 @@ impl HttpServerJs {
                     closed: std::sync::atomic::AtomicBool::new(false),
                 })
             });
+        // 中止面目标（真双机实证 2026-09-30）：provider 上游被取消/掐断时须向
+        // 对端显式 RESET——engine 的 mpsc-None→FIN 会把截断伪装成干净 EOF
+        // （消费端拿到 200+空/截断体，ports 等价性违背）。
+        let abort_target = self
+            .bridge
+            .bodies
+            .blocking_lock()
+            .get(&id)
+            .map(|b| (Arc::clone(b.body.shared()), b.stream_id));
         Ok(Some(StreamWriterJs {
             tx: std::sync::Mutex::new(Some(btx)),
             flags,
+            abort_target,
+            aborted: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -592,7 +628,13 @@ impl HttpServerJs {
     #[napi]
     pub async fn request_body_next(&self, request_id: f64) -> Result<Option<Buffer>> {
         let id = request_id as u64;
-        let body = self.bridge.bodies.lock().await.get(&id).cloned();
+        let body = self
+            .bridge
+            .bodies
+            .lock()
+            .await
+            .get(&id)
+            .map(|b| b.body.clone());
         let Some(body) = body else {
             return Err(Error::new(
                 Status::GenericFailure,
@@ -659,6 +701,10 @@ impl HttpServerJs {
 pub struct StreamWriterJs {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Bytes>>>,
     flags: Arc<RequestFlags>,
+    /// 中止面目标（会话共享核 + 逻辑流 id）：abort() 向对端发 RESET——截断
+    /// 不得伪装干净 EOF（finish()=正常半关；abort()=上游被取消掐断）。
+    abort_target: Option<(Arc<SessionShared>, u64)>,
+    aborted: std::sync::atomic::AtomicBool,
 }
 
 #[napi]
@@ -711,6 +757,21 @@ impl StreamWriterJs {
     #[napi]
     pub fn finish(&self) -> Result<()> {
         *self.tx.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// 中止（幂等）：停止 body 供给并向对端发 RESET——「上游被取消/掐断」
+    /// 的截断响应不得伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性
+    /// 承诺：要么成功有体、要么明确失败）。通道已死时发送失败即中止目的已达。
+    #[napi]
+    pub async fn abort(&self) -> Result<()> {
+        if self.aborted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        *self.tx.lock().unwrap() = None;
+        if let Some((shared, stream_id)) = &self.abort_target {
+            shared.send_reset(*stream_id).await;
+        }
         Ok(())
     }
 }

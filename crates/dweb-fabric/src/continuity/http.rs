@@ -310,7 +310,37 @@ pub async fn fetch_http(
     session: &Session,
     init: HttpRequestInit,
 ) -> Result<HttpClientResponse, FabricError> {
-    let channel = session.channel();
+    let head_timeout = init
+        .head_timeout
+        .unwrap_or(std::time::Duration::from_secs(30));
+    // 活性通道闸门（真双机实证 2026-09-30：LAN 连接周期性颤动 → 会话 Recovering
+    // → 死通道上 open_stream 立即失败 → 消费端 fetch 502/空响应抖动）。与
+    // open_session 的 wait_for_existing_session 活性闸门同源：死通道按无通道
+    // 处理——Recovering 期间等 auto-resume 安装新代（有界=head 预算），终态
+    // （Dead/Closed）立即失败。请求一旦发出，断线续传由 journal 重放承接。
+    let channel = {
+        let deadline = tokio::time::Instant::now() + head_timeout;
+        loop {
+            let ch = session.channel();
+            if !ch.is_dead() {
+                break ch;
+            }
+            if matches!(
+                session.phase().await,
+                super::session::SessionPhase::Dead | super::session::SessionPhase::Closed
+            ) {
+                return Err(FabricError::Session(SessionError::Connect(
+                    "session dead/closed".into(),
+                )));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(FabricError::Session(SessionError::Connect(
+                    "response head timeout".into(),
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    };
     let idem = hex16(
         &super::session::rand_16().ok_or_else(|| HttpEngineError("entropy unavailable".into()))?,
     );
@@ -340,9 +370,7 @@ pub async fn fetch_http(
     }
     // 等 meta 行（首块；有界——head_timeout 可配，默认 30s）。超时前发 RESET
     // 清理 provider 侧在途请求（未清理则 handler 悬挂至其自身超时）。
-    let head_timeout = init
-        .head_timeout
-        .unwrap_or(std::time::Duration::from_secs(30));
+    // （head_timeout 已在入口活性闸门处解析——闸门等待与 head 等待共享同一预算。）
     let head_timeout_err =
         || FabricError::Session(SessionError::Connect("response head timeout".into()));
     // RESET 为 best-effort 有界发送：通道已死时对端同样终结该流（取消目的已

@@ -7,7 +7,9 @@
 //    host 重写为 localhost:<remotePort> 直连语义；content-length 按缓冲后实际
 //    字节重算——/http 请求体=静态分块 Array<Uint8Array>，须先有界缓冲）→
 //    fetchHttp(session, {path:"/wpk1/ports/proxy/<remotePort><原始path+query>"})
-//    → 响应头 + 流式体回写（bodyNext 逐块 pull，SSE 不缓冲）。
+//    → 响应头延迟提交（首个 body 块或干净 EOF 才 writeHead）+ 流式体回写
+//    （bodyNext 逐块 pull，SSE 不缓冲）。体传输失败绝不允许伪装干净 200：
+//    头未外显→502 upstream-body-lost；头已外显→销毁连接（传输失败形态）。
 // 3. 两阶段取消（design §4 r2-B1 冻结协议，按 /http 实际面实现）：
 //    - 阶段 A（响应头等待期）：本机下游断开 → 请求 AbortController.abort() →
 //      fetchHttp request.signal（头等待期取消键仍注册）→ 即时 RESET → 对端
@@ -441,17 +443,29 @@ export function createMappingServer(opts) {
       // 阶段 B：响应头已回——请求 signal 取消键已注销，此后取消走响应句柄 abort()
       fetchResp = resp;
       phase = "body";
-      res.writeHead(resp.status, arrayHeadersToNode(forwardResponseHeaders(resp.headers ?? [])));
+      // 响应头延迟提交（真双机实证 2026-09-30：会话翻转/对端取消的截断流曾以
+      // 「200+空/截断体」外显——ports 等价性承诺：要么成功有体、要么明确失败）：
+      // 首个 body 块到达或干净 EOF 才 writeHead——体失败发生在头未落本地前时
+      // 仍可回 5xx。SSE 首事件随首块即时透传（不缓冲）。
+      let headSent = false;
+      const sendHead = () => {
+        if (headSent || res.destroyed || res.writableEnded) return;
+        headSent = true;
+        res.writeHead(resp.status, arrayHeadersToNode(forwardResponseHeaders(resp.headers ?? [])));
+      };
+      let bodyFailed = false;
       // 流式回写（bodyNext pull-first——SSE 逐事件透传，不缓冲）
       for (;;) {
         let chunk;
         try {
           chunk = await resp.bodyNext();
         } catch {
-          break; // 传输失败/本端 abort（阶段 B 取消）：停止拉取
+          bodyFailed = true; // 传输失败（RESET/会话终态/本端 abort）——不是干净 EOF
+          break;
         }
-        if (chunk === null) break;
+        if (chunk === null) break; // 干净 EOF（对端 FIN）
         if (res.destroyed || res.writableEnded) break;
+        sendHead(); // 首块即提交头
         if (!res.write(chunk)) {
           await new Promise((resolve) => {
             res.once("drain", resolve);
@@ -460,6 +474,23 @@ export function createMappingServer(opts) {
           });
         }
       }
+      if (bodyFailed) {
+        if (!headSent && !res.headersSent) {
+          // 头未外显：明确 5xx——空/截断响应绝不允许以 200 形态外显
+          log("warn", `ports mapping ${mapping.id} body transfer failed (status ${resp.status} never surfaced)`);
+          respondJsonAndClose(res, 502, {
+            code: "upstream-body-lost",
+            message: `proxied response body to peer ${mapping.peer}:${mapping.remotePort} was terminated mid-transfer before any body byte; the upstream response (status ${resp.status}) was not delivered`,
+          });
+          return;
+        }
+        // 头已外显（HTTP 状态行无法改写）：销毁连接——客户端见到传输失败，
+        // 而不是把截断体当作完整 200
+        log("warn", `ports mapping ${mapping.id} body transfer failed after head; destroying local connection`);
+        res.destroy();
+        return;
+      }
+      sendHead(); // 干净 EOF 且零体（合法空响应）：此刻提交头
       // 流式回写完成（writableFinished 置位——close 监听据此分辨正常收尾）
       if (!res.destroyed && res.writable) res.end();
     } catch (e) {

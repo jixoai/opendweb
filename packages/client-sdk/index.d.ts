@@ -299,6 +299,12 @@ export declare class StreamWriterJs {
   write(chunk: Buffer): Promise<void>
   /** 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。 */
   finish(): void
+  /**
+   * 中止（幂等）：停止 body 供给并向对端发 RESET——「上游被取消/掐断」
+   * 的截断响应不得伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性
+   * 承诺：要么成功有体、要么明确失败）。通道已死时发送失败即中止目的已达。
+   */
+  abort(): Promise<void>
 }
 
 /**
