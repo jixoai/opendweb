@@ -285,3 +285,63 @@ maybeTest("streaming: provider abort during recovery → RESET re-delivered afte
     await b.shutdown();
   }
 });
+
+// r12-B1（a）同轮 abort()/finish() 线性化（first-terminal-wins）：JS wrapper
+// 的 abort() 先同步落 abort-requested（native requestAbort）——同一事件轮次
+// 内紧随的 finish() 必须拒绝（抛错），中止的异步完成（终态落位 + RESET +
+// 供给面关闭）不受 JS 微任务时序影响。消费端终态：bodyNext reject（绝不
+// resolve null）。修复前 finish() 同步关闭 sender 且不检查 abort 请求状态
+// ——abort 后同轮 finish 可让 dispatch 以干净 FIN 收尾出空/截断 200。
+maybeTest("streaming: same-tick abort() then finish() — finish refused, bodyNext never null", async () => {
+  const { a, b } = await pair();
+  let server;
+  try {
+    const seen = { finishRefused: false };
+    server = await withTimeout(
+      serveHttp(b, a.endpointId, async (req) => {
+        assert.equal(req.path, "/same-tick");
+        const writer = req.respondStreaming(200, [{ name: "content-type", value: "text/plain" }]);
+        await writer.write(Buffer.from("same-tick-prefix;"));
+        await sleep(100); // 前缀先行交付（截断形态）
+        writer.abort();
+        // 同一轮次紧随 finish——必须抛错（abort-requested 已同步落位）
+        try {
+          writer.finish();
+          seen.finishRefused = false;
+        } catch (e) {
+          seen.finishRefused = /abort requested|first-terminal/i.test(e.message);
+          if (!seen.finishRefused) throw e;
+        }
+      }),
+      10_000,
+      "serveHttp",
+    );
+    const session = await withTimeout(a.openSession(b.endpointId), 20_000, "openSession");
+    const resp = await withTimeout(
+      fetchHttp(session, { method: "GET", path: "/same-tick" }),
+      20_000,
+      "fetchHttp head",
+    );
+    assert.equal(resp.status, 200);
+    const first = await withTimeout(resp.bodyNext(), 10_000, "first chunk");
+    assert.equal(first.toString(), "same-tick-prefix;");
+    // 终态断言：必须以错误终结（reset by peer / aborted locally），绝不 null
+    await assert.rejects(
+      () => withTimeout(resp.bodyNext(), 15_000, "terminal bodyNext"),
+      (err) => {
+        assert.match(
+          err.message,
+          /reset by peer|aborted locally|session/i,
+          `terminal must be an error, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+    assert.ok(seen.finishRefused, "abort 之后的同轮 finish() 必须拒绝（first-terminal-wins）");
+    await session.close();
+  } finally {
+    await server?.close();
+    await a.shutdown();
+    await b.shutdown();
+  }
+});

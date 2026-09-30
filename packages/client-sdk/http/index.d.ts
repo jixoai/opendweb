@@ -20,7 +20,12 @@ export interface HttpRequestInit {
   body?: Array<Uint8Array> | null;
   /** WS 隧道模式：不半关请求方向（101 后双向持续；配合 sendTunnel） */
   keepOpen?: boolean;
-  /** 响应头等待上限毫秒（默认 30000；超时发 RESET 清理 provider 在途请求） */
+  /**
+   * head 操作单一预算毫秒（默认 30000）。预算覆盖整次 fetch 前段：活性
+   * 闸门等待 + OPEN 发送 + 请求体逐块发送 + FIN + 响应头等待（r12-B4 冻结
+   * 语义——非仅「响应头等待上限」）。任一阶段超预算即失败并发 RESET 清理
+   * provider 在途请求。
+   */
   headTimeoutMs?: number;
   /**
    * 消费端取消信号（0.6.0）：abort → head 等待期即时 RESET（对端在途请求
@@ -47,13 +52,19 @@ export declare function fetchHttp(
 export interface StreamWriterHandle {
   /** 写入一块 body（有界通道背压；finish 后写或通道已死 → reject） */
   write(chunk: Uint8Array): Promise<void>;
-  /** 半关（EOF；幂等） */
+  /**
+   * 半关（EOF；幂等）。r12-B1 first-terminal-wins：abort-requested 之后
+   * 调用立即抛错（中止终态已声明的流不得补发干净 EOF；供给面由 abort
+   * 路径自身关闭）。
+   */
   finish(): void;
   /**
    * 中止（幂等）：向对端显式 RESET——「上游被取消/掐断」的截断响应不得
    * 伪装成干净 EOF（对端 bodyNext 以错误暴露；取消终态先于供给面关闭原子
    * 落位、跨恢复代保留，RESET 丢失由恢复重放补发）。缺 native abort() 即
    * ABI 不匹配——明确失败，绝不回退 finish()。
+   * r12-B1：进入时同步落 abort-requested——同一事件轮次内随后的 finish()
+   * 立即拒绝（native 中止的异步完成不早于该同步意图）。
    */
   abort(): void;
   /** 本地已调用 finish()（半关意图） */

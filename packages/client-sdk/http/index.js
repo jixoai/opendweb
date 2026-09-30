@@ -13,7 +13,8 @@ let fetchAbortKeySeq = 0;
 /**
  * 发起 HTTP 请求（design §3.4）。本阶段 body 为静态分块（AsyncIterable 请求
  * 体后续 phase）；响应经 pull-first bodyNext() 消费，亦可 for-await 迭代。
- * headTimeoutMs 可配（默认 30s——长轮询/慢上游按需放宽）。
+ * headTimeoutMs 是 head 操作单一预算（默认 30s——覆盖活性等待 + OPEN +
+ * 请求体发送 + FIN + 响应头等待；长轮询/慢上游按需放宽）。
  * signal 可配（0.6.0）：abort → head 等待期即时 RESET（清理对端在途请求）。
  * @param {import("../index.js").SessionHandle} session
  * @param {{
@@ -84,8 +85,9 @@ async function fetchHttp(session, request) {
  * （bodyNext 拉取请求体，EOF = null；respondStreaming 流式回响应）：
  * - 返回 { status, headers?, bodyChunks? } —— 一次性静态响应；
  * - 调用 req.respondStreaming(status, headers) —— 响应头立即发出，返回
- *   { write(chunk), finish(), finished, cancelled, closed }（SSE/长连接/
- *   WS 101 早发等真实流式）。
+ *   { write(chunk), finish(), abort(), finished, cancelled, closed }
+ *   （SSE/长连接/WS 101 早发等真实流式；finish/abort 互斥——
+ *   first-terminal-wins：abort 声明后 finish 拒绝）。
  *
  * 生命周期信号（0.6.0 sdk-lifecycle-signals）：
  * - req.sessionId —— 请求所属逻辑会话（hex；授权缓存隔离键）
@@ -176,9 +178,15 @@ async function serveHttp(fabric, peerId, handler) {
               // 中止（上游被取消/掐断）：向对端显式 RESET——截断不得伪装干净
               // EOF（消费端按错误暴露）。r11：native writer 缺 abort() 即 ABI
               // 不匹配——明确失败，绝不回退 finish()（取消≠干净 EOF）。
+              // r12-B1：先同步落 abort-requested（同一事件轮次内随后的
+              // finish() 立即拒绝——first-terminal-wins），再触发异步中止
+              // （终态落位 + RESET + 供给面关闭）。
               abort: () => {
                 if (typeof writer.abort !== "function") {
                   throw new TypeError("native StreamWriter lacks abort() ABI (refusing finish() fallback)");
+                }
+                if (typeof writer.requestAbort === "function") {
+                  writer.requestAbort();
                 }
                 writer.abort();
                 finalizeRequest(rid);

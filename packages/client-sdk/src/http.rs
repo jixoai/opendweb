@@ -628,6 +628,7 @@ impl HttpServerJs {
             flags,
             abort_target,
             aborted: std::sync::atomic::AtomicBool::new(false),
+            abort_requested: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -730,6 +731,12 @@ pub struct StreamWriterJs {
     /// 不得伪装干净 EOF（finish()=正常半关；abort()=上游被取消掐断）。
     abort_target: Option<(Arc<SessionShared>, u64)>,
     aborted: std::sync::atomic::AtomicBool,
+    /// r12-B1 同步中止意图（first-terminal-wins 的 JS 线性化点）：
+    /// `requestAbort()` 在 JS 调用线程上同步置位——同一事件轮次内随后的
+    /// `finish()` 立即拒绝（native abort() 是异步的，其终态落位不保证与
+    /// JS 微任务时序对齐；同步意图面把「abort 先于 finish 声明」冻结在
+    /// 调用序上）。
+    abort_requested: std::sync::atomic::AtomicBool,
 }
 
 #[napi]
@@ -779,9 +786,31 @@ impl StreamWriterJs {
     }
 
     /// 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。
+    /// r12-B1：abort-requested 后拒绝（first-terminal-wins）——中止终态已
+    /// 声明的流不得再补发干净 EOF；供给面的关闭由 abort 路径自身完成。
     #[napi]
     pub fn finish(&self) -> Result<()> {
+        if self
+            .abort_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "[session] stream writer abort requested: finish refused (first-terminal-wins)",
+            ));
+        }
         *self.tx.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// 同步落 abort-requested 意图（r12-B1）：JS 事件轮次内的调用序由此
+    /// 冻结——`requestAbort()` 之后的 `finish()` 立即拒绝，先于 native
+    /// `abort()` 的异步完成（终态落位 + RESET + 供给面关闭）。SDK 胶水层
+    /// 的 writer.abort() 应先调用本方法再触发异步 abort。
+    #[napi]
+    pub fn request_abort(&self) -> Result<()> {
+        self.abort_requested
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -793,11 +822,15 @@ impl StreamWriterJs {
     /// ——dispatch 对已取消供给禁 FIN；RESET 发送失败由恢复重放补发（修复前
     /// 的竞速：先关 sender → dispatch 当正常 EOF 发 FIN → 客户端以 null 收尾
     /// 出空/截断 200）。
+    /// r12-B1：同步落 abort-requested（finish 随后拒绝）；内核侧与 FIN 发送
+    /// 共享 terminal_arb（first-terminal-wins 线性化）。
     #[napi]
     pub async fn abort(&self) -> Result<()> {
         if self.aborted.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
+        self.abort_requested
+            .store(true, std::sync::atomic::Ordering::Release);
         if let Some((shared, stream_id)) = &self.abort_target {
             shared.abort_stream(*stream_id).await; // 终态落位 + best-effort RESET
         }

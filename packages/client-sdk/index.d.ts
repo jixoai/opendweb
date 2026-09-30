@@ -297,8 +297,19 @@ export declare class StreamWriterJs {
    * finish 后写、或对端已取消（RESET/引擎丢弃）→ 错误。
    */
   write(chunk: Buffer): Promise<void>
-  /** 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。 */
+  /**
+   * 半关（EOF；幂等）：对端随后的 bodyNext 返回 null。
+   * r12-B1：abort-requested 后拒绝（first-terminal-wins）——中止终态已
+   * 声明的流不得再补发干净 EOF；供给面的关闭由 abort 路径自身完成。
+   */
   finish(): void
+  /**
+   * 同步落 abort-requested 意图（r12-B1）：JS 事件轮次内的调用序由此
+   * 冻结——`requestAbort()` 之后的 `finish()` 立即拒绝，先于 native
+   * `abort()` 的异步完成（终态落位 + RESET + 供给面关闭）。SDK 胶水层
+   * 的 writer.abort() 应先调用本方法再触发异步 abort。
+   */
+  requestAbort(): void
   /**
    * 中止（幂等）：向对端发 RESET——「上游被取消/掐断」的截断响应不得
    * 伪装成干净 EOF（对端 bodyNext 以错误暴露，ports 等价性承诺：要么成功
@@ -308,6 +319,8 @@ export declare class StreamWriterJs {
    * ——dispatch 对已取消供给禁 FIN；RESET 发送失败由恢复重放补发（修复前
    * 的竞速：先关 sender → dispatch 当正常 EOF 发 FIN → 客户端以 null 收尾
    * 出空/截断 200）。
+   * r12-B1：同步落 abort-requested（finish 随后拒绝）；内核侧与 FIN 发送
+   * 共享 terminal_arb（first-terminal-wins 线性化）。
    */
   abort(): Promise<void>
 }
