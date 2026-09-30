@@ -413,7 +413,10 @@ async fn v2_recipient_bound_join_member_root_accessors_and_ensure_refusal() {
     .unwrap();
 
     // root 判定：root 册 = Some(self)
-    assert_eq!(a.root_endpoint_id().await.as_deref(), Some(a.endpoint_id().as_str()));
+    assert_eq!(
+        a.root_endpoint_id().await.as_deref(),
+        Some(a.endpoint_id().as_str())
+    );
 
     let fabric_id = a.fabric_id_hex().await;
     // B（joiner）：同为 CustomWithCaps（消费面装配形态），attach 空册
@@ -426,14 +429,25 @@ async fn v2_recipient_bound_join_member_root_accessors_and_ensure_refusal() {
     )
     .await
     .unwrap();
-    assert_eq!(b.root_endpoint_id().await, None, "empty attach roster has no root");
+    assert_eq!(
+        b.root_endpoint_id().await,
+        None,
+        "empty attach roster has no root"
+    );
 
     // v2 邀请：recipient 恒必填（Some(B)）→ dweb2. 令牌（直连地址随签）
     let token = a
-        .invite_with(300_000, Some(&b.endpoint_id()), dweb_fabric::InviteOptions::default())
+        .invite_with(
+            300_000,
+            Some(&b.endpoint_id()),
+            dweb_fabric::InviteOptions::default(),
+        )
         .await
         .unwrap();
-    assert!(token.starts_with("dweb2."), "restricted relay config signs v2 tokens");
+    assert!(
+        token.starts_with("dweb2."),
+        "restricted relay config signs v2 tokens"
+    );
     // 回环 relay 剔除（真双机验收实证）：直连地址在场时 issuer 本机回环
     // relay 条目不签入令牌——跨机 joiner 的 relay 相位死等会拖垮整个 dial
     //（iroh 路径选择不回落 direct，实测 30s join deadline 全耗尽）。
@@ -449,8 +463,14 @@ async fn v2_recipient_bound_join_member_root_accessors_and_ensure_refusal() {
     );
 
     // 兑换（relay 不可达，直连主路径）→ member 册 root = issuer
-    b.join(&token).await.expect("v2 recipient-bound join via direct addr");
-    assert_eq!(b.members().await.len(), 2, "joiner is a member after redeem");
+    b.join(&token)
+        .await
+        .expect("v2 recipient-bound join via direct addr");
+    assert_eq!(
+        b.members().await.len(),
+        2,
+        "joiner is a member after redeem"
+    );
     assert_eq!(
         b.root_endpoint_id().await.as_deref(),
         Some(a.endpoint_id().as_str()),
@@ -461,9 +481,10 @@ async fn v2_recipient_bound_join_member_root_accessors_and_ensure_refusal() {
     // 消费面（webui joinWithToken/startSequence）必须按 root 判定分流。
     let refused = b.ensure_relay_capabilities().await;
     match refused {
-        Err(dweb_fabric::FabricError::Roster(
-            dweb_fabric::roster::RosterError::NotRoot { caller, root },
-        )) => {
+        Err(dweb_fabric::FabricError::Roster(dweb_fabric::roster::RosterError::NotRoot {
+            caller,
+            root,
+        })) => {
             assert_eq!(
                 dweb_fabric::identity::endpoint_id_display(&caller),
                 b.endpoint_id()

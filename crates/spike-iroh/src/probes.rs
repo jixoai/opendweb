@@ -42,7 +42,10 @@ async fn connected_pair(tag: &str) -> Result<(Endpoint, Endpoint, Connection, Co
     let target = EndpointAddr::new(server_ep.id())
         .with_ip_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
     let t0 = Instant::now();
-    let client_conn = client_ep.connect(target, PROBE_ALPN).await.context("connect")?;
+    let client_conn = client_ep
+        .connect(target, PROBE_ALPN)
+        .await
+        .context("connect")?;
     let server_conn = server_task.await.context("accept task")??;
     println!("[{tag}] pair connected in {:?}", t0.elapsed());
     Ok((client_ep, server_ep, client_conn, server_conn))
@@ -81,7 +84,10 @@ pub async fn probe_exporter() -> Result<()> {
     conn2
         .export_keying_material(&mut k2, b"appproto/probe", b"ctx-A")
         .map_err(|e| anyhow::anyhow!("conn2 export: {e:?}"))?;
-    println!("conn1 与 conn2 同 label/context 派生不同 = {}（单连接 TLS 绑定）", k1 != k2);
+    println!(
+        "conn1 与 conn2 同 label/context 派生不同 = {}（单连接 TLS 绑定）",
+        k1 != k2
+    );
     println!(
         "结论：exporter 仅能证明『当前物理连接已认证』，不能作跨连接长期 resume token；\
          session token 须自生成随机值（design §2.3.0 已如此设计）"
@@ -142,7 +148,10 @@ pub async fn probe_datagram() -> Result<()> {
 // ---------- §4.3 timeouts ----------
 
 pub async fn probe_timeouts(secs: u64) -> Result<()> {
-    println!("=== probe-timeouts：默认配置下空闲连接时间线（{}s 观察）===", secs);
+    println!(
+        "=== probe-timeouts：默认配置下空闲连接时间线（{}s 观察）===",
+        secs
+    );
     println!("源码默认：HEARTBEAT_INTERVAL=5s / PATH_MAX_IDLE_TIMEOUT=15s（iroh socket.rs）");
     let (client_ep, server_ep, cconn, _sconn) = connected_pair("timeouts").await?;
     let mut events = cconn.path_events();
@@ -224,7 +233,10 @@ pub async fn probe_close() -> Result<()> {
         println!("C close 前 close_reason = {:?}", cconn.close_reason());
         sconn.close(VarInt::from_u32(0), b"peer-done");
         tokio::time::sleep(Duration::from_millis(100)).await;
-        println!("C 对端 close 后本端 close_reason = {:?}", cconn.close_reason());
+        println!(
+            "C 对端 close 后本端 close_reason = {:?}",
+            cconn.close_reason()
+        );
         teardown(&client_ep, &server_ep);
     }
     println!(
@@ -237,7 +249,10 @@ pub async fn probe_close() -> Result<()> {
 // ---------- §4.5 flow / 并发 ----------
 
 pub async fn probe_flow(stream_count: usize) -> Result<()> {
-    println!("=== probe-flow：并发流上限与控制流隔离（{} 流）===", stream_count);
+    println!(
+        "=== probe-flow：并发流上限与控制流隔离（{} 流）===",
+        stream_count
+    );
     let (client_ep, server_ep, cconn, sconn) = connected_pair("flow").await?;
 
     // 服务端：第一条接受流 = 控制 echo（立即回写）；其余 = 慢读回声（每 2ms 读 4KiB）
@@ -334,7 +349,7 @@ pub async fn probe_flow(stream_count: usize) -> Result<()> {
          说明流级流控隔离良好；上限数值对照 quinn 默认 max_concurrent_bidi_streams",
         stream_count
     );
-    let _ = control;
+    drop(control); // clippy(let_underscore_future)：JoinHandle 是 future——显式 drop
     cconn.close(VarInt::from_u32(0), b"probe-done");
     teardown(&client_ep, &server_ep);
     Ok(())
@@ -346,7 +361,10 @@ async fn futures_join_all(
 ) -> Vec<anyhow::Result<()>> {
     let mut out = Vec::with_capacity(tasks.len());
     for t in tasks {
-        out.push(t.await.unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))));
+        out.push(
+            t.await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("join: {e}"))),
+        );
     }
     out
 }
