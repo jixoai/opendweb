@@ -524,3 +524,42 @@ test("F6 regression: fast-forward/merge with subdirectories keeps unchanged file
     await p.cleanup();
   }
 });
+
+// 真双机验收第六批 F7（2026-09-30）：fetchFromPeer「零缺失」早退路径曾跳过对端
+// device ref 镜像——对端 ref 推进到既有对象集（重 seed/复用对象的新提交）时，
+// 本端镜像停留旧值 → 下轮 mergeBase 误判 unrelated-histories。回归：零缺失轮
+// 也必须更新镜像。
+test("F7 regression: zero-missing fetch round still mirrors the peer device ref (no stale unrelated-histories)", async () => {
+  const p = await makePair({ aId: ID_A, bId: ID_B });
+  try {
+    const aRoot = await makeRoot({ "shared.md": "v0\n" });
+    const bRoot = await makeRoot();
+    await createPairGroup(p.a, p.b, { id: "f7", aRoot, bRoot, seedAuthority: ID_A });
+    await p.a.syncNow("f7");
+    await p.b.syncNow("f7");
+    // B 侧：复用现有 tree/parent 造一个新 commit（对象 A 全有），并把它的人工
+    // 投放到 A 的对象库（模拟「对象已在、仅 ref 推进」——重 seed/对象复用形态）
+    const { writeCommitOid, readRef, readCommitParsed, readObject, writeObject, writeRef, deviceRef } = await import("../src/objects.mjs");
+    const gdB = path.join(p.bHome, "plugins", "sync", "f7", "r1", "git");
+    const gdA = path.join(p.aHome, "plugins", "sync", "f7", "r1", "git");
+    const bHead = await readRef(gdB, deviceRef(ID_B));
+    const headCommit = await readCommitParsed(gdB, bHead);
+    const c2 = await writeCommitOid(gdB, { message: "f7 object-reuse commit", tree: headCommit.tree, parent: [bHead], authorName: "device-b", authorEmail: "b@b", timestamp: Date.now() + 5000 });
+    await writeRef(gdB, deviceRef(ID_B), c2);
+    await writeRef(gdB, "refs/heads/main", c2);
+    const { type, bytes } = await readObject(gdB, c2);
+    await writeObject(gdA, type, bytes); // 对象预置——A 的 fetch 将零缺失
+    // A 轮：refs 已推进、闭包全在 → 修复前：镜像跳过 → A 的 peerDev 停留旧值
+    const r = await p.a.syncNow("f7");
+    assert.equal(r[0].result.phase, "done", JSON.stringify(r));
+    assert.notEqual(r[0].result.code, "unrelated-histories");
+    assert.equal(await readRef(gdA, deviceRef(ID_B)), c2, "peer device ref mirrored even on a zero-missing round");
+    // B 再改一轮 → 正常合并路径恢复
+    await write(bRoot, "shared.md", "v1 from B after f7\n");
+    await p.b.syncNow("f7");
+    await p.a.syncNow("f7");
+    assert.equal(await readOrNull(aRoot, "shared.md"), "v1 from B after f7\n", "normal merge path resumes");
+  } finally {
+    await p.cleanup();
+  }
+});

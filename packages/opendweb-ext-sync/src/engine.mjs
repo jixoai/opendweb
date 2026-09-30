@@ -225,6 +225,14 @@ export function createSyncEngine(opts) {
       if (commit === undefined || commit === null) continue;
       const local = await readRef(ctx.gitdir, ref);
       if (local === commit) continue;
+      // 对端 device ref 镜像先于「零缺失」早退（真双机验收第六批 F7 修复，
+      // 2026-09-30）：对端 ref 推进到**既有对象集**（重 seed/复用对象的新提交）
+      // 时闭包零缺失，旧逻辑在早退路径跳过镜像 → 本端停留旧值 → 下轮
+      // mergeBase 误判 unrelated-histories。镜像是纯 ref 元数据操作，与对象
+      // 缺失与否无关。
+      if (ref === deviceRef(peer)) {
+        await writeRef(ctx.gitdir, ref, commit); // 对端 device ref=镜像元数据 ref
+      }
       for (const oid of await wantClosure(commit)) missing.add(oid);
     }
     if (missing.size === 0) return { refs: peerRefs, imported: 0, bytes: 0 };
