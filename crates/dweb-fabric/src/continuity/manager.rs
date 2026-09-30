@@ -45,15 +45,10 @@ fn conn_is_dead(h: &ConnHandle) -> bool {
     h.conn.close_reason().is_some()
 }
 
-/// 尸体静默阈值：两个 iroh 心跳周期（HEARTBEAT_INTERVAL=5s）。活连接的心跳
-/// ACK 让 rx 计数每 ~5s 增长；静默 ≥10s 且传输层未判死的连接按尸体裁决
-/// （存活方自己的旧拨号在瞬断重拨后被对端崩溃留成半开尸体——initiator
-/// 较小仍会压制重加入者，真双机验收实证 2026-09-30）。
-const CORPSE_SILENCE: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// 尸体判定：传输层已判死，或 rx 静默超过两个心跳周期（正向活性信号缺失）。
+/// 阈值常量（[`super::state::CORPSE_SILENCE`]）与会话通道层共用（E1′ 硬化）。
 fn is_corpse(h: &ConnHandle) -> bool {
-    conn_is_dead(h) || h.rx_silent_for() > CORPSE_SILENCE
+    conn_is_dead(h) || h.rx_silent_for() > super::state::CORPSE_SILENCE
 }
 
 impl DialingGuard {
@@ -288,6 +283,9 @@ async fn dial_and_adopt(
                     false,
                 )
                 .await;
+            // N1 活性修剪：两步拨号计划全败 → 可淘汰地址条目计一次失败
+            //（墓地死地址按阈值淘汰；announced 保留）。
+            Fabric::note_dial_failure(inner, remote).await;
             return Err(FabricError::Session(SessionError::Connect(reason)));
         }
     };
@@ -299,7 +297,7 @@ async fn dial_and_adopt(
             .await;
     }
     let handle = Arc::new(ConnHandle::new(conn.clone(), inner.identity.endpoint_id()));
-    match adopt_with_winner(inner, remote, handle).await {
+    match adopt_with_winner(inner, remote, handle, true).await {
         Some(h) => Ok(h),
         None => {
             // 被 winner 规则否决（对端已有更小发起方连接）：不算错误，
@@ -320,11 +318,15 @@ pub(crate) async fn register_incoming(
     conn: iroh::endpoint::Connection,
 ) {
     let handle = Arc::new(ConnHandle::new(conn, remote));
-    let _ = adopt_with_winner(inner, &remote, handle).await;
+    let _ = adopt_with_winner(inner, &remote, handle, false).await;
 }
 
 /// winner 采纳：无既有 → 安装；并存 → 发起方 EndpointId 较小者胜，
 /// 败者 deliberate 关闭。返回胜者句柄（新连接败选时返回既有句柄）。
+/// `dialed`：胜者是否为本端拨出（N1 地址学习来源分治——拨出连接的选中
+/// 路径对端地址 = 拨号成功验证，DialOk 落盘；对端拨入连接的源地址 =
+/// ObservedInbound，**不落盘**：可能是对端 direct-dial 专用 endpoint 的
+/// 临时随机端口，E1′ 交叉学习实证其随端点弃置即死）。
 /// 真双机验收实证修正（2026-09-30）：
 /// - **尸体不参裁**：既有时续的传输层已终结（close_reason=Some）或 rx 静默
 ///   超两个心跳周期时按无既有时续处理——驱逐（标记 deliberate 使其在途
@@ -340,6 +342,7 @@ async fn adopt_with_winner(
     inner: &Arc<FabricInner>,
     remote: &EndpointId,
     candidate: Arc<ConnHandle>,
+    dialed: bool,
 ) -> Option<Arc<ConnHandle>> {
     let state = &inner.continuity;
     let existing = state.active(remote).await;
@@ -384,10 +387,11 @@ async fn adopt_with_winner(
         .unwrap_or(LinkStatus::Unknown);
     let path = selected;
     state.adopt(remote, Arc::clone(&winner), path).await;
-    // 直连路径学习 + 持久化（真双机验收实证 2026-09-30）：known_addrs 跨重启
-    // 存活是对端崩溃/relay 失效时的回落资本（open 路径不重跑 join）。
+    // 直连路径学习（N1 来源分治）：本端拨出 = 拨号成功验证（DialOk 落盘，
+    // 跨重启存活是对端崩溃/relay 失效时的回落资本）；对端拨入 = 观测源地址
+    // （ObservedInbound 不落盘——可能是 scratch 临时端口，TTL/失败修剪）。
     if selected == LinkStatus::Direct {
-        Fabric::learn_selected_direct_addr(inner, remote, &winner.conn).await;
+        Fabric::learn_selected_direct_addr(inner, remote, &winner.conn, dialed).await;
     }
     spawn_supervisor(inner, *remote, Arc::clone(&winner));
     Some(winner)
@@ -487,7 +491,12 @@ pub async fn accept_stream(
         .accept_bi()
         .await
         .map_err(|e| FabricError::Session(SessionError::Connect(format!("{e}"))))?;
-    Ok(ContinuityTransport::from_parts(send, recv, epoch))
+    Ok(ContinuityTransport::from_parts(
+        handle.conn.clone(),
+        send,
+        recv,
+        epoch,
+    ))
 }
 
 /// 公开入口：非故意关闭当前连接（故障注入/强制重拨——supervisor 视为
@@ -512,17 +521,12 @@ fn now_ms() -> u64 {
 }
 
 /// 拨号地址推导（复用 Fabric::endpoint_addr_for 的候选合并语义）。
+/// N1：候选按「宣告 > 手工 > 近期拨号成功 > 观测」优先序（惰性修剪后）。
 async fn endpoint_addr_for(
     inner: &Arc<FabricInner>,
     id: &EndpointId,
 ) -> Result<EndpointAddr, FabricError> {
-    let learned = inner
-        .known_addrs
-        .lock()
-        .await
-        .get(id)
-        .map(|s| s.to_vec())
-        .unwrap_or_default();
+    let learned = inner.known_addrs.lock().await.ordered_addrs(id, now_ms());
     let addr = Fabric::merge_dial_candidates(id, &learned, &inner.relay);
     if addr.addrs.is_empty() {
         return Err(FabricError::Session(SessionError::NoAddressingInfo(

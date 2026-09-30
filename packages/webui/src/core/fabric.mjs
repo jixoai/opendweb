@@ -437,6 +437,26 @@ export async function createFabricHost(opts = {}) {
     // 事件接线（start 后才有会话事件）：peer-connected 绑 serveHttp + 在线回调；
     // peer-disconnected 拆线+逐出会话
     unsubscribeEvents = wireFabricEvents(f);
+    // E1′ 硬化（2026-09-30 双机实证）：serveHttp 不得依赖 peer-connected
+    //（legacy 连接事件）——对端与本端之间只有 continuity 连接时（对端先拨、
+    // 本端采纳），legacy 连接可能永远不建立（iroh 对同 NodeAddr 既有连接的
+    // 新握手存在抑制面），数据面请求到达会话层却无 serve 循环分发 → 永久
+    // response head timeout。启动即对 roster 全员**预绑** serveHttp（幂等）；
+    // peer-connected 路径保留（后加入成员的动态绑定）。
+    try {
+      const members = await f.members();
+      for (const m of members) {
+        if (typeof m?.endpointId !== "string" || m.endpointId === "") continue;
+        // roster endpointId 为 hex64 冻结形态——serveHttp/bind 键用 z32 展示串
+        //（与 sessionResolver/事件的归一形态一致）
+        const peerKey = /^[0-9a-f]{64}$/.test(m.endpointId) ? hexToZ32(m.endpointId) : m.endpointId;
+        if (peerKey === f.endpointId) continue;
+        connectedPeers.add(peerKey);
+        bindPeer(peerKey).catch(() => {});
+      }
+    } catch (e) {
+      log(`fabric: roster pre-bind skipped (${e?.message ?? e})`);
+    }
     status = "started";
     log(
       `fabric: started (endpoint ${f.endpointId}, ${relayDataPlane !== null ? `explicit relay data plane (${(relayDataPlane.relays ?? relayDataPlane.urls ?? []).length} relays)` : "direct-only [W12]"}${adoptedOwnFabric ? "" : ", existing roster"})`,
@@ -515,8 +535,21 @@ export async function createFabricHost(opts = {}) {
       peer = peerKey;
       const f = await ensureStarted();
       const hit = sessions.get(peer);
-      if (hit !== undefined && !hit.closed) return hit.session;
-      if (hit !== undefined) evictSession(peer);
+      if (hit !== undefined && !hit.closed) {
+        // E1′ 硬化：终态（dead/closed）缓存会话不得继续供消费——onState
+        // 跳变可能早于缓存查询（订阅竞态），每查询先快照复核；快照读取
+        // 失败按沿用处理（不因观测面失败制造会话风暴）。
+        let phase = null;
+        try {
+          phase = (await hit.session.state?.())?.phase ?? null;
+        } catch {
+          phase = null;
+        }
+        if (phase === null || phase === "active" || phase === "recovering") return hit.session;
+        evictSession(peer);
+      } else if (hit !== undefined) {
+        evictSession(peer);
+      }
       await f.connect(peer); // 幂等（活跃连接直接成功）
       const session = await f.openSession(peer);
       const entry = {

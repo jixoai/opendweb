@@ -128,7 +128,11 @@ impl RequestCancel {
 
     /// 会话 id（hex；授权隔离键——同 peer 异 session 不共享，spec §3.2）。
     pub fn session_id_hex(&self) -> String {
-        self.shared.session_id.iter().map(|b| format!("{b:02x}")).collect()
+        self.shared
+            .session_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// 挂起等待终裁。取消复查在完成复查之前——FIN 与 RESET 竞速时宁可
@@ -452,25 +456,73 @@ pub async fn serve_http(
     opts: SessionOptions,
     handler: Arc<dyn HttpHandler>,
 ) -> Result<(), FabricError> {
-    loop {
-        let Ok(session) = accept_any(fabric, peer_id, opts).await else {
-            // 拒绝/死流/收敛期死连接：退避后继续（防热自旋）
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            continue;
-        };
-        let session = Arc::new(session);
-        let handler = Arc::clone(&handler);
+    // E1′ 硬化（2026-09-30 双机实证）：serve 面有两个来源——
+    // ① 对端发起的新会话（accept_any，既有语义：**不可中途取消**——其内
+    //    部 ensure_connection 的在途拨号被取消会留半开连接，故以常驻 worker
+    //    + mpsc 承载，select 只等结果不取消工作）；
+    // ② 本端 client/canonical 会话的**反向到达流**：并发双开收敛后对端
+    //    adopted 本端发起的会话（open_session 的 ALREADY_ACTIVE adopt 路径
+    //    /幂等复用），对端在其上开 provider 向流发请求——该会话从未经过
+    //    accept_any，无 dispatch 任务 → 请求到达 pump 却永不分发（真双机
+    //    实证：response head timeout 循环 + 对端 Reset）。每 tick 复核
+    //    canonical：未见过的 sid 挂 dispatch（通道死亡任务退出后重挂——
+    //    恢复轮新通道由重挂承接）。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Session>();
+    {
+        let fabric = fabric.clone();
+        let peer_id = peer_id.to_owned();
         tokio::spawn(async move {
             loop {
-                let Some(stream_id) = session.next_incoming().await else {
-                    return; // 通道终结（恢复轮由新任务接管）
-                };
-                let handler = Arc::clone(&handler);
-                let session = Arc::clone(&session);
-                tokio::spawn(dispatch_stream(session, stream_id, handler));
+                match accept_any(&fabric, &peer_id, opts).await {
+                    Ok(session) => {
+                        let _ = tx.send(session);
+                    }
+                    // 拒绝/死流/收敛期死连接：退避后继续（防热自旋）
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                }
             }
         });
     }
+    let mut reverse_served: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        let session = tokio::select! {
+            s = rx.recv() => s,
+            _ = tick.tick() => None,
+        };
+        if let Some(s) = session {
+            spawn_session_dispatch(Arc::new(s), Arc::clone(&handler));
+        }
+        // 面②：canonical 会话的反向到达（收敛/自开会话）
+        if let Some(shared) = fabric
+            .inner
+            .continuity_sessions
+            .reusable_for_peer(peer_id)
+            .await
+            && let Some(session) = Session::from_shared_for_serve(shared)
+            && reverse_served.insert(session.shared().session_id)
+        {
+            spawn_session_dispatch(Arc::new(session), Arc::clone(&handler));
+        }
+    }
+}
+
+/// 单会话 dispatch 任务（新入站会话与反向到达面共用）：next_incoming 逐流
+/// 派发；通道终结退出（恢复轮/canonical 更替由调用方的复核重挂承接）。
+fn spawn_session_dispatch(session: Arc<Session>, handler: Arc<dyn HttpHandler>) {
+    tokio::spawn(async move {
+        loop {
+            let Some(stream_id) = session.next_incoming().await else {
+                return; // 通道终结（恢复轮由新任务接管）
+            };
+            let handler = Arc::clone(&handler);
+            let session = Arc::clone(&session);
+            tokio::spawn(dispatch_stream(session, stream_id, handler));
+        }
+    });
 }
 
 /// 等会话回到 Active（断线桥接：发送失败期间 body mpsc 背压暂停上游；

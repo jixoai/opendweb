@@ -595,8 +595,8 @@ fn load_known_addrs(data_dir: &std::path::Path) -> KnownAddrs {
     let Ok(bytes) = std::fs::read(&path) else {
         return KnownAddrs::default();
     };
-    match serde_json::from_slice::<Vec<(String, Vec<String>)>>(&bytes) {
-        Ok(entries) => KnownAddrs::from_persisted(entries),
+    match serde_json::from_slice::<Vec<(String, Vec<crate::known_addrs::PersistEntry>)>>(&bytes) {
+        Ok(entries) => KnownAddrs::from_persisted(entries, now_ms()),
         Err(e) => {
             tracing::warn!(
                 path = %path.display(),
@@ -609,7 +609,10 @@ fn load_known_addrs(data_dir: &std::path::Path) -> KnownAddrs {
 }
 
 /// 快照落盘（原子写：tmp+rename）。写失败 warn（地址学习是尽力而为面）。
-fn persist_known_addrs_entries(data_dir: &std::path::Path, entries: &[(String, Vec<String>)]) {
+fn persist_known_addrs_entries(
+    data_dir: &std::path::Path,
+    entries: &[(String, Vec<crate::known_addrs::PersistedAddr>)],
+) {
     let path = known_addrs_path(data_dir);
     let json = match serde_json::to_string_pretty(entries) {
         Ok(j) => j,
@@ -636,16 +639,28 @@ fn persist_known_addrs_entries(data_dir: &std::path::Path, entries: &[(String, V
     }
 }
 
-/// 学习一条对端地址（内存 push + 全量快照落盘）。幂等（重复地址不触发写）。
-async fn learn_known_addr(inner: &Arc<FabricInner>, remote: EndpointId, addr: String) {
-    let (changed, snapshot) = {
+/// 学习一条对端地址（N1 来源分治的学习收口）：
+/// - 拨号成功观测（选中路径对端地址）：DialOk——验证过可达，随快照持久化；
+/// - 入站连接观测（对端拨号源地址）：ObservedInbound——**可能是对端
+///   direct-dial 专用 endpoint 的临时端口**（E1′ 交叉学习实证），一律
+///   不落盘，仅内存 + TTL/失败修剪（本端拨号成功后升格 DialOk 落盘）。
+async fn learn_known_addr(
+    inner: &Arc<FabricInner>,
+    remote: EndpointId,
+    addr: String,
+    dial_verified: bool,
+) {
+    let snapshot = {
         let mut ka = inner.known_addrs.lock().await;
-        let before = ka.get(&remote).map(<[String]>::len);
-        ka.push(remote, addr);
-        let changed = before != ka.get(&remote).map(<[String]>::len);
-        (changed, ka.snapshot_for_persist())
+        if dial_verified {
+            ka.record_dial_success(&remote, &addr, now_ms());
+            Some(ka.snapshot_for_persist())
+        } else {
+            ka.record_inbound_observed(&remote, &addr, now_ms());
+            None
+        }
     };
-    if changed {
+    if let Some(snapshot) = snapshot {
         persist_known_addrs_entries(&inner.data_dir, &snapshot);
     }
 }
@@ -3288,7 +3303,7 @@ impl Fabric {
             learned.extend(token.invite.issuer_direct_addrs.iter().cloned());
             let snapshot = {
                 let mut ka = self.inner.known_addrs.lock().await;
-                ka.set(token.invite.issuer, learned);
+                ka.announce(token.invite.issuer, learned, now_ms());
                 ka.snapshot_for_persist()
             };
             // 持久化（真双机验收实证 2026-09-30）：open 路径重启不重跑 join，
@@ -3455,7 +3470,7 @@ impl Fabric {
             learned.extend(token.invite.direct_addrs.iter().map(|a| a.to_string()));
             let snapshot = {
                 let mut ka = self.inner.known_addrs.lock().await;
-                ka.set(token.invite.issuer, learned);
+                ka.announce(token.invite.issuer, learned, now_ms());
                 ka.snapshot_for_persist()
             };
             // 持久化（真双机验收实证 2026-09-30）：同 v1 路径——直连候选跨
@@ -3766,6 +3781,11 @@ impl Fabric {
         }
         let result = self.connect_dial(&id).await;
         drop(guard_opt.take());
+        // N1 活性修剪：整个拨号计划失败（非 shutdown 类）→ 该对端全部可淘汰
+        // 地址条目计一次失败（墓地死地址按阈值淘汰，announced 保留）。
+        if result.is_err() && !self.inner.lifecycle_closing() {
+            Self::note_dial_failure(&self.inner, &id).await;
+        }
         result
     }
 
@@ -3973,8 +3993,9 @@ impl Fabric {
                     // 成功：清除该对端的近期断开记录（沉降窗口已无意义）
                     self.inner.recent_disconnects.lock().await.remove(id);
                     // 直连路径学习（持久化 known_addrs）：LAN 直连可达性跨重启
-                    // 存活，是 relay 失效时的回落资本。
-                    Self::learn_selected_direct_addr(&self.inner, id, &conn).await;
+                    // 存活，是 relay 失效时的回落资本。N1：本端拨出的连接——
+                    // 选中路径对端地址按拨号成功验证（DialOk）落盘。
+                    Self::learn_selected_direct_addr(&self.inner, id, &conn, true).await;
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -4170,15 +4191,18 @@ impl Fabric {
         });
     }
 
-    /// 从已采纳连接的当前选中路径学习直连地址（写入 known_addrs 并持久化）。
-    /// 真双机验收实证（2026-09-30）：known_addrs 是纯内存结构，成员重启
-    /// （open 路径不重跑 join）后对 root 只剩 relay 配置候选——relay 客户端
-    /// 退避期间拨号全部超时且无 direct 回落资本。学习面必须在连接健康期
+    /// 从已采纳连接的当前选中路径学习直连地址（写入 known_addrs）。
+    /// 真双机验收实证（2026-09-30）：known_addrs 学习面必须在连接健康期
     /// 落盘，重启后回落路径才存在。
+    /// N1 来源分治（E1′ 同日第二轮实证）：`dial_verified` 区分两类观测——
+    /// 本端拨出的连接（选中路径对端地址 = 拨号成功验证，DialOk 可持久）vs
+    /// 对端拨入的连接（源地址 = 对端拨号源，可能是对端 scratch 专用 endpoint
+    /// 的临时随机端口——ObservedInbound 不落盘，TTL/失败修剪）。
     pub(crate) async fn learn_selected_direct_addr(
         inner: &Arc<FabricInner>,
         remote: &EndpointId,
         conn: &iroh::endpoint::Connection,
+        dial_verified: bool,
     ) {
         let paths = conn.paths();
         let Some(sa) = paths
@@ -4191,14 +4215,27 @@ impl Fabric {
         else {
             return;
         };
-        learn_known_addr(inner, *remote, sa.to_string()).await;
+        learn_known_addr(inner, *remote, sa.to_string(), dial_verified).await;
+    }
+
+    /// 整个拨号计划失败（两步全败）后的活性修剪记账：可淘汰条目计一次失败
+    /// （阈值淘汰见 known_addrs）。shutting down / 非拨号类失败不计。
+    pub(crate) async fn note_dial_failure(inner: &Arc<FabricInner>, remote: &EndpointId) {
+        let mut ka = inner.known_addrs.lock().await;
+        ka.record_dial_failure(remote, now_ms());
     }
 
     /// 显式登记对端可达地址（relay URL 或 ip:port），供后续 connect 使用。
     /// 有界（HB 3.1）：per-endpoint 超限淘汰最旧地址；重复地址幂等。
+    /// N1：手工注入 = Manual 来源（可持久）。
     pub async fn add_known_addr(&self, id: &str, addr: String) -> Result<(), FabricError> {
         let id = endpoint_id_parse(id).map_err(|_| FabricError::BadEndpointId(id.into()))?;
-        learn_known_addr(&self.inner, id, addr).await;
+        let snapshot = {
+            let mut ka = self.inner.known_addrs.lock().await;
+            ka.record_manual(id, addr, now_ms());
+            ka.snapshot_for_persist()
+        };
+        persist_known_addrs_entries(&self.inner.data_dir, &snapshot);
         Ok(())
     }
 
@@ -4433,16 +4470,15 @@ impl Fabric {
     }
 
     /// 为拨号构造 EndpointAddr：learned 与本地 relay 配置合并（见
-    /// [`merge_dial_candidates`]）。
+    /// [`merge_dial_candidates`]）。N1：候选按「宣告 > 手工 > 近期拨号成功 >
+    /// 观测」排序（known_addrs::ordered_addrs 惰性修剪后的优先序）。
     async fn endpoint_addr_for(&self, id: &EndpointId) -> Result<EndpointAddr, FabricError> {
         let learned = self
             .inner
             .known_addrs
             .lock()
             .await
-            .get(id)
-            .map(|s| s.to_vec())
-            .unwrap_or_default();
+            .ordered_addrs(id, now_ms());
         let addr = Self::merge_dial_candidates(id, &learned, &self.inner.relay);
         if addr.addrs.is_empty() {
             return Err(FabricError::Session(SessionError::NoAddressingInfo(

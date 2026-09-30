@@ -733,6 +733,12 @@ impl SessionShared {
         let owner = ctl.channel_owner + 1;
         ctl.channel_owner = owner;
         ctl.active_epoch = epoch;
+        let conn = send.conn.clone();
+        let rx_sample = std::sync::Mutex::new(super::state::RxSample {
+            datagrams: conn.stats().udp_rx.datagrams,
+            at: std::time::Instant::now(),
+        });
+        let last_frame_rx = std::sync::Mutex::new(std::time::Instant::now());
         let chan = Arc::new(SessionChannel {
             shared: Arc::clone(self),
             send: tokio::sync::Mutex::new(send),
@@ -745,6 +751,9 @@ impl SessionShared {
             stopped_notify: tokio::sync::Notify::new(),
             epoch,
             owner,
+            conn,
+            rx_sample,
+            last_frame_rx,
         });
         if ctl.channel.as_ref().is_none_or(|(o, _)| owner > *o) {
             ctl.channel = Some((owner, Arc::downgrade(&chan)));
@@ -1874,6 +1883,14 @@ pub struct SessionChannel {
     /// 本通道的 owner id（ResumeCtl 单调分配；fence 键 2/2——同 epoch 的
     /// 双通道由它区分）。
     owner: u64,
+    /// 所属 continuity 连接（E1′ 硬化 2026-09-30：通道级 rx 静默活性信号）。
+    conn: iroh::endpoint::Connection,
+    /// 连接 rx 采样（与 ConnHandle 同源的活性原语）。
+    rx_sample: std::sync::Mutex<super::state::RxSample>,
+    /// 最近一次收到会话帧的时刻（流级正向活性——E1′ 硬化第二信号：
+    /// 进程双活 + 连接心跳正常但会话流停滞的 zombie（「response head
+    /// timeout」现场）在连接级信号上不可见，只有流级帧静默可判）。
+    last_frame_rx: std::sync::Mutex<std::time::Instant>,
 }
 
 impl SessionChannel {
@@ -1896,6 +1913,35 @@ impl SessionChannel {
     /// 通道是否已终结（pump 退出）——IfVacant 策略的存活判定。
     pub fn is_dead(&self) -> bool {
         self.dead.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 通道所属连接的 rx 静默时长（E1′ 硬化：半开尸体连接上 pump 阻塞在
+    /// 永不返回的流读盘，`is_dead` 恒 false——连接级心跳 ACK 计数是唯一
+    /// 可靠的正向活性证据；与 ConnHandle::rx_silent_for 同源）。
+    pub(crate) fn rx_silent_for(&self) -> std::time::Duration {
+        let mut sample = self.rx_sample.lock().unwrap();
+        super::state::rx_silent_for(&mut sample, &self.conn)
+    }
+
+    /// 自最近一次收到会话帧以来的时长（流级活性——pump 每帧刷新）。
+    pub(crate) fn frame_silent_for(&self) -> std::time::Duration {
+        self.last_frame_rx.lock().unwrap().elapsed()
+    }
+
+    /// 通道活性（pump 存活且连接 rx 未静默超阈）——canonical 会话压制新
+    /// INIT 的判据（E1′ 硬化：仅 `!is_dead()` 会把半开尸体的 Active canonical
+    /// 变成 ALREADY_ACTIVE 滞留，重加入者当日不可恢复）。
+    pub(crate) fn is_live(&self) -> bool {
+        !self.is_dead() && self.rx_silent_for() <= super::state::CORPSE_SILENCE
+    }
+
+    /// 通道是否可被新 sid INIT 替换（E1′ 硬化的替换判据）：非活（pump 退出/
+    /// 连接 rx 静默超阈——崩溃与半开类），或**流级帧静默超窗**（进程双活 +
+    /// 心跳正常但会话流停滞的 zombie——连接级信号不可见；窗口取 30s：客户端
+    /// openSession 对存活会话幂等复用不发新 sid，「新 sid INIT ⟹ 客户端已
+    /// 放弃旧会话」为冻结不变式，帧静默只是防御性第二道闸）。
+    pub(crate) fn replaceable_by_new_init(&self) -> bool {
+        !self.is_live() || self.frame_silent_for() > session_frame_silence()
     }
 
     /// 终结传输（Session::close Shutdown 语义）：发送半 FIN + 置 dead。
@@ -2137,6 +2183,8 @@ impl SessionChannel {
                     }
                 }
             };
+            // 流级活性刷新（E1′ 硬化：frame_silent_for 的采样点）
+            *self.last_frame_rx.lock().unwrap() = std::time::Instant::now();
             self.dispatch_frame(&f).await?;
             if trace_enabled() {
                 strace!(
@@ -2372,6 +2420,21 @@ impl Session {
     }
 }
 
+impl Session {
+    /// 由 shared 组装服务面句柄（serve_http 的反向到达面——E1′ 硬化）：
+    /// 通道在场才有可服务面；无通道（协商中/已终结）返回 None。
+    /// 句柄不持 pump（泵随通道安装已由所有者驱动）；发送面经 shared 解析
+    /// 当前代通道（与 adopt_session 同构）。
+    pub(crate) fn from_shared_for_serve(shared: Arc<SessionShared>) -> Option<Self> {
+        let chan = shared.current_channel()?;
+        Some(Self {
+            shared,
+            channel: std::sync::RwLock::new(chan),
+            pump: std::sync::Mutex::new(None),
+        })
+    }
+}
+
 /// 并发 INIT 败方收敛（R3-3c）：从本地注册表采纳 canonical 会话——等待
 /// 本端 accept 侧把胜方 INIT 登记进注册表并装好通道，返回复用句柄
 /// （不重复 pump；发送面经 shared 解析当前代通道）。
@@ -2583,21 +2646,28 @@ impl SessionRegistry {
             // e2e 实证永卡）。通道存活的 Recovering（真实瞬断，RESUME 在途）
             // 仍保持 canonical。客户端侧 openSession 对 recovering 会话幂等
             // 复用（不发新 sid），故新 sid INIT ⟹ 客户端已放弃旧会话。
+            // E1′ 硬化（2026-09-30 第六批实证）：「通道已死」判定扩为
+            // 「通道可被新 INIT 替换」（is_dead / 连接 rx 静默超 CORPSE_SILENCE
+            // / 流级帧静默超 SESSION_FRAME_SILENCE）——半开尸体连接上 pump
+            // 阻塞在永不返回的流读盘、is_dead 恒 false；进程双活的流停滞
+            // zombie 连接级信号恒活、QUIC 空闲超时永不触发。两者都会把
+            // Active canonical 变成 ALREADY_ACTIVE 滞留，重加入者当日不可
+            // 恢复（mutual-scratch 死锁的会话层支柱）。
             let recovering_dead_channel = existing_phase == SessionPhase::Recovering
                 && existing
                     .shared
                     .current_channel()
-                    .is_none_or(|c| c.is_dead());
+                    .is_none_or(|c| c.replaceable_by_new_init());
             // 真双机验收实证（2026-09-30）：Active 但通道已死（对端崩溃后旧
             // 连接被 winner 替换/传输层死亡尚未被 pump 处理完）同样放行新
             // INIT——通道已死的 Active 无法交付任何帧，滞留只会让重加入者的
             // 首个会话吃一次 ALREADY_ACTIVE 拒绝（pump 处理完流终结前存在
-            // 该竞态窗口）。
+            // 该竞态窗口）。E1′ 硬化同上：rx 静默/帧静默超阈同判。
             let active_dead_channel = existing_phase == SessionPhase::Active
                 && existing
                     .shared
                     .current_channel()
-                    .is_none_or(|c| c.is_dead());
+                    .is_none_or(|c| c.replaceable_by_new_init());
             let incoming_wins = (existing_phase == SessionPhase::Negotiating
                 && existing
                     .initiator
@@ -3104,6 +3174,26 @@ enum TryAgain {
 }
 
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// 会话通道的流级帧静默窗（E1′ 硬化）：超过该窗未收到任何会话帧的
+/// Active/Recovering canonical 可被新 sid INIT 替换（进程双活 + 连接心跳
+/// 正常但会话流停滞的 zombie——连接级 rx 信号恒活，QUIC 空闲超时永不触发）。
+const SESSION_FRAME_SILENCE: std::time::Duration = std::time::Duration::from_secs(30);
+/// 帧静默窗测试注入（None = 生产常量；E1′ zombie 类单测需要短窗）。
+static FRAME_SILENCE_OVERRIDE: std::sync::Mutex<Option<std::time::Duration>> =
+    std::sync::Mutex::new(None);
+
+fn session_frame_silence() -> std::time::Duration {
+    FRAME_SILENCE_OVERRIDE
+        .lock()
+        .unwrap()
+        .unwrap_or(SESSION_FRAME_SILENCE)
+}
+
+/// 测试注入口：替换帧静默窗（传 None 恢复生产常量）。
+#[doc(hidden)]
+pub fn set_frame_silence_for_tests(value: Option<std::time::Duration>) {
+    *FRAME_SILENCE_OVERRIDE.lock().unwrap() = value;
+}
 /// 收敛重试预算（真双机验收实证 2026-09-30）：对端崩溃后存活方槽位里的
 /// 半开尸体（close_reason 未判死）会把重加入者的前几个候选连接按 winner
 /// 规则判负掐掉，直到尸体被 rx 静默阈值驱逐（两个心跳周期 ≈10s）——
@@ -3148,6 +3238,11 @@ async fn wait_for_existing_session(shared: Arc<SessionShared>) -> Result<Session
 /// 对 provider 幂等（同 sid+token → OK 重发既有会话），ghost 会话不再累积。
 /// R3-3c：发起侧登记（continuity_campaigns）——双端并发 INIT 的全序裁决面；
 /// 成功后保留（迟到交叉 INIT 的收敛锚），最终失败移除。
+/// E1′ 硬化（2026-09-30 第六批实证）：reusable 既有会话的通道若已不可救
+/// （pump 退出/连接 rx 静默超阈/流级帧静默超窗——「response head timeout」
+/// 后客户端复用 zombie 通道反复撞墙），不再幂等复用——显式放弃
+/// （remove_if 与 tombstone 防复活）后以新 sid 全新建会话；协商中的
+/// campaign（无通道）保持 single-flight 等待。
 pub async fn open_session(
     fabric: &Fabric,
     peer_id: &str,
@@ -3162,7 +3257,36 @@ pub async fn open_session(
         .reusable_for_peer(peer_id)
         .await
     {
-        return wait_for_existing_session(existing).await;
+        // E1′ 硬化修正（2026-09-30 互开现场实证）：只放弃**本端自己的
+        // client campaign**（is_client——本端发起、本端可重开）。对端发起
+        // 会话在本端的 provider 孪生（is_client=false）绝不得 tombstone：
+        // 它是对端 Active campaign 的 canonical——对端 reject 时以它为锚、
+        // 本端 adopt 需在本地注册表找到它；tombstone 后成 mutual 拒绝死锁
+        //（双方互相以对方无法 adopt 的 canonical 拒绝，永不收敛）。provider
+        // 孪生的死通道由对端自己的重开（admit 替换路径）承接。
+        let corpse_channel = existing.is_client
+            && match existing.current_channel() {
+                Some(c) => c.replaceable_by_new_init(),
+                None => !matches!(existing.phase_sync(), SessionPhase::Negotiating),
+            };
+        if corpse_channel {
+            // 不可救通道上的本端 campaign 无法交付任何帧：放弃旧 sid
+            //（tombstone 防本地复活），以全新 campaign 建立——provider 侧
+            // 同信号（admit_init_ordered）保证新 INIT 被即时采纳。
+            fabric
+                .inner
+                .continuity_sessions
+                .remove_if(&existing.session_id)
+                .await;
+            fabric
+                .inner
+                .continuity_campaigns
+                .lock()
+                .await
+                .remove(peer_id);
+        } else {
+            return wait_for_existing_session(existing).await;
+        }
     }
     let session_id = rand_16().ok_or_else(entropy_err)?;
     let token = rand_16().ok_or_else(entropy_err)?;
@@ -3387,9 +3511,13 @@ pub async fn accept_any(
                 strace!("accept transport epoch={}", t.epoch);
                 t
             }
-            // 收敛期 accept 侧连接死亡（败者连接被 winner 规则关闭）：重接受
+            // 收敛期 accept 侧连接死亡（败者连接被 winner 规则关闭）：重接受。
+            // 退避（E1′ 硬化 2026-09-30 双机实证）：NoAddressingInfo 类错误
+            //（serve 预绑的不可达成员）在此 continue 曾无退避热自旋——真双机
+            // 实测 3 分钟 270 万条 trace；拨号类错误重试至少间隔一个拨号周期。
             Err(e) => {
                 strace!("accept_stream err {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 continue;
             }
         };
@@ -3513,11 +3641,17 @@ async fn accept_session_init(
         // 活跃判定只认 Active / （通道存活的）Recovering：Dead/Closed 与
         // 通道已死的 Recovering 不得压制新 INIT（canonical 由 reap_terminal
         // 懒清；放弃看门狗负责转 Dead；死通道 Recovering 即时替换语义见
-        // admit_init_ordered）。
+        // admit_init_ordered）。E1′ 硬化：「通道存活」= is_live（含连接 rx
+        // 静默信号——半开尸体连接上 is_dead 恒 false，Active 侧同样不得
+        // 用尸体通道压制新 INIT）；Active 且无通道（罕见中间态）保守视为
+        // 活跃（真并发双 INIT 收敛优先）。
         let local_is_active = local_shared.as_ref().is_some_and(|shared| {
-            matches!(shared.phase_sync(), SessionPhase::Active)
-                || (shared.phase_sync() == SessionPhase::Recovering
-                    && shared.current_channel().is_some_and(|c| !c.is_dead()))
+            let phase = shared.phase_sync();
+            if phase == SessionPhase::Active {
+                return shared.current_channel().is_none_or(|c| c.is_live());
+            }
+            phase == SessionPhase::Recovering
+                && shared.current_channel().is_some_and(|c| c.is_live())
         });
         let incoming_wins = (incoming_endpoint, sid) < (local_endpoint, campaign.session_id);
         if local_is_active || !incoming_wins {
@@ -5306,5 +5440,141 @@ mod tests {
             "auto-7",
             "无键 payload 退化为确定性占位键"
         );
+    }
+
+    /// E1′ zombie 类（2026-09-30 第六批实证）：**进程双活 + 连接心跳正常
+    /// 但会话流停滞**的 Active canonical——连接级 rx 信号恒活（RawLink 的
+    /// 服务端受理连接但永不发帧，QUIC ACK 照常回，udp_rx 持续增长）、
+    /// is_dead 恒 false（pump 阻塞在流读盘）、QUIC 空闲超时永不触发——
+    /// 唯一可判信号是流级帧静默。帧静默超窗后新 sid INIT 必须替换而非
+    /// ALREADY_ACTIVE 滞留。
+    #[tokio::test]
+    async fn admit_replaces_frame_silent_active_canonical() {
+        let _guard =
+            FrameSilenceOverrideGuard::set(Some(std::time::Duration::from_millis(200))).await;
+        let link = raw_link().await;
+        let peer = "zombie-peer";
+        let shared = std::sync::Arc::new(SessionShared::new(
+            [0xA7u8; 16],
+            [0xB7u8; 16],
+            peer.to_owned(),
+            false,
+            JournalLimits::default(),
+        ));
+        // 通道安装（真实 iroh 连接；服务端永不发帧 = 会话流停滞）+ Active。
+        // 句柄必须保活：ctl.channel 只持 Weak，Arc 释放即 current_channel=None
+        //（None 在准入判定里按死通道处理）。
+        let (send, recv) = link.transport(1).await.into_split();
+        let _chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installed");
+        shared.set_phase_sync(SessionPhase::Active);
+        // 注册为 peer 的 canonical
+        let registry = SessionRegistry::new();
+        let initiator = iroh_base::SecretKey::from_bytes(&[9u8; 32]).public();
+        let (_s, is_owner) = registry
+            .register_local(std::sync::Arc::clone(&shared), peer.to_owned(), initiator)
+            .await;
+        assert!(is_owner);
+        // 连接级活性在场（ACK 流动，rx 静默 ≈ 0——zombie 的连接级伪装）；
+        // canonical 就位
+        assert_eq!(
+            registry.canonical_sid_for_peer(peer).await,
+            Some([0xA7u8; 16]),
+            "canonical 就位"
+        );
+        // 帧静默超窗（200ms 窗，等待 300ms）
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // 新 sid INIT：必须 Replaced（不得 Canonical 拒绝）
+        let incoming = iroh_base::SecretKey::from_bytes(&[8u8; 32]).public();
+        match registry
+            .admit_init_ordered(
+                [0xA8u8; 16],
+                [0xB8u8; 16],
+                peer.to_owned(),
+                incoming,
+                JournalLimits::default(),
+            )
+            .await
+        {
+            InitAdmission::Replaced(_, old) => {
+                assert_eq!(
+                    old.phase_sync(),
+                    SessionPhase::Dead,
+                    "被替换旧 canonical 立即置 Dead"
+                );
+            }
+            InitAdmission::Canonical(_) => {
+                panic!("帧静默超窗的 Active canonical 必须被新 INIT 替换（E1′ zombie）")
+            }
+            _ => panic!("unexpected admission outcome"),
+        }
+    }
+
+    /// 对照：新鲜通道（帧静默未超窗）的 Active canonical 仍然压制新 INIT
+    ///（真并发双 INIT 收敛语义不受 E1′ 硬化影响）。
+    #[tokio::test]
+    async fn admit_keeps_fresh_active_canonical() {
+        let _guard = FrameSilenceOverrideGuard::set(Some(std::time::Duration::from_secs(60))).await;
+        let link = raw_link().await;
+        let peer = "fresh-peer";
+        let shared = std::sync::Arc::new(SessionShared::new(
+            [0xA9u8; 16],
+            [0xB9u8; 16],
+            peer.to_owned(),
+            false,
+            JournalLimits::default(),
+        ));
+        let (send, recv) = link.transport(1).await.into_split();
+        let _chan = shared
+            .install_channel(send, recv, InstallPolicy::Force, None, None)
+            .await
+            .expect("channel installed");
+        shared.set_phase_sync(SessionPhase::Active);
+        let registry = SessionRegistry::new();
+        let initiator = iroh_base::SecretKey::from_bytes(&[9u8; 32]).public();
+        let (_s, is_owner) = registry
+            .register_local(std::sync::Arc::clone(&shared), peer.to_owned(), initiator)
+            .await;
+        assert!(is_owner);
+        let incoming = iroh_base::SecretKey::from_bytes(&[8u8; 32]).public();
+        match registry
+            .admit_init_ordered(
+                [0xAAu8; 16],
+                [0xBAu8; 16],
+                peer.to_owned(),
+                incoming,
+                JournalLimits::default(),
+            )
+            .await
+        {
+            InitAdmission::Canonical(_) => {}
+            _ => panic!("unexpected admission outcome"),
+        }
+    }
+
+    /// 帧静默窗注入的 RAII 守卫（测试退出即恢复生产常量——全局静态不泄漏）。
+    /// 同时持有互斥锁：窗注入是全局静态，zombie/对照两测试并行会互相污染
+    ///（对照测试曾被 200ms 短窗泄漏误判 Replaced）。
+    static FRAME_SILENCE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct FrameSilenceOverrideGuard(
+        #[expect(dead_code, reason = "字段仅为持有互斥锁至 Drop；Drop 侧不读它")]
+        Option<tokio::sync::MutexGuard<'static, ()>>,
+    );
+
+    impl FrameSilenceOverrideGuard {
+        async fn set(value: Option<std::time::Duration>) -> Self {
+            let lock = FRAME_SILENCE_TEST_LOCK.lock().await;
+            set_frame_silence_for_tests(value);
+            Self(Some(lock))
+        }
+    }
+
+    impl Drop for FrameSilenceOverrideGuard {
+        fn drop(&mut self) {
+            set_frame_silence_for_tests(None);
+        }
     }
 }

@@ -75,8 +75,12 @@ impl StreamFramer {
 
 /// 发送半边（[`ContinuityTransport::into_split`] 产物）。
 /// 会话层将收发半边分别加锁——收帧等待与数据发送互不阻塞（design §5）。
+/// `conn`：所属 continuity 连接的克隆（E1′ 硬化 2026-09-30：通道级 rx 静默
+/// 活性信号需要连接数据报计数——半开尸体连接上 pump 阻塞在永不返回的流读
+/// 盘，`is_dead` 恒 false，唯一可靠的正向活性证据是连接级心跳 ACK 计数）。
 pub struct TransportSend {
     pub epoch: u64,
+    pub(crate) conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
 }
 
@@ -171,7 +175,7 @@ impl ContinuityTransport {
             .open_bi()
             .await
             .map_err(|e| TransportError::Io(format!("{e}")))?;
-        Ok(Self::from_parts(send, recv, epoch))
+        Ok(Self::from_parts(conn.clone(), send, recv, epoch))
     }
 
     pub async fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
@@ -185,13 +189,14 @@ impl ContinuityTransport {
 
     /// 由已建立的 (send, recv) 组装（接受侧入口）。
     pub fn from_parts(
+        conn: iroh::endpoint::Connection,
         send: iroh::endpoint::SendStream,
         recv: iroh::endpoint::RecvStream,
         epoch: u64,
     ) -> Self {
         Self {
             epoch,
-            send: TransportSend { epoch, send },
+            send: TransportSend { epoch, conn, send },
             recv: TransportRecv {
                 epoch,
                 recv,

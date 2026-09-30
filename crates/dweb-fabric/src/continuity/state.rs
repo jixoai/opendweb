@@ -63,10 +63,34 @@ pub struct ConnHandle {
     pub(crate) rx_sample: std::sync::Mutex<RxSample>,
 }
 
+/// 尸体静默阈值：两个 iroh 心跳周期（HEARTBEAT_INTERVAL=5s）。活连接的心跳
+/// ACK 让 rx 计数每 ~5s 增长；静默 ≥10s 且传输层未判死的连接按尸体裁决。
+/// continuity 连接层（ConnHandle）与会话通道层（SessionChannel）共用
+///（E1′ 硬化 2026-09-30：会话 canonical 的活性判定引入同一信号——半开
+/// 尸体连接上 pump 永不退出，`is_dead` 恒 false，ALREADY_ACTIVE 滞留）。
+pub(crate) const CORPSE_SILENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// rx 采样点：最近一次观测到的 udp_rx 计数与时刻。
 pub(crate) struct RxSample {
     pub(crate) datagrams: u64,
     pub(crate) at: std::time::Instant,
+}
+
+/// 连接级 rx 静默采样（ConnHandle 与 SessionChannel 共用的活性原语）：
+/// 计数增长即刷新采样点并返回 ~0；不增长则返回距上次采样点的时长。
+/// 活连接的心跳 ACK 周期 ≈ 5s（iroh HEARTBEAT_INTERVAL），故静默 ≥10s
+///（两个周期）= 对端已不在的强信号。
+pub(crate) fn rx_silent_for(
+    sample: &mut RxSample,
+    conn: &iroh::endpoint::Connection,
+) -> std::time::Duration {
+    let now_datagrams = conn.stats().udp_rx.datagrams;
+    if now_datagrams > sample.datagrams {
+        sample.datagrams = now_datagrams;
+        sample.at = std::time::Instant::now();
+        return std::time::Duration::ZERO;
+    }
+    sample.at.elapsed()
 }
 
 impl ConnHandle {
@@ -94,14 +118,8 @@ impl ConnHandle {
     /// 活连接的心跳 ACK 周期 ≈ 5s（iroh HEARTBEAT_INTERVAL），故静默 ≥10s
     /// （两个周期）= 对端已不在的强信号。
     pub(crate) fn rx_silent_for(&self) -> std::time::Duration {
-        let now_datagrams = self.conn.stats().udp_rx.datagrams;
         let mut sample = self.rx_sample.lock().unwrap();
-        if now_datagrams > sample.datagrams {
-            sample.datagrams = now_datagrams;
-            sample.at = std::time::Instant::now();
-            return std::time::Duration::ZERO;
-        }
-        sample.at.elapsed()
+        rx_silent_for(&mut sample, &self.conn)
     }
 }
 
