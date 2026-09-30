@@ -473,3 +473,54 @@ test("F4 regression: async sessionResolver (Promise form) carries a full two-way
     await p.cleanup();
   }
 });
+
+// 真双机验收第六批 F6（2026-09-30，数据丢失级）：buildMaterializeOps 曾对
+// ours 树中的**目录条目**生成 delete（rm -rf）——mergedEntries 只含 blob，目录
+// 在 mergedMap 必然缺席。真实形态目录树（子目录中混合「变更+未变更」文件）
+// fast-forward 后未变更文件被连坐删除（实测 30 文件只剩 5 个变更文件）。既有
+// 夹具全扁平或目录内全部变更，从未命中。回归：目录树跟随/合并不丢未变更文件。
+test("F6 regression: fast-forward/merge with subdirectories keeps unchanged files (real-shape data loss)", async () => {
+  const p = await makePair({ aId: ID_A, bId: ID_B });
+  try {
+    const aRoot = await makeRoot({
+      "skills/alpha/SKILL.md": "alpha v0\n",
+      "skills/beta/SKILL.md": "beta v0\n",
+      "wiki/deep/page.md": "page v0\n",
+      "wiki/deep/other.md": "other v0\n",
+      "configs/settings.json": "{\n}\n",
+      "top-level.md": "top v0\n",
+    });
+    const bRoot = await makeRoot();
+    await createPairGroup(p.a, p.b, { id: "f6", aRoot, bRoot, seedAuthority: ID_A });
+    await p.a.syncNow("f6");
+    await p.b.syncNow("f6");
+    // A：目录内改 1 + 增 1 + 删 1 + 顶层改 1（其余不变）
+    await write(aRoot, "skills/alpha/SKILL.md", "alpha v1\n");
+    await write(aRoot, "wiki/deep/new-page.md", "new\n");
+    await (await import("node:fs/promises")).rm(path.join(aRoot, "wiki/deep/other.md"));
+    await write(aRoot, "top-level.md", "top v1\n");
+    await p.a.syncNow("f6");
+    const bFf = await p.b.syncNow("f6");
+    assert.equal(bFf[0].result.phase, "done");
+    assert.equal(await readOrNull(bRoot, "skills/beta/SKILL.md"), "beta v0\n", "unchanged file in sibling dir survives");
+    assert.equal(await readOrNull(bRoot, "wiki/deep/page.md"), "page v0\n", "unchanged file in SAME dir as a change survives");
+    assert.equal(await readOrNull(bRoot, "configs/settings.json"), "{\n}\n", "unchanged dir with no changes survives");
+    assert.equal(await readOrNull(bRoot, "top-level.md"), "top v1\n", "changed file follows");
+    assert.equal(await readOrNull(bRoot, "wiki/deep/new-page.md"), "new\n", "new file follows");
+    assert.equal(await readOrNull(bRoot, "wiki/deep/other.md"), null, "deleted file propagates");
+    // 双向合并路径同查：两端各改不同文件 → 合并后未变更文件仍在
+    await write(aRoot, "skills/beta/SKILL.md", "beta v1 by A\n");
+    await write(bRoot, "configs/settings.json", "{\n  \"by\": \"B\"\n}\n");
+    await p.a.syncNow("f6");
+    await p.b.syncNow("f6");
+    await p.a.syncNow("f6");
+    assert.equal(await readOrNull(aRoot, "skills/alpha/SKILL.md"), "alpha v1\n", "A keeps earlier change post-merge");
+    assert.equal(await readOrNull(bRoot, "skills/alpha/SKILL.md"), "alpha v1\n", "B receives earlier change post-merge");
+    assert.equal(await readOrNull(aRoot, "wiki/deep/page.md"), "page v0\n", "unchanged deep file survives merge on A");
+    assert.equal(await readOrNull(bRoot, "wiki/deep/page.md"), "page v0\n", "unchanged deep file survives merge on B");
+    assert.equal(await readOrNull(aRoot, "configs/settings.json"), "{\n  \"by\": \"B\"\n}\n", "B's edit merges to A");
+    assert.equal(await readOrNull(bRoot, "skills/beta/SKILL.md"), "beta v1 by A\n", "A's edit merges to B");
+  } finally {
+    await p.cleanup();
+  }
+});

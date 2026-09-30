@@ -350,8 +350,15 @@ export function createSyncEngine(opts) {
     /** @type {Array<{ op: "write" | "delete", path: string, pre: { oid: string | null, type: "blob" | "tree" | null, mode: number | null } | null, post: { oid: string | null, type: "blob" | "tree" | null, mode: number | null } | null }>} */
     const ops = [];
     for (const p of paths) {
-      if (oursFlat.get(p) === undefined && !mergedMap.has(p)) continue;
       const inOurs = oursFlat.get(p);
+      // 目录条目不是物化单位（真双机验收第六批 F6 数据丢失修复，2026-09-30）：
+      // mergedEntries 只含 blob（调用方 filter），ours 树里的目录在 mergedMap
+      // 必然缺席——旧逻辑在此为每个已存在目录生成 delete（rm -rf）→ 目录内
+      // 未变更文件被连坐删除（实测：30 文件目录树 fast-forward 后仅剩 5 个
+      // 变更文件）。目录的存亡由其子路径文件 ops 决定：写路径按需 mkdir；
+      // 全删后残留空目录不入树（git 空目录语义）。
+      if (inOurs !== undefined && inOurs.type === "tree") continue;
+      if (inOurs === undefined && !mergedMap.has(p)) continue;
       const inMerged = mergedMap.get(p);
       const same = inOurs !== undefined && inMerged !== undefined && inOurs.type === "blob" && inOurs.oid === inMerged.oid && inOurs.mode === inMerged.mode;
       if (same) continue;
