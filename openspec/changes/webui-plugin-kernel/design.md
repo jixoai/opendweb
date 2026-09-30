@@ -453,6 +453,28 @@ device 历史后毒化后续全部 push、会话饱和后新请求也失败—�
 经同进程双运行时 harness（真 home/工作树）；协议边界直打端点 handler），
 E1′ 修复后可原样重放。
 
+**第七轮实录（E1′ 闭合 + F5 + 真双机矩阵复放，2026-09-30 下午）**：E1′ 三支柱修复
+闭合且比移交清单多挖两层——① known_addrs 来源分治（Announced/Manual/DialOk
+可持久；**ObservedInbound 不落盘**——scratch 交叉学习面堵死）+ 活性修剪
+（失败计分/未验证 TTL/条数上限/「宣告>手工>拨号成功>观测」排序/v1 加载
+降级+迁移宽限+**末位保留**——失败淘汰不得清空候选集）；② canonical 替换
+判据双信号化（连接 rx 静默 >10s + **流级帧静默** >30s——半开尸体与「进程
+双活+心跳正常但流停滞」两类 zombie 在 is_dead 上均不可见）；③ 客户端
+zombie campaign 显式放弃（仅 is_client——**provider 孪生绝不 tombstone**，
+否则 mutual canonical 拒绝死锁，mutual_open.rs 复现钉住）；④ serve_http
+双面化（accept worker + canonical **反向到达面**——并发双开收敛后对端在
+本端自开会话上的反向流曾永无 dispatch，response head timeout 循环）；
+⑤ serveHttp 预绑 roster 全员（不再依赖 legacy peer-connected——continuity-
+only 连接形态下 legacy 连接可能永不建立）。F5 落地（intervalMs/debounceMs
+经 config→scheduler.setTiming→活跃组即时重挂；宿主 onConfigChange 钩子）。
+真双机：双端重启 mini 19090→200（~28ms/次）；**仅重启 mini ~25–67s 恢复、
+仅重启 iMac +5s 恢复**（双向恢复语义）；第六批迁移模式替代的矩阵 #2 双向/
+#3/#4/#9 真双机复放 4/4 PASS（37/37 文件 md5 一致、冲突决议 hunk 级）。
+绿门：fabric **316/0**（306 基线+10）、clippy 0、ext-sync 61、webui 259、
+client-sdk 96、strict 通过。E1′ 遗留①（进程内拨号停滞/iroh 同 NodeAddr
+新握手抑制面）续档。详见 docs/acceptance-webui-plugin-kernel-dualmachine.md
+第七批。
+
 ## 10. 评审处置表
 
 | 轮 | 结论 | 处置 |

@@ -300,3 +300,91 @@ mini 代码副本（/tmp/wpk-mini/repo）随修同步（md5 审计 53 文件 JS 
 - **F2 裁定材料齐**：sync 侧三层上限（帧 1MiB/流 2MiB/会话 8MiB）+ 超限 blob 历史毒化 + 会话饱和三份新证据。
 - **E1′ 移交**：fabric 会话层双向互毒（含 iMac mihomo TUN 环境漂移实证、ALREADY_ACTIVE 尸体 canonical、scratch 端口交叉学习死锁）——建议内核侧独立 change 跟进（会话保活/尸体驱逐窗口/known_addrs 修剪已在三轮遗留清单）；修复后按本记录 §0 命令原样重放真双机全矩阵。
 - F3 残留：UI 建组表单的 id 输入框（管理面已透传）。
+
+---
+
+# webui-plugin-kernel 真双机验收实录——第七批（E1′ 内核残余死锁簇闭合 + F5 + 真双机 sync 矩阵复放）
+
+> 时间：2026-09-30（UTC 04:5x–06:4x / 本地 12:5x–14:4x）
+> 环境：iMac（fabric root，192.168.2.8，sidecar 18801/3341）↔ Mac mini（member，192.168.2.10，`/usr/bin/ssh macmini`，sidecar 18801/3342）
+> worktree：`opendweb-sdk-mgmt-surface`（分支 sdk-mgmt-surface，起点 HEAD 8379408）
+> 语义依据：design §9.1 第六轮 E1′ 移交清单 + 本批修复要求（known_addrs 卫生/canonical 硬化/恢复语义/F5/两条 cosmetic）
+> 结论先行：**E1′ 三支柱（per-remote 尸体+scratch 交叉学习墓地+ALREADY_ACTIVE canonical 滞留）修复闭合；部署途中间歇开出的第二簇缺陷（互开死锁/serve 反向到达面缺失）一并闭合；双向恢复语义成立（mini-only ~25s / iMac-only +5s → 200）；第六批被迁移模式替代的 sync 矩阵 #2/#3/#4/#9 原样真双机复放 4/4 PASS；F5 接线落地**。修复 commit：内核 `07596d7`（fabric 六层 + webui serve 预绑/会话逐出）；F5+cosmetic `39fd8e4`（ext-sync + webui 宿主钩子）。
+
+## 0. 修复前现场复现（修复基线取证）
+
+- mini `curl http://127.0.0.1:19090/`：`502 upstream-unreachable: [session] session: connect: response head timeout`（30s；另有 8s 级 000）——第六批终态的 E1′ 失败仍在，未被环境自愈。
+- **双端 known_addrs 墓地取证（v1 文件原文）**：
+  - mini（对 iMac `3pyssy4p…`）：`192.168.2.8:3341`（活，宣告）+ `192.168.2.8:56873`、`192.168.2.8:52169`（**两个死 scratch 端口**）；
+  - iMac（对 mini `71ymwthn…`）：`192.168.2.10:3342`（活）+ `192.168.2.8:3343`（**死错机条目**——第六批迁移仪器 rlc 的残留）。
+- mihomo 基线：双端路由表无 198.18.0.0/15、无 TUN 路由；iMac mihomo API `tun.enable=false`（第六批 TUN 事件未复发）；裸 UDP 双向探针通。
+
+## 1. E1′ 根因链与修复面（比第六批移交清单多两层——部署过程中实证挖出）
+
+修复落地后的完整因果链（mini→iMac 当日不可恢复 = 六层叠加，逐层闭合）：
+
+1. **scratch 端口交叉学习**（移交支柱③）：continuity 层 `adopt_with_winner` 对**入站连接**的对端源地址一律学习并持久化——对端 direct-dial 专用 endpoint（随机端口）弃置即死，墓地跨重启存活。修复：known_addrs 来源分治——`Announced`（invite 宣告，唯一权威）/`Manual`/`DialOk`（本端拨出连接的选中路径，验证过可达可持久）/**`ObservedInbound`（入站源地址——一律不落盘**，仅内存 + 10min TTL/失败修剪；本端拨通后升格 DialOk）。
+2. **墓地无活性修剪**（N1）：修复：per-条目 `fail_count`（整计划拨号失败计分，≥3 淘汰；**末位保留**——失败淘汰不得清空候选集，实证：对端未换新时整计划失败可由对端滞留造成，清空即 NoAddressingInfo 死局）+ ObservedInbound 未验证 TTL（10min）+ per-endpoint Observed 条数上限（4）+ 拨号候选排序「宣告>手工>近期拨号成功>观测」；v1 旧文件加载时**降级 ObservedInbound + 迁移宽限**（learned_at=加载时刻——存量唯一活路由先可拨，曾因记 0 加载即全数过期）。
+3. **ALREADY_ACTIVE canonical 滞留**（移交支柱②）：canonical 的「死通道」判定只认 pump 退出（`is_dead`）——两类 zombie 在此信号上不可见：半开尸体连接（pump 阻塞在永不返回的流读盘）与**进程双活+心跳正常但会话流停滞**（连接级信号恒活、QUIC 空闲超时永不触发——「response head timeout」现场）。修复：通道接入双活性信号——连接级 rx 静默（与 ConnHandle 同源采样，>10s）+ **流级帧静默**（pump 每帧刷新，>30s，`SESSION_FRAME_SILENCE`，测试注入钩子）；`admit_init_ordered` 的 Active/Recovering 替换判据、campaign 压制的 `local_is_active`、客户端 `open_session` 的 reusable 复用判据统一改用。
+4. **客户端 zombie 会话复用**（部署实证）：response head timeout 后 sessionResolver 缓存会话永久复用。修复（双层）：`open_session` 对**本端 client campaign**（is_client）的不可救通道显式放弃（remove_if+tombstone）后全新建会话；**provider 孪生绝不 tombstone**（它是发端 campaign 的 canonical 锚——tombstone 后双方互相以对方无法 adopt 的 canonical 拒绝，mutual 死锁；provider 孪生死通道由对端重开的 admit 替换承接）——`mutual_open.rs` 互开+连接翻覆复现测试钉住。JS 侧 `sessionResolver` 每查询快照复核（dead/closed 即逐出，不依赖 onState 跳变）。
+5. **serve 反向到达面缺失**（部署实证，本批最深一层）：并发双开收敛（ALREADY_ACTIVE adopt）后，对端在本端**自发起的会话**上开 provider 向流发请求——该会话从未经过 `accept_any`，无 dispatch 任务 → 请求到达 pump 却永不分发（trace 实证：对端 Open/Fin 到达、本端零回包、~30s 后对端 Reset）。修复：`serve_http` 双面化——accept worker（不可取消语义保持，mpsc 承载）+ 每 250ms 复核 canonical 的**反向到达面**（未见过的 sid 挂 dispatch）。
+6. **serveHttp 绑定依赖 legacy peer-connected**（部署实证）：绑定只挂在 legacy 连接事件上——对端与本端只有 continuity 连接时（iroh 对同 NodeAddr 既有连接的新握手存在抑制面）legacy 连接可能永不建立 → serve 循环缺席。修复：webui fabric 宿主启动即对 roster 全员**预绑** serveHttp（幂等；peer-connected 动态绑定保留）；预绑暴露的 `accept_any` 无退避热自旋（真双机 3 分钟 270 万条 trace）一并修复（错误路径 200ms 退避）。
+
+修复中的两类测试拦击（绿门价值实证）：cargo 全量首跑抓出候选排序方向写反（宣告被排到最后）；部署现场抓出 v1 文件 serde 解析失败（`#[serde(untagged)]` 缺失——单测绕过 serde 构造 PersistEntry 掩盖，补 serde 字节级回归）。
+
+## 2. F5（ext-sync config 接线）与 cosmetic
+
+- **F5**：`createSyncRuntime({config:{intervalMs,debounceMs}})` 构造期入调度器；`applyConfig`（`scheduler.setTiming`——interval 对活跃组即时重挂、debounce 后续生效；非法值拒绝）；webui 宿主 `onEnable` ctx 携带 `config`、`setConfig` 持久化后通知可选 `onConfigChange` 钩子（抛错经 `onConfigChangeError` 观测、不回滚已落盘配置）；PluginRuntime 契约 typedef 扩展（可选钩子，零破坏）。
+- **cosmetic 两条**：`gcStaging` 空壳（0 对象）staging 目录即时回收（有对象目录仍按 TTL——崩溃现场语义不变）；`executeIntent` 完成后清理 intent/done 文件对（`recoverIntent` 同构；done 落盘与清理之间崩溃=done 对在场，readPendingIntent 幂等 null）。
+
+## 3. 绿门
+
+| 套件 | 数字 |
+|---|---|
+| cargo test -p dweb-fabric（全量） | **316 passed / 0 failed**（306 基线 + 10 新增：known_addrs 来源分治 8 例、session zombie/对照 2 例、e1p_stale_state 1 例、mutual_open 1 例——known_addrs 原 4 例重写） |
+| clippy（--all-targets） | 0 warning |
+| rustfmt --edition 2024 | 触碰文件全格式化（仓库既有未触碰文件存在格式漂移，未卷入） |
+| ext-sync node --test | **61/61**（57 基线 + F5 两例 + cosmetic 两例） |
+| webui node --test | **259/259**（258 基线 + F5 宿主钩子一例） |
+| client-sdk node --test | 96/96（NAPI 重建后） |
+| openspec validate --strict | 通过 |
+| git diff --check | 干净 |
+| NAPI 重建门 | build 内置 strip -Sx + codesign + 真实 dlopen（两端 md5 `bf34bc0f…` 一致 + mini 独立 require 成功） |
+
+## 4. 双机验证（时间戳均为 UTC）
+
+### 4.1 部署与恢复
+
+- 部署：iMac worktree 重建 + mini ssh-rsync（src + .node，md5 双端核对）；sidecar 以 DWEB_SESSION_TRACE=1 起观测。
+- **双端重启后**：mini 19090 → **200**（python 目录列表 50682B，~28ms/次 ×3 复测稳定）。
+- **仅重启 mini**（06:21:32 kill -9 验死 → 拉起）：06:22:39 → 200（首周期 67s；第二周期 06:22:51 起 ~25s 内 500→200）。修复前：当日不可恢复。
+- **仅重启 iMac**（06:25:10 kill -9 验死 → 拉起）：**06:25:15 → 200（+5s）**。双向恢复语义成立。
+
+### 4.2 sync 矩阵复放（第六批被迁移模式替代的 4 项，原样真双机重放）
+
+组 `g-055af40c`/root `r1` 状态完好（groupRef=deviceRef=`a9c1c2a6…` 第六批收敛态，双端 36 文件）：
+
+| 矩阵 | 操作 | 结果 |
+|---|---|---|
+| **#2 单边跟随（正向）** | iMac 改 wiki/Home.md + 增 prompts/matrix2-imac.md → sync-now（local ahead pushed）→ mini sync（up to date） | **PASS**：双端 md5 `2fdba372…`/`2529133e…` 逐对一致 |
+| **#2 单边跟随（反向）** | mini 改 wiki/ops/runbook.md + 增 prompts/rev/matrix2-mini.md → push → iMac fast-forward | **PASS**：md5 `d03bedcf…`/`b39b2e05…` 一致 |
+| **#3 非重叠合并** | iMac 改 skills/research + mini 改 skills/diagnosing-bugs → mini 轮 `merged` → iMac fast-forward | **PASS**：双端各含双方变更；**37/37 文件 md5 全一致**（含中文空格名文件） |
+| **#4 重叠冲突决议** | 双端同文件 prompts/plan-task.md 追加不同行 → mini 轮 `conflicted`（hunk 级 1 处，base/ours/theirs OID 持久化）→ `POST …/conflicts/g-055af40c/r1/resolve {choices:[{hunkIndex:0,choice:"theirs"}]}` → 决议提交 `09e5602f` → iMac fast-forward | **PASS**：双端 plan-task.md 均为 IMAC 行，md5 `19a3d847…` 一致（注：决议 body 首次以 `["theirs"]` 字符串形态提交报 internal——choices 语法为 `[{hunkIndex,choice}]`，非缺陷） |
+| **#9 重连收敛** | mini kill -9（06:30:39 验死）→ iMac 编辑+push（mini 下线时失败，mini 06:31:26 重启后 08s 内 push 成功）→ mini 重启后 sync | **PASS**：wiki/Home.md `a0fb066d…` + 新增 reconnect-file.md `0d081de1…` 双端 md5 一致 |
+
+## 5. 遗留与移交
+
+- **E1′ 遗留①（进程内拨号停滞）仍未根治**：本批部署窗口再现一例（sidecar 进程新出站拨号停滞、同刻独立进程 40ms 通——同 NodeId 二进程探针的 canonical 干扰后判定为「对端同 NodeAddr 既有连接的新握手抑制」面的另一表现；层 5/6 修复后该形态不再阻塞数据面，但 iroh 层抑制机制未定位，续档）。
+- known_addrs v2 落盘格式已上线（v1 兼容读入）；双端首启后旧墓地以 ObservedInbound 内存态过渡，首个成功拨号后以 DialOk 重新落盘。
+- F3 残留（UI 建组表单 id 输入框）、F2 裁定材料——不变，续第六批移交清单。
+
+## 6. 结束态与进程回收
+
+| 项 | 状态 |
+|---|---|
+| iMac sidecar | 运行（修复后代码，18801=200；pid 见 `/tmp/wpk-imac-sidecar.pid`，trace 开着可复现观测，收官走查可按需去 trace 重启） |
+| mini sidecar | 运行（修复后代码，18801=200），ports/files/sync enabled |
+| 19090 | 200（多次复测）；sync 组 `g-055af40c` 双端收敛态（37 文件，含本批复放增量） |
+| 8080（pid 1749）/hub（pid 19232） | 全程未动，200 |
+| 探针回收 | mini：/tmp/wpk-probe.mjs、/tmp/wpk-connect-probe.mjs、/tmp/wpk-bind-probe.mjs、/tmp/wpk-mini-home-probe（身份副本）已删；iMac：误建的本地 /tmp/wpk-mini（rsync 目标误写本地路径产物）已删 |
+| 验收数据 | /tmp/wpk-sync-{imac,mini}/agents-skills 保留（37 文件收敛态） |
