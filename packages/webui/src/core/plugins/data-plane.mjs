@@ -18,6 +18,8 @@
 //    e2e 语义不变）；真实安装按 package.json dependencies 解析。
 // 零凭证：本模块不读 argv/env；一切会话经注入的 fabric 宿主。
 
+import { z32ToHex } from "../fabric.mjs";
+
 /**
  * sync fetchImpl 适配（client-sdk fetchHttp → sync 契约）。
  * @param {(session: unknown, request: object) => Promise<{ bodyNext: () => Promise<Buffer | null>, status: number }>} fetchHttp
@@ -102,13 +104,16 @@ export async function buildPluginRuntimes(opts) {
     });
     syncUnavailable = null;
     // 会话在线 → 组调度跟随（design §7.5 触发源之一；notifyOnline 对未调度组
-    // 是 no-op——无需在此判定插件启停）
+    // 是 no-op——无需在此判定插件启停）。peer 事件 endpointId 是 z32 展示串、
+    // 组成员登记 hex64——同钥异码先归一再比（真双机验收 F-sync 同族修复，
+    // 2026-09-30；归一与 fabric.mjs z32ToHex 同源语义，此处内联保守实现）
     fabric.onPeerOnline((peer) => {
+      const peerHex = /^[0-9a-f]{64}$/.test(peer) ? peer : /^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(peer) ? z32ToHex(peer) : peer;
       sync
         .listGroups()
         .then((groups) => {
           for (const g of groups) {
-            if (g.members.some((m) => m.endpointId === peer)) sync.scheduler.notifyOnline(g.id);
+            if (g.members.some((m) => m.endpointId.toLowerCase() === peerHex)) sync.scheduler.notifyOnline(g.id);
           }
         })
         .catch(() => {});

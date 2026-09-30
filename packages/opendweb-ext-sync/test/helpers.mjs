@@ -31,7 +31,7 @@ export async function makeRoot(files = {}, prefix = "dweb-sync-root-") {
  * 双端 loopback 装配：两台设备的 runtime 互相以内存 fetchImpl 直调对端
  * handleSyncRequest（无真实 Fabric 会话——契约同形：fetchHttp/serveHttp 的
  * JS 投影）。
- * @param {{ aId: string, bId: string, aName?: string, bName?: string, now?: () => number, log?: object }} opts
+ * @param {{ aId: string, bId: string, aName?: string, bName?: string, now?: () => number, log?: object, asyncSessionResolver?: boolean }} opts
  */
 export async function makePair(opts) {
   const { createSyncRuntime } = await import("../src/index.mjs");
@@ -48,6 +48,12 @@ export async function makePair(opts) {
    */
   function register(selfId, selfName, home) {
     const fetchImpl = async (session, req) => {
+      // 生产保真防线（真双机验收 F4 回归网）：真实宿主 fabric.sessionResolver
+      // 是异步的——引擎若不 await，fetchImpl 会收到 Promise（生产报
+      // session.fetchHttp is not a function）。loopback 在此如实拒绝。
+      if (session !== null && typeof session === "object" && typeof /** @type {any} */ (session).then === "function") {
+        throw new Error("session.fetchHttp is not a function (engine passed an unresolved sessionResolver promise)");
+      }
       const target = endpoints.get(/** @type {{ peerEndpointId: string }} */ (session).peerEndpointId);
       if (target === undefined) return { status: 404, body: jsonBody({ ok: false, code: "not-found", detail: "peer runtime not registered" }) };
       return target.runtime.handleSyncRequest({
@@ -59,7 +65,12 @@ export async function makePair(opts) {
         signal: req.signal,
       });
     };
-    const sessionResolver = (peerEndpointId) => ({ peerEndpointId, selfEndpointId: selfId, sessionId: "loopback" });
+    const sessionObj = (peerEndpointId) => ({ peerEndpointId, selfEndpointId: selfId, sessionId: "loopback" });
+    // asyncSessionResolver：真实宿主形态（Promise 返回——webui fabric.mjs
+    // sessionResolver 是 async 函数；同步 loopback 形态曾掩盖 F4）
+    const sessionResolver = opts.asyncSessionResolver
+      ? (peerEndpointId) => Promise.resolve(sessionObj(peerEndpointId))
+      : (peerEndpointId) => sessionObj(peerEndpointId);
     const runtime = createSyncRuntime({ home, endpointId: selfId, deviceName: selfName, now: opts.now, fetchImpl, sessionResolver, log: opts.log ?? {} });
     endpoints.set(selfId, { runtime, home });
     return runtime;

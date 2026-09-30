@@ -444,3 +444,32 @@ test("recovery surfaces conflicted state to the job (user-edits path) and blocks
     await p.cleanup();
   }
 });
+
+// 真双机验收 F4（2026-09-30）：真实宿主 fabric.sessionResolver 是 async 函数
+// （返回 Promise）；引擎 callPeer 不 await 时 fetchImpl 收到 Promise——生产报
+// "session.fetchHttp is not a function"（iMac↔mini 实测）。本 Scenario 以
+// Promise 形态 resolver 走完整双向闭环（loopback fetchImpl 带生产保真防线：
+// 收到 thenable 即抛同款错误——修复前本测试红）。
+test("F4 regression: async sessionResolver (Promise form) carries a full two-way sync round", async () => {
+  const p = await makePair({ aId: ID_A, bId: ID_B, asyncSessionResolver: true });
+  try {
+    const aRoot = await makeRoot({ "shared.md": "v0\n" });
+    const bRoot = await makeRoot(); // 空根——首拉采纳基线
+    await createPairGroup(p.a, p.b, { id: "async-sess", aRoot, bRoot, seedAuthority: ID_A });
+    const aSeed = await p.a.syncNow("async-sess");
+    assert.equal(aSeed[0].result.phase, "done", JSON.stringify(aSeed));
+    const bPull = await p.b.syncNow("async-sess");
+    assert.equal(bPull[0].result.phase, "done", JSON.stringify(bPull));
+    assert.equal(await readOrNull(bRoot, "shared.md"), "v0\n", "baseline adopted through the async resolver");
+    // 反向跟随一轮（双向 push 亦经 async resolver）
+    await write(bRoot, "shared.md", "v1 from B\n");
+    await p.b.syncNow("async-sess");
+    await p.a.syncNow("async-sess");
+    assert.equal(await readOrNull(aRoot, "shared.md"), "v1 from B\n", "A follows B through the async resolver");
+    const groupsA = await p.a.listGroups();
+    const groupsB = await p.b.listGroups();
+    assert.ok(groupsA[0].roots[0].groupRef !== null && groupsA[0].roots[0].groupRef === groupsB[0].roots[0].groupRef, "refs converge");
+  } finally {
+    await p.cleanup();
+  }
+});

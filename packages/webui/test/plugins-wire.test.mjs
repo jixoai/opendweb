@@ -445,3 +445,74 @@ test("wire: close runs plugin dispose before the fabric shutdown", async (t) => 
   assert.ok(shutdownIdx > openIdx, "fabric shutdown happens during close");
   assert.equal(fake.calls.filter((c) => c === "shutdown").length, 1, "close is idempotent on the fabric");
 });
+
+// ---- 管理面：sync 建组显式 id 透传（真双机验收 F3，2026-09-30） ------------------------
+// 组模型语义=两端各建一次**同 id** 组（design §7.2/GroupsPage 表单说明）；建组路由
+// 不透传 id 时对端永远无法配对（随机 id）。显式 id 必须被采纳，非法字符集按
+// invalid 拒绝，同 id 同形状幂等、同 id 异形状 conflict。
+
+test("wire: sync group creation honors an explicit id (cross-device same-id pairing); invalid/duplicate shapes rejected", async (t) => {
+  const home = await tempHome(true);
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const fake = makeFakeSdk();
+  const sc = await createSidecar({ homeDir: home, sdk: fake.sdk });
+  t.after(() => sc.close());
+  const sameOrigin = { host: `127.0.0.1:${sc.port}`, origin: sc.origin };
+  const rootDir = path.join(home, "sync-root");
+  await mkdir(rootDir, { recursive: true });
+  const draft = {
+    name: "agents-skills",
+    peerEndpointId: PEER,
+    peerDeviceName: "peer-device",
+    roots: [{ localPath: rootDir, mode: "twoway", seedAuthority: "self" }],
+  };
+
+  const created = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/sync/groups",
+    headers: { ...sameOrigin, ...jsonHeaders },
+    body: JSON.stringify({ ...draft, id: "agents-skills-main" }),
+  });
+  assert.equal(created.status, 200, created.text);
+  assert.equal(JSON.parse(created.text).group.id, "agents-skills-main", "explicit id is honored (not randomized)");
+
+  // 同 id 同形状（本端视角成员顺序恒 [self, peer]）→ 幂等成功
+  const replay = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/sync/groups",
+    headers: { ...sameOrigin, ...jsonHeaders },
+    body: JSON.stringify({ ...draft, id: "agents-skills-main" }),
+  });
+  assert.equal(replay.status, 200, replay.text);
+
+  // 同 id 异形状 → conflict 400
+  const clash = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/sync/groups",
+    headers: { ...sameOrigin, ...jsonHeaders },
+    body: JSON.stringify({ ...draft, id: "agents-skills-main", name: "renamed" }),
+  });
+  assert.equal(clash.status, 400);
+  assert.equal(JSON.parse(clash.text).error.code, "conflict");
+
+  // 非法字符集（大写/下划线）→ invalid 400
+  const badId = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/sync/groups",
+    headers: { ...sameOrigin, ...jsonHeaders },
+    body: JSON.stringify({ ...draft, id: "Bad_Id" }),
+  });
+  assert.equal(badId.status, 400);
+  assert.equal(JSON.parse(badId.text).error.code, "invalid");
+
+  // 无 id → 随机生成（既有行为不变）
+  const auto = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/sync/groups",
+    headers: { ...sameOrigin, ...jsonHeaders },
+    body: JSON.stringify(draft),
+  });
+  assert.equal(auto.status, 200, auto.text);
+  const autoId = JSON.parse(auto.text).group.id;
+  assert.match(autoId, /^g-/, "omitted id still falls back to random generation");
+});

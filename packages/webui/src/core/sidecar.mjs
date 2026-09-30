@@ -1432,9 +1432,12 @@ export async function createSidecar(opts = {}) {
         const identity = await fabricHost.identity();
         if (identity === null) return syncUnavailableResp(res, req, startedAt);
         // GroupDraft（UI 契约）→ createGroup 输入：members=[self, peer]；
-        // seedAuthority "self" 解析为本端 endpointId（[W9] 显式选择）
-        const draft = /** @type {{ name?: unknown, peerEndpointId?: unknown, peerDeviceName?: unknown, roots?: unknown }} */ (parsed ?? {});
+        // seedAuthority "self" 解析为本端 endpointId（[W9] 显式选择）；
+        // id 可选显式指定（两端各建一次**同 id** 组是组模型的既定语义——
+        // 随机 id 令对端永远无法配对；真双机验收 F3 修复 2026-09-30）
+        const draft = /** @type {{ id?: unknown, name?: unknown, peerEndpointId?: unknown, peerDeviceName?: unknown, roots?: unknown }} */ (parsed ?? {});
         const name = typeof draft.name === "string" ? draft.name : "";
+        const groupId = typeof draft.id === "string" && draft.id.trim() !== "" ? draft.id.trim().toLowerCase() : undefined;
         const peerEndpointId = typeof draft.peerEndpointId === "string" ? draft.peerEndpointId.trim().toLowerCase() : "";
         const peerDeviceName = typeof draft.peerDeviceName === "string" ? draft.peerDeviceName : "";
         const rootsIn = Array.isArray(draft.roots) ? draft.roots : [];
@@ -1448,6 +1451,7 @@ export async function createSidecar(opts = {}) {
           roots.push({ localPath, mode, seedAuthority });
         }
         const r = await sync.createGroup({
+          ...(groupId !== undefined ? { id: groupId } : {}),
           name,
           members: [
             { endpointId: identity.endpointId, deviceName: identity.deviceName },

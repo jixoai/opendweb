@@ -64,6 +64,35 @@ export const STAGING_TTL_MS = 10 * 60 * 1000;
 const ERROR_STATUS = { unauthorized: 403, "not-found": 404, "bad-request": 400, aborted: 400, "body-too-large": 413, "line-too-large": 413, oversize: 413, budget: 429, busy: 429, "cas-mismatch": 409, "closure-missing": 409, integrity: 422, internal: 500 };
 
 /**
+ * peer id 归一（真双机验收 F-sync 同钥异码修复，2026-09-30）：fabric 会话
+ * peerEndpointId 是 z-base-32 展示串（SDK endpoint_id_display），组账本成员
+ * 登记 hex64（server 租约冻结形态）——同钥异码先归一再比，防「组内成员仍
+ * 403」。与 ext-files/ext-ports 的 normalizePeerId 同源实现（包边界隔离，
+ * 各自内联——真双机验收第一轮 ④/第五批 F1 同族缺陷的 sync 侧闭合）。
+ * @param {string} peer
+ * @returns {string} hex64 小写（z32 输入）；hex64 与未知形态原样返回
+ */
+function normalizePeerId(peer) {
+  if (typeof peer !== "string") return peer;
+  if (/^[0-9a-f]{64}$/.test(peer)) return peer;
+  if (!/^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/.test(peer)) return peer;
+  const A = "ybndrfg8ejkmcpqxot1uwisza345h769";
+  let bits = 0;
+  let value = 0n;
+  const bytes = [];
+  for (const ch of peer) {
+    value = value * 32n + BigInt(A.indexOf(ch));
+    bits += 5;
+    while (bits >= 8) {
+      bits -= 8;
+      bytes.push(Number((value >> BigInt(bits)) & 0xffn));
+      value = value % (1n << BigInt(bits));
+    }
+  }
+  return Buffer.from(bytes).toString("hex");
+}
+
+/**
  * 创建对象同步端点 handler（provider 侧——宿主 serveHttp 的 /wpk1/sync/* 分派
  * 目标；测试以内存 loopback 直调）。
  * @param {{ home: string, now?: () => number, log?: { debug?: (m: string) => void, info?: (m: string) => void, warn?: (m: string) => void, error?: (m: string) => void }, repoMutexFor?: (gitdir: string) => { run: (label: string, fn: () => Promise<unknown>) => Promise<unknown> }, crashAt?: (stage: string) => void }} opts
@@ -96,8 +125,10 @@ export function createSyncEndpointHandler(opts) {
       const group = findGroup(ledger, groupId);
       if (group === null) return fail("not-found", { groupId });
       if (group.roots.every((r) => r.id !== rootId)) return fail("not-found", { groupId, rootId });
-      // 授权 deny-by-default：peer 必须是组内成员（会话密码学身份之外的组级门）
-      if (request.peerEndpointId === undefined || !group.members.some((mm) => mm.endpointId === request.peerEndpointId)) {
+      // 授权 deny-by-default：peer 必须是组内成员（会话密码学身份之外的组级门；
+      // 编码归一——z32 wire peer 与 hex64 成员登记同钥等价）
+      const peerHex = normalizePeerId(request.peerEndpointId);
+      if (request.peerEndpointId === undefined || !group.members.some((mm) => mm.endpointId.toLowerCase() === peerHex)) {
         log.warn?.(`sync endpoint: denied ${request.method} ${request.path} (peer ${request.peerEndpointId ?? "unknown"} not a member; session ${request.sessionId ?? "?"})`);
         return fail("unauthorized", { groupId });
       }

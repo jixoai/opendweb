@@ -225,6 +225,62 @@ test("authorization: non-member peer denied (deny-by-default); malformed request
   await rm(home, { recursive: true, force: true });
 });
 
+// 真双机验收 F-sync（2026-09-30）：fabric 会话 peer 是 z32 展示串、组账本成员
+// 登记 hex64（server 租约冻结形态）——同钥异码必须归一后再比（与 ext-files F1
+// 同族）。同钥对为 SDK ground-truth（第五批验收 §0 实测校准）。
+const Z32_MINI = "71ymwthndzi4kychf9zn71i13uqkogrf5sgsd6qsxrdwcxtko6py";
+const HEX_MINI = "ec80ba47821deba5019c2fee2ecab2ccdca81885dd8d61f9d67907463e2a879a";
+const Z32_IMAC = "3pyssy4pexat7ez7jbtqwwzgytg3dj7opj84qbuxpdcp9bd3g1ay";
+const HEX_IMAC = "cb416b034d43f11ea2fd4862ea52e6044d91a7b06a4fa7066f68d8df847934b0";
+
+test("authorization: z32 wire peer is equivalent to hex64 member registration (same-key dual-encoding)", async () => {
+  const home = await mkdtemp(path.join(tmpdir(), "dweb-ep-authz32-"));
+  const rootA = path.join(home, "rootA");
+  await mkdir(rootA, { recursive: true });
+  // 账本成员按 hex64 登记（server 租约冻结形态）
+  const g = await createGroup(home, {
+    id: "g1",
+    name: "g1",
+    members: [
+      { endpointId: HEX_MINI, deviceName: "mini" },
+      { endpointId: HEX_IMAC, deviceName: "imac" },
+    ],
+    roots: [{ id: "r1", localPath: rootA, mode: "twoway", seedAuthority: HEX_IMAC }],
+  });
+  assert.ok(g.ok, JSON.stringify(g));
+  const handler = createSyncEndpointHandler({ home, now: () => 1_700_000_000_000 });
+  const gitdir = gitdirFor(home, "g1", "r1");
+  const ch = await chain(gitdir);
+  await writeRef(gitdir, GROUP_REF, ch.c2);
+
+  // z32 wire peer（fabric 会话真实形态）对 hex 成员账本 → 200（修复前恒 403）
+  const viaZ32 = await call(handler, "GET", "/wpk1/sync/g1/r1/refs", { peer: Z32_MINI });
+  assert.equal(viaZ32.status, 200, JSON.stringify(viaZ32));
+  assert.deepEqual(viaZ32.body.refs, { [GROUP_REF]: ch.c2 });
+
+  // hex wire peer（测试/本机形态）不受影响 → 200
+  const viaHex = await call(handler, "GET", "/wpk1/sync/g1/r1/refs", { peer: HEX_MINI });
+  assert.equal(viaHex.status, 200);
+
+  // 异钥 z32 → 仍拒（归一只做同钥等价，不做兜底放行）
+  const strangerZ32 = Z32_MINI.slice(0, -1) + (Z32_MINI.endsWith("a") ? "y" : "a");
+  const denied = await call(handler, "GET", "/wpk1/sync/g1/r1/refs", { peer: strangerZ32 });
+  assert.equal(denied.status, 403);
+  assert.equal(denied.body.code, "unauthorized");
+  // 未知形态（非 z32 非 hex）→ 拒
+  const deniedJunk = await call(handler, "GET", "/wpk1/sync/g1/r1/refs", { peer: "not-a-key" });
+  assert.equal(deniedJunk.status, 403);
+
+  // push 路径同享归一：z32 wire peer 推对端 device ref（hex 命名白名单不受影响）
+  const push = await call(handler, "POST", "/wpk1/sync/g1/r1/push", {
+    peer: Z32_IMAC,
+    body: pushBody({ ref: deviceRef(HEX_IMAC), expectedOldRef: null, targetCommit: ch.c1 }, await readAll(gitdir, [ch.c1, ch.t1, ch.b1])),
+  });
+  assert.equal(push.status, 200, JSON.stringify(push));
+  assert.equal(await readRef(gitdir, deviceRef(HEX_IMAC)), ch.c1);
+  await rm(home, { recursive: true, force: true });
+});
+
 test("bounded body: oversize request body rejected incrementally (413-equivalent), stream stops early", async () => {
   const { home, handler } = await setup("body");
   let consumed = 0;

@@ -102,15 +102,19 @@ export function createSyncEngine(opts) {
 
   /**
    * 对端调用（sessionResolver→fetchImpl→JSON 解析）。
+   * sessionResolver 可能异步（真实宿主 fabric.sessionResolver 返回 Promise；
+   * 测试 loopback 返回普通对象）——统一 await 归一（真双机验收 F4：不 await
+   * 时 fetchImpl 收到 Promise，报 session.fetchHttp is not a function）。
    * @param {string} peerEndpointId
    */
   function callPeer(peerEndpointId) {
-    const session = sessionResolver(peerEndpointId);
+    const sessionP = Promise.resolve(sessionResolver(peerEndpointId));
     /**
      * @param {string} p
      * @param {{ method?: string, body?: unknown, signal?: AbortSignal, rawBody?: Uint8Array }} [init]
      */
     return async (p, init = {}) => {
+      const session = await sessionP;
       const body = init.rawBody ?? (init.body === undefined ? null : new Uint8Array(Buffer.from(JSON.stringify(init.body), "utf8")));
       const resp = await fetchImpl(session, { method: init.method ?? "GET", path: p, body, signal: init.signal });
       let parsed = null;
