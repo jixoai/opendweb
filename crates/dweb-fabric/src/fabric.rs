@@ -964,19 +964,23 @@ async fn close_endpoint_bounded(inner: &Arc<FabricInner>, deadline: tokio::time:
 /// 主 endpoint 5s + 四段各 5s）。
 const SHUTDOWN_DRAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// abort 后的有界 join（[B2]）：先发 abort 请求，再在同一 deadline 内等待
-/// 句柄真正结束（tokio Timeout 先 poll 内层 future 一次——已 abort 的异步
-/// 任务首个 poll 即收敛，deadline 已过也有这一次机会）。join 不在预算内
-/// 完成（任务处于不可取消的同步/不让出路径）时返回 false：句柄丢弃
-/// （detached），调用方记录 incomplete-drain 错误。绝不无条件 `task.await`
-/// ——那是预算外的无限等待（r7 指出的越界面）。
+/// abort 后的有界 join（[B2]）：先发 abort 请求，再等待句柄真正结束。
+/// r11 实证修正：deadline 已耗尽时 `timeout_at` 不保证给被 abort 任务首次
+/// poll 机会（运行时取消处理尚未完成 → Pending → Elapsed）——accept-loop
+/// 停在半开握手的 connecting.await 上吃满全部预算后，后续 phase 的 abort
+/// join 全部假阴性（accept-child 被误记 incomplete-drain）。abort 后改用
+/// 固定宽限（100ms 覆盖运行时取消处理）：仅 degraded 路径最多按任务数
+/// 线性溢出预算，换取假阴性消除。join 仍不在宽限内完成（任务处于不可
+/// 取消的同步/不让出路径）时返回 false：句柄丢弃（detached），调用方记录
+/// incomplete-drain 错误。绝不无条件 `task.await`——那是预算外的无限等待
+/// （r7 指出的越界面）。
 async fn abort_join_bounded(
     task: &mut tokio::task::JoinHandle<()>,
-    deadline: tokio::time::Instant,
+    _deadline: tokio::time::Instant,
     phase: &str,
 ) -> bool {
     task.abort();
-    match tokio::time::timeout_at(deadline, &mut *task).await {
+    match tokio::time::timeout(std::time::Duration::from_millis(100), &mut *task).await {
         Ok(_) => true,
         Err(_) => {
             tracing::error!(
