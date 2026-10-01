@@ -1,0 +1,24 @@
+{
+  "name": "@jixo/opendweb-ext-ai",
+  "version": "0.1.0",
+  "description": "opendweb webui plugin — ai: share AI subscriptions across devices (provider keyring/services + /wpk1/ai/v1 wire ABI; adapted from ai-fly v0.6.0)",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "files": [
+    "src",
+    "test"
+  ],
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+  },
+  "dependencies": {
+    "zod": "^4.5.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/opendweb.git"
+  }
+}
