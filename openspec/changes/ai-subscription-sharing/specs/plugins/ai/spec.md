@@ -13,10 +13,14 @@ salt 哈希、timingSafeEqual、revision、raw key 可选存储——ai-fly 上�
 裁决 2026-09-13 沿用），内置 ai-fly 上游预设表 **17 项**（codex 条目占位
 `requires:"ai-codex-oauth"` 不激活）+ models.dev 长尾与 hooks 四阶段管线。
 auth 槽 SHALL 仅 `{secret}|{script,args?}|{literal}`（+可选 bearer；literal
-间接引用仅 `$secret:`）；**凭证 env 三面全闭**：`$env:` 形态与 env.cjs
-MUST NOT 存在（声明面）、hook 子进程仅接收净化 env（非凭证 allowlist）且
-auth 路径 `process.env` fallback MUST 删除（脚本面）、预设 `keyEnv` 降为
-UI 提示且服务激活前 MUST 绑定 secret 名（预设面；未绑定不可启用）；凭证
+间接引用仅 `$secret:`）；**凭证 env 四面防线**：`$env:` 形态与 env.cjs
+MUST NOT 存在（声明面）；②脚本面=v1 hook 为**宿主进程内 require()**（内核
+可信插件信任模型——hook 与宿主同权限、可读 process.env 与 secrets.json，
+本 change 不宣称防御恶意 hook，文档明示），保证=auth 路径 `process.env`
+fallback MUST 删除+auth 槽三族是凭证进入上游请求的唯一通道；③预设面
+`keyEnv` 降为 UI 提示，服务激活前 MUST 绑定 secret 名（未绑定不可启用）；
+④**ambient env 防绕（fail-closed）**：provider 启动时检测已启用服务的预设
+keyEnv 名单变量存在于进程环境→启动失败（列明变量名+指引转 secret 槽）。凭证
 判定线=值进入上游请求头/体；CODEX_HOME 类运行时 env 不受限；「env 中存有
 等值 secret 但请求不得携带」为必有负向测试。ai-fly 配置导入 MUST 两阶段
 staging（机器可读 blocked 清单、安全条目不激活、映射后一次性 commit、禁止
@@ -77,7 +81,9 @@ keyId）| 全错 `403 {v:1,code:"key_all_invalid"}`）、`GET catalog?since=<rev
 拒绝）、`POST request`（头 `x-odai-service`[唯一来源，body/query 同名
 信息=400]/`x-odai-method`/`x-odai-path`/`x-odai-key-id`/`x-odai-headers`
 [≤4KiB]；raw body ≤`maxChunkPayload` → 200 `{responseId,epoch,status,
-headers}`；404 `path_not_offered`/429 `rate_limited|quota_exceeded`/413
+headers}`；keyId 失效=`403 {code:"key_invalid"}`（从未有效）|`{code:
+"key_revoked"}`（已撤）——与 AUTH 全钥失败 `key_all_invalid` 三码分立；
+404 `path_not_offered`/429 `rate_limited|quota_exceeded`/413
 超限/400 `metadata_too_large`）、`POST response/<rid>`（头 `x-odai-key-id`/
 `x-odai-from-seq`；就绪=200 raw 单分片+`x-odai-seq|x-odai-done|
 x-odai-next-seq`；未就绪=**204 hold ≤20s** 后返回重试；终态=摘要 200 零

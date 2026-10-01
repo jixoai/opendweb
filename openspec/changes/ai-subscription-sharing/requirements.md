@@ -42,7 +42,9 @@ salt 哈希、timingSafeEqual、revision、**raw key 可选存储**——上游 
 Host/Origin 守卫内）MAY 显式复制。分享链接沿用 `aifly1.` 信封语法（一邀请
 +一密钥）；链接再生成可复用已存 raw key。撤钥三态 SHALL 冻结（粒度=keyId，
 绑定见 wire requirement）：①单 keyId 撤销且 session 另有有效 key——该
-keyId 新请求/新拉取 403、在途 rid 按快照授权 drain；②session 全钥失效
+keyId 新 request `403 {code:"key_revoked"}`（**在途 rid 按创建时授权快照
+续拉至终态——response 拉取不因撤钥 403，仅新 request/新 rid 被拒**）；
+②session 全钥失效
 ——drain deadline 5s（settle 或 abort，错误码 `auth_revoked`）后断开该
 fabric 会话（**有意分歧声明**：ai-fly 即时 disconnect，本 v1 加 5s 有界
 drain）；③peer 被 gate 撤销——gate 拒新、在途随会话关闭收敛。
@@ -61,10 +63,15 @@ maxConcurrency 占位在流终态即释放（不等 TTL）。
 SHALL 内置 ai-fly 预设表 **17 项**（codex 条目占位 `requires:"ai-codex-oauth"`
 不随包激活）+ models.dev 长尾，与 hooks 管线（四阶段）。auth 槽 SHALL 仅
 `{secret:<name>} | {script:<name>,args?} | {literal:<v>}`（+可选 bearer；
-literal 间接引用仅 `$secret:`）——**凭证 env 三面全闭**：①声明面 `$env:`
-形态与 env.cjs MUST NOT 存在；②脚本面 hook 子进程仅接收净化 env（非凭证
-allowlist），auth 路径 `process.env` fallback MUST 删除；③预设面 `keyEnv`
-降为 UI 提示，服务激活前 MUST 绑定 secret 名（未绑定不可启用）。凭证判定
+literal 间接引用仅 `$secret:`）——**凭证 env 四面防线**：①声明面 `$env:`
+形态与 env.cjs MUST NOT 存在（声明面）；②脚本面=v1 hook 为**宿主进程内
+require()**（内核可信插件信任模型——hook 与宿主同权限、可读 process.env
+与 secrets.json，**本 change 不宣称防御恶意 hook**，文档明示），保证=
+auth 路径 `process.env` fallback MUST 删除+auth 槽三族是凭证进入上游请求
+的唯一通道；③预设面 `keyEnv` 降为 UI 提示，服务激活前 MUST 绑定 secret 名
+（未绑定不可启用）；④**ambient env 防绕（fail-closed）**：provider 启动时
+检测已启用服务的预设 keyEnv 名单变量存在于进程环境→**启动失败**（列明
+变量名+指引转 secret 槽；不剥离值）。凭证判定
 线=值进入上游请求头/体；CODEX_HOME 类运行时 env 不受限（「env 中存有等值
 secret 但请求不得携带」为必有负向测试）。消费方入站凭据头
 （authorization/proxy-authorization/cookie）MUST 协议层剥离；上游 URL 仅
@@ -115,7 +122,9 @@ ai-fly CATALOG_WATCH_TIMEOUT_MS 且严小于内核 head deadline 30s；204/200
 全量；**全量 ≤256 服务且 JSON ≤256KiB**，超配工厂期拒绝）；
 `POST request`（头 `x-odai-service`[**唯一来源**，body/query 同名信息=400]/
 `x-odai-method`/`x-odai-path`/`x-odai-key-id`/`x-odai-headers`[≤4KiB]；
-raw body ≤maxChunkPayload → 200 `{responseId,epoch,status,headers}`）；
+raw body ≤maxChunkPayload → 200 `{responseId,epoch,status,headers}`；keyId
+失效=`403 {code:"key_invalid"}`（从未有效）|`{code:"key_revoked"}`（已撤）——
+与 AUTH 全钥失败 `key_all_invalid` 三码分立）；
 `POST response/<rid>`（头 `x-odai-key-id`/`x-odai-from-seq`；就绪=200 raw
 单分片+`x-odai-seq/x-odai-done/x-odai-next-seq`，未就绪=**204 hold ≤20s**，
 终态=摘要 200 零 body；`fromSeq≠committedSeq+1`=409 `invalid_from_seq`；
@@ -144,8 +153,9 @@ done`；全部转移（produce/cancel/expiry/commit/拉取）在 per-rid 互斥�
 寿命为有界终止无死锁路径；取消双向传播；断线/过期/竞态 MUST 显式错误，
 MUST NOT 静默截断成成功。请求/拉取 MUST 绑定 `x-odai-key-id`（quota/usage/
 撤钥判定按 keyId；在途 rid 授权=request 时刻快照——撤钥不撕已在途流）。
-**撤钥三态**：①单 keyId 撤销+session 另有有效 key=该 keyId 新请求/拉取
-403、在途 drain；②session 全钥失效=5s drain deadline（settle/abort，
+**撤钥三态**：①单 keyId 撤销+session 另有有效 key=该 keyId 新 request
+`403 {code:"key_revoked"}`（在途 rid 按创建时快照续拉至终态）
+；②session 全钥失效=5s drain deadline（settle/abort，
 `auth_revoked`）后断 fabric 会话（**有意分歧声明**：ai-fly 即时 disconnect，
 本 v1 加 5s 有界 drain）；③peer 被 gate 撤销=gate 拒新、在途随会话关闭。
 maxConcurrency 占位在流终态即释放。

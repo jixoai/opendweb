@@ -104,7 +104,7 @@ HTTP 头（`x-odai-*`），body=纯载荷字节**——单一无歧义 framing�
 |---|---|---|---|
 | `POST auth` | body `{v:1, keys:[≤8]}` | `200 {v:1, status:"ok", groups:[{keyId,group,limits:{maxConcurrency?,dailyRequests?},services:[ServiceEntry]}]（≥1）, rejected?:[{code:"key_invalid"\|"key_revoked"}]}`（**与 ai-fly frames.ts AUTH_OK 同型**：rejected 仅 code 不带 keyId——有效键集合=groups[].keyId，与输入的对应由此确立） | key 全错=`403 {v:1, code:"key_all_invalid"}`（AUTH_ERR 同型） |
 | `GET catalog?since=<rev>` | — | `200 {v:1, refresh:true, catalog, rev}`；无变化 `204`（**hold ≤20s**——对齐 ai-fly CATALOG_WATCH_TIMEOUT_MS，且留裕量于内核 head deadline 30s 之内） | 未 auth=`403 key_all_invalid`；**全量 catalog ≤256 服务/JSON ≤256KiB**（工厂期拒绝超配——服务数超限即不可保存） |
-| `POST request` | 头：`x-odai-service`/`x-odai-method`/`x-odai-path`/`x-odai-key-id`（auth 所得）/`x-odai-headers`（上游头白名单 JSON 数组 ≤4KiB）；body=raw 载荷 ≤maxChunkPayload | `200 {responseId,epoch,status,headers}` | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 key_all_invalid`（keyId 无效/已撤）；载荷超限 `413`；头预算超限 `400 metadata_too_large` |
+| `POST request` | 头：`x-odai-service`/`x-odai-method`/`x-odai-path`/`x-odai-key-id`（auth 所得）/`x-odai-headers`（上游头白名单 JSON 数组 ≤4KiB）；body=raw 载荷 ≤maxChunkPayload | `200 {responseId,epoch,status,headers}` | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；**keyId 失效=403 `{code:"key_invalid"}`（从未有效）或 `{code:"key_revoked"}`（已撤）——与 AUTH 全钥失败 `key_all_invalid` 三码分立**；载荷超限 `413`；头预算超限 `400 metadata_too_large` |
 | `POST response/<rid>` | 头：`x-odai-key-id`/`x-odai-from-seq`；body 空 | 就绪=`200` raw 单分片+`x-odai-seq`/`x-odai-done`/`x-odai-next-seq`；未就绪=`204`+`x-odai-next-seq`（**hold ≤20s** 后返回，consumer 重试——同 catalog watch 常量；**必小于内核 head deadline 30s**，consumer 侧不要求调大 head timeout）；终态后=摘要 `200` 零 body+`x-odai-done:1` | `404 {code:"response_not_found"\|"response_expired"}`；fromSeq≠committedSeq+1=`409 invalid_from_seq`；同 rid 并发第二拉取=`409 pull_in_flight` |
 | `POST cancel` | body `{responseId,epoch}` | `200 {status:"cancelled"}`（幂等终态重放） | 404 族同上 |
 
@@ -177,17 +177,21 @@ allocated → producing →（逐 seq：ready(seq) → in-flight → committed�
 - auth 槽=ai-fly 现行三族单选+可选 bearer：`{secret:<name>} | {script:<name>,
   args?} | {literal:<v>}`（**无 file 族**——文件取值经 `{script:"file"}`，
   与上游一致；r1 proposal 笔误在本版修正）。literal 间接引用仅 `$secret:`。
-- **env 二分法（r2-P1-F/r3 修正：进程内 hook 的诚实表述）**：ai-fly hooks
-  为**宿主进程内 require()**（hook.ts:266），非子进程——v1 **保持进程内
-  执行**（内核「可信插件」信任模型的既定边界：hook 脚本与宿主同权限、可读
-  `process.env`——这不是 ai 插件能单独收窄的面，文档明示）。凭证 env 闭合
-  由**源头保证**承担：①凭证从不进 env——W11 后 sidecar 进程环境不含任何
-  凭证，上游密钥唯一来源是 0600 secrets.json（auth 槽三族解析不经 env）；
-  ②声明面 `$env:` 形态与 env.cjs 不存在、auth 路径 `process.env` fallback
-  删除（hook 可读到 env，但 env 中无凭证可读）；③预设面 `keyEnv` 降为 UI
-  提示，服务激活前 MUST 绑定 secret 名（未绑定不可启用）。判定线=值进入
-  上游请求头/体；CODEX_HOME 类运行时 env 不受限。负向测试「env 中人为放入
-  等值 secret，请求仍不得携带」保留（证明闭合靠槽解析而非环境清洁）。
+- **env 二分法（r2-P1-F/r4 终版：进程内 hook+启动卫生）**：ai-fly hooks 为
+  **宿主进程内 require()**（hook.ts:266），非子进程——v1 **保持进程内执行**
+  （内核「可信插件」信任模型的既定边界：hook 脚本与宿主同权限，可读
+  `process.env` 与 secrets.json——**本 change 不宣称防御恶意 hook**（其与
+  恶意插件同级，读密钥库与读 env 同难度）；文档明示此边界）。保证面冻结
+  为两层：①**插件自身代码路径不经 env 取凭证**——`$env:` 形态与 env.cjs
+  不存在、auth 路径 `process.env` fallback 删除、auth 槽三族（secret/
+  script/literal[仅 `$secret:` 间接]）是凭证进入上游请求的唯一通道、预设
+  `keyEnv` 降 UI 提示且激活前 MUST 绑定 secret；②**ambient env 防绕
+  （fail-closed）**——provider 启动时检测**已启用服务的预设 keyEnv 名单**
+  变量是否存在于进程环境：存在即**启动失败**（错误列明变量名，指引转
+  secret 槽；不剥离值——剥离改变用户环境语义，拒绝才是诚实边界）。
+  判定线=值进入上游请求头/体；CODEX_HOME 类运行时 env 不受限。负向测试
+  「env 中人为放入等值 secret，请求仍不得携带」（槽解析不经 env）+「启动
+  检测命中即拒启」双断言。
 - **导入两阶段 staging**：扫描 ai-fly services.json → 返回机器可读
   `{blocked:[{service,field,ref}], ready:[...]}`（安全条目不激活）→ 用户
   完成 $env→secret 映射 → 一次性 commit；**禁止 env 自动快照**。

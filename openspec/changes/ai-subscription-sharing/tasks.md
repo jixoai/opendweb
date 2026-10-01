@@ -12,8 +12,9 @@
 - [ ] A2 vendor 移植 provider 纯逻辑（secrets/store[raw key 沿用]/auth
       [groups 多 key]/limits/detail/rewrite[删 $env+auth 路径 env fallback]/
       match-pattern/uri-template/upstream——engine 拆 accept/catalog/forward）
-- [ ] A3 auth 三族+env 净化（hook 子进程 allowlist env）+keyEnv→secret 绑定
-      门+两阶段导入器
+- [ ] A3 auth 三族+env 四面防线（进程内 hook 事实下的槽源唯一性+auth 路径
+      env fallback 删除+keyEnv→secret 绑定门+启动 ambient env 检测
+      fail-closed）+两阶段导入器
 - [ ] A4 presets 17 项+codex 占位+models-dev 长尾
 - [ ] A5 wire ABI provider 端（header framing 端点表逐项+`x-odai-service`
       单源+gate 内 404 同体+catalog 长轮询+256KiB/256 服务上限）
@@ -33,11 +34,7 @@
       错误 JSON）+钥环/`aifly1.` 导入+fabric 宿主注入面接线
 - [ ] B4 竞态矩阵测试（design §7.3 全清单）
 - [ ] B5 e2e 双进程真内核（全链路+延迟目标 p95）+泄露面扫描测试
-- [ ] **B 门**：A 门 + `cd $WT/packages/opendweb-ext-ai && node --test
-      test/e2e/`（退出码 0）+ 三插件回归各一命令（`cd $WT/packages/
-      opendweb-ext-ports && npm test`；`cd $WT/packages/opendweb-ext-files &&
-      npm test`；`cd $WT/packages/opendweb-ext-sync && npm test`——均退出码
-      0）。阻断：竞态矩阵任一非 0 或 p95 超标。receipt：
+- [ ] **B 门**：A 门 + `cd $WT/packages/opendweb-ext-ai && node --test test/e2e/`（退出码 0）+ 三插件回归（各单行执行，退出码 0）：`cd $WT/packages/opendweb-ext-ports && npm test`；`cd $WT/packages/opendweb-ext-files && npm test`；`cd $WT/packages/opendweb-ext-sync && npm test`。阻断：竞态矩阵任一非 0 或 p95 超标。receipt：
       `$WT/docs/receipts/ai-plugin/phase-b-e2e.md`（命令+输出尾+延迟 p95 表）。
 
 ## Phase C — UI 页组 + 占位替换 + 生命周期
@@ -73,8 +70,8 @@
       `cd $WT/packages/webui && npm test`（0）；`cd $WT/packages/opendweb &&
       npm test`（0）；`cd $WT/packages/tray && npm test`（0）；
       `cd $WT/packages/opendweb-ext-ai && npm test`（0）；
-      `PATH="$HOME/.cargo/bin:$PATH" CARGO_TARGET_DIR="$HOME/.cargo-target/dweb"
-      cargo test -p dweb-server -j2 -- --test-threads=1`（0，零回归）；
+      `PATH="$HOME/.cargo/bin:$PATH" mbx test -j 2 -p dweb-server --
+      --test-threads 2`（0，零回归——仓规 Cargo 一律经 mbx 前缀）；
       Codex 终审 GO → 归档（archive→merge main→push）+ herdr 资源回收
       （`herdr agent get codex-ai-r1` 确认退出→`herdr workspace close w82`）。
       阻断：任一非 0 或终审 NOT-READY。receipt：
