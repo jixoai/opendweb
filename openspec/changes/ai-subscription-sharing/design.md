@@ -7,8 +7,9 @@
 > fromSeq 越过 committedSeq、无租约竞态、204 hold 语义、全部转移单锁）；
 > 重启幂等降为**同进程重试**（P1-C）；gate 范围收缩为 ai handler 内统一 404
 > （P1-D：内核插件级 404/503 语义不改，op-aware gate 列 follow-up）；请求
-> 绑定 `x-odai-key-id`+5s drain 声明为有意分歧（P1-E）；hook 净化 env+
-> keyEnv 仅提示（P1-F）；rid 绝对寿命上界+终态摘要保留（P1-G）；绿门
+> 绑定 `x-odai-key-id`+5s drain 声明为有意分歧（P1-E）；hook 进程内执行+
+> ambient env 启动/激活拒绝（P1-F，r4 终版）；rid 绝对寿命上界+终态摘要
+> 保留（P1-G）；绿门
 > receipt 路径（P1-H）；rust-fetch 承接条款补发现顺序（P2-I）。
 
 ## 0. 移植总策略
@@ -186,12 +187,14 @@ allocated → producing →（逐 seq：ready(seq) → in-flight → committed�
   不存在、auth 路径 `process.env` fallback 删除、auth 槽三族（secret/
   script/literal[仅 `$secret:` 间接]）是凭证进入上游请求的唯一通道、预设
   `keyEnv` 降 UI 提示且激活前 MUST 绑定 secret；②**ambient env 防绕
-  （fail-closed）**——provider 启动时检测**已启用服务的预设 keyEnv 名单**
-  变量是否存在于进程环境：存在即**启动失败**（错误列明变量名，指引转
+  （fail-closed，两个时点）**——检测时机=**provider 启动时**与**每次服务的
+  新增/启用/预设或 keyEnv 变更/staging commit**（管理面原子变更内）：任一
+  已启用（或将启用）服务的预设 keyEnv 名单变量存在于进程环境即**拒绝**
+  （启动时=拒绝启动；运行时=原子拒绝该变更），错误列明变量名，指引转
   secret 槽；不剥离值——剥离改变用户环境语义，拒绝才是诚实边界）。
   判定线=值进入上游请求头/体；CODEX_HOME 类运行时 env 不受限。负向测试
   「env 中人为放入等值 secret，请求仍不得携带」（槽解析不经 env）+「启动
-  检测命中即拒启」双断言。
+  检测命中即拒（启动+运行中激活两时点）」双断言。
 - **导入两阶段 staging**：扫描 ai-fly services.json → 返回机器可读
   `{blocked:[{service,field,ref}], ready:[...]}`（安全条目不激活）→ 用户
   完成 $env→secret 映射 → 一次性 commit；**禁止 env 自动快照**。
@@ -223,7 +226,8 @@ v1 不含：codex 预设（OAuth 登录态）、rust-fetch sidecar、codex 写�
 
 1. 单测（ai-fly 矩阵移植，vitest→node --test；fake 注入不触原生）。
 2. **wire 契约测试（Phase A 内）**：ABI 表逐端点（含 404 同体三形态 byte
-   级、403 `key_all_invalid`/`key_revoked`、404/409/429 矩阵、413 边界
+   级、**三码分立独立用例**（AUTH `key_all_invalid` / request 未知 keyId
+   `key_invalid` / 已撤 `key_revoked`）、403/404/409/429 矩阵、413 边界
    maxChunkPayload±1、400 头预算超限、serviceId 双源拒绝、AUTH 多 key
    正/部分失败/全失败三态 fixture 序列化断言、gate op 名、admission 超积
    拒启、catalog 256KiB 上限）。

@@ -19,8 +19,11 @@ MUST NOT 存在（声明面）；②脚本面=v1 hook 为**宿主进程内 requi
 本 change 不宣称防御恶意 hook，文档明示），保证=auth 路径 `process.env`
 fallback MUST 删除+auth 槽三族是凭证进入上游请求的唯一通道；③预设面
 `keyEnv` 降为 UI 提示，服务激活前 MUST 绑定 secret 名（未绑定不可启用）；
-④**ambient env 防绕（fail-closed）**：provider 启动时检测已启用服务的预设
-keyEnv 名单变量存在于进程环境→启动失败（列明变量名+指引转 secret 槽）。凭证
+④**ambient env 防绕（fail-closed，两个时点）**：检测时机=provider 启动时
+与每次服务新增/启用/预设或 keyEnv 变更/staging commit（管理面原子变更
+内）——已启用（或将启用）服务的预设 keyEnv 名单变量存在于进程环境→启动
+时拒绝启动、运行时原子拒绝该变更（列明变量名+指引转 secret 槽）；「运行
+中启用带 keyEnv 服务且环境存在该变量」为必有负向测试。凭证
 判定线=值进入上游请求头/体；CODEX_HOME 类运行时 env 不受限；「env 中存有
 等值 secret 但请求不得携带」为必有负向测试。ai-fly 配置导入 MUST 两阶段
 staging（机器可读 blocked 清单、安全条目不激活、映射后一次性 commit、禁止
@@ -134,10 +137,12 @@ TTL=最后 200 拉取+120s（204 hold 不续期）；**绝对寿命=创建+10min
 
 #### Scenario: 双层准入错误矩阵
 
-- **WHEN** ai handler 内：peer 未授权 / op 未授权 / 未知子路径 / 双过+错
-  keyId / 双过+白名单外路径
+- **WHEN** ai handler 内：peer 未授权 / op 未授权 / 未知子路径 / 双过+**未知
+  keyId** / 双过+**已撤 keyId** / 双过+白名单外路径
 - **THEN** 前三者与未知路径 `404 {error:"not_found"}` byte 级同体；第四
-  `403 {code:"key_revoked"}`；第五 `404 path_not_offered`（仅双过后可出现）；内核
+  `403 {code:"key_invalid"}`（从未有效）；第五 `403 {code:"key_revoked"}`
+  （已撤）；第六 `404 path_not_offered`（仅双过后可出现）；三码
+  （+AUTH `key_all_invalid`）各有独立契约测试；内核
   插件级响应（unknown-plugin 404/plugin-disabled 503）保持现状不属本矩阵
 
 ### Requirement: ai 配额、限流与用量审计

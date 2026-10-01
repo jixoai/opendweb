@@ -13,8 +13,9 @@
       [groups 多 key]/limits/detail/rewrite[删 $env+auth 路径 env fallback]/
       match-pattern/uri-template/upstream——engine 拆 accept/catalog/forward）
 - [ ] A3 auth 三族+env 四面防线（进程内 hook 事实下的槽源唯一性+auth 路径
-      env fallback 删除+keyEnv→secret 绑定门+启动 ambient env 检测
-      fail-closed）+两阶段导入器
+      env fallback 删除+keyEnv→secret 绑定门+ambient env 检测 fail-closed
+      **两时点**：provider 启动+服务新增/启用/预设变更/staging commit 的
+      原子变更内）+两阶段导入器
 - [ ] A4 presets 17 项+codex 占位+models-dev 长尾
 - [ ] A5 wire ABI provider 端（header framing 端点表逐项+`x-odai-service`
       单源+gate 内 404 同体+catalog 长轮询+256KiB/256 服务上限）
