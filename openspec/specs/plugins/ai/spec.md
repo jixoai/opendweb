@@ -1,4 +1,8 @@
-# plugins/ai —— ai-subscription-sharing
+# plugins/ai —— AI 订阅共享插件
+
+## Purpose
+
+把一个 AI 订阅/上游（OpenAI/Anthropic/Gemini/DeepSeek/Z.ai/Kimi 等 17 预设）经 opendweb fabric 邀请制共享给家庭其它设备：提供方（admin）配置服务/分组/密钥，消费方（member）贴 aifly1. 链接在本机 127.0.0.1 获得 OpenAI/Anthropic 兼容端点（SSE 字节流透明中继）。基于 ai-fly v0.6.0 适配移植（webui 内置第四插件）。
 ## Requirements
 
 ### Requirement: AI 订阅共享插件（提供方/消费方双姿态）
