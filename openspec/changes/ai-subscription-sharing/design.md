@@ -1,173 +1,196 @@
 # Design: ai-subscription-sharing
 
+> r1 评审（Codex，2026-10-01，NOT-READY 4.8/10）全部 P0/P1/P2 已处置：
+> §3 重写为具体 JSON-over-HTTP ABI + 中继状态机（P0-1/P0-2）；预算按
+> 编码后最坏计账（P1-1）；SSE 改字节流透明语义+延迟目标（P1-2）；auth
+> 三族统一+env 二分法+两阶段导入（P1-3）；gate 错误面统一 404（P1-4）；
+> 撤钥三态冻结（P1-5）；codex OAuth+rust-fetch 拆后续 change（P1-6/征询③）；
+> 阶段绿门命令化（P1-7）；raw key 对齐上游 Owner 裁决（P2-1）；密钥语法
+> 保持 ai-fly（征询①）；v1 用响应中继不动内核（征询②）。
+
 ## 0. 移植总策略
 
 **vendor 适配，不改上游、不改内核。** ai-fly（/Users/kzf/Dev/GitHub/ai-fly，
-v0.6.0）作为只读参照；适配源落 `packages/opendweb-ext-ai/`，每文件头保留
-`// adapted from ai-fly <path> (v0.6.0, MIT)` 标注。不引入 ai-fly 为依赖
-（它是独立仓库 + 自带桌面壳），不修改 client-sdk / webui 内核契约；内核
-包络不够用的地方用**逻辑流分片**绕行（§3），不搭车改内核。
+v0.6.0）只读参照；适配源落 `packages/opendweb-ext-ai/`，每文件头保留
+`// adapted from ai-fly <path> (v0.6.0)` 标注。**移植基线=ai-fly 现行
+HTTP 投影面**（旧 AUTH/REQ/RESP envelope 已在上游退役——`src/wire/
+http-protocol.ts`），本设计的 §3 ABI 是它的 wpk1 化重述，不是帧协议。
 
 ### 模块映射表（ai-fly → ext-ai）
 
-| ai-fly 源 | 去处 | 适配要点 |
+| ai-fly 源 | 去处 | 适配要点（含与上游的有意分歧） |
 |---|---|---|
-| provider/secrets.ts, store.ts, auth.ts, limits.ts, detail.ts | `src/provider/` 原样移植 | 路径根改 `<DWEB_HOME>/plugins/ai/`；SSRF 门禁原样 |
-| provider/rewrite.ts, match-pattern.ts, uri-template.ts, upstream.ts | `src/provider/` | **auth 槽删 `$env` 族**（§4） |
-| provider/hook.ts + hooks/*.cjs | `src/provider/hooks/` | 脚本发现路径改插件目录；codex/secret/file 保留、**env.cjs 删除**、rust-fetch 保留 |
-| presets/providers.json, models-dev.ts | `src/presets/` 数据原样 | 无逻辑改动 |
-| wire/frames.ts, z32.ts, http-errors.ts | `src/wire/` | 帧语义作为 `/wpk1/ai/v1/*` 的 body 协议（§3） |
-| consumer/gateway.ts（hono 面）, ports.ts, join.ts | `src/consumer/` | hono 依赖随包引入；forward 层从「自有 fabric 会话」改接**宿主注入的 sidecar fabric host**（与 ports 同款注入面） |
-| consumer/providers.ts（会话状态机） | `src/consumer/sessions.mjs` | fabric 数据面换宿主；钥环 `plugins/ai/keyring.json` 0600 |
-| app/writers/{codex,claude-code}.ts | `src/consumer/writers/` | 只移植两写手（cursor/cline/continue 不带） |
-| provider/engine.ts, serve.ts | `src/provider/serve.mjs` | accept 循环从自有 Fabric 改挂 wpk router（§3） |
-| app/*（OpenTray/oRPC/web-server）、webui/、sidecars/rust-fetch | 除 rust-fetch 外**不移植** | webui 宿主替代；rust-fetch 经 §5 打包 |
+| provider/{secrets,store,auth,limits,detail}.ts | `src/provider/` | 路径根 `<DWEB_HOME>/plugins/ai/`；写原语换 atomicWrite0600 家族；**raw key 可选落盘照搬**（上游 Owner 裁决 2026-09-13，§2） |
+| provider/{rewrite,match-pattern,uri-template,upstream}.ts | `src/provider/` | `$env` 凭证引用族删除（§4）；SSE 字节流语义照搬（无事件边界对齐，上游本无 SSE parser） |
+| provider/hook.ts + hooks/{secret,file,codex}.cjs | `src/provider/hooks/` | **env.cjs 不存在**；codex.cjs 移后续 change（§5） |
+| presets/providers.json, models-dev.ts | `src/presets/` | **codex 条目 v1 不随包**（17 项；codex 位保留 `requires:"ai-codex-oauth"` 占位） |
+| wire/http-protocol.ts, frames.ts, z32.ts, http-errors.ts | `src/wire/` | 常量族改名 `x-odai-*`；schema 复用其静态定义层 |
+| consumer/{gateway,ports,join}.ts | `src/consumer/` | forward 层从自有 fabric 改接**宿主注入面**（ports 同款） |
+| consumer/providers.ts（会话状态机） | `src/consumer/sessions.mjs` | 钥环 `plugins/ai/keyring.json` 0600 |
+| app/writers/claude-code.ts | `src/consumer/writers/` | **只带 claude-code 写手**（codex 写手随 codex change） |
+| provider/engine.ts, serve.ts | `src/provider/{accept,catalog,forward}.mjs` **三拆** | engine 含 peer-accept/AUTH/watch/forward 生命周期——按 wpk router 子面拆三文件独立验收（r1-C 抽查意见） |
+| app/*（桌面壳）、webui/、sidecars/rust-fetch | **不移植** | 宿主替代；rust-fetch 随 codex change（§5） |
 
-运行时依赖预算：hono（本地端点）+ zod（schema）为新增运行时依赖；@orpc/ws/
-opentray 全部不进。包保持零原生依赖（rust-fetch 为独立子进程二进制）。
+运行时新依赖仅 hono（本地端点）+ zod；零原生依赖。
 
 ## 1. 宿主接入（内核七接入点）
 
-1. descriptor：`src/webui-plugin.mjs` 导出 `descriptor`（id=`ai`，webuiApi=1）。
-   pages：
-   - `provider`（admin；type=page；服务/分组/密钥/配额/用量控制台）
-   - `consumer`（member；type=page；目录/本地端点/钥环/写手）
-   - `catalog`（member；type=page；可连共享服务浏览）——v1 并入 consumer 单页
-     亦可（实现期定，descriptor 页数 ≤3）
-   dataEndpoints：`[{id:"wire", path:"/wpk1/ai/"}]`；configSchema：
-   `{maxConcurrency:number, dailyRequests:number, usageLog:boolean}`（required
-   空；域校验在工厂：1–128 / 0–1_000_000 / bool）。
-2. `registry.mjs`：`builtinWebuiPluginDescriptors()` 加入 import；`comingSoonPlugins()`
-   删 `{id:"ai"}`。
-3. `data-plane.mjs`：`buildPluginRuntimes()` 加 `createAiRuntime({home, fabric
-   注入面, log, now})`——provider 侧挂 `createWpkRouter({gate})` 的 `/wpk1/ai/`
-   子面；consumer 侧惰性（member 姿态才装配本地端点）。admin/member 双姿态
-   共存（一台机可同时是提供方与消费方——按视角装配互不排斥）。
-4. `sidecar.mjs`：`/sidecar/plugins/ai/<mgmt>` 管理面（服务 CRUD/密钥签发撤
-   销/配额配置/用量查询；Host 守卫+精确 Origin 沿用）。
-5. UI：`plugin-registry.ts`（`#/p/ai/provider`、`#/p/ai/consumer`）；
-   `plugin-pages.ts` 绑定层；页面组件 `ui/src/components/plugins/ai/`；
-   `PluginPanel.svelte` META 中文名「AI 订阅共享」。
-6. 生命周期：onEnable=装配（provider wpk 面 + consumer 端点恢复）；停用四步
-   序（摘牌→drain 10s→dispose（本地 listener 全关、在途上游 abort）→落盘）。
-7. 数据目录：`<DWEB_HOME>/plugins/ai/`（0700；secrets/services/quota-day/
-   keyring/usage.jsonl 全 0600，写原语用 opendweb `atomicWrite0600` 家族）。
+同 r1 版不变：descriptor（id=`ai`；pages=provider(admin)/consumer(member)，
+≤3；dataEndpoints=`[{id:"wire",path:"/wpk1/ai/"}]`；configSchema=
+`{maxConcurrency:number, dailyRequests:number, usageLog:boolean}`，域校验
+工厂 1–32 / 0–1_000_000 / bool——**maxConcurrency 域上限由 §3 统一 admission
+公式联动**）；registry 注册+占位删除；data-plane 双姿态装配（一台机可同时
+提供+消费，视角互不排斥）；`/sidecar/plugins/ai/*` 管理面；UI 七接入点；
+生命周期四步序（dispose=本地端点全关+在途上游 abort）；数据目录
+`<DWEB_HOME>/plugins/ai/`（0700；0600 文件家族）。
 
-## 2. 两层准入与凭证模型
+## 2. 两层准入、凭证模型与撤钥三态
 
-设备层=fabric 邀请（dweb1.，内核既有）；应用层=分组密钥（`sk-aifly-`
-CSPRNG，SHA-256+salt 哈希落台账，timingSafeEqual 校验）。wpk1 gate
-（peer×plugin×op deny-by-default）先过，ai 层密钥校验后过——独立失败面。
-分享链接沿用 ai-fly `aifly1.` 信封语法（一邀请+一密钥；URL-safe base64）：
-**v1 保持 ai-fly 语法**（移植保真、继承其测试矩阵与既有用户肌肉记忆）；
-rebrand（`sk-dweb-ai-`/`odai1.`）列为 Codex 轮征询项，若改则改常量单点。
+设备层=fabric 邀请（dweb1.）；应用层=分组密钥（**保持 ai-fly 语法**
+`sk-aifly-`/`aifly1.`，征询①采纳——rebrand 留后续，改则常量单点）。wpk1
+gate（peer×op deny-by-default）先过、ai 层密钥校验后过。
 
-**撤钥语义冻结：drain 不硬断。** 撤 key 后：新请求 401；既有在途请求按流
-完成（与 ai-fly 语义一致，实现最薄）；目录/授权缓存 refresh 重算。
+**gate 错误面（P1-4 冻结）**：gate 失败（未知 peer/未授权 op/插件停用）
+一律 `404 {error:"not_found"}`——与未知路径同体、固定 body、不解析 key；
+gate 过后才出现 ai 层码（403 `auth_failed` 等）。白名单外路径的
+`path_not_offered` **仅在 gate+key 双过后可出现**（此时路径存在性已无泄露
+面——对端已持有效 key）。响应矩阵进测试（§7）。
 
-## 3. wire 面：`/wpk1/ai/v1/*` 与响应中继（本设计最关键决策）
+**raw key（P2-1 处置）**：对齐上游 Owner 裁决——raw key 可选存 services.json
+（0600，本机明文与密钥库同威胁模型）；**远程面**（wire 响应/日志/目录披露/
+usage）恒掩码；**webui 本地管理面**允许显式复制动作（127.0.0.1+Host/Origin
+守卫内，与 ai-fly GUI 同位）。修正 r1 版「仅一次性展示」表述；链接再生成
+（link 复用已存 key）照搬。
 
-ai-fly 自有 wire（AUTH/REQ/RESP 帧）作为 body 协议挂到 wpk1 版本化前缀：
+**撤钥三态（P1-5 冻结）**：
+- ①单 key 撤销、session 尚有其他有效 key：不断会话；该 key 新请求 403
+  `auth_failed`；在途按流完成（drain）。
+- ②session 全钥失效：drain deadline **5s**（在途 settle 或 abort，错误码
+  `auth_revoked`）；随后断开该 fabric 会话（对齐 ai-fly engine.disconnect）。
+- ③peer 被 gate 撤销：gate 拒新（404 同体）；在途随 fabric 会话关闭收敛。
+- 三态的 maxConcurrency 占位都在流 terminal（done/cancelled/expired）即释放
+  （不等 TTL）。并发撤钥×在途×拉取竞态进测试矩阵。
 
-- `POST /wpk1/ai/v1/auth`：body=auth 帧（key）→ 授权目录 + 密钥指纹 +
-  catalog revision。
-- `GET /wpk1/ai/v1/catalog?since=<rev>`：目录快照；**长轮询 ≤30s**（变更即
-  返回；超时返回当前值+新 rev）。v1 不做服务端推送（ai-fly catalog-watch
-  语义降维，简化实现；推送列后续）。
-- `POST /wpk1/ai/v1/request`：body=REQ 帧（serviceId/路径/头白名单/体分块）。
-- `POST /wpk1/ai/v1/response/<responseId>/<seq>`：**响应分片拉取**（见下）。
+## 3. wire ABI：`/wpk1/ai/v1/*`（JSON-over-HTTP，P0-1 冻结）
 
-### 响应中继=逻辑流分片（不动内核包络）
+对齐 ai-fly HTTP 投影形态的 wpk1 化重述。serviceId 路由头 `x-odai-service`
+（消费端注入；提供端剥离，**绝不透传上游**）。不兼容变更升 `/wpk1/ai/v2/`。
+gate op 名（内核授权粒度，随前缀带版本）：`ai/v1/auth`、`ai/v1/catalog`、
+`ai/v1/request`、`ai/v1/response`、`ai/v1/cancel`。
 
-内核 v1 包络（1MiB 单帧、单流 2MiB、在飞 8MiB）对「单 HTTP 流」设预算；
-LLM 响应无界。方案：**provider 把上游响应缓冲成有界分片，consumer 以独立
-短请求逐片拉取**——每次 `response/<id>/<seq>` 是一个 ≤1MiB 的完整 wpk1
-请求/响应（天然落在包络内），总量无上限：
+| method+path | 请求 | 成功响应 | 错误 |
+|---|---|---|---|
+| `POST auth` | `{v:1, keys:[≤8]}` | `200 {status:"ok",keyId,catalog,catalogRev}` | gate=404 同体；key 错=`403 {status:"err",code:"auth_failed"}` |
+| `GET catalog?since=<rev>` | — | `200 {refresh:true,catalog,rev}`；无变化 `204`（≤30s 长轮询） | gate=404；未 auth=`403 auth_failed` |
+| `POST request` | JSON 元数据 `{v:1,serviceId,method,path,headers:[{n,v}]}` + **raw body**（octet-stream，≤maxChunkPayload，超限 413） | `200 {responseId,epoch,status,headers}`（上游头就绪即返） | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 auth_failed` |
+| `POST response/<rid>` | `{epoch,fromSeq}` | `200` + raw body=**单分片**（≤maxChunkPayload）+ 头 `x-odai-seq`/`x-odai-done`/`x-odai-lease-ms`/`x-odai-next-seq` | epoch/rid 不符=`404 {code:"response_not_found"}`；过期=`404 {code:"response_expired"}` |
+| `POST cancel` | `{responseId,epoch}` | `200 {status:"cancelled"}`（幂等，终态后重放同响应） | 同上 404 族 |
+
+**分片用 raw body+头携带元数据**（不做 base64——零膨胀，P1-1 简化）。
+
+### 3.1 预算与 admission 公式（P1-1 冻结）
+
+- `maxChunkPayload = 1 MiB − 4 KiB`（worst-case envelope：JSON 元数据+头+
+  分片头，4 KiB 封顶）→ **编码后落帧 payload ≤1 MiB 恒成立**（fabric
+  MAX_FRAME=1 MiB 是 payload 上限，crates/dweb-fabric/src/continuity/frame.rs）。
+- 每个 wpk1 调用（request/response 拉/cancel）=独立完整会话流，按内核既有
+  per-stream 2 MiB / session journal 8 MiB 记账：单调用 1 MiB+envelope 天然
+  在内；**无任何调用超过单流预算**，方向性计账由此闭合。
+- provider 端统一 admission：`在途上游请求 ≤ maxConcurrency（默认 8，域
+  1–32）`；`ring 总量 ≤ maxConcurrency × perRequestBuffer(2 MiB)`，且
+  **乘积 ≤64 MiB**（config 联动校验：超积拒绝启动插件——工厂期错误）。
+- 请求体 v1 单片上限=maxChunkPayload（≈1 MiB−4 KiB；与 ports 同量级；
+  更大请求体列 v2 分块上传）。
+
+### 3.2 响应中继状态机（P0-2 冻结）
 
 ```
-consumer                          provider
-  ├─ POST request ────────────────▶ 起上游转发，得 responseId
-  │   ◀── {responseId, status, headers}（首个元数据帧，立即返回）
-  ├─ POST response/rid/0 ────────▶ {chunk bytes ≤1MiB, seq, done?}
-  ├─ POST response/rid/1 ────────▶ …（在飞拉取窗 ≤2 并发）
-  │    （provider 端：response ring buffer 有界（默认 2MiB/请求）；
-  │     缓冲满→上游读暂停（背压）；缓冲浅→恢复读）
-  └─ …直到 done；异常→显式 error 帧（consumer 抛出，绝不静默截断）
+allocated → producing →（逐 seq：ready(seq) → leased → committed）→ done
+终态（互斥，terminal arbiter 单点裁决）：done | cancelled | expired
 ```
 
-- 请求体：≤1MiB 静态分块沿内核惯例；超限 413。
-- SSE 语义：chunk 即 SSE 事件块边界（ai-fly 已保证逐块 flush 透传；本地端
-  点收到即向下游 flush）。延迟代价：每 chunk 一 RTT——flush 策略 =首 chunk
-  立发 + 后续 `min(256KiB | 50ms | 上游块边界)` 攒批（实现期可调常量）。
-- 取消：consumer 本地连接断 → abort 在飞拉取 + `POST response/rid/cancel`
-  → provider abort 上游 signal（ai-fly abort 传播链原样）。
-- 恢复窗口：fabric 90s 会话恢复语义覆盖单次拉取；responseId 缓冲跨恢复存活
-  （provider 端 TTL 120s，超时显式失败帧）。
-- **open question（Codex 轮）**：内核若后续开放 per-plugin 长流预算豁免，
-  本中继可平滑升级为单流增量帧（接口已按帧序列设计，consumer 侧无感）。
+- **responseId = `<epoch>:<单调序号>`**；进程重启→新 epoch，旧 rid 一律
+  `response_not_found`——**不复用、不复活**（跨重启恢复=消费端重新 request，
+  幂等键 `{serviceId,method,path,bodyHash}` 使 provider 可识别重放并返回
+  存活中的既有 rid）。
+- **幂等键 `(epoch, rid, seq)`**：同键重放同内容 200；分片内容由上游字节
+  流序决定，同 seq 异内容=不可能（若发生=内部错误显式 500）。
+- **拉取租约**：`response` 调用返回即租（leaseMs 默认 30_000）；租约内同
+  fromSeq 重拉=重放同分片；租约到期未推进→分片回 ready 可重拉；**隐式
+  提交**：下一次 fromSeq 推进（或 done 确认）即视为此前分片 committed，
+  ring 中对应槽位释放。
+- **done 裁决**：上游 EOF 分片带 `x-odai-done:1`；此后拉取返回零 body+
+  done 头（终态重放），有效期至 TTL。
+- **cancel/done 竞态**：terminal arbiter 先到先定，后到幂等返回既有终态。
+- **TTL（绝对 deadline）**：元数据帧返回时刻 +120s；有拉取活动则续至最后
+  活动 +120s；到期→若仍 producing 先 abort 上游→expired→释放 concurrency
+  占位与 ring。
+- **满 buffer 无拉取**：上游读暂停（背压）持续到 buffer 浅/拉取/TTL 三者
+  之一——TTL 是有界终止保证，无死锁路径；concurrency 占位在 terminal 即
+  释放（不等 TTL）。
+- **取消**：consumer 本地连接断→cancel 调用（+拉取窗内 abort）→上游
+  abort（ai-fly abort 链照搬）。
 
-### 在飞/并发预算
+### 3.3 SSE/流式语义（P1-2 冻结：字节流透明，不做事件对齐）
 
-分组 maxConcurrency（默认 8，config 可调 1–128）计**在途上游请求**（拉取
-窗内多片属同一请求不重复计）。全插件在飞字节数沿用内核 8MiB 门（wpk router
-层既有）；provider 端 ring buffer 总量默认 16MiB（并发×单请求缓冲）有界。
+上游响应=**字节流透明中继**（ai-fly 本无 SSE parser；splitBodyChunks 256KiB
+按字节切）。对 SSE 消费方的保证=**字节保序、零丢失、零重复**——事件完整性
+由标准 SSE 客户端解析自愈（SSE 规范本就容忍任意 chunk 边界）。攒批策略：
+首分片立即就绪可拉；后续 `min(256 KiB | 50ms | 上游块边界)`。**延迟目标**
+（e2e 断言，双机 LAN）：元数据帧 p95 ≤600ms（不含上游 TTFB）；首分片
+（自上游首字节）p95 ≤300ms；后续分片间 p95 ≤150ms。事件边界对齐 flush
+列 follow-up（实测 agent 兼容性问题再上）。
 
-## 4. auth 槽三族与 `$env` 移除（W11 收敛）
+## 4. auth 槽三族与 env 二分法（P1-3 冻结）
 
-- 保留：`{secret:<name>}`（密钥库）、`{script:<name>,args}`、`{literal:<v>}`
-  （literal 间接引用**仅** `$secret:<name>`）。
-- 删除：`$env:` literal 形态、`hooks/env.cjs`、hook 四阶段中一切
-  `process.env` 凭证读取。
-- **存量迁移**：从 ai-fly 导入 services.json 时遇 `$env` 条目 → 导入失败并
-  逐条列出（服务名/字段/`$env` 引用名），指引转 `{secret:}`；不做任何自动
-  env 快照（那等于把 env 凭证固化进文件，违背 W11 精神）。
-- codex hook 原样：只读 `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`），
-  注入 codex CLI 同款头集；user-agent 去掉 codexHome 路径（ai-fly 已知信息
-  泄露点，顺手修）。
+- auth 槽=ai-fly 现行三族单选+可选 bearer：`{secret:<name>} | {script:<name>,
+  args?} | {literal:<v>}`（**无 file 族**——文件取值经 `{script:"file"}`，
+  与上游一致；r1 proposal 笔误在本版修正）。literal 间接引用仅 `$secret:`。
+- **env 二分法**：**凭证 env 禁止**（`$env:` 形态、env.cjs、hook 读
+  process.env 中将值注入上游请求的变量）；**运行时配置 env 允许**（
+  CODEX_HOME、EXT_AI_* 开关、路径类）——判定线=「值进入上游请求头/体」。
+- **导入两阶段 staging**：扫描 ai-fly services.json → 返回机器可读
+  `{blocked:[{service,field,ref}], ready:[...]}`（安全条目不激活）→ 用户
+  完成 $env→secret 映射 → 一次性 commit；**禁止 env 自动快照**。
 
-## 5. rust-fetch sidecar 打包
+## 5. codex OAuth + rust-fetch：拆后续 change（征询③采纳）
 
-- 源：ai-fly `sidecars/rust-fetch/`（rustls + HTTP/2 出站，stdio JSON 协议）
-  复制为 `packages/opendweb-ext-ai/native/rust-fetch/`（同源标注）。
-- 分发：workspace crate `crates/ai-rust-fetch` + `packages/ext-ai-binary`
-  模仿 `@jixo/opendweb-server-binary` 的 pack.mjs（release 构建→vendored
-  bin→CI 出 win32）。发现顺序：`EXT_AI_RUST_FETCH` 显式路径（仅调试用）
-  > 包内 vendored 二进制 > **缺失**（codex 预设显式降级
-  `rust_fetch_unavailable`，其余预设不受影响）。
-- 凭证经 stdin 管道（JSON meta 行）不进 argv——ai-fly 原样，W11 合规。
+v1 不含：codex 预设（OAuth 登录态）、rust-fetch sidecar、codex 写手、
+`hooks/codex.cjs`。presets 表 17 项 + codex 占位条目（`requires:"ai-codex-oauth"`
+呈现「需后续版本」）。后续 change `ai-codex-oauth` 承接：auth.json 只读
+hook、rust-fetch vendored 打包（生产仅包内+平台匹配+manifest hash 校验；
+显式路径仅 dev flag+绝对路径+权限检查——P1-6 的约束直接写进该 change 的
+requirements）、真订阅验收。本 change tasks Phase D 相应收缩。
 
-## 6. 页面与交互（v1 范围）
+## 6. 页面与交互（v1）
 
-- **provider 页**（admin）：服务列表（预设选择+自定义上游）→ 分组 → 密钥
-  （签发一次性展示/copy；撤键即时）→ 配额设置 → 用量表（元数据聚合）。
-  上游连通性探活（provider 本机直发 1 次 HEAD/最小请求，经同一 hook 管线）。
-- **consumer 页**（member）：贴 `aifly1.` 链接/分别输入邀请+key → 目录列出
-  可用服务 → 每服务显示本地端口（可改，冲突真实报错）→ 写手两段式写入。
-- 面板 META：「AI 订阅共享」；禁用态下本地端点全部关闭（生命周期 dispose）。
+- provider 页（admin）：服务列表（17 预设+自定义）→分组→密钥（签发/命名/
+  **本地复制**（§2 raw key）/撤键三态呈现）→配额→用量（元数据聚合）→
+  上游探活（provider 本机直发最小请求，经同一 hook 管线）。
+- consumer 页（member）：贴 `aifly1.` 链接或邀请+key 分开输入→目录→本地
+  端口（冲突真实报错）→claude-code 写手（preview→diff→apply，占位符 token）。
+- 面板 META「AI 订阅共享」；禁用=端点全关。
 
-## 7. 测试策略
+## 7. 测试策略（P1-7 命令化绿门见 tasks）
 
-1. **单测（继承 ai-fly 矩阵）**：auth/limits/secrets/rewrite/detail/frames
-   的 ai-fly 测试随源移植（vitest→node --test 语法转换；包跑器=node --test
-   对齐仓库惯例）；fake 注入面（fabric/hook/上游）不触原生模块。
-2. **wire 单测**：wpk router `/wpk1/ai/v1/*` 全 op（auth/catalog/request/
-   response 分片/cancel）× 预算边界（1MiB±1、并发+1、缓冲满背压）× 双层
-   准入（gate 过/key 错、gate 拒/key 对）。
-3. **e2e（双进程真内核）**：A/B 两 home 真 fabric（ext-cf/hub-process 同款
-   骨架）：全链路（链接导入→auth→请求→SSE 长响应>4MiB→撤钥→配额→重启
-   持久化）。
-4. **泄露面扫描测试**：e2e 后扫描 argv/env/日志/usage.jsonl/stderr 断言零
-   凭证（requirements 安全基线 Scenario 的可执行化）。
-5. **回归门**：webui 262 + plugins-host/sidecar/route/wire 既有面零回归；
-  三插件 e2e 零回归。
+1. 单测（ai-fly 矩阵移植，vitest→node --test；fake 注入不触原生）。
+2. **wire 契约测试（Phase A 内）**：ABI 表逐端点（含 404 同体三形态、
+   403/404/429 矩阵、413 边界 maxChunkPayload±1、gate op 名）。
+3. **中继竞态矩阵（Phase B 内）**：满 buffer×0/1/2 并发拉、cancel×done
+   交叉、租约过期重拉、TTL 过期×producing、epoch 重启、幂等重放、断线
+   90s 续拉零重复零丢失、5 MiB 长响应、并发撤钥三态。
+4. e2e 双进程真内核（全链路+延迟目标 p95 断言）。
+5. 泄露面扫描（argv/env[仅凭证判定线内]/日志/usage/stderr 零凭证）。
+6. 回归门：webui 262 面零回归+三插件 e2e 零回归。
 
 ## 8. 风险与分期
 
-- **P0 风险**：响应中继的背压正确性（ring buffer 满死锁/恢复窗口内
-  responseId 失效竞态）——测试 §7.2/§7.3 重点覆盖；hono 与 webui 宿主
-  共存（依赖面冲突）——ext 包独立 node_modules，宿主不 import hono。
-- 分期：Phase A（provider 纯逻辑+wire 面+单测）→ Phase B（consumer 端点+
-  中继+e2e）→ Phase C（UI 页组+占位替换+回归门）→ Phase D（codex hook+
-  rust-fetch 打包+写手）→ Phase E（specs 归档同步+walkthrough 文档）。
-- 不做（v1 明确出界）：WS 透传、cursor/cline/continue 写手、catalog 服务端
-  推送、CLI 插件面、$env 凭证、Linux 原生二进制、非回环监听。
+- P0 风险仍是中继背压/竞态——§3.2 状态机+§7.3 矩阵对打；hono 依赖隔离
+  （ext 包内，宿主不 import）。
+- 分期 A（provider 纯逻辑+wire 契约）→B（中继+消费端点+竞态矩阵+e2e）→
+  C（UI+占位替换+生命周期）→D（claude-code 写手+探活+17 预设验证）→
+  E（specs 同步+walkthrough+归档）。每门=可执行命令+阻断条件（tasks）。
+- 不做（v1）：codex OAuth/rust-fetch/codex 写手（→`ai-codex-oauth` change）、
+  WS 透传、事件边界 flush、>maxChunkPayload 请求体分块、cursor/cline/
+  continue 写手、catalog 服务端推送、CLI 插件面、$env 凭证、Linux 原生、
+  非回环监听。
