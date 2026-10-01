@@ -42,6 +42,7 @@ import {
 	loadOwners,
 	loadStatus,
 	loadVisitors,
+	startSidecarHub,
 	patchOwnerMeta,
 	patchSidecarLeaseLabel,
 	patchVisitorMeta,
@@ -297,6 +298,9 @@ class ConsoleStore {
 	hubError = $state<AdminError | null>(null);
 	/** GET /sidecar/hub 404 = 这台设备没有中枢身份（正常态呈现，不是错误）。 */
 	hubAbsent = $state(false);
+	/** 一键本地中枢动作锁（setup 页故事 B / 中枢状态卡共用）。 */
+	hubStartBusy = $state(false);
+	hubStartError = $state<AdminError | null>(null);
 	/** 行内展开的租约 id（一次至多一条）。 */
 	leaseExpanded = $state<string | null>(null);
 	/** label 行内编辑会话（id 定位；prev/value trim 前）。 */
@@ -686,6 +690,44 @@ class ConsoleStore {
 			} else {
 				this.hubError = err;
 			}
+		}
+	}
+
+	/**
+	 * 一键本地中枢（用户故事 B「连接本地服务器」；setup 页与中枢状态卡共用）：
+	 * initialize=true 允许在未初始化机器上走 hub init --yes。connected=true 时
+	 * sidecar 已注入本机中枢 admin 目标——清空业务缓存、刷新世界（setup→ready
+	 * 翻转由 refreshSidecar 驱动）并落总览；connected=false（row 2 daemon-down
+	 * 恢复）仅刷新 hub 投影与健康面。
+	 */
+	async startLocalHub(initialize: boolean): Promise<boolean> {
+		this.hubStartBusy = true;
+		this.hubStartError = null;
+		try {
+			const r = await startSidecarHub(initialize);
+			if (r.connected) {
+				this.#clearAllBusinessData();
+				await this.refreshSidecar();
+				await Promise.all([this.refreshHub(), this.refreshStatus(), this.refreshConnections()]);
+				await Promise.all([
+					this.refreshOwners(),
+					this.refreshKnocks(),
+					this.refreshVisitors(),
+					this.refreshBlocklist(),
+					this.refreshCodes(),
+					this.refreshNodes(),
+				]);
+				location.hash = "#/overview";
+				this.hash = "#/overview";
+			} else {
+				await Promise.all([this.refreshHub(), this.refreshSidecar()]);
+			}
+			return true;
+		} catch (e) {
+			this.hubStartError = toAdminError(e);
+			return false;
+		} finally {
+			this.hubStartBusy = false;
 		}
 	}
 
@@ -1706,6 +1748,30 @@ class ConsoleStore {
 			await this.refreshNodes();
 		} catch (e) {
 			this.nodesError = toAdminError(e);
+		}
+	}
+
+	/**
+	 * setup 世界的「连接已保存节点」（用户故事 C「管理本地连接」）：一次点击直达
+	 * switchSidecarNode（已存节点面，零新输入），成功即 setup→ready 世界翻转
+	 * （sidecar 端 switchCore 置 mode=ready）+ 业务缓存清空重拉 + 落总览。
+	 */
+	async connectNodeFromSetup(node: SidecarNode): Promise<void> {
+		const label = node.name.trim() !== "" ? node.name : node.server_host;
+		this.switchingTo = label;
+		this.nodesError = null;
+		try {
+			await switchSidecarNode(node.id);
+			this.#clearAllBusinessData();
+			await this.refreshSidecar();
+			await Promise.all([this.refreshNodes(), this.refreshStatus(), this.refreshConnections()]);
+			await Promise.all([this.refreshOwners(), this.refreshKnocks(), this.refreshVisitors(), this.refreshBlocklist(), this.refreshCodes()]);
+			location.hash = "#/overview";
+			this.hash = "#/overview";
+		} catch (e) {
+			this.nodesError = toAdminError(e);
+		} finally {
+			this.switchingTo = null;
 		}
 	}
 

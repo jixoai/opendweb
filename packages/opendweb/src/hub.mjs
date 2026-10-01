@@ -268,7 +268,7 @@ function defaultOpenBrowser(url) {
  * @param {Partial<HubCtx>} [ctx]
  * @returns {Required<HubCtx>}
  */
-function resolveHubCtx(ctx = {}) {
+export function resolveHubCtx(ctx = {}) {
   return {
     home: ctx.home ?? process.env.DWEB_HOME ?? path.join(os.homedir(), ".opendweb"),
     cwd: ctx.cwd ?? process.cwd(),

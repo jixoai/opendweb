@@ -266,6 +266,29 @@ export function fetchSidecarHub(): Promise<HubData> {
   return jsonFetch("/sidecar/hub") as Promise<HubData>;
 }
 
+/** POST /sidecar/hub/start 结果（一键本地中枢；connected=本 sidecar 已注入 admin 目标）。 */
+export interface HubStartResult {
+  ok: true;
+  url: string;
+  connected: boolean;
+  initialized: boolean;
+  started: boolean;
+}
+
+/**
+ * POST /sidecar/hub/start {initialize}（写路由——精确 Origin）。initialize=true
+ * 允许在未初始化机器上执行 hub init --yes（0600 凭证 + 默认端口 + 自检）。
+ * 一切失败码：not-initialized / init-failed / start-failed / hub-not-healthy /
+ * hub-unavailable / bad-origin-host / member-closed。
+ */
+export function startSidecarHub(initialize: boolean): Promise<HubStartResult> {
+  return jsonFetch("/sidecar/hub/start", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ initialize }),
+  }) as Promise<HubStartResult>;
+}
+
 // ---- /sidecar/plugins* WebUI 插件控制面（webui-plugin-kernel Phase 0） -----------
 
 /** 插件页声明（服务端 descriptor 投影；与宿主契约 webuiApi 1 同形）。 */

@@ -41,7 +41,14 @@
 //    3e）：ports mappings/allowlist CRUD、files shares CRUD + bridge（B 侧
 //    浏览器→sidecar→fabric fetchHttp 的 /wpk1/files/ 信封转发——路径钉死
 //    files wire 前缀，非通用代理）、sync groups/status/conflicts/seed-block
-//    （无租约设备=sync-unavailable 明示；数据面动作要求插件 enabled）。
+//    （无租约设备=sync-unavailable 明示；数据面动作要求插件 enabled）；
+// 3h. POST /sidecar/hub/start 一键本地中枢（用户故事 B「连接本地服务器」；
+//    2026-10-02）：{initialize?} → ensureHubRunning（hubInit --yes（0600 凭证
+//    + 端口自检零残留）/hubStart detached 自举//healthz 就绪轮询——全链复用
+//    packages/opendweb hub.mjs，hub.lock 互斥不变）→ setup 态注入 target+token
+//    （磁盘态来源，row 2 自动形态同源；浏览器零 URL 输入，目标冻结模型不变）；
+//    row 2 daemon-down 启动即自愈；远端 ready 目标绝不改指。写路由=精确
+//    Origin（guardWriteOrigin 四类）；member 姿态 403；响应/日志零 token。
 // 4. stdlib http/https.request 按解析 IP + SNI + Host 逐请求连接（agent:false
 //    + 响应结束/abort 即 destroy socket）；body 界 64KiB/1MiB；10s 超时；
 // 5. 日志只记 method/path/status/耗时——token 不进任何日志/响应。
@@ -63,10 +70,12 @@ import { createPluginHost } from "./plugins/host.mjs";
 import { buildPluginRuntimes } from "./plugins/data-plane.mjs";
 import { createFabricHost, createWpkRouter, adaptSyncHandler } from "./fabric.mjs";
 import {
+  ensureHubRunning,
   hubProjection,
   hubSnapshotSlot,
   leasesProjection,
   probeVisit,
+  readLocalHubToken,
   setLeaseLabel,
   visitsProjection,
 } from "./home.mjs";
@@ -225,7 +234,7 @@ export async function startSidecar(opts = {}) {
 /**
  * sidecar 全量内部句柄（home-hub 2a）：createConsole 的进程内宿主消费——
  * controls.switchNode=进程内切换（不经 HTTP）、controls.snapshot=同步快照。
- * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null, member?: boolean, hubLocal?: boolean, homeDir?: string | null, hostname?: string, interfaces?: object | null, homeFetch?: typeof fetch, homeIsPidAlive?: (pid: number) => boolean, pluginsHost?: import("./plugins/host.mjs").PluginHost | null, fabricHost?: import("./fabric.mjs").FabricHost | null, sdk?: { Fabric: object, fetchHttp: Function, serveHttp: Function }, leasesLoader?: (home: string) => Promise<{ version: 1, leases: Array<Record<string, unknown>> }> }} [opts]
+ * @param {{ target?: object | null, token?: string, port?: number, distDir?: string, log?: (line: string) => void, allowInsecure?: boolean, dns?: object, now?: () => number, nodesFile?: string | null, nodesStore?: object | null, bus?: import("./events.mjs").EventBus | null, capabilities?: import("./capability.mjs").CapabilityRegistry | null, member?: boolean, hubLocal?: boolean, homeDir?: string | null, hostname?: string, interfaces?: object | null, homeFetch?: typeof fetch, homeIsPidAlive?: (pid: number) => boolean, hubStart?: { spawnImpl?: object, readProcessIdentity?: (pid: number) => Promise<{ lstart: string, command: string } | null>, startupTimeoutMs?: number }, pluginsHost?: import("./plugins/host.mjs").PluginHost | null, fabricHost?: import("./fabric.mjs").FabricHost | null, sdk?: { Fabric: object, fetchHttp: Function, serveHttp: Function }, leasesLoader?: (home: string) => Promise<{ version: 1, leases: Array<Record<string, unknown>> }> }} [opts]
  *   - bus：事件总线注入（schema v1 帧派发；缺省 null=不发事件，既有行为不变）
  *   - capabilities：会话 capability 注册表注入（启用 /sidecar/session 引导面）
  *   - member（home-hub 2b design §4.2 row 3）：member 姿态——不生成配对码、
@@ -235,6 +244,8 @@ export async function startSidecar(opts = {}) {
  *     probe/label + 插件宿主/数据面；core/home.mjs）
  *   - hostname/interfaces/homeFetch/homeIsPidAlive/homeProbeTimeoutMs：hub 投影
  *     与锁协议/探测注入面（测试）
+ *   - hubStart：/sidecar/hub/start 的 ensureHubRunning 注入面（测试替身：
+ *     spawnImpl/readProcessIdentity/startupTimeoutMs——缺省真实 detached 自举）
  *   - pluginsHost：插件宿主直接注入（测试；缺省按 homeDir 创建并接线 runtimes）
  *   - fabricHost/sdk/leasesLoader：fabric 数据面宿主注入面（测试替身；缺省
  *     真实 client-sdk + opendweb leases——惰性启动）
@@ -255,18 +266,21 @@ export async function createSidecar(opts = {}) {
     bus = null,
     capabilities = null,
     member = false,
-    hubLocal = false,
+    hubLocal: initialHubLocal = false,
     homeDir = null,
     hostname,
     interfaces = null,
     homeFetch,
     homeIsPidAlive,
     homeProbeTimeoutMs,
+    hubStart,
     pluginsHost,
     fabricHost: optsFabricHost,
     sdk,
     leasesLoader,
   } = opts;
+  /** row 2 标记（let——/sidecar/hub/start 连接段从 setup 接管本机中枢时置位） */
+  let hubLocal = initialHubLocal;
   if (target && (typeof token !== "string" || token === "")) {
     throw new Error("startSidecar: target requires a token");
   }
@@ -628,6 +642,24 @@ export async function createSidecar(opts = {}) {
         return;
       }
       await handleNodes(req, res, startedAt);
+      return;
+    }
+    // 一键本地中枢（用户故事 B「连接本地服务器」）：POST /sidecar/hub/start。
+    // homeDir 注入即启用；member 姿态 403；与 nodes 面同族先于 POST-only/
+    // target-frozen 门分派——本端点不接受任何浏览器侧 URL/host 输入，目标
+    // 一律来自 hub.json/hub-token 磁盘态（0600 文件凭证纪律不变）。
+    if (req.method === "POST" && req.url === "/sidecar/hub/start") {
+      if (member) {
+        sendJson(res, 403, { error: { code: "member-closed", message: "this sidecar runs in member mode; the admin console is closed" } });
+        logAccess(req, 403, startedAt);
+        return;
+      }
+      if (homeDir === null) {
+        sendJson(res, 404, { error: { code: "not-found", message: "local hub face is not enabled" } });
+        logAccess(req, 404, startedAt);
+        return;
+      }
+      await handleHubStart(req, res, startedAt);
       return;
     }
     // 会话 capability 引导面（home-hub 2a，design §5.1）：capabilities 注册表
@@ -1920,6 +1952,92 @@ export async function createSidecar(opts = {}) {
     } finally {
       nodeMutationInFlight = false;
     }
+  }
+
+  // ---- /sidecar/hub/start 一键本地中枢（用户故事 B） -------------------------------
+
+  /**
+   * POST /sidecar/hub/start {initialize?: boolean}：把本机中枢带到运行态，并在
+   * 允许时以 admin 连接。守卫序：guardWriteOrigin（精确 Origin——浏览器按钮语义，
+   * 裸 HTTP 客户端缺 Origin 拒，与 probe/label 写面同纪律）→ ensureHubRunning
+   * （可选 hubInit --yes → hubStart detached 自举 → /healthz 就绪轮询；全链
+   * 复用 CLI 实现，hub.lock 互斥/零残留语义不变）→ 连接段：仅 setup 态注入
+   * target+token（磁盘态来源，与 row 2 自动形态同源——目标冻结模型不变，浏览器
+   * 零 URL 输入）；row 2（hubLocal 且已有 target，daemon-down 场景）启动后代理
+   * 自愈，不动 target；远端 ready 目标绝不被本端点改指（connected=false 如实
+   * 报告）。响应/日志零 token。
+   */
+  async function handleHubStart(req, res, startedAt) {
+    if (!guardWriteOrigin(req, res, startedAt)) return;
+    const body = await readBody(req, res);
+    if (body === null) {
+      logAccess(req, 413, startedAt);
+      return;
+    }
+    let initialize = false;
+    if (body.length > 0) {
+      let parsed;
+      try {
+        parsed = JSON.parse(body.toString("utf8"));
+      } catch {
+        parsed = null;
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        sendJson(res, 400, { error: { code: "invalid-request", message: "body must be JSON {initialize?: boolean}" } });
+        logAccess(req, 400, startedAt);
+        return;
+      }
+      for (const key of Object.keys(parsed)) {
+        if (key !== "initialize") {
+          sendJson(res, 400, { error: { code: "invalid-request", message: "hub/start accepts {initialize?} only; no url/host fields" } });
+          logAccess(req, 400, startedAt);
+          return;
+        }
+      }
+      initialize = parsed.initialize === true;
+    }
+    const home = path.resolve(/** @type {string} */ (homeDir));
+    const r = await ensureHubRunning(home, {
+      initialize,
+      ...(homeFetch !== undefined ? { fetchImpl: homeFetch } : {}),
+      ...(hubStart ?? {}),
+    });
+    if (!r.ok) {
+      sendJson(res, r.status, { error: { code: r.code, message: r.message } });
+      logAccess(req, r.status, startedAt);
+      return;
+    }
+    let connected = false;
+    if (state.mode === "setup" && state.target === null) {
+      let token;
+      try {
+        token = await readLocalHubToken(home);
+      } catch (e) {
+        sendJson(res, 500, { error: { code: "token-unreadable", message: safeError(e) } });
+        logAccess(req, 500, startedAt);
+        return;
+      }
+      const v = await validateTarget(r.base, { allowInsecure: false, dns });
+      if (!v.ok) {
+        sendJson(res, 500, { error: { code: "bad-target", message: `local hub base rejected by target guard: ${v.error}` } });
+        logAccess(req, 500, startedAt);
+        return;
+      }
+      state.target = v.value;
+      state.token = token;
+      state.mode = "ready";
+      state.pairing = null;
+      hubLocal = true; // 中枢视角/中枢状态卡数据源（与 row 2 自动形态同位）
+      connected = true;
+      if (bus !== null) bus.emit("state-change", { mode: "ready" });
+      log(`sidecar: connected to local hub (${v.value.scheme}://${v.value.hostHeader})`);
+    } else {
+      // row 2 daemon-down 恢复：target 已是本机中枢——启动即自愈；远端 ready
+      // 目标不被改指，connected 如实为 false（UI 不从该状态调用本端点）
+      connected = state.target !== null && hubLocal === true;
+    }
+    sendJson(res, 200, { ok: true, url: r.base, connected, initialized: r.initialized, started: r.started });
+    logAccess(req, 200, startedAt);
   }
 
   // ---- 静态面 ----

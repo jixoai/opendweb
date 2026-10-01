@@ -856,8 +856,9 @@ test("default-not-started: fresh DWEB_HOME survives normal commands, webui attem
     for (const argv of [["id"], ["marketplace", "list"], ["plugin", "list"], ["hub", "status"]]) {
       await execFileAsync(NODE, [HUB_BIN_PATH, ...argv], { env }).catch(() => {});
     }
-    // 无 hub.json 的 webui（插件解析失败即可——重点是零副作用）
-    await execFileAsync(NODE, [HUB_BIN_PATH, "webui"], { env }).catch(() => {});
+    // 无 hub.json 的 webui：仓库内经 workspace 回退（e82828f）可真实解析并启动
+    // sidecar——限时 + SIGTERM 收割（无论成败均可），重点是零 hub 副作用断言不变
+    await execFileAsync(NODE, [HUB_BIN_PATH, "webui"], { env, timeout: 2_500 }).catch(() => {});
     // 模拟成员会话：join 指向不可达地址（失败，无本地状态）
     await execFileAsync(NODE, [HUB_BIN_PATH, "join", "--server", "http://127.0.0.1:9", "--code", "dwebc1.x", "--allow-insecure"], { env }).catch(() => {});
     // 断言：无 hub 状态文件、无 hub-data、无服务安装、无 server 子进程（端口可 bind）

@@ -114,6 +114,11 @@ async function defaultReadToken(home) {
   return hub.readHubToken(home);
 }
 
+/** hub-token 读取的导出面（/sidecar/hub/start 连接段；只进 sidecar 进程内存）。 */
+export async function readLocalHubToken(home) {
+  return defaultReadToken(home);
+}
+
 // ---- 租约投影 ---------------------------------------------------------------------
 
 /**
@@ -260,6 +265,110 @@ async function probeHealthz(base, fetchImpl = fetch) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ---- 一键本地中枢（用户故事 B：setup 页/中枢状态卡 → sidecar 本地控制面） ----------
+
+/** 启动后 /healthz 就绪等待上限（daemon 冷启动余量；hubStart 自带 1.5s 早退窗） */
+export const HUB_STARTUP_TIMEOUT_MS = 10_000;
+
+/**
+ * ensureHubRunning 结果。
+ * @typedef {Object} EnsureHubResult
+ * @property {true} ok
+ * @property {string} base 本机中枢 admin base（http://127.0.0.1:<port>）
+ * @property {boolean} initialized 本次调用前 hub.json 已存在
+ * @property {boolean} started 本次调用实际拉起了守护进程（已在跑=false）
+ * @property {string[]} output 初始化/启动链的终端输出（hub 卡片/自检文案；无秘密）
+ */
+
+/**
+ * 把本机中枢带到「已初始化且 /healthz 可达」状态（POST /sidecar/hub/start 数据源）。
+ * 序列：hub.json 缺失且 initialize=true → hubInit(--yes)（0600 凭证 + 端口自检 +
+ * hub.json 最后写，全链复用 CLI 实现；失败=零残留）；/healthz 探测（已在跑=跳过
+ * 启动）；hubStart detached 自举（守护子进程 + pid 三元组 + 早退监视，hub.lock
+ * 互斥由执行链保证）；就绪轮询 ≤ startupTimeoutMs。
+ * 纪律与 resolveLaunch 同源：token 绝不出现在返回值/输出（hubInit 只打印卡片，
+ * 凭证 0600 落盘不显示）。
+ * @param {string} home
+ * @param {{ initialize?: boolean, gateway?: string, relay?: string, fetchImpl?: typeof fetch, spawnImpl?: object, readProcessIdentity?: (pid: number) => Promise<{ lstart: string, command: string } | null>, now?: () => number, startupTimeoutMs?: number }} [opts]
+ * @returns {Promise<EnsureHubResult | { ok: false, status: number, code: string, message: string }>}
+ */
+export async function ensureHubRunning(home, opts = {}) {
+  const hubMod = await loadHubModule();
+  if (hubMod === null) {
+    return { ok: false, status: 503, code: "hub-unavailable", message: "opendweb/src/hub.mjs is not available" };
+  }
+  /** @type {string[]} */
+  const output = [];
+  const hubCtx = hubMod.resolveHubCtx({
+    home,
+    isTTY: false,
+    stdout: (line) => output.push(String(line)),
+    ...(opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
+    ...(opts.spawnImpl !== undefined ? { spawnImpl: opts.spawnImpl } : {}),
+    ...(opts.readProcessIdentity !== undefined ? { readProcessIdentity: opts.readProcessIdentity } : {}),
+  });
+  let state = null;
+  try {
+    state = await hubMod.loadHubState(home);
+  } catch {
+    state = null; // 损坏 hub.json 按「未初始化」如实处理（init 会拒绝接管半程残留？——hubInit 侧 loadHubState 再判）
+  }
+  const initialized = state !== null;
+  if (state === null) {
+    if (opts.initialize !== true) {
+      return { ok: false, status: 409, code: "not-initialized", message: 'hub is not initialized; run "opendweb hub init" first (or pass initialize)' };
+    }
+    /** @type {string[]} */
+    const initArgs = ["--yes"];
+    if (typeof opts.gateway === "string") initArgs.push("--gateway", opts.gateway);
+    if (typeof opts.relay === "string") initArgs.push("--relay", opts.relay);
+    try {
+      const code = await hubMod.hubInit(initArgs, hubCtx);
+      if (code !== 0) {
+        return { ok: false, status: 400, code: "init-failed", message: output.join("\n") || `hub init exited with ${code}` };
+      }
+    } catch (e) {
+      return { ok: false, status: 400, code: "init-failed", message: safeInitError(e, output) };
+    }
+    try {
+      state = await hubMod.loadHubState(home);
+    } catch {
+      state = null;
+    }
+    if (state === null) {
+      return { ok: false, status: 500, code: "init-failed", message: "hub init reported success but hub.json is missing" };
+    }
+  }
+  const base = probeBindBase(String(state.gateway_bind ?? "0.0.0.0:8787"));
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  if (await probeHealthz(base, fetchImpl)) {
+    return { ok: true, base, initialized, started: false, output };
+  }
+  try {
+    await hubMod.hubStart([], hubCtx);
+  } catch (e) {
+    return { ok: false, status: 400, code: "start-failed", message: safeInitError(e, output) };
+  }
+  const now = opts.now ?? Date.now;
+  const deadline = now() + (opts.startupTimeoutMs ?? HUB_STARTUP_TIMEOUT_MS);
+  for (;;) {
+    if (await probeHealthz(base, fetchImpl)) {
+      return { ok: true, base, initialized, started: true, output };
+    }
+    if (now() >= deadline) {
+      return { ok: false, status: 504, code: "hub-not-healthy", message: `hub daemon was started but ${base}/healthz did not become ready; see the hub log (opendweb hub status)` };
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+/** init/start 异常的稳定文案（CliExit.message 优先；附带已捕获的终端输出尾行）。 */
+function safeInitError(e, output) {
+  const msg = e instanceof Error ? e.message : String(e ?? "unknown error");
+  const tail = output.length > 0 ? `\n${output.slice(-6).join("\n")}` : "";
+  return `${msg}${tail}`;
 }
 
 /**
