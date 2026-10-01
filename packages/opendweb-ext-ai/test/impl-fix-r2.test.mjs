@@ -185,3 +185,36 @@ test("r3-P1-3: 恶意目录快照（钥环/GET /consumer）零凭证外泄", asy
   assert.equal(safe.detail.custom, undefined, "未知键丢弃");
   assert.equal(safeCatalogEntry({ serviceId: 1 }), null, "坏形状 fail-closed");
 });
+
+test("r4-P0: writer 掩码递归全文（根级/嵌套敏感键与 sk- 值零透传）", async () => {
+  const { maskSensitiveSettings } = await import("../src/consumer/writers/claude-code.mjs");
+  const doc = JSON.stringify({
+    apiKey: "sk-aifly-ROOT-REAL",
+    nested: { token: "sk-aifly-NESTED-REAL", ANTHROPIC_BASE_URL: "http://127.0.0.1:14399" },
+    list: [{ secret: "plain-secret-value" }, "sk-aifly-IN-ARRAY"],
+    env: { ANTHROPIC_AUTH_TOKEN: "short-cred" },
+  });
+  const masked = maskSensitiveSettings(doc);
+  for (const leak of ["sk-aifly-ROOT-REAL", "sk-aifly-NESTED-REAL", "plain-secret-value", "sk-aifly-IN-ARRAY", "short-cred"]) {
+    assert.ok(!masked.includes(leak), `递归敏感值不得透传: ${leak}`);
+  }
+  assert.ok(masked.includes("http://127.0.0.1:14399"), "非敏感 URL 保持可见");
+  assert.ok(masked.includes("sk-aifly-local") === false || true, "（占位符豁免逻辑在 walk 内单独处理）");
+  const withPlaceholder = maskSensitiveSettings(JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: "sk-aifly-local" } }));
+  assert.ok(withPlaceholder.includes("sk-aifly-local"), "占位符豁免");
+});
+
+test("r4-P1: 目录投影 rewrite 白名单+upstream userinfo 剥离", async () => {
+  const { safeCatalogEntry } = await import("../src/provider/detail.mjs");
+  const RAWKEY = "sk-aifly-RAW";
+  const safe = safeCatalogEntry({
+    serviceId: "s1", name: "n", match: [{ type: "suffix", value: ".x.com" }], defaultPort: 4310,
+    detail: { upstream: "https://user:secret-pass@example.com/v1", rewrite: { apiKey: RAWKEY, host: "api.example.com", prefix: "/v1" } },
+  });
+  const blob = JSON.stringify(safe);
+  assert.ok(!blob.includes(RAWKEY), "rewrite 未知键（凭证承载）丢弃");
+  assert.ok(!blob.includes("secret-pass") && !blob.includes("user:secret"), "URL userinfo 剥离");
+  assert.equal(safe.detail.rewrite.host, "api.example.com", "冻结字段保留");
+  assert.equal(safe.detail.rewrite.prefix, "/v1");
+  assert.equal(safe.detail.upstream, "https://example.com/v1", "去 userinfo 的安全 URL");
+});

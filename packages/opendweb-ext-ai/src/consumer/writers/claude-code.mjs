@@ -273,30 +273,37 @@ export async function previewClaudeCodeWriter(target) {
 }
 
 /**
- * 敏感值掩码（r3-P0-1）：settings.json 的 env 块中**敏感键**（token/key/
- * secret/password/credential 类）取值与 `sk-` 前缀值一律固定掩码——展示面零
- * 既有凭证；非敏感键（如 ANTHROPIC_BASE_URL——预览的核心展示对象）保持
- * 可见。掩码仅用于响应展示；apply 写盘走 canonical+占位符。
+ * 敏感值掩码（r3-P0-1/r4-P0）：**递归全文**——JSON 任意深度（对象/数组）中
+ * 敏感键（token/key/secret/password/credential/auth 类）的字符串取值与所有
+ * `sk-` 前缀字符串一律固定掩码；仅精确占位符 `sk-aifly-local` 保留；非敏感
+ * 键（如 ANTHROPIC_BASE_URL——预览的核心展示对象）保持可见。非对象 JSON
+ * 兜底正则掩码 sk- 值。掩码仅用于响应展示；apply 写盘走 canonical+占位符。
  * @param {string} text
  * @returns {string}
  */
 export function maskSensitiveSettings(text) {
   const MASK = "●●●●";
-  const sensitiveKey = (k) => /token|key|secret|password|credential|auth/i.test(k);
   const PLACEHOLDER = "sk-aifly-local";
+  const sensitiveKey = (k) => /token|key|secret|password|credential|auth/i.test(k);
+  /** @param {unknown} v @param {string | null} key */
+  const walk = (v, key) => {
+    if (typeof v === "string") {
+      if (v === PLACEHOLDER) return v;
+      if ((key !== null && sensitiveKey(key)) || v.startsWith("sk-")) return MASK;
+      return v;
+    }
+    if (v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return v.map((item) => walk(item, null));
+    return Object.fromEntries(Object.entries(/** @type {Record<string, unknown>} */ (v)).map(([k, val]) => [k, walk(val, k)]));
+  };
   let obj;
   try {
     obj = JSON.parse(text);
   } catch {
     return text.replace(/"(sk-[^"\\]{8,})"/g, (m, v) => (v === PLACEHOLDER ? m : `"${MASK}"`));
   }
-  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return text;
-  if (obj.env !== null && typeof obj.env === "object" && !Array.isArray(obj.env)) {
-    obj.env = Object.fromEntries(
-      Object.entries(obj.env).map(([k, v]) => [k, v === PLACEHOLDER ? v : sensitiveKey(k) || (typeof v === "string" && v.startsWith("sk-")) ? MASK : v]),
-    );
-  }
-  return `${JSON.stringify(obj, null, 2)}\n`;
+  if (obj === null || typeof obj !== "object") return text;
+  return `${JSON.stringify(walk(obj, null), null, 2)}\n`;
 }
 
 /**

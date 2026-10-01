@@ -166,18 +166,28 @@ export function safeCatalogEntry(entry) {
   if (e.detail !== null && typeof e.detail === "object" && !Array.isArray(e.detail)) {
     const d = /** @type {Record<string, unknown>} */ (e.detail);
     const safe = /** @type {Record<string, unknown>} */ ({});
-    if (typeof d.upstream === "string" && d.upstream.length <= 2048) safe.upstream = d.upstream;
+    if (typeof d.upstream === "string" && d.upstream.length <= 2048) {
+      // r4-P1：URL userinfo 剥离——https://user:pass@host/ 只输出安全形
+      try {
+        const u = new URL(d.upstream);
+        safe.upstream = u.username !== "" || u.password !== "" ? u.origin + u.pathname + u.search : d.upstream;
+      } catch {
+        // 非 URL 形态（相对描述等）——非凭证承载，长度界内保留
+        safe.upstream = d.upstream;
+      }
+    }
     if (Array.isArray(d.match)) {
       safe.match = d.match
         .filter((m) => m !== null && typeof m === "object" && typeof /** @type {Record<string, unknown>} */ (m).type === "string" && typeof /** @type {Record<string, unknown>} */ (m).value === "string")
         .map((m) => ({ type: /** @type {Record<string, unknown>} */ (m).type, value: /** @type {Record<string, unknown>} */ (m).value }));
     }
     if (d.rewrite !== null && typeof d.rewrite === "object" && !Array.isArray(d.rewrite)) {
-      safe.rewrite = Object.fromEntries(
-        Object.entries(/** @type {Record<string, unknown>} */ (d.rewrite))
-          .filter(([, v]) => typeof v === "string" && v.length <= 512)
-          .map(([k, v]) => [k, /** @type {string} */ (v)]),
-      );
+      // r4-P1：rewrite 冻结字段白名单 {host, prefix}——未知键（可承载凭证）丢弃
+      const rw = /** @type {Record<string, unknown>} */ (d.rewrite);
+      const safeRw = /** @type {Record<string, string>} */ ({});
+      if (typeof rw.host === "string" && rw.host.length <= 2048) safeRw.host = rw.host;
+      if (typeof rw.prefix === "string" && rw.prefix.length <= 512) safeRw.prefix = rw.prefix;
+      safe.rewrite = safeRw;
     }
     if (Array.isArray(d.routes)) {
       safe.routes = d.routes.map((r) => {
