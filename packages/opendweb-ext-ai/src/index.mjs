@@ -1,6 +1,7 @@
 // @jixo/opendweb-ext-ai 出口桶（ai-subscription-sharing Phase A+B——提供方纯逻辑
 // + wire 契约 + 响应中继状态机 + 消费方端点；Phase C 增运行时工厂/管理面/descriptor
-// ——宿主接入经 ./opendweb-webui-plugin 子路径与本出口的 createAiRuntime）。
+// ——宿主接入经 ./opendweb-webui-plugin 子路径与本出口的 createAiRuntime；
+// Phase D 增上游探活 + claude-code 写手）。
 
 export { atomicWrite0600, acquireFileLock } from "./fsutil.mjs";
 
@@ -52,6 +53,7 @@ export {
 } from "./provider/upstream.mjs";
 export { ambientEnvViolations, assertStartupEnvSafety, assertRuntimeChange } from "./provider/envguard.mjs";
 export { stageAiflyConfig, commitAiflyImport, convertServiceInput, envRefName } from "./provider/importer.mjs";
+export { probeUpstream, PROBE_TIMEOUT_MS } from "./provider/probe.mjs";
 export { assertCatalogBudget, buildCatalogView, watchCatalogRevision } from "./provider/catalog.mjs";
 export { parseWirePath, createOpGate, opGateName } from "./provider/accept.mjs";
 export { createForwardPlane, validateAdmission, errorHttpStatus } from "./provider/forward.mjs";
@@ -86,9 +88,23 @@ export {
   filterRequestHeaders,
   mapRoute,
   localErrorStatus,
+  classifyLocalError,
   openAiErrorBody,
   LOOPBACK_HOST,
 } from "./consumer/gateway.mjs";
+
+// claude-code 写手（Phase D1：preview→diff 确认→apply；占位符 token 纪律）
+export {
+  claudeCodeSettingsPath,
+  composeClaudeCodeSettings,
+  anthropicBaseUrl,
+  previewClaudeCodeWriter,
+  applyClaudeCodeWriter,
+  unifiedDiff,
+  sha256Hex,
+  CLAUDE_CODE_PLACEHOLDER_TOKEN,
+  WriterError,
+} from "./consumer/writers/claude-code.mjs";
 
 export {
   loadCuratedPresets,

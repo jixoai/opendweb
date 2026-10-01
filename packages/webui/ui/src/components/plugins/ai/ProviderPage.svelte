@@ -1,13 +1,15 @@
 <script lang="ts">
-	// ai 插件·提供方页（ai-subscription-sharing Phase C / design §6 provider 页）。
+	// ai 插件·提供方页（ai-subscription-sharing Phase C / design §6 provider 页；
+	// Phase D 服务行接上游探活）。
 	// 纯展示组件：数据与动作全部经 ctl（plugins-ai-controller——绑定层装配的
 	// store↔props 面）注入；页面零 fetch。分区（Tabs，二八法则：高频=服务+密钥）：
-	// 服务（17 预设选择+自定义+启停+secret 绑定）/ 分组（限额=配额）/ 密钥与链接
-	// （签发一次性展示+本地复制+撤钥三态+aifly1. 链接生成）/ 密钥库 / 用量（元
-	// 数据聚合）/ 导入器（两阶段 staging）/ 插件配额配置（configSchema 通用
-	// renderer）。上游探活=Phase D（占位说明）。
+	// 服务（17 预设选择+自定义+启停+secret 绑定+上游探活）/ 分组（限额=配额）/
+	// 密钥与链接（签发一次性展示+本地复制+撤钥三态+aifly1. 链接生成）/ 密钥库 /
+	// 用量（元数据聚合）/ 导入器（两阶段 staging）/ 插件配额配置（configSchema
+	// 通用 renderer）。
 	// 凭证纪律：密钥/链接原文只出现在一次性视图（关闭即清空；复制=显式动作）；
-	// 列表/用量恒掩码（keyId/名称/长度指纹）。
+	// 列表/用量恒掩码（keyId/名称/长度指纹）；探活结果三态脱敏（无头表无原始
+	// 错误文案）。
 	import * as Alert from "$lib/components/ui/alert";
 	import * as Card from "$lib/components/ui/card";
 	import * as Empty from "$lib/components/ui/empty";
@@ -117,6 +119,22 @@
 		togglingId = serviceId;
 		await ctl.toggleService(serviceId, enabled);
 		togglingId = null;
+	}
+
+	/** 探活三态呈现文案（Phase D2：脱敏结果——无原始错误文案）。 */
+	function probeText(result: { state: string; status?: number; reason?: string; keyEnv?: string; ms: number }): string {
+		if (result.state === "reachable") return `可达（上游应答 ${result.status ?? "?"}，${result.ms}ms）`;
+		if (result.state === "no_auth") {
+			return result.reason === "keyenv_unbound" ? `未配置 auth——绑定 keyEnv ${result.keyEnv ?? ""} 对应的 secret 后再探活` : "未配置 auth——已绑 secret 在密钥库中缺失";
+		}
+		const reasons: Record<string, string> = {
+			upstream_unreachable: "连接失败或超时",
+			timeout: "上游应答超时（>5s）",
+			hook_failed: "auth/headers 脚本管线失败",
+			path_not_offered: "无白名单路径可探（pattern 路由服务）",
+			protocol_error: "服务配置无法构造探活请求",
+		};
+		return `不可达——${reasons[result.reason ?? ""] ?? result.reason ?? "未知原因"}`;
 	}
 
 	async function confirmedRemoveService(): Promise<void> {
@@ -299,7 +317,7 @@
 					<Card.Header>
 						<Card.Title>服务列表</Card.Title>
 						<Card.Description>
-							{overview.services.length} 个服务（≤256）。带 <span class="font-mono text-xs">keyEnv</span> 的预设服务须先绑定本机密钥库中的 secret 才能启用（环境变量取值被拒绝——凭证只走密钥库）。上游探活将在 Phase D 提供。
+							{overview.services.length} 个服务（≤256）。带 <span class="font-mono text-xs">keyEnv</span> 的预设服务须先绑定本机密钥库中的 secret 才能启用（环境变量取值被拒绝——凭证只走密钥库）。每行「探活」经同一 hook 管线/auth 槽向上游发最小请求（超时 5s，三态脱敏呈现）。
 						</Card.Description>
 					</Card.Header>
 					<Card.Content class="flex flex-col gap-3">
@@ -324,10 +342,25 @@
 												{row.authBound ? "已绑定 secret" : `keyEnv ${row.keyEnv} 未绑定`}
 											</Badge>
 										{/if}
-										<span class="ml-auto flex items-center gap-2">
-											<Button size="sm" variant="outline" disabled={ctl.providerBusy} onclick={() => void toggleService(row.serviceId, !row.enabled)}>
-												{row.enabled ? "停用" : "启用"}
-											</Button>
+									<span class="ml-auto flex items-center gap-2">
+										{#if ctl.probeResults[row.serviceId] !== undefined}
+											<span
+												class="rounded-md border px-2 py-0.5 text-xs {ctl.probeResults[row.serviceId].state === 'reachable'
+													? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+													: ctl.probeResults[row.serviceId].state === 'no_auth'
+																						? 'border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400'
+																						: 'border-red-500/40 bg-red-500/10 text-red-600 dark:text-red-400'}"
+												data-probe-result={row.serviceId}
+											>
+												{probeText(ctl.probeResults[row.serviceId])}
+											</span>
+										{/if}
+										<Button size="sm" variant="outline" disabled={ctl.providerBusy || ctl.probingId !== null} onclick={() => void ctl.probeService(row.serviceId)} data-action="ai-probe">
+											{#if ctl.probingId === row.serviceId}探活中…{:else}探活{/if}
+										</Button>
+										<Button size="sm" variant="outline" disabled={ctl.providerBusy} onclick={() => void toggleService(row.serviceId, !row.enabled)}>
+											{row.enabled ? "停用" : "启用"}
+										</Button>
 											<Button size="sm" variant="outline" class="text-destructive" disabled={ctl.providerBusy} onclick={() => (confirmService = { serviceId: row.serviceId, name: row.name })}>
 												<Trash class="size-3.5" /> 删除
 											</Button>

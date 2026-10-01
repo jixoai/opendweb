@@ -438,3 +438,52 @@ test("lifecycle: enable restores consumer endpoints; disable closes them all and
   assert.equal(reenable.status, 200, reenable.text);
   assert.equal(await portAccepts(port), true, "端点按账本恢复");
 });
+
+// ---- ⑤ Phase D：上游探活 HTTP 面（本地 fake 上游——零外网零真实 HOME） -----------------
+
+test("mgmt probe: POST /services/:id/probe three-state over the sidecar HTTP chain", async (t) => {
+  const home = await tempHome(true);
+  t.after(() => rm(home, { recursive: true, force: true }));
+
+  // 本地 fake 上游（探活可达面——任意状态即达；显式回收）
+  const upstreamHits = [];
+  const upstreamServer = (await import("node:http")).createServer((req, res) => {
+    upstreamHits.push({ method: req.method, url: req.url, authorization: req.headers["authorization"] ?? null });
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((resolve) => upstreamServer.listen(0, "127.0.0.1", resolve));
+  const upstreamPort = upstreamServer.address().port;
+  t.after(() => new Promise((resolve) => { upstreamServer.closeAllConnections?.(); upstreamServer.close(() => resolve()); }));
+
+  const fake = makeFakeSdk();
+  const sc = await createSidecar({ homeDir: home, sdk: fake.sdk });
+  t.after(() => sc.close());
+
+  // 自定义服务（无 keyEnv——匿名探活面）+ 带 keyEnv 未绑定的预设形态服务
+  const created = await request(sc.port, {
+    method: "POST",
+    path: "/sidecar/plugins/ai/services",
+    headers: { ...jsonHeaders, ...sameOrigin(sc) },
+    body: JSON.stringify({ service: { name: "local-fake", upstream: `http://127.0.0.1:${upstreamPort}`, match: [{ type: "suffix", value: ".local" }] } }),
+  });
+  assert.equal(created.status, 200, created.text);
+  const serviceId = JSON.parse(created.text).service.serviceId;
+
+  // 写路由 Origin 纪律沿家族（缺失 Origin=403）
+  const noOrigin = await request(sc.port, { method: "POST", path: `/sidecar/plugins/ai/services/${serviceId}/probe`, headers: { ...jsonHeaders, host: `127.0.0.1:${sc.port}` }, body: "{}" });
+  assert.equal(noOrigin.status, 403);
+
+  // reachable：fake 上游 401 亦算可达；断言经同一管线（GET、匿名无 authorization）
+  const probed = await request(sc.port, { method: "POST", path: `/sidecar/plugins/ai/services/${serviceId}/probe`, headers: { ...jsonHeaders, ...sameOrigin(sc) }, body: "{}" });
+  assert.equal(probed.status, 200, probed.text);
+  const probeBody = JSON.parse(probed.text);
+  assert.equal(probeBody.state, "reachable");
+  assert.equal(probeBody.status, 401);
+  assert.ok(typeof probeBody.ms === "number");
+  assert.ok(!JSON.stringify(probeBody).includes("headers"), "脱敏投影：零头表");
+  assert.deepEqual(upstreamHits.map((h) => h.method), ["GET"]);
+
+  // 未知服务 → 404
+  assert.equal((await request(sc.port, { method: "POST", path: "/sidecar/plugins/ai/services/nope/probe", headers: { ...jsonHeaders, ...sameOrigin(sc) }, body: "{}" })).status, 404);
+});

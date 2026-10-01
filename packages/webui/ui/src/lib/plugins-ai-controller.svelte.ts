@@ -10,6 +10,7 @@
 
 import {
 	addAiConsumerKey,
+	applyAiWriter,
 	commitAiImport,
 	createAiGroup,
 	createAiLink,
@@ -25,6 +26,8 @@ import {
 	issueAiKey,
 	patchAiGroup,
 	patchAiService,
+	previewAiWriter,
+	probeAiService,
 	refreshAiConsumer,
 	revokeAiKey,
 	setAiSecret,
@@ -35,7 +38,9 @@ import {
 	type AiConsumerData,
 	type AiOverviewData,
 	type AiPreset,
+	type AiServiceProbeResult,
 	type AiUsageData,
+	type AiWriterPreview,
 } from "./api";
 
 /** 签发密钥的一次性全文视图（离开即清空——列表只有 keyId/状态）。 */
@@ -72,6 +77,18 @@ class AiController {
 	consumer = $state<AiConsumerData | null>(null);
 	consumerError = $state<string | null>(null);
 	consumerBusy = $state(false);
+
+	// ---- 上游探活（Phase D2：服务行内动作——结果留驻行内呈现） -----------------------
+
+	probeResults = $state<Record<string, AiServiceProbeResult>>({});
+	probingId = $state<string | null>(null);
+
+	// ---- claude-code 写手（Phase D1：preview → diff 确认 → apply） -------------------
+
+	writerPreview = $state<AiWriterPreview | null>(null);
+	writerBusy = $state(false);
+	writerError = $state<string | null>(null);
+	writerApplied = $state<{ path: string; baseUrl: string } | null>(null);
 
 	/** 提供方数据面刷新（页面进入/动作后）。 */
 	async refreshProvider(): Promise<void> {
@@ -244,6 +261,61 @@ class AiController {
 
 	stopEndpoint(id: string): Promise<boolean> {
 		return this.#consumerAction(() => stopAiConsumerEndpoint(id));
+	}
+
+	/** 上游探活（Phase D2：三态脱敏结果留驻 probeResults[serviceId]）。 */
+	async probeService(serviceId: string): Promise<void> {
+		if (this.providerBusy || this.probingId !== null) return;
+		this.probingId = serviceId;
+		try {
+			this.probeResults[serviceId] = await probeAiService(serviceId);
+		} catch (e) {
+			this.providerError = toAdminError(e).message;
+		} finally {
+			this.probingId = null;
+		}
+	}
+
+	// ---- claude-code 写手（Phase D1） -----------------------------------------------
+
+	/** 预览写手改动（不写盘；成功后 writerPreview 持 diff+确认令牌）。 */
+	async previewWriter(endpointId: string): Promise<void> {
+		if (this.writerBusy) return;
+		this.writerBusy = true;
+		this.writerError = null;
+		this.writerApplied = null;
+		try {
+			this.writerPreview = await previewAiWriter(endpointId);
+		} catch (e) {
+			this.writerPreview = null;
+			this.writerError = toAdminError(e).message;
+		} finally {
+			this.writerBusy = false;
+		}
+	}
+
+	/** 确认应用（令牌由当前 writerPreview 携带；不符=409 stale-preview 呈现）。 */
+	async applyWriter(): Promise<void> {
+		const preview = this.writerPreview;
+		if (preview === null || this.writerBusy) return;
+		this.writerBusy = true;
+		this.writerError = null;
+		try {
+			const out = await applyAiWriter(preview.endpointId, preview.tokenSha256);
+			this.writerApplied = { path: out.path, baseUrl: out.baseUrl };
+			this.writerPreview = null;
+		} catch (e) {
+			this.writerError = toAdminError(e).message;
+		} finally {
+			this.writerBusy = false;
+		}
+	}
+
+	/** 关闭写手一次性视图（应用成功回执/预览 diff）。 */
+	closeWriterView(): void {
+		this.writerPreview = null;
+		this.writerApplied = null;
+		this.writerError = null;
 	}
 
 	/** 剪贴板复制（无权限/非安全上下文静默降级——与 console store 同拍）。 */

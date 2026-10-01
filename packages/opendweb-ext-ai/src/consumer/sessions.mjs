@@ -49,6 +49,28 @@ function headerValue(headers, name) {
 }
 
 /**
+ * wire 错误体码位提取（Phase D 顺手项）：provider 端两种 JSON 形态都取——
+ * ai handler 自有面 `{code,message}`（平铺）与内核 wpk 路由 `jsonResp` 面
+ * `{error:{code,message}}`（嵌套——A 停用 503 plugin-disabled 等）。取不到
+ * 归 internal（消费方不臆造码）。
+ * @param {any} body
+ * @param {string} [fallback]
+ */
+function wireErrorCode(body, fallback = "internal") {
+  const code = body?.code ?? body?.error?.code;
+  return typeof code === "string" && code !== "" ? code : fallback;
+}
+
+/**
+ * wire 错误体文案提取（同上双形态）。
+ * @param {any} body
+ */
+function wireErrorMessage(body) {
+  const message = body?.message ?? body?.error?.message;
+  return typeof message === "string" ? message : undefined;
+}
+
+/**
  * 消费方 wire 会话。
  * @param {{ fetchImpl: (init: { method: string, path: string, headers: Array<{name: string, value: string}>, body?: Buffer[], signal?: AbortSignal }) => Promise<{ status: number, headers: Array<{name: string, value: string}>, bodyChunks: Buffer[] }>, log?: (level: "info" | "warn" | "error", msg: string) => void }} opts
  */
@@ -92,8 +114,8 @@ export function createConsumerSession(opts) {
    */
   async function auth(keys) {
     const res = await call({ method: "POST", path: "/auth", body: Buffer.from(JSON.stringify({ v: 1, keys })) });
-    if (res.status === 403) throw new WireError(403, res.json()?.code ?? "key_all_invalid", res.json()?.message);
-    if (res.status !== 200) throw new WireError(res.status, res.json()?.code ?? "internal", res.json()?.message);
+    if (res.status === 403) throw new WireError(403, wireErrorCode(res.json(), "key_all_invalid"), wireErrorMessage(res.json()));
+    if (res.status !== 200) throw new WireError(res.status, wireErrorCode(res.json()), wireErrorMessage(res.json()));
     const body = res.json();
     return { groups: body.groups ?? [], rejected: body.rejected };
   }
@@ -110,7 +132,7 @@ export function createConsumerSession(opts) {
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
     if (res.status === 204) return { changed: false, rev: Number(res.header(HDR_REV) ?? input.since ?? 0) };
-    if (res.status !== 200) throw new WireError(res.status, res.json()?.code ?? "internal", res.json()?.message);
+    if (res.status !== 200) throw new WireError(res.status, wireErrorCode(res.json()), wireErrorMessage(res.json()));
     const body = res.json();
     return { changed: true, rev: body.rev, catalog: body.catalog };
   }
@@ -144,7 +166,7 @@ export function createConsumerSession(opts) {
       ...(input.body !== undefined && input.body.length > 0 ? { body: input.body } : {}),
       ...(input.signal !== undefined ? { signal: input.signal } : {}),
     });
-    if (res.status !== 200) throw new WireError(res.status, res.json()?.code ?? "internal", res.json()?.message);
+    if (res.status !== 200) throw new WireError(res.status, wireErrorCode(res.json()), wireErrorMessage(res.json()));
     const body = res.json();
     return { responseId: body.responseId, epoch: body.epoch, status: body.status, headers: body.headers ?? {} };
   }
@@ -168,7 +190,7 @@ export function createConsumerSession(opts) {
     if (res.status === 204) {
       return { status: 204, done: false, nextSeq: Number(res.header(HDR_NEXT_SEQ) ?? input.fromSeq) };
     }
-    if (res.status !== 200) throw new WireError(res.status, res.json()?.code ?? "internal", res.json()?.message);
+    if (res.status !== 200) throw new WireError(res.status, wireErrorCode(res.json()), wireErrorMessage(res.json()));
     return {
       status: 200,
       seq: res.header(HDR_SEQ) !== null ? Number(res.header(HDR_SEQ)) : undefined,
@@ -189,7 +211,7 @@ export function createConsumerSession(opts) {
       headers: [{ name: HDR_KEY_ID, value: input.keyId }],
       body: Buffer.from(JSON.stringify({ responseId: input.rid, epoch: input.epoch })),
     });
-    if (res.status !== 200) throw new WireError(res.status, res.json()?.code ?? "internal", res.json()?.message);
+    if (res.status !== 200) throw new WireError(res.status, wireErrorCode(res.json()), wireErrorMessage(res.json()));
     return res.json();
   }
 

@@ -29,6 +29,7 @@
 //    不读 argv；env 仅经注入面（ambient env 检测的判定源）。
 
 import path from "node:path";
+import { homedir } from "node:os";
 import { randomZ32 } from "./provider/z32.mjs";
 import { ProviderStore } from "./provider/store.mjs";
 import { SecretsStore } from "./provider/secrets.mjs";
@@ -87,6 +88,7 @@ export function validateAiConfig(values) {
  *   now?: () => number,
  *   env?: (name: string) => string | undefined,
  *   random?: (n: number) => string,
+ *   writerHome?: string,
  * }} opts
  */
 export async function createAiRuntime(opts = {}) {
@@ -97,6 +99,9 @@ export async function createAiRuntime(opts = {}) {
   const log = opts.log ?? (() => {});
   const env = opts.env ?? ((name) => process.env[name]);
   const random = opts.random ?? ((n) => randomZ32(n));
+  // claude-code 写手的配置根（~/.claude——真实用户 home；与 DWEB_HOME 独立。
+  // 测试注入 tmp 路径——绝不触真实用户目录）。
+  const writerHome = opts.writerHome ?? homedir();
   const dataDir = path.join(home, "plugins", "ai");
 
   // ---- 惰性存储面（构造零 IO——未启用 ai 的 sidecar 不建目录） --------------------
@@ -426,6 +431,59 @@ export async function createAiRuntime(opts = {}) {
   }
 
   /**
+   * 写手目标解析（endpointId → 活跃端点 + anthropic 路由投影）。要求端点正在
+   * 监听（写进配置的端口必须真实可用）；pattern 路由不参与写手 base 推导。
+   * @param {string} endpointId
+   * @returns {Promise<{ port: number, routes: Array<{ forms: string[], localPrefix: string }> }>}
+   */
+  async function writerTarget(endpointId) {
+    await loadEndpoints();
+    const entry = endpointsLedger.endpoints.find((e) => e.id === endpointId);
+    if (entry === undefined) {
+      throw Object.assign(new Error(`consumer endpoint '${endpointId}' not found`), { code: "not-found" });
+    }
+    if (!activeListeners.has(entry.id)) {
+      throw Object.assign(new Error(`local endpoint 127.0.0.1:${entry.port} is not listening (start it first)`), { code: "conflict" });
+    }
+    const kr = await keyring();
+    const provider = kr.findProvider(entry.providerEndpointId);
+    const service = /** @type {Array<Record<string, any>>} */ (provider?.services ?? []).find((s) => s?.serviceId === entry.serviceId);
+    const routes = /** @type {Array<Record<string, any>>} */ (service?.detail?.routes ?? [])
+      .filter((r) => (r?.mode ?? "prefix") !== "pattern")
+      .map((r) => ({ forms: Array.isArray(r?.forms) ? r.forms : [], localPrefix: typeof r?.localPrefix === "string" ? r.localPrefix : "" }));
+    return { port: entry.port, routes };
+  }
+
+  /**
+   * claude-code 写手预览（Phase D1：surgical 合成 + diff + sha256 令牌；不写盘）。
+   * @param {string} endpointId
+   */
+  async function previewWriter(endpointId) {
+    const { previewClaudeCodeWriter } = await import("./consumer/writers/claude-code.mjs");
+    const target = await writerTarget(endpointId);
+    const preview = await previewClaudeCodeWriter({ home: writerHome, ...target });
+    return { endpointId, ...preview };
+  }
+
+  /**
+   * claude-code 写手应用（令牌不符 → 409 stale-preview；文件不写任何真实凭证）。
+   * @param {string} endpointId
+   * @param {string} tokenSha256
+   */
+  async function applyWriter(endpointId, tokenSha256) {
+    const { applyClaudeCodeWriter, WriterError } = await import("./consumer/writers/claude-code.mjs");
+    const target = await writerTarget(endpointId);
+    try {
+      return await applyClaudeCodeWriter({ home: writerHome, ...target }, tokenSha256);
+    } catch (e) {
+      if (e instanceof WriterError && (e.code === "invalid_settings" || e.code === "stale_preview")) {
+        throw Object.assign(new Error(e.message), { code: e.code === "stale_preview" ? "stale-preview" : "invalid-settings" });
+      }
+      throw e;
+    }
+  }
+
+  /**
    * 消费方目录刷新（AUTH 回填 + catalog 快照）：逐 key 单独 AUTH（精确回填
    * keyId/group——多 key AUTH 响应不含 key→keyId 映射），再按首个有效 key 拉全量
    * catalog 更新服务快照。需要 fabric（宿主注入面 ensureStarted 惰性起）。
@@ -502,6 +560,8 @@ export async function createAiRuntime(opts = {}) {
       },
       startConsumerEndpoint,
       stopConsumerEndpoint,
+      previewWriter,
+      applyWriter,
     },
     fabric,
   });

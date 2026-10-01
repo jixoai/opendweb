@@ -66,6 +66,8 @@ function err(status, code, message) {
  *     loadEndpoints: () => Promise<Array<Record<string, unknown>>>,
  *     startConsumerEndpoint: (input: { providerEndpointId: string, serviceId: string, port: number }) => Promise<{ id: string, endpoint: Record<string, unknown> }>,
  *     stopConsumerEndpoint: (id: string) => Promise<{ removed: Record<string, unknown> }>,
+ *     previewWriter: (endpointId: string) => Promise<Record<string, unknown>>,
+ *     applyWriter: (endpointId: string, tokenSha256: string) => Promise<Record<string, unknown>>,
  *   },
  *   fabric: {
  *     identity?: () => Promise<{ endpointId: string, deviceName: string, relays?: Array<{ url: string }> } | null>,
@@ -201,6 +203,22 @@ export function createAiManagement(deps) {
         }
         return err(errorStatus(e), "internal", e instanceof Error ? e.message : String(e));
       }
+    }
+
+    // 上游探活（Phase D2：provider 本机经同一 hook 管线/auth 槽发最小请求；
+    // 结果三态脱敏投影——不含凭证与完整头）。
+    const probeMatch = /^\/services\/([a-zA-Z0-9_-]+)\/probe$/.exec(p);
+    if (method === "POST" && probeMatch !== null) {
+      const st = await store();
+      const service = st.getService(probeMatch[1]);
+      if (service === undefined) return err(404, "not-found", `service '${probeMatch[1]}' not found`);
+      const { probeUpstream } = await import("./provider/probe.mjs");
+      const out = await probeUpstream({
+        service,
+        secrets: (name) => secrets().get(name),
+        home: join(dataDir, "..", ".."),
+      });
+      return { status: 200, body: { serviceId: probeMatch[1], name: service.name, ...out } };
     }
 
     const serviceMatch = /^\/services\/([a-zA-Z0-9_-]+)$/.exec(p);
@@ -436,6 +454,43 @@ export function createAiManagement(deps) {
         return { status: 200, body: { ok: true } };
       } catch (e) {
         return err(errorStatus(e), /** @type {{code?: string}} */ (e)?.code ?? "internal", e instanceof Error ? e.message : String(e));
+      }
+    }
+
+    // ---- claude-code 写手（Phase D1：preview→diff 确认→apply） ----------------------
+
+    if (method === "POST" && p === "/consumer/writer/preview") {
+      const input = body ?? {};
+      if (typeof input.endpointId !== "string" || input.endpointId === "") {
+        return err(400, "invalid-request", "body must be {endpointId: string}");
+      }
+      try {
+        const out = await consumer.previewWriter(input.endpointId);
+        return { status: 200, body: out };
+      } catch (e) {
+        const code = /** @type {{code?: string}} */ (e)?.code;
+        if (code === "invalid-settings") return err(400, code, e instanceof Error ? e.message : String(e));
+        if (code === "not-found") return err(404, code, e instanceof Error ? e.message : String(e));
+        if (code === "conflict") return err(409, code, e instanceof Error ? e.message : String(e));
+        return err(errorStatus(e), code ?? "internal", e instanceof Error ? e.message : String(e));
+      }
+    }
+
+    if (method === "POST" && p === "/consumer/writer/apply") {
+      const input = body ?? {};
+      if (typeof input.endpointId !== "string" || input.endpointId === "" || typeof input.tokenSha256 !== "string" || input.tokenSha256 === "") {
+        return err(400, "invalid-request", "body must be {endpointId: string, tokenSha256: string}");
+      }
+      try {
+        const out = await consumer.applyWriter(input.endpointId, input.tokenSha256);
+        return { status: 200, body: { applied: true, ...out } };
+      } catch (e) {
+        const code = /** @type {{code?: string}} */ (e)?.code;
+        if (code === "stale-preview") return err(409, code, e instanceof Error ? e.message : String(e));
+        if (code === "invalid-settings") return err(400, code, e instanceof Error ? e.message : String(e));
+        if (code === "not-found") return err(404, code, e instanceof Error ? e.message : String(e));
+        if (code === "conflict") return err(409, code, e instanceof Error ? e.message : String(e));
+        return err(errorStatus(e), code ?? "internal", e instanceof Error ? e.message : String(e));
       }
     }
 

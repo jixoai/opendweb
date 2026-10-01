@@ -10,7 +10,9 @@
 // 等双向零过桥）；路由=预设白名单映射（未声明路径 404 path_not_offered 本地
 // 即拒、零触达上游）；SSE=字节流透明中继（逐块 flush——首块立发，后续按
 // 上游块边界即到即发（≤min(256KiB|50ms|上游块边界) 上界）；错误=OpenAI
-// 风格 error JSON（rate_limited/quota_exceeded 透传码）；本地断开→cancel+
+// 风格 error JSON（rate_limited/quota_exceeded 透传码）；提供方不可用族
+// （A 停用 plugin-disabled/离线传输失败）→ 502 upstream_unreachable 明确码
+// +固定脱敏文案（Phase D 顺手项——classifyLocalError）；本地断开→cancel+
 // 在途拉取 abort（取消双向传播）。
 
 import http from "node:http";
@@ -105,11 +107,39 @@ export function localErrorStatus(code) {
     case "aborted":
     case "idle_timeout":
       return 504;
+    case "upstream_unreachable":
+      return 502;
     case "auth_revoked":
       return 503;
     default:
       return 502;
   }
+}
+
+/**
+ * 提供方不可用族（Phase D 顺手项：「A 已停用」等会话错误的明确码化）：内核
+ * wpk 路由的 plugin-disabled/router-missing/unknown-plugin（503/404 族，A 停用
+ * 或摘牌）+ 会话层未识别的 internal（fabric 传输失败/A 离线）→ 本地 502
+ * upstream_unreachable（502 族明确码），文案固定脱敏（不透传原始错误文案与
+ * 头）。OpenAI 风格 error JSON 形态不变（openAiErrorBody）。
+ */
+const PROVIDER_UNAVAILABLE_CODES = new Set(["plugin-disabled", "router-missing", "unknown-plugin", "internal"]);
+
+/**
+ * 会话错误 → 本地回复三元组（状态/码/文案）。
+ * @param {{ code?: string | null, message?: string | null }} err
+ * @returns {{ status: number, code: string, message: string }}
+ */
+export function classifyLocalError(err) {
+  const code = typeof err?.code === "string" && err.code !== "" ? err.code : "internal";
+  if (PROVIDER_UNAVAILABLE_CODES.has(code)) {
+    return {
+      status: 502,
+      code: "upstream_unreachable",
+      message: "the provider endpoint is unreachable, offline, or its ai plugin is not running",
+    };
+  }
+  return { status: localErrorStatus(code), code, message: err?.message ?? code };
 }
 
 /**
@@ -285,7 +315,10 @@ export function createConsumerGateway(opts) {
             if (!res.writableEnded) res.end();
           },
           onError(err) {
-            reply(localErrorStatus(err.code), err.code, err.message ?? err.code);
+            // 分族：提供方不可用族（A 停用/离线）→ 502 upstream_unreachable
+            // 明确码+固定脱敏文案（Phase D 顺手项）；其余按 localErrorStatus。
+            const classified = classifyLocalError(err);
+            reply(classified.status, classified.code, classified.message);
           },
         },
       );

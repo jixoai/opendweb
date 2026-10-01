@@ -899,6 +899,62 @@ export function stopAiConsumerEndpoint(id: string): Promise<{ ok: true }> {
 	return jsonFetch(`/sidecar/plugins/ai/consumer/endpoints/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
 }
 
+// ---- claude-code 写手 + 上游探活（ai-subscription-sharing Phase D） ------------------
+
+/** claude-code 写手预览（不写盘；tokenSha256=sha256(diff)——apply 前置确认令牌）。 */
+export interface AiWriterPreview {
+	endpointId: string;
+	agent: "claude-code";
+	path: string;
+	exists: boolean;
+	baseUrl: string;
+	before: string | null;
+	after: string;
+	diff: string;
+	tokenSha256: string;
+}
+
+/** POST /sidecar/plugins/ai/consumer/writer/preview（真实凭证绝不入产物——token 恒占位符）。 */
+export function previewAiWriter(endpointId: string): Promise<AiWriterPreview> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/writer/preview", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ endpointId }),
+	}) as Promise<AiWriterPreview>;
+}
+
+/** POST /sidecar/plugins/ai/consumer/writer/apply（令牌不符=409 stale-preview；预览后盘面被并发改动同样拒绝）。 */
+export function applyAiWriter(endpointId: string, tokenSha256: string): Promise<{ applied: true; agent: "claude-code"; path: string; baseUrl: string }> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/writer/apply", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ endpointId, tokenSha256 }),
+	}) as Promise<{ applied: true; agent: "claude-code"; path: string; baseUrl: string }>;
+}
+
+/** 上游探活三态结果（脱敏投影——零头表零原始错误文案）。 */
+export interface AiServiceProbeResult {
+	serviceId: string;
+	name: string;
+	state: "reachable" | "unreachable" | "no_auth";
+	/** reachable：上游应答的 HTTP 状态（任意状态即达）。 */
+	status?: number;
+	/** unreachable/no_auth：原因码（upstream_unreachable/timeout/hook_failed/path_not_offered/protocol_error | keyenv_unbound/secret_missing）。 */
+	reason?: string;
+	/** no_auth(keyenv_unbound)：待绑定的环境变量名提示。 */
+	keyEnv?: string;
+	ms: number;
+}
+
+/** POST /sidecar/plugins/ai/services/<id>/probe（provider 本机经同一 hook 管线发最小请求，超时 5s）。 */
+export function probeAiService(serviceId: string): Promise<AiServiceProbeResult> {
+	return jsonFetch(`/sidecar/plugins/ai/services/${encodeURIComponent(serviceId)}/probe`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: "{}",
+	}) as Promise<AiServiceProbeResult>;
+}
+
 
 // ---- /api/* 业务代理面（wire 冻结于 sdk-mgmt-surface specs/server） -----------
 

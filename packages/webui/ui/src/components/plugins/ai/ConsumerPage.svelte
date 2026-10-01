@@ -1,9 +1,11 @@
 <script lang="ts">
-	// ai 插件·消费方页（ai-subscription-sharing Phase C / design §6 consumer 页）。
+	// ai 插件·消费方页（ai-subscription-sharing Phase C / design §6 consumer 页；
+	// Phase D 写手区接真）。
 	// 纯展示组件：数据与动作经 ctl（plugins-ai-controller）注入；页面零 fetch。
 	// 分区：接入（贴 aifly1. 链接 / 邀请+密钥分开输入）→ 目录列表（钥环快照 +
 	// AUTH/catalog 刷新）→ 本地端点（端口管理——冲突真实报错，不静默换端口）→
-	// claude-code 写手入口（Phase D 接入——占位说明）。
+	// claude-code 写手（Phase D：选端点 → 预览 diff → 确认应用；token 恒占位符
+	// sk-aifly-local——真实凭证绝不写进 ~/.claude/settings.json）。
 	// 凭证纪律：粘贴的链接/密钥提交后即刻清空、不回显（钥环列表只有掩码）；
 	// 本页不落任何凭证到 localStorage。
 	import * as Alert from "$lib/components/ui/alert";
@@ -113,6 +115,17 @@
 			name: typeof s.name === "string" ? s.name : "",
 			port: typeof s.defaultPort === "number" ? s.defaultPort : "—",
 		}));
+	}
+
+	// ---- claude-code 写手（Phase D1：选端点 → 预览 diff → 确认应用） -------------------
+
+	let writerEndpointId = $state("");
+
+	const listeningEndpoints = $derived((data?.endpoints ?? []).filter((e) => e.listener === "listening"));
+
+	async function applyWriter(): Promise<void> {
+		await ctl.applyWriter();
+		if (ctl.writerApplied !== null) toast.success(`已写入 ${ctl.writerApplied.path}（token=占位符）`);
 	}
 </script>
 
@@ -296,9 +309,75 @@
 
 		<Card.Root>
 			<Card.Header>
-				<Card.Title class="flex items-center gap-2"><PenLine class="size-4 text-muted-foreground" /> 写手接入（Phase D）</Card.Title>
-				<Card.Description>claude-code 写手（预览 → diff → 应用，占位符 token）在 Phase D 接入——届时可一键把本地端点写进工具配置。</Card.Description>
+				<Card.Title class="flex items-center gap-2"><PenLine class="size-4 text-muted-foreground" /> claude-code 写手</Card.Title>
+				<Card.Description>
+					把选中本地端点写进 <span class="font-mono text-xs">~/.claude/settings.json</span> 的
+					<span class="font-mono text-xs">env.ANTHROPIC_BASE_URL</span>；token 恒为占位符
+					<span class="font-mono text-xs">sk-aifly-local</span>（真实凭证绝不写入——本地网关剥离凭据头，跨网凭证走钥环）。
+					先预览 diff，确认后才落盘。
+				</Card.Description>
 			</Card.Header>
+			<Card.Content class="flex flex-col gap-3" data-writer-section>
+				{#if listeningEndpoints.length === 0}
+					<p class="text-sm text-muted-foreground">没有监听中的本地端点——先在上方「本地端点」启动一个。</p>
+				{:else}
+					<div class="flex flex-wrap items-end gap-2.5">
+						<div class="flex min-w-56 flex-col gap-1.5">
+							<Label for="ai-writer-endpoint">本地端点</Label>
+							<select id="ai-writer-endpoint" class="dark:bg-input/30 border-input focus-visible:border-ring focus-visible:ring-ring/50 h-9 w-full rounded-md border bg-transparent px-2.5 py-1 text-sm shadow-xs outline-none focus-visible:ring-3" bind:value={writerEndpointId} disabled={ctl.writerBusy}>
+								<option value="">选择端点…</option>
+								{#each listeningEndpoints as ep (ep.id)}
+									<option value={ep.id}>{ep.name} · 127.0.0.1:{ep.port}</option>
+								{/each}
+							</select>
+						</div>
+						<Button size="sm" variant="outline" disabled={ctl.writerBusy || writerEndpointId === ""} onclick={() => void ctl.previewWriter(writerEndpointId)} data-action="ai-writer-preview">
+							<Play class="size-3.5" /> 预览改动
+						</Button>
+					</div>
+
+					{#if ctl.writerError !== null}
+						<Alert.Root variant="destructive" data-writer-error>
+							<CircleAlert />
+							<Alert.Title>写手操作失败</Alert.Title>
+							<Alert.Description>{ctl.writerError}</Alert.Description>
+						</Alert.Root>
+					{/if}
+
+					{#if ctl.writerPreview !== null}
+						{@const preview = ctl.writerPreview}
+						<div class="flex flex-col gap-2 rounded-lg border p-3" data-writer-diff>
+							<div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+								<span class="font-medium text-foreground">{preview.path}</span>
+								<Badge variant="outline" class="border-muted-foreground/30 text-muted-foreground">{preview.exists ? "已存在，surgical 合并" : "新建"}</Badge>
+								<code class="font-mono">base = {preview.baseUrl}</code>
+							</div>
+							{#if preview.diff === ""}
+								<p class="text-sm text-muted-foreground">无变更——配置已是目标状态（可直接关闭）。</p>
+							{:else}
+								<pre class="max-h-72 overflow-auto rounded-md bg-muted/60 p-3 font-mono text-xs leading-relaxed">{preview.diff}</pre>
+							{/if}
+							<div class="flex flex-wrap items-center gap-2">
+								<Button size="sm" disabled={ctl.writerBusy || preview.diff === ""} onclick={() => void applyWriter()} data-action="ai-writer-apply">
+									{#if ctl.writerBusy}写入中…{:else}确认应用（写入文件）{/if}
+								</Button>
+								<Button size="sm" variant="ghost" disabled={ctl.writerBusy} onclick={() => ctl.closeWriterView()}>取消</Button>
+								<span class="text-xs text-muted-foreground">令牌 sha256:{preview.tokenSha256.slice(0, 12)}…（预览后文件被改动会拒绝写入）</span>
+							</div>
+						</div>
+					{/if}
+
+					{#if ctl.writerApplied !== null}
+						<div class="flex flex-col gap-1.5 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-3" data-writer-applied>
+							<p class="text-sm font-medium text-emerald-600 dark:text-emerald-400">已写入 {ctl.writerApplied.path}</p>
+							<p class="font-mono text-xs text-muted-foreground">ANTHROPIC_BASE_URL = {ctl.writerApplied.baseUrl} · ANTHROPIC_AUTH_TOKEN = sk-aifly-local（占位符）</p>
+							<div>
+								<Button size="sm" variant="ghost" onclick={() => ctl.closeWriterView()}>知道了</Button>
+							</div>
+						</div>
+					{/if}
+				{/if}
+			</Card.Content>
 		</Card.Root>
 	{/if}
 
