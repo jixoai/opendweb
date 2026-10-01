@@ -101,11 +101,13 @@ test("C-2: refreshProviders 的 error 投影经 sanitizeError（注入 fabric �
     now: () => Date.now(),
     fabric: {
       identity: { endpointId: "consumer1", endpointIdHex: "a".repeat(64) },
-      fetchImpl: async () => {
+      // r3-P2-4：字段名对齐 runtime 注入面（fetchHttpImpl+sessionResolver 返回
+      // 真会话）——探针直达声明的 transport 异常路径
+      fetchHttpImpl: async () => {
         throw new Error("/absolute/plugins/ai/keyring.json transport failed");
       },
+      sessionResolver: async () => ({ id: "sess1" }),
       ensureStarted: async () => {},
-      sessionResolver: async () => null,
       issueInvite: async () => "dweb1.invite",
     },
   });
@@ -117,7 +119,7 @@ test("C-2: refreshProviders 的 error 投影经 sanitizeError（注入 fabric �
     JSON.stringify({ v: 1, providers: [{ endpointId: "prov1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", alias: "p", relayUrls: [], keys: [{ keyId: "k1", key: "sk-aifly-testkey-0001", group: "family" }], services: [] }] }),
     { mode: 0o600 },
   );
-  await rt.start().catch(() => {});
+  await rt.start().catch((e) => logs.push(`start: ${e?.message ?? e}`));
   const out = await rt.mgmt.handle("POST", "/consumer/refresh", new URLSearchParams(), { providerRef: "prov1aaaaaaaa" });
   assert.equal(out.status, 404);
   const bodyText = JSON.stringify(out.body);
@@ -125,4 +127,61 @@ test("C-2: refreshProviders 的 error 投影经 sanitizeError（注入 fabric �
   assert.ok(!bodyText.includes("keyring.json"), "文件名不得进入响应");
   await rt.stop().catch(() => {});
   await fsp.rm(home, { recursive: true, force: true });
+});
+
+// ---- r3 残余：P0-1 writer preview 掩码 / P1-2 声明面 save 终审 / P1-3 目录投影 ----
+
+test("r3-P0-1: writer preview 零既有凭证（before/diff 掩码+token 对 canonical+apply 不写掩码）", async () => {
+  const { previewClaudeCodeWriter, applyClaudeCodeWriter } = await import("../src/consumer/writers/claude-code.mjs");
+  const home = await tmpDir();
+  const settings = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settings), { recursive: true });
+  const REAL = "sk-aifly-REAL-KEY-MATERIAL";
+  fs.writeFileSync(settings, JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: REAL, OTHER: "keepme-long-value-1234" } }, null, 2));
+  const target = { home, port: 14399 };
+  const pv = await previewClaudeCodeWriter(target);
+  const blob = JSON.stringify(pv) + pv.diff;
+  assert.ok(!blob.includes(REAL), "既有凭证（敏感键/sk- 前缀）不得进入 preview 响应");
+  assert.ok(blob.includes("keepme-long-value-1234"), "非敏感键保持可见（preview 的展示职责）");
+  assert.ok(pv.diff.includes("ANTHROPIC_BASE_URL"), "diff 仍展示结构变更");
+  // apply：token 对 canonical——预览后未改盘面 → 成功；落盘保留其它 env 真值 + token 占位符
+  const ap = await applyClaudeCodeWriter(target, pv.tokenSha256);
+  const applied = JSON.parse(fs.readFileSync(settings, "utf8"));
+  assert.equal(applied.env.OTHER, "keepme-long-value-1234", "apply 写 canonical（其它 env 真值保留）");
+  assert.equal(applied.env.ANTHROPIC_AUTH_TOKEN, "sk-aifly-local", "token 占位符");
+  assert.ok(String(applied.env.ANTHROPIC_BASE_URL).startsWith("http://127.0.0.1:14399"));
+  await fsp.rm(home, { recursive: true, force: true });
+});
+
+test("r3-P1-2: 公开 data+save 的 $env 声明（auth.literal 与 headers.set）被落盘终审拒绝", async () => {
+  const dir = await tmpDir();
+  const store = await ProviderStore.open(dir, { secretsSource: () => true });
+  await store.addService(baseService());
+  const rev = store.data.revision;
+  // ① auth.literal $env（schema 终审或槽规范化拒绝均可——关键=fail-closed）
+  store.data.services[0].auth = { literal: "$env:LEAK" };
+  await assert.rejects(() => store.save(), /schema|\$env|invalid/i);
+  // ② headers.set $env（不在激活门投影内——靠 save 终审）
+  store.data.services[0].auth = { secret: "bound-secret" };
+  store.data.services[0].headers = { set: { "x-key": "$env:LEAK" } };
+  await assert.rejects(() => store.save(), /schema|\$env|invalid/i);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(dir, "services.json"), "utf8"));
+  assert.equal(onDisk.revision, rev, "盘上 revision 不变");
+  assert.equal(onDisk.services[0].headers, undefined, "非法 headers 未落盘");
+  // 合法形态对照：headers.set 普通字面量放行
+  store.data.services[0].headers = { set: { "x-trace": "abc" } };
+  await store.save();
+  await fsp.rm(dir, { recursive: true, force: true });
+});
+
+test("r3-P1-3: 恶意目录快照（钥环/GET /consumer）零凭证外泄", async () => {
+  const { safeCatalogEntry } = await import("../src/provider/detail.mjs");
+  const RAW = "sk-aifly-RAW-CATALOG-CREDENTIAL";
+  const entry = { serviceId: "s1", name: "n", match: [{ type: "suffix", value: ".x.com" }], defaultPort: 4310, detail: { upstream: "http://x/", custom: RAW, auth: { literal: RAW } } };
+  const safe = safeCatalogEntry(entry);
+  const blob = JSON.stringify(safe);
+  assert.ok(!blob.includes(RAW), "恶意快照凭证不得进入投影");
+  assert.equal(safe.detail.auth, "●");
+  assert.equal(safe.detail.custom, undefined, "未知键丢弃");
+  assert.equal(safeCatalogEntry({ serviceId: 1 }), null, "坏形状 fail-closed");
 });

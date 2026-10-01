@@ -238,11 +238,10 @@ export function sha256Hex(text) {
 // ---------------------------------------------------------------------------
 
 /**
- * 预览（不写盘）：读当前盘面 → 合成新内容 → diff + 确认令牌（sha256(diff)）。
+ * 内部 canonical 预览（不写盘、不掩码）——apply 写盘与令牌比对的唯一源。
  * @param {{ home: string, port: number, routes?: WriterTarget["routes"] }} target
- * @returns {Promise<{ agent: "claude-code", path: string, exists: boolean, baseUrl: string, before: string | null, after: string, diff: string, tokenSha256: string }>}
  */
-export async function previewClaudeCodeWriter(target) {
+async function computeWriterPreview(target) {
   const path = claudeCodeSettingsPath(target.home);
   const baseUrl = anthropicBaseUrl(target.port, target.routes ?? []);
   let before = null;
@@ -255,7 +254,49 @@ export async function previewClaudeCodeWriter(target) {
   }
   const after = composeClaudeCodeSettings(before, baseUrl);
   const diff = unifiedDiff(before ?? "", after, path, path);
-  return { agent: "claude-code", path, exists: before !== null, baseUrl, before, after, diff, tokenSha256: sha256Hex(diff) };
+  return { path, baseUrl, before, after, diff, tokenSha256: sha256Hex(diff) };
+}
+
+/**
+ * 预览（不写盘，**响应面**）：r3-P0-1——before/after/diff 全走掩码视图，既有
+ * settings.json 敏感值（env 块取值）不得进入浏览器状态；确认令牌仍对未掩码
+ * canonical diff 哈希（apply 侧按盘面重算比对，掩码不影响令牌链）。
+ * @param {{ home: string, port: number, routes?: WriterTarget["routes"] }} target
+ * @returns {Promise<{ agent: "claude-code", path: string, exists: boolean, baseUrl: string, before: string | null, after: string, diff: string, tokenSha256: string }>}
+ */
+export async function previewClaudeCodeWriter(target) {
+  const canonical = await computeWriterPreview(target);
+  const beforeMasked = canonical.before !== null ? maskSensitiveSettings(canonical.before) : null;
+  const afterMasked = maskSensitiveSettings(canonical.after);
+  const diffMasked = unifiedDiff(beforeMasked ?? "", afterMasked, canonical.path, canonical.path);
+  return { agent: "claude-code", path: canonical.path, exists: canonical.before !== null, baseUrl: canonical.baseUrl, before: beforeMasked, after: afterMasked, diff: diffMasked, tokenSha256: canonical.tokenSha256 };
+}
+
+/**
+ * 敏感值掩码（r3-P0-1）：settings.json 的 env 块中**敏感键**（token/key/
+ * secret/password/credential 类）取值与 `sk-` 前缀值一律固定掩码——展示面零
+ * 既有凭证；非敏感键（如 ANTHROPIC_BASE_URL——预览的核心展示对象）保持
+ * 可见。掩码仅用于响应展示；apply 写盘走 canonical+占位符。
+ * @param {string} text
+ * @returns {string}
+ */
+export function maskSensitiveSettings(text) {
+  const MASK = "●●●●";
+  const sensitiveKey = (k) => /token|key|secret|password|credential|auth/i.test(k);
+  const PLACEHOLDER = "sk-aifly-local";
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return text.replace(/"(sk-[^"\\]{8,})"/g, (m, v) => (v === PLACEHOLDER ? m : `"${MASK}"`));
+  }
+  if (obj === null || typeof obj !== "object" || Array.isArray(obj)) return text;
+  if (obj.env !== null && typeof obj.env === "object" && !Array.isArray(obj.env)) {
+    obj.env = Object.fromEntries(
+      Object.entries(obj.env).map(([k, v]) => [k, v === PLACEHOLDER ? v : sensitiveKey(k) || (typeof v === "string" && v.startsWith("sk-")) ? MASK : v]),
+    );
+  }
+  return `${JSON.stringify(obj, null, 2)}\n`;
 }
 
 /**
@@ -268,10 +309,11 @@ export async function applyClaudeCodeWriter(target, expectedSha256) {
   if (typeof expectedSha256 !== "string" || expectedSha256 === "") {
     throw new WriterError("stale_preview", "expectedSha256 is required (preview first, then confirm the diff)");
   }
-  const preview = await previewClaudeCodeWriter(target);
-  if (preview.tokenSha256 !== expectedSha256) {
+  // canonical（未掩码）重算：令牌比对与写盘同源——掩码视图绝不出现在写盘面
+  const canonical = await computeWriterPreview(target);
+  if (canonical.tokenSha256 !== expectedSha256) {
     throw new WriterError("stale_preview", "configuration changed since preview (or the token does not match); preview again and confirm the new diff");
   }
-  await atomicWrite0600(preview.path, preview.after);
-  return { agent: "claude-code", path: preview.path, baseUrl: preview.baseUrl };
+  await atomicWrite0600(canonical.path, canonical.after);
+  return { agent: "claude-code", path: canonical.path, baseUrl: canonical.baseUrl };
 }

@@ -135,3 +135,73 @@ export function detailDisplayLines(detail) {
   if (detail.hooks !== undefined) lines.push(`hooks: preset <hidden>`);
   return lines;
 }
+
+// ---------------------------------------------------------------------------
+// 消费侧目录安全投影（r3-P1-3）
+// ---------------------------------------------------------------------------
+
+/**
+ * 钥环/链接快照里的目录条目 → 浏览器安全视图（fail-closed）。
+ * 顶层只保留白名单字段；detail 重建白名单键——auth/headers/request/response/
+ * hooks 一律掩码（合法条目本就是提供方掩码产物；恶意/旧快照的任何取值形态
+ * 都不得原样进入响应）。形状不符=返回 null（调用方丢弃该条目）。
+ * @param {unknown} entry
+ * @returns {{ serviceId: string, name: string, match: {type: string, value: string}[], defaultPort: number, detail?: Record<string, unknown> } | null}
+ */
+export function safeCatalogEntry(entry) {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const e = /** @type {Record<string, unknown>} */ (entry);
+  if (typeof e.serviceId !== "string" || e.serviceId === "" || e.serviceId.length > 128) return null;
+  if (typeof e.name !== "string" || e.name === "" || e.name.length > 256) return null;
+  if (!Number.isInteger(e.defaultPort) || /** @type {number} */ (e.defaultPort) < 1 || /** @type {number} */ (e.defaultPort) > 65535) return null;
+  if (!Array.isArray(e.match) || e.match.length > 64) return null;
+  const match = [];
+  for (const m of e.match) {
+    if (m === null || typeof m !== "object") return null;
+    const mm = /** @type {Record<string, unknown>} */ (m);
+    if (typeof mm.type !== "string" || typeof mm.value !== "string" || mm.value.length > 2048) return null;
+    match.push({ type: mm.type, value: mm.value });
+  }
+  const out = { serviceId: e.serviceId, name: e.name, match, defaultPort: /** @type {number} */ (e.defaultPort) };
+  if (e.detail !== null && typeof e.detail === "object" && !Array.isArray(e.detail)) {
+    const d = /** @type {Record<string, unknown>} */ (e.detail);
+    const safe = /** @type {Record<string, unknown>} */ ({});
+    if (typeof d.upstream === "string" && d.upstream.length <= 2048) safe.upstream = d.upstream;
+    if (Array.isArray(d.match)) {
+      safe.match = d.match
+        .filter((m) => m !== null && typeof m === "object" && typeof /** @type {Record<string, unknown>} */ (m).type === "string" && typeof /** @type {Record<string, unknown>} */ (m).value === "string")
+        .map((m) => ({ type: /** @type {Record<string, unknown>} */ (m).type, value: /** @type {Record<string, unknown>} */ (m).value }));
+    }
+    if (d.rewrite !== null && typeof d.rewrite === "object" && !Array.isArray(d.rewrite)) {
+      safe.rewrite = Object.fromEntries(
+        Object.entries(/** @type {Record<string, unknown>} */ (d.rewrite))
+          .filter(([, v]) => typeof v === "string" && v.length <= 512)
+          .map(([k, v]) => [k, /** @type {string} */ (v)]),
+      );
+    }
+    if (Array.isArray(d.routes)) {
+      safe.routes = d.routes.map((r) => {
+        if (r === null || typeof r !== "object") return { forms: [], localPrefix: "/", upstreamPrefix: "/" };
+        const rr = /** @type {Record<string, unknown>} */ (r);
+        const forms = Array.isArray(rr.forms) ? rr.forms.filter((f) => typeof f === "string") : [];
+        if (rr.mode === "pattern") {
+          return {
+            forms,
+            mode: "pattern",
+            matchPattern: typeof rr.matchPattern === "string" ? rr.matchPattern : "",
+            template: typeof rr.template === "string" ? rr.template : "",
+          };
+        }
+        return { forms, localPrefix: typeof rr.localPrefix === "string" ? rr.localPrefix : "/", upstreamPrefix: typeof rr.upstreamPrefix === "string" ? rr.upstreamPrefix : "/" };
+      });
+    }
+    // 凭证/脚本承载键：存在即掩码——绝不透传任何取值形态
+    if ("auth" in d) safe.auth = SERVICE_VALUE_MASK;
+    if ("headers" in d) safe.headers = SERVICE_VALUE_MASK;
+    if ("request" in d) safe.request = SERVICE_VALUE_MASK;
+    if ("response" in d) safe.response = SERVICE_VALUE_MASK;
+    if ("hooks" in d) safe.hooks = SERVICE_VALUE_MASK;
+    out.detail = safe;
+  }
+  return out;
+}

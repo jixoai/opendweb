@@ -17,7 +17,7 @@
 
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { buildServiceDetail, buildServiceEntry } from "./provider/detail.mjs";
+import { buildServiceDetail, buildServiceEntry, safeCatalogEntry } from "./provider/detail.mjs";
 import { stageAiflyConfig, commitAiflyImport, envRefName } from "./provider/importer.mjs";
 import { loadCuratedPresets } from "./presets/models-dev.mjs";
 import { StoreError } from "./provider/store.mjs";
@@ -180,7 +180,11 @@ export function createAiManagement(deps) {
             endpointId: provider.endpointId,
             alias: provider.alias,
             keys: provider.keys.map((k) => ({ keyId: k.keyId, group: k.group, masked: maskKey(k) })),
-            services: provider.services,
+            // r3-P1-3：目录快照走 fail-closed 安全投影（恶意/旧快照零凭证外泄；
+            // 形状不符条目丢弃而非透传）
+            services: Array.isArray(provider.services)
+              ? provider.services.map((s) => safeCatalogEntry(s)).filter((s) => s !== null)
+              : [],
           })),
           endpoints: await consumer.loadEndpoints(),
         },

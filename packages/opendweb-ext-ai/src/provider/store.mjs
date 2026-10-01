@@ -727,6 +727,19 @@ export class ProviderStore {
    * 已启用且安全面未变的存量写路径不重判（secret 事后移除不得毒化无关写）。
    */
   async save() {
+    // r3-P1-2：落盘前对**全部**服务做声明面终审——schema 复解析（构造期
+    // $env:/headers.set 拒绝在 normalizeAuthSlot/normalizeHeadersSlot 内）+
+    // SERVICE_STORE_SCHEMA 全量校验。公开 data+save() 的任何直接变更（含
+    // 已启用服务、headers 等不在激活门投影内的字段）都不得写入非法形态；
+    // 失败=StoreError（fail-closed 零写入，revision/文件/基线不变）。
+    for (const service of this.data.services) {
+      const checked = SERVICE_STORE_SCHEMA.safeParse(service);
+      if (!checked.success) {
+        throw new StoreError("invalid", "error: service failed schema validation on save (public data mutations must stay valid)");
+      }
+      normalizeAuthSlot(checked.data.auth);
+      normalizeHeadersSlot(checked.data.headers);
+    }
     const baseline = this.#persistedEnabled ?? new Map();
     for (const service of this.data.services) {
       if (service.enabled === false) continue;

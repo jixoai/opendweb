@@ -115,10 +115,16 @@ export async function importLink(link, opts) {
   if (opts.fabric !== undefined && typeof opts.fabric.fetchImpl !== "function") {
     throw new JoinError("fabric injection face must be {fetchImpl} (host-assembled in Phase C)");
   }
+  // r3-P1-3：链接内目录快照入环前过 fail-closed 投影（恶意链接零凭证入环；
+  // 形状不符条目丢弃）
+  const { safeCatalogEntry } = await import("../provider/detail.mjs");
+  const services = (Array.isArray(payload.services) ? payload.services : [])
+    .map((s) => safeCatalogEntry(s))
+    .filter((s) => s !== null);
   opts.keyring.upsertProvider(
     { endpointId: payload.provider.endpointId, alias: payload.provider.alias, relayUrls: payload.provider.relayUrls },
     { keyId: payload.keyId, key: payload.key, group: payload.group },
-    /** @type {Array<Record<string, any>>} */ (payload.services),
+    services,
   );
   await opts.keyring.save();
   return { payload };

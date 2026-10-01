@@ -136,3 +136,11 @@
 - 测试内显式回收：relay 用例逐个 `relay.dispose()`；P2-2 用例断言 stop 后
   全部 listener=stopped 且**在测试体内证明失败路径 listener close**（同端口
   重试成功=端口真实释放）；上游 listener `t.after(() => up.close())`。
+
+## r3 处置追加（2026-10-02，编排者直修）
+
+- P0-1：preview/apply 拆 canonical（内部，写盘+令牌源）与展示面（掩码：敏感键名[auth/token/key/secret/password/credential]取值+sk- 前缀值→●●●●；占位符 sk-aifly-local 豁免；非敏感键如 BASE_URL 保持可见）；回归=既有真实 token 零入响应+apply 写 canonical 保留其它 env 真值+占位符。
+- P1-2：save() 落盘前全服务 SERVICE_STORE_SCHEMA 终审+槽规范化（auth.literal/headers.set 的 $env 双探针拒绝，revision/盘上不变；普通字面量放行）。
+- P1-3：detail.mjs 新增 safeCatalogEntry（顶层白名单+detail 重建白名单键+凭证/脚本键恒掩码+坏形状 null）；GET /consumer 与 join.importLink 两侧接入（恶意快照零凭证外泄回归）。
+- P2-4：C-2 夹具修正（fetchHttpImpl+sessionResolver 真会话+start 异常记录）。
+- 门：ext-ai 158/158（两轮稳定）· webui 267/267。
