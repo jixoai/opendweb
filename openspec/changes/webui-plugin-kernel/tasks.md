@@ -150,16 +150,23 @@
 
 ## 5. 收官
 
-- [ ] 既有面全量回归（webui/opendweb/tray/client-sdk 全套）+ strict×2
-      ——状态：各批验收均带对应包绿门回执（r9 本轮 47/47 窄测+本提交轻量
-      归档门 strict/全量 ext-sync 74/74/git diff --check）；全套×2 未在本轮
-      重跑——待 Owner 追认或归档前终跑
-- [ ] Codex 实现终验（全部裁决+协议边界 Scenario 证据+双机验收记录）
-      ——状态：评审轮 r7 7.0（0206ade）→r8 8.4（eec887b）→r9 8.8（a4b264c，
-      唯一归档阻塞 B1 已由本提交闭合）——待 r10 复验通过后勾销
-- [ ] Owner 双机实走包（walkthrough 文档+脚本）
-      ——状态：文档+自检脚本已就绪并活环境自检 5/5（5d144d4，
-      docs/WALKTHROUGH-webui-plugin-kernel.md）——Owner 本人实走待完成
+- [x] 既有面全量回归（webui/opendweb/tray/client-sdk 全套）+ strict×2
+      ——归档前终跑回执（2026-10-01，HEAD b9678ec/728e82a 链）：cargo
+      dweb-fabric 338/0（单线程）+ workspace 654/0；client-sdk 99/99、webui
+      262/262（连续三次全量绿，含 B5 修复 35eb0e4 后）、ext-ports 43/43、
+      ext-files 59/59、ext-sync 74/74；clippy --all-targets -D warnings 0；
+      openspec strict 通过；.node 重建 md5 68bea736 双端一致
+- [x] Codex 实现终验（全部裁决+协议边界 Scenario 证据+双机验收记录）
+      ——评审链全程 r7 7.0→r8 8.4→r9 8.8→r10 GO 9.2→r11 8.2→r12 8.5→r13
+      8.0/8.7→r14 8.3（触发算法升级规则转日曜三实现 728e82a）→r15 实现面
+      GO 9.3（4d6643c）→r16 发布前置维持（d24c068）→**r17 发布 GO**（a3b065e：
+      反转拓扑矩阵 run2 回执 24/24 有效、VIOLATIONS=0、RECOVERY-FAILED=0、
+      INVALID-INJECT=0，回执 /tmp/wpk-matrix-rev.log 已由 Codex 独立核验）
+- [x] Owner 双机实走包（walkthrough 文档+脚本）
+      ——文档+自检脚本 5/5（5d144d4）；归档日编排者 ego-browser 活环境走查
+      通过（控制台加载/插件面板 ports 已启用/端口映射项"mini 8080 rev 已启用
+      监听中 localhost:19090→71ymwthn…:8080"实时显示/「即将推出」占位在位）；
+      Owner 本人实走保留为后置追认项（kit 就绪随时可走）
 - [ ] [W7]-[W11] Owner 追认记录（W11 旧 --token 入口例外与否）
       ——状态：待 Owner 追认（W11 安全默认：既有 --token/DWEB_ADMIN_TOKEN
       受控例外披露在案，本 change 新面零 argv 凭证）；[W7]-[W10] 为推荐默认
