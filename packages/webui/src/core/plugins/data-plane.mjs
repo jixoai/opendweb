@@ -1,5 +1,6 @@
-// 三插件运行时组装（webui-plugin-kernel 收官接线 / design v2.3 §1+§3.2）。
-// 意图（2026-09-29）：
+// 插件运行时组装（webui-plugin-kernel 收官接线 / design v2.3 §1+§3.2；
+// ai 接线=ai-subscription-sharing Phase C）。
+// 意图（2026-09-29；ai 增补 2026-10-01）：
 // 1. 三个 ext 包工厂的单一装配点：createPortsRuntime/createFilesRuntime/
 //    createSyncRuntime 经注入面共享同一 fabric 宿主——消费侧 sessionResolver
 //    同源（ports 映射代理与 sync 拉取推送到同一对端用同一缓存会话）、提供侧
@@ -74,7 +75,7 @@ function toSyncFetch(fetchHttp) {
  * }} opts
  * @returns {Promise<{
  *   channel: Record<string, { onEnable: (ctx: { home: string, dataDir: string }) => Promise<void>, onDispose: () => Promise<void> }>,
- *   management: { ports: object, files: object, sync: object | null, syncUnavailable: string | null },
+ *   management: { ports: object, files: object, sync: object | null, syncUnavailable: string | null, ai: object },
  * }>}
  */
 export async function buildPluginRuntimes(opts) {
@@ -82,11 +83,12 @@ export async function buildPluginRuntimes(opts) {
   const log = opts.log ?? (() => {});
   const now = opts.now ?? (() => Date.now());
 
-  // 惰性加载（见头注 5；三包并行动态 import——真实面=workspace 链接）
-  const [{ createPortsRuntime }, { createFilesRuntime }, { createSyncRuntime }] = await Promise.all([
+  // 惰性加载（见头注 5；四包并行动态 import——真实面=workspace 链接）
+  const [{ createPortsRuntime }, { createFilesRuntime }, { createSyncRuntime }, { createAiRuntime }] = await Promise.all([
     import("@jixo/opendweb-ext-ports"),
     import("@jixo/opendweb-ext-files"),
     import("@jixo/opendweb-ext-sync"),
+    import("@jixo/opendweb-ext-ai"),
   ]);
 
   const ports = await createPortsRuntime({
@@ -102,6 +104,24 @@ export async function buildPluginRuntimes(opts) {
     now,
     log: (line) => log(`files: ${line}`),
     resolvePeer: (sessionId) => fabric.resolvePeerBySession(sessionId),
+  });
+
+  // ai（ai-subscription-sharing Phase C / design §1 双姿态共存互不排斥）：
+  // provider 面恒装配（构造零副作用——惰性开账本）；consumer 面按钥环/端点
+  // 账本存在性装配（member 姿态主用例）。fabric 注入面=sessionResolver/
+  // fetchHttpImpl（消费侧 wire）+ identity/issueInvite（链接生成）+
+  // ensureStarted（消费侧首用惰性起 fabric——与 sync 数据面同拍）。
+  const ai = await createAiRuntime({
+    home,
+    fabric: {
+      fetchHttpImpl: (session, request) => fabric.fetchHttpImpl(session, request),
+      sessionResolver: (peer) => fabric.sessionResolver(peer),
+      identity: () => fabric.identity(),
+      issueInvite: (opts) => fabric.issueInvite(opts),
+      ensureStarted: () => fabric.ensureStarted(),
+    },
+    now,
+    log: (line) => log(`ai: ${line}`),
   });
 
   const identity = await fabric.identity();
@@ -144,6 +164,9 @@ export async function buildPluginRuntimes(opts) {
   const channel = {
     ports,
     files,
+    // ai 原生即 PluginRuntime 形状（onEnable=面装配+端点恢复 / onDispose=端点
+    // 全关+在途上游 abort / onConfigChange=配额即时生效——runtime.mjs 头注）。
+    ai,
     ...(sync !== null
       ? {
           sync: {
@@ -165,6 +188,6 @@ export async function buildPluginRuntimes(opts) {
 
   return {
     channel,
-    management: { ports, files, sync, syncUnavailable },
+    management: { ports, files, sync, syncUnavailable, ai },
   };
 }

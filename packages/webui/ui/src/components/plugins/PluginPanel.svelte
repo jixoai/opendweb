@@ -1,9 +1,10 @@
 <script lang="ts">
 	// 插件面板页（webui-plugin-kernel Phase 0——宿主内建管理面 #/p/host/panel，
-	// r2-B6 冻结范围）：内置三插件（ports/files/sync）启停/配置 + 「即将推出」
-	// 占位（vpn/clash/ai/ssh/screen——[W6] 无实现仅展示）+「外部 WebUI 插件=后续
-	// 版本」标注。marketplace 的 CLI 插件候选不呈现为可安装/可启用（CLI 插件
-	// 清单是独立入口；`opendweb plugin add` 安装的命令插件不出现在这里）。
+	// r2-B6 冻结范围）：内置插件（ports/files/sync/ai——ai 自 Phase C 入册）启停/
+	// 配置 + 「即将推出」占位（vpn/clash/ssh/screen——[W6] 无实现仅展示）+
+	// 「外部 WebUI 插件=后续版本」标注。marketplace 的 CLI 插件候选不呈现为可
+	// 安装/可启用（CLI 插件清单是独立入口；`opendweb plugin add` 安装的命令
+	// 插件不出现在这里）。
 	// 面板不触发 npm 安装（[W10]——安装仅 CLI）。
 	import * as Card from "$lib/components/ui/card";
 	import * as Empty from "$lib/components/ui/empty";
@@ -25,11 +26,11 @@
 		ports: { name: "端口共享", blurb: "把另一台设备的本地端口映射到本机——B:9090 等同 A:8080。", icon: Network },
 		files: { name: "文件夹共享", blurb: "在设备之间共享一个文件夹——浏览、上传、下载，可设只读或读写。", icon: Folder },
 		sync: { name: "文件同步", blurb: "多台设备间同步 agents-skills、prompt、wiki 与配置，自动合并、冲突交还。", icon: RefreshCw },
+		ai: { name: "AI 订阅共享", blurb: "把本机 AI 订阅共享给家庭设备：提供方配服务签密钥，消费方贴链接起本地端点。", icon: Sparkles },
 	};
 	const COMING_SOON_LABEL: Record<string, string> = {
 		vpn: "VPN 互联",
 		clash: "Clash 代理",
-		ai: "AI 助手",
 		ssh: "SSH 终端",
 		screen: "屏幕共享",
 	};
@@ -138,9 +139,9 @@
 			</div>
 		</div>
 
-		<!-- 外部 WebUI 插件标注（r2-B6：v1 只管理编译内置三插件；安装仅 CLI） -->
+		<!-- 外部 WebUI 插件标注（r2-B6：v1 只管理编译内置插件；安装仅 CLI） -->
 		<p class="text-xs leading-relaxed text-muted-foreground" data-external-note>
-			外部 WebUI 插件将在后续版本提供——本面板只管理内置的端口共享、文件夹共享与文件同步。插件包的安装仅经命令行（opendweb plugin add）；CLI 安装的命令插件不会出现在这里，也不能在 WebUI 中启用。
+			外部 WebUI 插件将在后续版本提供——本面板只管理内置的端口共享、文件夹共享、文件同步与 AI 订阅共享。插件包的安装仅经命令行（opendweb plugin add）；CLI 安装的命令插件不会出现在这里，也不能在 WebUI 中启用。
 		</p>
 	{/if}
 </section>

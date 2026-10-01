@@ -1,8 +1,12 @@
 // @jixo/opendweb-ext-ai 出口桶（ai-subscription-sharing Phase A+B——提供方纯逻辑
-// + wire 契约 + 响应中继状态机 + 消费方端点；descriptor（id=ai）与宿主接入按
-// tasks Phase C 定稿，本出口不含 webui-plugin 子路径）。
+// + wire 契约 + 响应中继状态机 + 消费方端点；Phase C 增运行时工厂/管理面/descriptor
+// ——宿主接入经 ./opendweb-webui-plugin 子路径与本出口的 createAiRuntime）。
 
 export { atomicWrite0600, acquireFileLock } from "./fsutil.mjs";
+
+export { createAiRuntime, validateAiConfig } from "./runtime.mjs";
+export { createAiManagement } from "./mgmt.mjs";
+export { aiWebuiPluginDescriptor } from "./webui-plugin.mjs";
 
 export * from "./provider/lifecycle.mjs";
 export { ProviderStore, StoreError, hashKeyMaterial, parseUpstreamUrl, assertServiceActivatable } from "./provider/store.mjs";

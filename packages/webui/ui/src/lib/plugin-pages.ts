@@ -12,12 +12,14 @@ import FilesBrowserBinding from "../components/plugins/bindings/FilesBrowserBind
 import SyncGroupsBinding from "../components/plugins/bindings/SyncGroupsBinding.svelte";
 import SyncStatusBinding from "../components/plugins/bindings/SyncStatusBinding.svelte";
 import SyncConflictsBinding from "../components/plugins/bindings/SyncConflictsBinding.svelte";
+import AiProviderBinding from "../components/plugins/bindings/AiProviderBinding.svelte";
+import AiConsumerBinding from "../components/plugins/bindings/AiConsumerBinding.svelte";
 import type { PluginRouteEntry } from "./plugin-registry";
 
 /** 组件类型（Svelte 5 组件构造形态）。 */
 type SvelteComponentLike = new (...args: never[]) => unknown;
 
-/** routeId → 组件。三插件页=绑定层（真实数据渲染路径：store → 页面 props）。 */
+/** routeId → 组件。插件页=绑定层（真实数据渲染路径：store → 页面 props）。 */
 export const PLUGIN_PAGE_COMPONENTS: Record<string, SvelteComponentLike> = {
 	"#/p/host/panel": PluginPanel as SvelteComponentLike,
 	"#/p/ports/mappings": PortsMappingsBinding as SvelteComponentLike,
@@ -25,6 +27,8 @@ export const PLUGIN_PAGE_COMPONENTS: Record<string, SvelteComponentLike> = {
 	"#/p/sync/groups": SyncGroupsBinding as SvelteComponentLike,
 	"#/p/sync/status": SyncStatusBinding as SvelteComponentLike,
 	"#/p/sync/conflicts": SyncConflictsBinding as SvelteComponentLike,
+	"#/p/ai/provider": AiProviderBinding as SvelteComponentLike,
+	"#/p/ai/consumer": AiConsumerBinding as SvelteComponentLike,
 };
 
 /**

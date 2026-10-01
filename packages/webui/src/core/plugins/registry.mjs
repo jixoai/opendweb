@@ -6,8 +6,9 @@
 //    收官收敛：pages/perspective/dataEndpoints/configSchema 以包内 descriptor
 //    为准——files browser perspective=both（B 机成员姿态是浏览远端共享的核心
 //    用例）、sync pages=groups/status/conflicts 三页）。
-// 2. 「即将推出」占位清单（vpn/clash/ai/ssh/screen——[W6] Owner 裁决：无实现
-//    仅展示）与「外部 WebUI 插件=后续版本」标注（r2-B6 收口：v1 不加载外部
+// 2. 「即将推出」占位清单（vpn/clash/ssh/screen——[W6] Owner 裁决：无实现
+//    仅展示；ai 自 Phase C（ai-subscription-sharing）入册实现，占位删除）与
+//    「外部 WebUI 插件=后续版本」标注（r2-B6 收口：v1 不加载外部
 //    npm WebUI 插件；marketplace CLI 候选不呈现为可启用的 WebUI 插件）。
 // 3. 本文件零 IO——纯数据工厂（每调用返回深拷贝对象，防共享可变状态——ports
 //    包导出的是模块级常量，files/sync 是工厂函数，统一经 cloneDescriptor 归一）。
@@ -18,6 +19,7 @@
 import { descriptor as portsDescriptorSource } from "@jixo/opendweb-ext-ports/opendweb-webui-plugin";
 import { filesDescriptor } from "@jixo/opendweb-ext-files/opendweb-webui-plugin";
 import { syncWebuiPluginDescriptor } from "@jixo/opendweb-ext-sync/opendweb-webui-plugin";
+import { aiWebuiPluginDescriptor } from "@jixo/opendweb-ext-ai/opendweb-webui-plugin";
 import { validateWebuiPluginDescriptor } from "./contract.mjs";
 
 /**
@@ -54,18 +56,21 @@ function portsDescriptor() {
 /**
  * 内置 WebUI 插件 descriptor 集（编译期静态注册）。每个 descriptor 在宿主
  * 构造时经 validateWebuiPluginDescriptor 全量校验（fail-fast）。
+ * ai-subscription-sharing Phase C：ai 入册（provider[admin]/consumer[member]
+ * 双页——design §1 双姿态共存互不排斥）。
  * @returns {import("./contract.mjs").WebuiPluginDescriptor[]}
  */
 export function builtinWebuiPluginDescriptors() {
-  return [portsDescriptor(), cloneDescriptor(filesDescriptor()), cloneDescriptor(syncWebuiPluginDescriptor())];
+  return [portsDescriptor(), cloneDescriptor(filesDescriptor()), cloneDescriptor(syncWebuiPluginDescriptor()), cloneDescriptor(aiWebuiPluginDescriptor)];
 }
 
 /**
- * 「即将推出」占位清单（[W6]：vpn/clash/ai/ssh/screen——无实现，面板仅展示）。
+ * 「即将推出」占位清单（[W6]：vpn/clash/ssh/screen——无实现，面板仅展示）。
+ * Phase C 起 ai 已实现入册（ai-subscription-sharing design §1 占位删除）。
  * @returns {Array<{ id: string }>}
  */
 export function comingSoonPlugins() {
-  return [{ id: "vpn" }, { id: "clash" }, { id: "ai" }, { id: "ssh" }, { id: "screen" }];
+  return [{ id: "vpn" }, { id: "clash" }, { id: "ssh" }, { id: "screen" }];
 }
 
 /**
@@ -74,7 +79,7 @@ export function comingSoonPlugins() {
  * 不产生可被 webui 启用的插件（两契约分版本并存，安装语义互不冒充）。
  */
 export const EXTERNAL_WEBUI_PLUGINS_NOTE =
-  "external webui plugins ship in a later version; this panel manages only the built-in ports/files/sync plugins; plugin packages install via the opendweb CLI only (opendweb plugin add installs CLI command plugins, which never appear here as enableable webui plugins)";
+  "external webui plugins ship in a later version; this panel manages only the built-in ports/files/sync/ai plugins; plugin packages install via the opendweb CLI only (opendweb plugin add installs CLI command plugins, which never appear here as enableable webui plugins)";
 
 /**
  * 内置 descriptor 自检（构造期 fail-fast 用；测试直测）。

@@ -52,16 +52,17 @@ async function cliProjectEnv() {
   await fsp.copyFile(path.join(PKG_ROOT, "package.json"), path.join(installed, "package.json"));
   await fsp.cp(path.join(PKG_ROOT, "src"), path.join(installed, "src"), { recursive: true });
   // home-hub 2b：webui 声明依赖 opendweb（workspace:*——真实安装必然并存），
-  // core/home.mjs 经深导入复用其 leases/锁协议/探测；收官接线再依赖三 ext 包
-  // （@jixo/opendweb-ext-{ports,files,sync}——registry descriptor 子路径为纯数据
-  // 模块；运行时工厂经 data-plane.mjs 惰性动态 import，本 e2e 的 --help 零执行
-  // 与 target 校验失败路径不触达）。临时项目镜像声明依赖（package.json+src）。
+  // core/home.mjs 经深导入复用其 leases/锁协议/探测；收官接线再依赖四 ext 包
+  // （@jixo/opendweb-ext-{ports,files,sync,ai}——registry 的 descriptor 子路径为
+  // 纯数据模块，静态 import 在 target 校验失败路径即触达；运行时工厂经
+  // data-plane.mjs 惰性动态 import，--help 零执行不触达）。临时项目镜像声明
+  // 依赖（package.json+src）。
   const OPENDBWEB_ROOT = path.resolve(PKG_ROOT, "..", "opendweb");
   const dep = path.join(dir, "node_modules", "opendweb");
   await fsp.mkdir(dep, { recursive: true });
   await fsp.copyFile(path.join(OPENDBWEB_ROOT, "package.json"), path.join(dep, "package.json"));
   await fsp.cp(path.join(OPENDBWEB_ROOT, "src"), path.join(dep, "src"), { recursive: true });
-  for (const name of ["opendweb-ext-ports", "opendweb-ext-files", "opendweb-ext-sync"]) {
+  for (const name of ["opendweb-ext-ports", "opendweb-ext-files", "opendweb-ext-sync", "opendweb-ext-ai"]) {
     const srcRoot = path.resolve(PKG_ROOT, "..", name);
     const depDir = path.join(dir, "node_modules", "@jixo", name);
     await fsp.mkdir(depDir, { recursive: true });

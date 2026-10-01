@@ -627,6 +627,279 @@ export function resolveSyncSeedBlock(groupId: string, rootId: string): Promise<u
 	);
 }
 
+// ---- /sidecar/plugins/ai/* 管理面（ai-subscription-sharing Phase C——提供方
+// ---- 服务/分组/密钥/配额/用量/导入 + 消费方钥环/目录/本地端点） -------------------
+// 凭证纪律：密钥原文只出现在签发（issueAiKey）与链接（createAiLink）的**一次性
+// 响应体**（本地面显式复制）；一切列表/usage 投影恒掩码。控制面请求体携带 secret
+// 值（写路由 same-origin Origin 内——与 CLI 同位），绝不进 URL query。
+
+/** 服务管理面投影（detail=脱敏披露——auth 槽/脚本位恒掩码 ●）。 */
+export interface AiServiceRow {
+	serviceId: string;
+	name: string;
+	enabled: boolean;
+	upstream: string;
+	defaultPort?: number;
+	keyEnv?: string;
+	/** 预设 keyEnv 是否已绑定 secret（未绑定不可启用——§4 ③） */
+	authBound?: boolean;
+	detail: Record<string, unknown>;
+	groups: string[];
+}
+
+export interface AiGroupRow {
+	name: string;
+	serviceIds: string[];
+	serviceNames: string[];
+	limits?: { maxConcurrency?: number; dailyRequests?: number };
+}
+
+/** 密钥行（无原文——status 三态 active/revoked 呈现撤钥语义）。 */
+export interface AiKeyRow {
+	keyId: string;
+	group: string;
+	name: string;
+	createdAt: number;
+	revokedAt?: number;
+	status: "active" | "revoked";
+}
+
+export interface AiOverviewData {
+	services: AiServiceRow[];
+	groups: AiGroupRow[];
+	keys: AiKeyRow[];
+	secrets: Array<{ name: string; createdAt: number; updatedAt: number }>;
+	hooks: Array<{ name: string; source: string; stages: string[] }>;
+	config: { maxConcurrency?: number; dailyRequests?: number; usageLog?: boolean };
+	plane: { epoch: string; inflight: number } | null;
+}
+
+/** GET /sidecar/plugins/ai/overview（读路由——基线 Host 守卫）。 */
+export function fetchAiOverview(): Promise<AiOverviewData> {
+	return jsonFetch("/sidecar/plugins/ai/overview") as Promise<AiOverviewData>;
+}
+
+/** 预设（17 可启用 + codex 占位——disabled=true 项不可选）。 */
+export interface AiPreset {
+	id: string;
+	label: string;
+	apiForm: string;
+	baseUrl: string;
+	keyEnv?: string;
+	defaultPort?: number;
+	matchDomains?: string[];
+	notes?: string;
+	disabled?: boolean;
+	requires?: string;
+}
+
+/** GET /sidecar/plugins/ai/presets。 */
+export function fetchAiPresets(): Promise<{ presets: AiPreset[] }> {
+	return jsonFetch("/sidecar/plugins/ai/presets") as Promise<{ presets: AiPreset[] }>;
+}
+
+/** 用量元数据聚合（零凭证零正文）。 */
+export interface AiUsageData {
+	enabled: boolean;
+	totals: { requests: number; bytes: number };
+	byKey: Array<{ keyId: string; requests: number; bytes: number }>;
+	byService: Array<{ serviceId: string; requests: number; bytes: number }>;
+	quotaDay: { date: string; counts: Record<string, number> } | null;
+	recent: Array<{ ts: number; keyId: string; serviceId: string; status: number | string; bytes: number }>;
+}
+
+/** GET /sidecar/plugins/ai/usage。 */
+export function fetchAiUsage(): Promise<AiUsageData> {
+	return jsonFetch("/sidecar/plugins/ai/usage") as Promise<AiUsageData>;
+}
+
+/** POST /sidecar/plugins/ai/services（预设或自定义 ServiceInput；写路由）。 */
+export function createAiService(input: {
+	preset?: string;
+	name?: string;
+	auth?: Record<string, unknown>;
+	defaultPort?: number;
+	enabled?: boolean;
+	service?: Record<string, unknown>;
+}): Promise<{ service: AiServiceRow }> {
+	return jsonFetch("/sidecar/plugins/ai/services", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ service: AiServiceRow }>;
+}
+
+/** PATCH /sidecar/plugins/ai/services/<id>（启停 / auth 重绑——预设变更面）。 */
+export function patchAiService(serviceId: string, patch: { enabled?: boolean; auth?: Record<string, unknown> | null }): Promise<{ service: AiServiceRow }> {
+	return jsonFetch(`/sidecar/plugins/ai/services/${encodeURIComponent(serviceId)}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(patch),
+	}) as Promise<{ service: AiServiceRow }>;
+}
+
+/** DELETE /sidecar/plugins/ai/services/<id>。 */
+export function deleteAiService(serviceId: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/ai/services/${encodeURIComponent(serviceId)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** POST /sidecar/plugins/ai/groups。 */
+export function createAiGroup(input: { name: string; serviceNames?: string[]; limits?: { maxConcurrency?: number; dailyRequests?: number } }): Promise<{ group: AiGroupRow }> {
+	return jsonFetch("/sidecar/plugins/ai/groups", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ group: AiGroupRow }>;
+}
+
+/** PATCH /sidecar/plugins/ai/groups/<name>（服务引用整表替换/限额变更；limits:null=清除）。 */
+export function patchAiGroup(name: string, patch: { serviceNames?: string[]; limits?: { maxConcurrency?: number; dailyRequests?: number } | null }): Promise<{ group: AiGroupRow }> {
+	return jsonFetch(`/sidecar/plugins/ai/groups/${encodeURIComponent(name)}`, {
+		method: "PATCH",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(patch),
+	}) as Promise<{ group: AiGroupRow }>;
+}
+
+/** DELETE /sidecar/plugins/ai/groups/<name>（仍有未撤密钥=409）。 */
+export function deleteAiGroup(name: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/ai/groups/${encodeURIComponent(name)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** 签发密钥（原文仅本响应体一次性出现——本地面显式复制）。 */
+export function issueAiKey(input: { group: string; name?: string }): Promise<{ keyId: string; key: string; createdAt: number }> {
+	return jsonFetch("/sidecar/plugins/ai/keys", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ keyId: string; key: string; createdAt: number }>;
+}
+
+/** DELETE /sidecar/plugins/ai/keys/<keyId>（撤钥——幂等；在途 rid 按授权快照续拉）。 */
+export function revokeAiKey(keyId: string): Promise<{ keyId: string; status: "revoked"; revokedAt: number }> {
+	return jsonFetch(`/sidecar/plugins/ai/keys/${encodeURIComponent(keyId)}`, { method: "DELETE" }) as Promise<{
+		keyId: string;
+		status: "revoked";
+		revokedAt: number;
+	}>;
+}
+
+/** POST /sidecar/plugins/ai/secrets（值不回显——响应只含名称/时间戳）。 */
+export function setAiSecret(name: string, value: string): Promise<{ secret: { name: string; createdAt: number; updatedAt: number } }> {
+	return jsonFetch("/sidecar/plugins/ai/secrets", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ name, value }),
+	}) as Promise<{ secret: { name: string; createdAt: number; updatedAt: number } }>;
+}
+
+/** DELETE /sidecar/plugins/ai/secrets/<name>。 */
+export function deleteAiSecret(name: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/ai/secrets/${encodeURIComponent(name)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+/** aifly1. 分享链接（原文内嵌密钥——仅本响应体一次性出现）。 */
+export function createAiLink(input: { group: string; recipient: string; keyId?: string; name?: string }): Promise<{ link: string; keyId: string; group: string; services: number; recipient: string; note: string }> {
+	return jsonFetch("/sidecar/plugins/ai/link", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ link: string; keyId: string; group: string; services: number; recipient: string; note: string }>;
+}
+
+/** 两阶段导入·阶段一（扫描——ready 不回显 ServiceInput，blocked 列 $env 引用）。 */
+export function stageAiImport(rawText: string): Promise<{
+	blocked: Array<{ service: string; field: string; ref: string; varName?: string; reason?: string }>;
+	ready: Array<{ name: string }>;
+}> {
+	return jsonFetch("/sidecar/plugins/ai/import-stage", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ rawText }),
+	}) as Promise<{
+		blocked: Array<{ service: string; field: string; ref: string; varName?: string; reason?: string }>;
+		ready: Array<{ name: string }>;
+	}>;
+}
+
+/** 两阶段导入·阶段二（$env→secret 映射 + 原子 commit）。 */
+export function commitAiImport(input: { rawText: string; mappings: Record<string, string>; groupName?: string }): Promise<{ added: string[]; group?: string }> {
+	return jsonFetch("/sidecar/plugins/ai/import-commit", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ added: string[]; group?: string }>;
+}
+
+/** 消费方钥环投影（密钥恒掩码——长度指纹）。 */
+export interface AiConsumerData {
+	providers: Array<{
+		endpointId: string;
+		alias: string;
+		keys: Array<{ keyId: string; group: string; masked: string }>;
+		services: Array<Record<string, unknown>>;
+	}>;
+	endpoints: AiConsumerEndpointRow[];
+}
+
+/** 消费方本地端点行（listener 运行态）。 */
+export interface AiConsumerEndpointRow {
+	id: string;
+	providerEndpointId: string;
+	serviceId: string;
+	name: string;
+	port: number;
+	createdAt: number;
+	listener: "listening" | "stopped";
+}
+
+/** GET /sidecar/plugins/ai/consumer。 */
+export function fetchAiConsumer(): Promise<AiConsumerData> {
+	return jsonFetch("/sidecar/plugins/ai/consumer") as Promise<AiConsumerData>;
+}
+
+/** POST /sidecar/plugins/ai/consumer/import（贴 aifly1. 链接——钥环不回显原文）。 */
+export function importAiLink(link: string): Promise<{ provider: { alias: string; endpointId: string }; group: string; keyId: string; keyMasked: string; services: number }> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/import", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ link }),
+	}) as Promise<{ provider: { alias: string; endpointId: string }; group: string; keyId: string; keyMasked: string; services: number }>;
+}
+
+/** POST /sidecar/plugins/ai/consumer/add-key（裸密钥入环——需已导入提供者）。 */
+export function addAiConsumerKey(key: string, providerRef: string): Promise<{ added: boolean; provider: { alias: string; endpointId: string } }> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/add-key", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ key, providerRef }),
+	}) as Promise<{ added: boolean; provider: { alias: string; endpointId: string } }>;
+}
+
+/** POST /sidecar/plugins/ai/consumer/refresh（AUTH 回填 + catalog 快照刷新）。 */
+export function refreshAiConsumer(providerRef?: string): Promise<{ results: Array<{ ok: boolean; endpointId?: string; alias?: string; error?: string }> }> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/refresh", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(providerRef === undefined ? {} : { providerRef }),
+	}) as Promise<{ results: Array<{ ok: boolean; endpointId?: string; alias?: string; error?: string }> }>;
+}
+
+/** POST /sidecar/plugins/ai/consumer/endpoints（端口冲突=真实报错——不静默换端口）。 */
+export function startAiConsumerEndpoint(input: { providerEndpointId: string; serviceId: string; port: number }): Promise<{ id: string; endpoint: AiConsumerEndpointRow }> {
+	return jsonFetch("/sidecar/plugins/ai/consumer/endpoints", {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(input),
+	}) as Promise<{ id: string; endpoint: AiConsumerEndpointRow }>;
+}
+
+/** DELETE /sidecar/plugins/ai/consumer/endpoints/<id>。 */
+export function stopAiConsumerEndpoint(id: string): Promise<{ ok: true }> {
+	return jsonFetch(`/sidecar/plugins/ai/consumer/endpoints/${encodeURIComponent(id)}`, { method: "DELETE" }) as Promise<{ ok: true }>;
+}
+
+
 // ---- /api/* 业务代理面（wire 冻结于 sdk-mgmt-surface specs/server） -----------
 
 /** GET /api/status → {mode, policy, generation, active_connections[], …} */

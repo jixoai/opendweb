@@ -39,10 +39,12 @@ export interface PluginRouteEntry {
 
 /**
  * 冻结集（收官接线后与各包 descriptor 对齐——descriptor 单一事实源=
- * packages/opendweb-ext-{ports,files,sync} 的 ./opendweb-webui-plugin）：
+ * packages/opendweb-ext-{ports,files,sync,ai} 的 ./opendweb-webui-plugin）：
  * host 面板（both，member 深链直达）+ ports mappings（admin）+ files browser
  * （**both**——B 机成员姿态是浏览远端共享的核心用例，Phase 2 包 descriptor
- * 裁决）+ sync groups/status/conflicts 三页（admin——同步组管理是本机管理面）。
+ * 裁决）+ sync groups/status/conflicts 三页（admin——同步组管理是本机管理面）
+ * + ai provider/consumer（ai-subscription-sharing Phase C：提供方=admin、
+ * 消费方=member——design §1 双姿态共存互不排斥，视角仅 UI 呈现过滤）。
  */
 export const PLUGIN_ROUTE_REGISTRY: readonly PluginRouteEntry[] = [
 	{ routeId: "#/p/host/panel", pluginId: "host", pageId: "panel", title: "插件面板", nav: "tools", icon: "puzzle", visibility: "both", managed: false },
@@ -51,6 +53,8 @@ export const PLUGIN_ROUTE_REGISTRY: readonly PluginRouteEntry[] = [
 	{ routeId: "#/p/sync/groups", pluginId: "sync", pageId: "groups", title: "同步组", nav: "tools", icon: "refresh", visibility: "admin", managed: true },
 	{ routeId: "#/p/sync/status", pluginId: "sync", pageId: "status", title: "同步状态", nav: "tools", icon: "activity", visibility: "admin", managed: true },
 	{ routeId: "#/p/sync/conflicts", pluginId: "sync", pageId: "conflicts", title: "同步冲突", nav: "tools", icon: "triangle-alert", visibility: "admin", managed: true },
+	{ routeId: "#/p/ai/provider", pluginId: "ai", pageId: "provider", title: "AI 订阅·提供方", nav: "tools", icon: "sparkles", visibility: "admin", managed: true },
+	{ routeId: "#/p/ai/consumer", pluginId: "ai", pageId: "consumer", title: "AI 订阅·消费方", nav: "tools", icon: "bot", visibility: "member", managed: true },
 ];
 
 /** 视角可见性判定（SideNav 行过滤与 routeFor 共用）。 */

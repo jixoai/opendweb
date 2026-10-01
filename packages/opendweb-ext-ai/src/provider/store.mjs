@@ -473,6 +473,27 @@ export class ProviderStore {
     return { changed: true };
   }
 
+  /**
+   * 重绑 auth 槽（Phase C 管理面：预设 keyEnv→secret 绑定/凭证轮换——design §4 ③
+   * 的 UI 落点）。启用中的服务过激活门（原子拒绝零写入）；auth 置 undefined=清除。
+   * @param {string} serviceId
+   * @param {unknown} auth AUTH_SLOT_SCHEMA 形状或 undefined（清除）
+   */
+  async setServiceAuth(serviceId, auth) {
+    const idx = this.data.services.findIndex((s) => s.serviceId === serviceId);
+    if (idx < 0) {
+      throw new StoreError("not-found", `error: service '${serviceId}' not found`);
+    }
+    const normalized = auth === undefined ? undefined : normalizeAuthSlot(auth);
+    const next = { ...this.data.services[idx] };
+    if (normalized === undefined) delete next.auth;
+    else next.auth = normalized;
+    assertServiceActivatable(next, { env: this.#env, secrets: this.#secretsSource });
+    this.data.services[idx] = next;
+    await this.save();
+    return { ...next };
+  }
+
   // -----------------------------------------------------------------------
   // 分组
   // -----------------------------------------------------------------------

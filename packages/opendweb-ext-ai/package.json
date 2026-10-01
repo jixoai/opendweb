@@ -9,7 +9,8 @@
     "test"
   ],
   "exports": {
-    ".": "./src/index.mjs"
+    ".": "./src/index.mjs",
+    "./opendweb-webui-plugin": "./src/webui-plugin.mjs"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"

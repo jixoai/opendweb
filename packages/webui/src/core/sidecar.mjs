@@ -340,7 +340,7 @@ export async function createSidecar(opts = {}) {
     plugins.onTransition = (id, transition) => {
       if (fabricHost === null) return;
       if (transition !== "registered→enabled" && transition !== "disabled→enabled") return;
-      if (id !== "ports" && id !== "files" && id !== "sync") return;
+      if (id !== "ports" && id !== "files" && id !== "sync" && id !== "ai") return;
       fabricHost.ensureStarted().catch((e) => {
         log(`sidecar: fabric start on ${id} enable failed: ${e?.message ?? e}`);
       });
@@ -349,7 +349,7 @@ export async function createSidecar(opts = {}) {
     // enable 转换——启动期按账本直接补触发，否则数据面在重启后静默不可用
     const alreadyEnabled = plugins
       .list()
-      .plugins.some((p) => (p.id === "ports" || p.id === "files" || p.id === "sync") && p.status === "enabled");
+      .plugins.some((p) => (p.id === "ports" || p.id === "files" || p.id === "sync" || p.id === "ai") && p.status === "enabled");
     if (alreadyEnabled) {
       fabricHost.ensureStarted().catch((e) => {
         log(`sidecar: fabric start on restart (already-enabled plugins) failed: ${e?.message ?? e}`);
@@ -372,6 +372,9 @@ export async function createSidecar(opts = {}) {
         return h(req);
       },
       files: (req) => pluginsRuntime.management.files.handler(req),
+      // ai wire 面（/wpk1/ai/v1/*——handler 恒注册；有效 admission 门与 plane
+      // 装配态在 runtime 内裁决；内核 gate 先行：未启用 503）
+      ai: (req, peer) => pluginsRuntime.management.ai.wireHandler(req, peer),
       ...(pluginsRuntime.management.sync !== null
         ? { sync: adaptSyncHandler((request) => pluginsRuntime.management.sync.handleSyncRequest(request)) }
         : {
@@ -1589,6 +1592,67 @@ export async function createSidecar(opts = {}) {
       }
       sendJson(res, 200, r);
       logAccess(req, 200, startedAt);
+      return;
+    }
+
+    // ai：管理面分发（ai-subscription-sharing Phase C——逻辑在 ext-ai mgmt.mjs；
+    // Host/Origin 纪律沿用家族：GET=基线 Host 守卫，POST/PATCH/DELETE=写路由
+    // 精确 Origin 四类）。enable/disable/config 由上方 Phase 0 控制面先行匹配。
+    const AI_MGMT_PREFIX = "/sidecar/plugins/ai/";
+    if (pathOnly.startsWith(AI_MGMT_PREFIX)) {
+      const { ai } = pluginsRuntimeManagement;
+      const subPath = pathOnly.slice(AI_MGMT_PREFIX.length - 1); // 保留前导 /
+      if (req.method === "GET") {
+        if (!guardLocalOrigin(req, res, startedAt)) return;
+        const out = await ai.mgmt.handle("GET", subPath, new URLSearchParams(query), undefined);
+        if (out === null) {
+          sendJson(res, 404, { error: { code: "not-found" } });
+          logAccess(req, 404, startedAt);
+          return;
+        }
+        sendJson(res, out.status, out.body);
+        logAccess(req, out.status, startedAt);
+        return;
+      }
+      if (req.method === "POST" || req.method === "PATCH") {
+        if (!guardWriteOrigin(req, res, startedAt)) return;
+        const body = await readPluginBody(req, res);
+        if (body === null) {
+          logAccess(req, 413, startedAt);
+          return;
+        }
+        let parsed;
+        try {
+          parsed = body.length === 0 ? {} : JSON.parse(body.toString("utf8"));
+        } catch {
+          sendJson(res, 400, { error: { code: "invalid-request", message: "body must be JSON" } });
+          logAccess(req, 400, startedAt);
+          return;
+        }
+        const out = await ai.mgmt.handle(req.method, subPath, new URLSearchParams(query), parsed);
+        if (out === null) {
+          sendJson(res, 404, { error: { code: "not-found" } });
+          logAccess(req, 404, startedAt);
+          return;
+        }
+        sendJson(res, out.status, out.body);
+        logAccess(req, out.status, startedAt);
+        return;
+      }
+      if (req.method === "DELETE") {
+        if (!guardWriteOrigin(req, res, startedAt)) return;
+        const out = await ai.mgmt.handle("DELETE", subPath, new URLSearchParams(query), undefined);
+        if (out === null) {
+          sendJson(res, 404, { error: { code: "not-found" } });
+          logAccess(req, 404, startedAt);
+          return;
+        }
+        sendJson(res, out.status, out.body);
+        logAccess(req, out.status, startedAt);
+        return;
+      }
+      sendJson(res, 404, { error: { code: "not-found" } });
+      logAccess(req, 404, startedAt);
       return;
     }
 

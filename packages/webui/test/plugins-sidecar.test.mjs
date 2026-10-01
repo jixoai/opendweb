@@ -57,14 +57,14 @@ test("GET /sidecar/plugins: registry + coming soon + external note; baseline rea
   const body = JSON.parse(bare.text);
   assert.deepEqual(
     body.plugins.map((p) => p.id),
-    ["ports", "files", "sync"],
+    ["ports", "files", "sync", "ai"],
   );
   assert.ok(body.plugins.every((p) => p.status === "registered" && p.webui_api === 1));
   assert.ok(body.plugins.every((p) => Array.isArray(p.pages) && p.config_schema !== undefined));
-  // 「即将推出」占位（[W6]）——恰五项
+  // 「即将推出」占位（[W6]）——恰四项（ai 自 Phase C 入册实现，占位删除）
   assert.deepEqual(
     body.coming_soon.map((c) => c.id),
-    ["vpn", "clash", "ai", "ssh", "screen"],
+    ["vpn", "clash", "ssh", "screen"],
   );
   // 外部 WebUI 插件=后续版本标注（r2-B6）
   assert.equal(body.external_webui_plugins.available, false);

@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@jixo/opendweb-client-sdk": "workspace:*",
+    "@jixo/opendweb-ext-ai": "workspace:*",
     "@jixo/opendweb-ext-files": "workspace:*",
     "@jixo/opendweb-ext-ports": "workspace:*",
     "@jixo/opendweb-ext-sync": "workspace:*",

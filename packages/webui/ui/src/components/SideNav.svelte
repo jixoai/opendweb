@@ -10,6 +10,8 @@
 	import Puzzle from "@lucide/svelte/icons/puzzle";
 	import Folder from "@lucide/svelte/icons/folder";
 	import RefreshCw from "@lucide/svelte/icons/refresh-cw";
+	import Sparkles from "@lucide/svelte/icons/sparkles";
+	import Bot from "@lucide/svelte/icons/bot";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import { pluginNavRows } from "$lib/plugin-registry";
 	import { cn } from "$lib/utils";
@@ -33,6 +35,8 @@
 		network: Network,
 		folder: Folder,
 		refresh: RefreshCw,
+		sparkles: Sparkles,
+		bot: Bot,
 	};
 
 	const activeRouteId = $derived(cs.route.view === "plugin" ? cs.route.routeId : null);

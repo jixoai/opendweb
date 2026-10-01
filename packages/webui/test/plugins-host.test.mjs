@@ -54,7 +54,7 @@ async function tempHome() {
 
 test("contract: builtin descriptors pass validation and registry self-check", () => {
   const descriptors = builtinWebuiPluginDescriptors();
-  assert.deepEqual(descriptors.map((d) => d.id), ["ports", "files", "sync"]);
+  assert.deepEqual(descriptors.map((d) => d.id), ["ports", "files", "sync", "ai"]);
   assert.equal(assertDescriptorsValid(descriptors).ok, true);
   for (const d of descriptors) {
     const v = validateWebuiPluginDescriptor(d);
