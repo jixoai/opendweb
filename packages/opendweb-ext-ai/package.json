@@ -13,7 +13,7 @@
     "./opendweb-webui-plugin": "./src/webui-plugin.mjs"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 --test-force-exit test/*.test.mjs"
+    "test": "node --test --test-concurrency=1 --test-force-exit \"test/*.test.mjs\" \"test/e2e/*.test.mjs\""
   },
   "dependencies": {
     "zod": "^4.5.2"

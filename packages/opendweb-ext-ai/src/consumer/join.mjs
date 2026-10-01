@@ -106,7 +106,7 @@ export function assertKeyFormat(key) {
  * 导入 aifly1. 链接（fabric=宿主注入面：{fetchImpl} 形状——Phase C 真接线；
  * Phase B 仅校验形状不触网。兑换/身份归位由宿主在 fabric 面完成）。
  * @param {string} link
- * @param {{ keyring: Awaited<ReturnType<import("./keyring.mjs").openKeyring>>, fabric?: { fetchImpl: (init: any) => Promise<any> } }} opts
+ * @param {{ keyring: Awaited<ReturnType<import("./keyring.mjs").openKeyring>>, fabric?: { fetchImpl: (init: { method: string, path: string, headers?: Array<{ name: string, value: string }>, body?: Buffer, signal?: AbortSignal }) => Promise<{ status: number, headers?: Array<{ name: string, value: string }>, bodyChunks?: Buffer[] }> } }} opts
  * @returns {Promise<{ payload: z.infer<typeof LINK_PAYLOAD_SCHEMA> }>}
  */
 export async function importLink(link, opts) {

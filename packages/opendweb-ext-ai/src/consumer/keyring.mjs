@@ -45,7 +45,8 @@ export async function openKeyring(file) {
     if (err?.code === "ENOENT") {
       // 新建空环
     } else if (err instanceof z.ZodError) {
-      throw new Error(`keyring file is corrupt or has an unsupported format: ${file}`);
+      // 文案不含文件路径（错误投影脱敏纪律）；结构化 code 供管理面固定映射。
+      throw Object.assign(new Error("keyring file is corrupt or has an unsupported format (fix or remove it manually)"), { code: "corrupt" });
     } else {
       throw err;
     }

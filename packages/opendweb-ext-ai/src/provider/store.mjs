@@ -53,16 +53,19 @@ export const KEY_MATERIAL_BYTES = 32; // randomZ32(32) -> 52 字符
 
 export const STORE_VERSION = 2;
 
-/** 存储层错误（用户面 message 为英文 ASCII，直接透出）。 */
+/** 存储层错误（message 为进程内诊断全文；HTTP/UI 投影经 redact.mjs 脱敏）。 */
 export class StoreError extends Error {
   /**
    * @param {"duplicate" | "not-found" | "invalid" | "corrupt" | "conflict"} code
    * @param {string} message
+   * @param {Record<string, unknown>} [details] 结构化安全字段（激活门 gate/keyEnv
+   *   等——redact.mjs 据此投影固定文案；secret 名/路径不得放入）
    */
-  constructor(code, message) {
+  constructor(code, message, details) {
     super(message);
     this.name = "StoreError";
     this.code = code;
+    if (details !== undefined) this.details = details;
   }
 }
 
@@ -236,7 +239,9 @@ export function routeLocalPrefix(route) {
  * 提供方存储（services.json v2）。
  * 打开时整读，save() 原子写并自增 revision；变更监听（onChange）供 catalog
  * 长轮询唤醒。激活门（keyEnv→secret 绑定 + ambient env fail-closed）在
- * addService(enabled)/setServiceEnabled(true) 的写路径内原子执行。
+ * addService(enabled)/setServiceEnabled(true) 的写路径内原子执行；save() 为
+ * 唯一落盘写入口，对全部将启用服务重跑激活门——公开 data/save 的直接变更
+ * 无法绕过（fail-closed 零写入）。
  */
 export class ProviderStore {
   /** @param {string} dataDir @param {StoreData} data @param {{ random?: (n: number) => string, env?: (name: string) => string | undefined, secretsSource?: (name: string) => boolean, home?: string }} opts */
@@ -248,12 +253,17 @@ export class ProviderStore {
     this.#secretsSource =
       opts.secretsSource ?? ((name) => defaultSecretExists(dataDir, name));
     this.#home = opts.home;
+    // 落盘基线（P1-7）：构造时的 enabled 状态=「已在盘上启用」集合——save() 只对
+    // 相对基线**将启用**（新增启用/停用翻转）的服务重跑激活门。
+    this.#persistedEnabled = new Map(data.services.map((s) => [s.serviceId, s.enabled !== false]));
   }
 
   #random;
   #env;
   #secretsSource;
   #home;
+  /** @type {Map<string, boolean> | null} 上次成功落盘的 per-service enabled 基线。 */
+  #persistedEnabled;
   /** @type {Set<() => void>} */
   #listeners = new Set();
 
@@ -708,9 +718,24 @@ export class ProviderStore {
   // 内部
   // -----------------------------------------------------------------------
 
+  /**
+   * 唯一落盘写入口：revision 自增 + 原子写 + 监听唤醒。
+   * 激活门兜底（P1-7）：对相对上次落盘基线**将启用**（新增启用/停用→启用翻转）
+   * 的服务重跑 assertServiceActivatable——公开可变 `data`+`save()` 的直接变更
+   * 绕过高层门时在落盘前被拒（fail-closed 零写入；判定失败文件与 revision 均
+   * 不变）。已启用存量不重判（启用时点已过门——secret 事后移除不得毒化无关
+   * 写路径/阻碍停用）。
+   */
   async save() {
+    const baseline = this.#persistedEnabled ?? new Map();
+    for (const service of this.data.services) {
+      if (service.enabled === false) continue;
+      if (baseline.get(service.serviceId) === true) continue; // 存量启用——不重判
+      assertServiceActivatable(service, { env: this.#env, secrets: this.#secretsSource });
+    }
     this.data.revision += 1;
     await atomicWrite0600(ProviderStore.filePath(this.dataDir), `${JSON.stringify(this.data, null, 2)}\n`);
+    this.#persistedEnabled = new Map(this.data.services.map((s) => [s.serviceId, s.enabled !== false]));
     for (const cb of [...this.#listeners]) {
       try {
         cb(this.data.revision);
@@ -722,7 +747,9 @@ export class ProviderStore {
 
   /**
    * 原子事务：快照→fn→任一抛错回滚快照并重写（状态等价恢复；revision 再 +1）。
-   * importer commit 的「一次性全量生效」落点。
+   * importer commit 的「一次性全量生效」落点。回滚重写失败（极端：门/磁盘）
+   * 不吞原始错误——盘上仍为事务前内容（门在写前、原子写在 tmp+rename），
+   * 内存保持快照一致。
    * @param {(store: ProviderStore) => Promise<T>} fn
    * @template T
    * @returns {Promise<T>}
@@ -733,7 +760,11 @@ export class ProviderStore {
       return await fn(this);
     } catch (err) {
       this.data = snapshot;
-      await this.save();
+      try {
+        await this.save();
+      } catch {
+        /* 回滚重写失败：盘=事务前内容（写未发生），保留原始错误传播 */
+      }
       throw err;
     }
   }
@@ -762,18 +793,21 @@ export function assertServiceActivatable(service, { env, secrets }) {
     throw new StoreError(
       "invalid",
       `error: service '${service.name}' uses preset keyEnv '${keyEnv}'; bind its credential via the {secret: <name>} auth slot before enabling it`,
+      { gate: "unbound-secret" },
     );
   }
   if (!secrets(auth.secret)) {
     throw new StoreError(
       "invalid",
       `error: service '${service.name}' binds secret '${auth.secret}' which is not in the secrets store; add it first`,
+      { gate: "missing-secret" },
     );
   }
   if (env(keyEnv) !== undefined) {
     throw new StoreError(
       "conflict",
       `error: refusing to enable service '${service.name}': ambient environment variable '${keyEnv}' is set; move the credential into the secrets store and keep the {secret} binding (values are never snapshotted from env)`,
+      { gate: "ambient-env", keyEnv },
     );
   }
 }

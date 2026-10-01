@@ -401,10 +401,10 @@ export function validatePluginConfig(
   values: unknown,
 ): { ok: true; value: Record<string, string | number | boolean> } | { ok: false; error: string };
 
-/** 内置三插件占位 descriptor（ports/files/sync；每调用返回新对象）。 */
+/** 内置四插件 descriptor（ports/files/sync/ai——ai 自 Phase C 实现入册；每调用返回新对象）。 */
 export function builtinWebuiPluginDescriptors(): WebuiPluginDescriptor[];
 
-/** 「即将推出」占位清单（[W6]：vpn/clash/ai/ssh/screen——无实现仅展示）。 */
+/** 「即将推出」占位清单（[W6]：vpn/clash/ssh/screen——无实现仅展示；ai 已实现入册不在列）。 */
 export function comingSoonPlugins(): Array<{ id: string }>;
 
 /** 外部 WebUI 插件标注（v1=后续版本；安装仅 CLI；CLI 命令插件不可被 webui 启用）。 */

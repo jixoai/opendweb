@@ -58,6 +58,28 @@ import { join } from "node:path";
 const CONTROL_BODY_LIMIT_BYTES = 64 * 1024;
 
 /**
+ * wire handler 请求形状（ext-ports HttpHandlerRequestLike 同拍——Phase C 经
+ * createWpkRouter routes.ai 挂内核；测试注入同形状 fake）。P2-5：注入面签名
+ * 以具体形状替代 any。
+ * @typedef {object} WireHandlerRequest
+ * @property {string} method
+ * @property {string} path 含查询串的承载端点路径
+ * @property {Array<{ name: string, value: string }>} headers
+ * @property {() => Promise<Buffer | null>} bodyNext
+ * @property {AbortSignal} [signal]
+ * @property {unknown} [respondStreaming]
+ */
+
+/**
+ * wire handler 响应形状（status/headers/bodyChunks——与 jsonResponse/204 家族
+ * 同构）。
+ * @typedef {object} WireHandlerResponse
+ * @property {number} status
+ * @property {Array<{ name: string, value: string }>} headers
+ * @property {Buffer[]} bodyChunks
+ */
+
+/**
  * 默认密钥读取面（直读 secrets.json——无内存态；与 SecretsStore.get 同拍语义，
  * 避免 endpoints↔secrets 循环 import）。
  * @param {string} dataDir
@@ -124,18 +146,33 @@ async function readBoundedBody(req, limit) {
 }
 
 /**
- * serviceId 双源检测（design §3：x-odai-service 唯一来源；body/查询串同名
- * 信息=400 拒绝——无冲突规则）。body 仅在可解析为 JSON object 时检测顶层键。
- * @param {string} path 含查询串
+ * serviceId 双源检测（design §3：x-odai-service 唯一来源；上游 path 查询串/
+ * body 同名信息=400 拒绝——无冲突规则）。查询串经 URL 解析器规范化 percent
+ * encoding（`servi%63eId=evil` 等编码键不可绕过）；body 仅在可解析为 JSON
+ * object 时检测顶层键。
+ * @param {string} path 含查询串（**x-odai-path 的值**——上游真实路径，不是承载端点 path）
  * @param {Buffer} body
  * @returns {boolean}
  */
 export function serviceIdDuplicateSource(path, body) {
   const qIdx = path.indexOf("?");
   if (qIdx >= 0) {
-    for (const pair of path.slice(qIdx + 1).split("&")) {
-      const key = pair.split("=", 1)[0];
-      if (key === "service" || key === "serviceId" || key === HDR_SERVICE) return true;
+    let search;
+    try {
+      search = new URLSearchParams(path.slice(qIdx + 1));
+    } catch {
+      search = null;
+    }
+    if (search !== null) {
+      for (const key of search.keys()) {
+        if (key === "service" || key === "serviceId" || key === HDR_SERVICE) return true;
+      }
+    } else {
+      // 解析器不可用（防御）——回退原始键扫描
+      for (const pair of path.slice(qIdx + 1).split("&")) {
+        const key = pair.split("=", 1)[0];
+        if (key === "service" || key === "serviceId" || key === HDR_SERVICE) return true;
+      }
     }
   }
   if (body.length === 0) return false;
@@ -161,7 +198,7 @@ export function serviceIdDuplicateSource(path, body) {
  *   maxConcurrency?: number,
  *   env?: (name: string) => string | undefined,
  *   authorize?: (peer: string, op: string) => boolean | Promise<boolean>,
- *   forwardPlane?: { request: (input: any) => Promise<any>, epoch: string, relay?: object },
+ *   forwardPlane?: { request: (input: object) => Promise<object>, epoch: string, relay?: object },
  *   home?: string,
  *   loader?: (name: string, home: string) => Record<string, unknown> | undefined,
  *   fetchImpl?: typeof fetch,
@@ -225,7 +262,7 @@ export function createAiProviderWireHandler(opts) {
 
   /**
    * @param {{ op: string, tail?: string }} parsed
-   * @returns {(req: any) => Promise<any>}
+   * @returns {(req: WireHandlerRequest) => Promise<WireHandlerResponse | null>}
    */
   const dispatch = (parsed) => {
     switch (parsed.op) {
@@ -245,7 +282,7 @@ export function createAiProviderWireHandler(opts) {
   };
 
   /**
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    * @param {string} peer
    */
   async function handleAuth(req) {
@@ -273,7 +310,7 @@ export function createAiProviderWireHandler(opts) {
   }
 
   /**
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    */
   async function handleCatalog(req) {
     if (req.method !== "GET") return notFoundResponse();
@@ -284,14 +321,19 @@ export function createAiProviderWireHandler(opts) {
       return jsonResponse(403, { v: 1, code: ERROR_CODE.key_all_invalid });
     }
     const grant = { keyId: keyCheck.keyId, group: keyCheck.group };
-    // since 解析（缺省=0=全量直取）
+    // since 解析（缺省=0=全量直取）；坏 percent encoding=请求元数据错误→400
     let since = 0;
     const qIdx = req.path.indexOf("?");
     if (qIdx >= 0) {
       for (const pair of req.path.slice(qIdx + 1).split("&")) {
         const eq = pair.indexOf("=");
         if (eq < 0 || pair.slice(0, eq) !== "since") continue;
-        const raw = decodeURIComponent(pair.slice(eq + 1));
+        let raw;
+        try {
+          raw = decodeURIComponent(pair.slice(eq + 1));
+        } catch {
+          return jsonResponse(400, { code: "metadata_invalid", message: "since query parameter has malformed percent encoding" });
+        }
         if (!/^\d+$/.test(raw)) {
           return jsonResponse(400, { code: "metadata_invalid", message: "since must be a non-negative integer" });
         }
@@ -330,7 +372,7 @@ export function createAiProviderWireHandler(opts) {
   }
 
   /**
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    */
   async function handleRequest(req) {
     if (req.method !== "POST") return notFoundResponse();
@@ -404,7 +446,10 @@ export function createAiProviderWireHandler(opts) {
     if (read.error === "over-limit") {
       return jsonResponse(413, { code: "body_too_large", message: `request body exceeds maxChunkPayload (${MAX_CHUNK_PAYLOAD} bytes)` });
     }
-    if (serviceIdDuplicateSource(req.path, read.body)) {
+    // serviceId 双源：承载端点查询串（req.path）与解析后的上游路径（x-odai-path
+    // 的值——percent encoding 已规范化）都检测（P1-5：后者此前漏检——承载 URL
+    // 干净但 x-odai-path 带 serviceId 的冲突可绕过）。
+    if (serviceIdDuplicateSource(req.path, read.body) || serviceIdDuplicateSource(path, read.body)) {
       return jsonResponse(400, {
         code: "service_source_conflict",
         message: "x-odai-service is the only serviceId source; service info in the query string or body is rejected",
@@ -446,7 +491,7 @@ export function createAiProviderWireHandler(opts) {
   /**
    * POST response/<rid>（B1 中继拉取：单飞/连续提交游标/204 hold/终态摘要）。
    * relay 缺席（注入面无中继的 fake forwardPlane）=端点未挂——404 同体。
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    * @param {string | undefined} rid
    */
   async function handleResponse(req, rid) {
@@ -465,10 +510,11 @@ export function createAiProviderWireHandler(opts) {
     if (fromSeqRaw === null || !/^\d+$/.test(fromSeqRaw) || Number(fromSeqRaw) > Number.MAX_SAFE_INTEGER) {
       return jsonResponse(400, { code: "metadata_invalid", message: "x-odai-from-seq header must be a non-negative integer" });
     }
-    // 请求体必须为空（拉取无载荷；防御性有界读取后忽略）
-    const read = await readBoundedBody(req, 1);
+    // 请求体必须为空（拉取无载荷）：上限 0——任何非空 body（含 1 字节/分块
+    // 累计 1 字节）= over-limit 400（冻结 ABI：POST response/<rid> body 为空）。
+    const read = await readBoundedBody(req, 0);
     if (read.error === "pull") return null;
-    if (read.error === "over-limit") {
+    if (read.error === "over-limit" || read.body.length > 0) {
       return jsonResponse(400, { code: "metadata_invalid", message: "response pull must carry an empty body" });
     }
     if (req.signal?.aborted) return null;
@@ -480,7 +526,7 @@ export function createAiProviderWireHandler(opts) {
 
   /**
    * POST cancel（B1：幂等取消——终态后重放同响应）。
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    */
   async function handleCancel(req) {
     if (req.method !== "POST") return notFoundResponse();
@@ -507,7 +553,7 @@ export function createAiProviderWireHandler(opts) {
 
   /**
    * handler（createWpkRouter routes.ai 挂点；peer=serveHttp 绑定对端）。
-   * @param {any} req
+   * @param {WireHandlerRequest} req
    * @param {string} peer
    */
   return async function aiWireHandler(req, peer) {
@@ -524,7 +570,10 @@ export function createAiProviderWireHandler(opts) {
     try {
       return await dispatch(parsed)(req);
     } catch (err) {
-      log("error", `ai wire handler error at ${parsed.op}: ${err instanceof Error ? err.message : String(err)}`);
+      // 结构化诊断（P1-8）：code+错误类名——原始 message 不进日志（可能含
+      // 路径/内部标识）；HTTP 投影恒固定 500 文案。
+      const diag = { scope: "ai", face: `wire ${parsed.op}`, error: { code: typeof err?.code === "string" ? err.code : "none", kind: err instanceof Error ? err.constructor.name : "unknown" } };
+      log("error", JSON.stringify(diag));
       return jsonResponse(500, { code: ERROR_CODE.internal, message: "internal provider error" });
     }
   };

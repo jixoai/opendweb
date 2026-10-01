@@ -21,26 +21,8 @@ import { buildServiceDetail, buildServiceEntry } from "./provider/detail.mjs";
 import { stageAiflyConfig, commitAiflyImport, envRefName } from "./provider/importer.mjs";
 import { loadCuratedPresets } from "./presets/models-dev.mjs";
 import { StoreError } from "./provider/store.mjs";
+import { sanitizeError, diagnosticLogLine } from "./redact.mjs";
 import { importLink, addKey, SHARE_LINK_PREFIX } from "./consumer/join.mjs";
-
-/**
- * StoreError → HTTP 状态映射（家族惯例：invalid=400 / not-found=404 /
- * duplicate·conflict=409 / corrupt=500）。
- * @param {unknown} e
- */
-function errorStatus(e) {
-  if (e instanceof StoreError) {
-    if (e.code === "invalid") return 400;
-    if (e.code === "not-found") return 404;
-    if (e.code === "duplicate" || e.code === "conflict") return 409;
-    return 500;
-  }
-  const code = /** @type {{ code?: string }} */ (e)?.code;
-  if (code === "invalid") return 400;
-  if (code === "not-found") return 404;
-  if (code === "conflict") return 409;
-  return 500;
-}
 
 /**
  * @param {number} status @param {string} code @param {string} message
@@ -48,6 +30,9 @@ function errorStatus(e) {
 function err(status, code, message) {
   return { status, body: { error: { code, message } } };
 }
+
+/** import-stage/commit 的解析失败固定文案（不含 ai-fly 文件名）。 */
+const INVALID_AIFLY_CONFIG_MESSAGE = "the provided ai-fly services config is not valid JSON or has an unexpected shape";
 
 /**
  * ai 管理面。
@@ -78,6 +63,24 @@ function err(status, code, message) {
  */
 export function createAiManagement(deps) {
   const { dataDir, now, store, secrets, consumer, fabric } = deps;
+  const logLine = deps.log ?? (() => {});
+
+  /**
+   * 内部结构化诊断（P1-8：code+类名，无 message/名称/路径）。
+   * @param {string} face @param {unknown} e
+   */
+  const diag = (face, e) => logLine(diagnosticLogLine(face, e));
+
+  /**
+   * 内部异常 → 固定脱敏投影（单一脱敏层 redact.mjs；含诊断日志）。
+   * @param {string} face
+   * @param {unknown} e
+   */
+  const sanitizedErr = (face, e) => {
+    diag(face, e);
+    const view = sanitizeError(e);
+    return err(view.status, view.code, view.message);
+  };
 
   /**
    * 服务条目 → 管理面投影（detail 脱敏——buildServiceDetail 掩码凭证位）。
@@ -108,10 +111,24 @@ export function createAiManagement(deps) {
 
   /**
    * 管理面路由（subPath 已剥 /sidecar/plugins/ai 前缀；body=已解析 JSON）。
+   * 外层单一脱敏兜底（P1-8）：路由体外未捕获的内部异常（如存储打开失败/
+   * 钥环损坏）投影固定 500 文案+结构化诊断——secret 名/脚本路径/绝对路径
+   * 不进响应。
    * @param {string} method @param {string} subPath @param {URLSearchParams} query @param {unknown} body
    * @returns {Promise<{ status: number, body: object } | null>}
    */
   async function handle(method, subPath, query, body) {
+    try {
+      return await route(method, subPath, query, body);
+    } catch (e) {
+      return sanitizedErr(`mgmt ${method} ${subPath.split("?")[0]}`, e);
+    }
+  }
+
+  /**
+   * @param {string} method @param {string} subPath @param {URLSearchParams} query @param {unknown} body
+   */
+  async function route(method, subPath, query, body) {
     const p = subPath.startsWith("/") ? subPath : `/${subPath}`;
 
     // ---- GET 读面 -----------------------------------------------------------------
@@ -196,12 +213,8 @@ export function createAiManagement(deps) {
         await deps.refreshLimitDefaults();
         return { status: 200, body: { service: serviceView(service, st) } };
       } catch (e) {
-        if (e instanceof StoreError) {
-          // 激活门拒绝（keyEnv 未绑定 secret / secret 不在库 / ambient env 命中）
-          const status = e.code === "conflict" ? 409 : 400;
-          return err(status, e.code, e.message);
-        }
-        return err(errorStatus(e), "internal", e instanceof Error ? e.message : String(e));
+        // 激活门拒绝等——固定脱敏投影（keyEnv 变量名按规范可保留）
+        return sanitizedErr("mgmt POST /services", e);
       }
     }
 
@@ -251,11 +264,7 @@ export function createAiManagement(deps) {
         await deps.refreshLimitDefaults();
         return { status: 200, body: { service: serviceView(service, st) } };
       } catch (e) {
-        if (e instanceof StoreError) {
-          const status = e.code === "conflict" ? 409 : e.code === "not-found" ? 404 : 400;
-          return err(status, e.code, e.message);
-        }
-        return err(errorStatus(e), "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt PATCH/DELETE /services/:id", e);
       }
     }
 
@@ -268,7 +277,7 @@ export function createAiManagement(deps) {
         await deps.refreshLimitDefaults();
         return { status: 200, body: { group } };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt POST /groups", e);
       }
     }
 
@@ -289,7 +298,7 @@ export function createAiManagement(deps) {
         if (group === undefined) return err(404, "not-found", `group '${name}' not found`);
         return { status: 200, body: { group } };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt PATCH/DELETE /groups/:name", e);
       }
     }
 
@@ -302,7 +311,7 @@ export function createAiManagement(deps) {
         const issued = await st.issueKey(input.group, typeof input.name === "string" && input.name !== "" ? input.name : "default", { now });
         return { status: 200, body: issued };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt POST /keys", e);
       }
     }
 
@@ -313,7 +322,7 @@ export function createAiManagement(deps) {
         const key = await st.revokeKey(keyMatch[1], { now });
         return { status: 200, body: { keyId: key.keyId, group: key.group, revokedAt: key.revokedAt, status: "revoked" } };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt DELETE /keys/:id", e);
       }
     }
 
@@ -327,7 +336,7 @@ export function createAiManagement(deps) {
         // 值不回显（名称/时间戳即可）
         return { status: 200, body: { secret: entry } };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt POST /secrets", e);
       }
     }
 
@@ -337,7 +346,7 @@ export function createAiManagement(deps) {
         await secrets().remove(decodeURIComponent(secretMatch[1]));
         return { status: 200, body: { ok: true } };
       } catch (e) {
-        return err(errorStatus(e), e instanceof StoreError ? e.code : "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt DELETE /secrets/:name", e);
       }
     }
 
@@ -348,19 +357,22 @@ export function createAiManagement(deps) {
     if (method === "POST" && p === "/import-stage") {
       const input = body ?? {};
       if (typeof input.rawText !== "string" || input.rawText === "") return err(400, "invalid-request", "body must be {rawText: string}");
+      let staging;
       try {
-        const staging = stageAiflyConfig(input.rawText);
-        // ready 不回显 ServiceInput（可能含 literal 凭证）——仅名字
-        return {
-          status: 200,
-          body: {
-            blocked: staging.blocked.map((b) => ({ ...b, varName: b.ref.startsWith("$env:") ? envRefName(b.ref) : undefined })),
-            ready: staging.ready.map((r) => ({ name: r.name })),
-          },
-        };
+        staging = stageAiflyConfig(input.rawText);
       } catch (e) {
-        return err(400, "invalid-config", e instanceof Error ? e.message : String(e));
+        // 固定脱敏文案（原文含 ai-fly 文件名——不进响应/日志）
+        diag("mgmt POST /import-stage", e);
+        return err(400, "invalid-config", INVALID_AIFLY_CONFIG_MESSAGE);
       }
+      // ready 不回显 ServiceInput（可能含 literal 凭证）——仅名字
+      return {
+        status: 200,
+        body: {
+          blocked: staging.blocked.map((b) => ({ ...b, varName: b.ref.startsWith("$env:") ? envRefName(b.ref) : undefined })),
+          ready: staging.ready.map((r) => ({ name: r.name })),
+        },
+      };
     }
 
     if (method === "POST" && p === "/import-commit") {
@@ -368,8 +380,14 @@ export function createAiManagement(deps) {
       if (typeof input.rawText !== "string" || input.rawText === "") return err(400, "invalid-request", "body must be {rawText: string, mappings: Record<string,string>, groupName?}");
       if (input.mappings === null || typeof input.mappings !== "object" || Array.isArray(input.mappings)) return err(400, "invalid-request", "mappings must be a JSON object of {envVar: secretName}");
       const st = await store();
+      let staging;
       try {
-        const staging = stageAiflyConfig(input.rawText);
+        staging = stageAiflyConfig(input.rawText);
+      } catch (e) {
+        diag("mgmt POST /import-commit", e);
+        return err(400, "invalid-config", INVALID_AIFLY_CONFIG_MESSAGE);
+      }
+      try {
         const out = await commitAiflyImport(staging, st, {
           mappings: input.mappings,
           secretExists: (name) => secrets().exists(name),
@@ -378,7 +396,11 @@ export function createAiManagement(deps) {
         await deps.refreshLimitDefaults();
         return { status: 200, body: out };
       } catch (e) {
-        return err(e instanceof StoreError ? errorStatus(e) : 400, e instanceof StoreError ? e.code : "invalid-config", e instanceof Error ? e.message : String(e));
+        // StoreError → 固定脱敏投影；importer 校验错（服务名/env 引用=调用方
+        // 输入面，无 secret 名/路径）保留原文案指导两阶段补全
+        if (e instanceof StoreError) return sanitizedErr("mgmt POST /import-commit", e);
+        diag("mgmt POST /import-commit", e);
+        return err(400, "invalid-config", e instanceof Error ? e.message : "import rejected");
       }
     }
 
@@ -442,8 +464,15 @@ export function createAiManagement(deps) {
         const out = await consumer.startConsumerEndpoint({ providerEndpointId: input.providerEndpointId, serviceId: input.serviceId, port: input.port });
         return { status: 200, body: out };
       } catch (e) {
-        // 端口冲突=真实 listen 错误（不静默换端口）——完整文案上抛
-        return err(errorStatus(e), /** @type {{code?: string}} */ (e)?.code ?? "endpoint-failed", e instanceof Error ? e.message : String(e));
+        // 端口冲突=真实 listen 错误（不静默换端口）；invalid/conflict 族文案为
+        // 调用方输入面（服务/提供者标识+端口——无 secret 名/路径）可保留；
+        // 其余（账本损坏等）固定脱敏。
+        const code = /** @type {{ code?: string }} */ (e)?.code;
+        if (code === "invalid" || code === "conflict") {
+          diag("mgmt POST /consumer/endpoints", e);
+          return err(code === "conflict" ? 409 : 400, code, e instanceof Error ? e.message : "endpoint failed");
+        }
+        return sanitizedErr("mgmt POST /consumer/endpoints", e);
       }
     }
 
@@ -453,7 +482,7 @@ export function createAiManagement(deps) {
         await consumer.stopConsumerEndpoint(endpointMatch[1]);
         return { status: 200, body: { ok: true } };
       } catch (e) {
-        return err(errorStatus(e), /** @type {{code?: string}} */ (e)?.code ?? "internal", e instanceof Error ? e.message : String(e));
+        return sanitizedErr("mgmt DELETE /consumer/endpoints/:id", e);
       }
     }
 
@@ -468,11 +497,7 @@ export function createAiManagement(deps) {
         const out = await consumer.previewWriter(input.endpointId);
         return { status: 200, body: out };
       } catch (e) {
-        const code = /** @type {{code?: string}} */ (e)?.code;
-        if (code === "invalid-settings") return err(400, code, e instanceof Error ? e.message : String(e));
-        if (code === "not-found") return err(404, code, e instanceof Error ? e.message : String(e));
-        if (code === "conflict") return err(409, code, e instanceof Error ? e.message : String(e));
-        return err(errorStatus(e), code ?? "internal", e instanceof Error ? e.message : String(e));
+        return writerErr("mgmt POST /consumer/writer/preview", e);
       }
     }
 
@@ -485,16 +510,35 @@ export function createAiManagement(deps) {
         const out = await consumer.applyWriter(input.endpointId, input.tokenSha256);
         return { status: 200, body: { applied: true, ...out } };
       } catch (e) {
-        const code = /** @type {{code?: string}} */ (e)?.code;
-        if (code === "stale-preview") return err(409, code, e instanceof Error ? e.message : String(e));
-        if (code === "invalid-settings") return err(400, code, e instanceof Error ? e.message : String(e));
-        if (code === "not-found") return err(404, code, e instanceof Error ? e.message : String(e));
-        if (code === "conflict") return err(409, code, e instanceof Error ? e.message : String(e));
-        return err(errorStatus(e), code ?? "internal", e instanceof Error ? e.message : String(e));
+        return writerErr("mgmt POST /consumer/writer/apply", e);
       }
     }
 
     return null;
+  }
+
+  /**
+   * 写手错误投影：invalid-settings/stale-preview/not-found/conflict 文案为
+   * 固定指导文（无内部状态）可保留；io 族（含本地文件路径）与其余内部异常
+   * 走固定脱敏文案（P1-8——路径不进响应/日志）。
+   * @param {string} face @param {unknown} e
+   */
+  function writerErr(face, e) {
+    const code = /** @type {{ code?: string }} */ (e)?.code;
+    if (code === "invalid-settings" || code === "not-found" || code === "conflict") {
+      diag(face, e);
+      const status = code === "not-found" ? 404 : code === "conflict" ? 409 : 400;
+      return err(status, code, e instanceof Error ? e.message : "writer failed");
+    }
+    if (code === "stale-preview") {
+      diag(face, e);
+      return err(409, code, e instanceof Error ? e.message : "preview is stale");
+    }
+    if (code === "io") {
+      diag(face, e);
+      return err(500, "io", "cannot access the local writer settings file");
+    }
+    return sanitizedErr(face, e);
   }
 
   /**
@@ -602,7 +646,9 @@ export function createAiManagement(deps) {
       const out = await fabric.issueInvite({ recipient, ttlMs: 10 * 60_000 });
       token = out.token;
     } catch (e) {
-      return err(503, "fabric-unavailable", `cannot issue a fabric invite: ${e instanceof Error ? e.message : String(e)}`);
+      // fabric 内部异常不透传原文（P1-8——宿主面错误可能含内部标识/路径）
+      diag("mgmt POST /link", e);
+      return err(503, "fabric-unavailable", "cannot issue a fabric invite (the host fabric face failed)");
     }
     const payload = {
       v: 1,

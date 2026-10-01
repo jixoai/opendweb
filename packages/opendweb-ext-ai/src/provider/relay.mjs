@@ -10,20 +10,26 @@
 //   同步代码段（无 await）」+ per-rid promise 链互斥锁双保险：同步段在事件
 //   循环上天然原子，互斥锁把异步复合操作（hold 等待、背压等待）串行化，
 //   等待本身发生在锁外（无锁内等待=无死锁）。
-// - 单飞拉取：同 rid 并发第二个 response 调用=409 pull_in_flight。
+// - 单飞拉取：同 rid 并发第二个 response 调用=409 pull_in_flight（占位覆盖
+//   ready/terminal/hold 全部 response 路径——锁内占位+finally 统一释放）。
 // - 连续提交游标 committedSeq 初值 −1：拉取必须 fromSeq===committedSeq+1
 //   （否则 409 invalid_from_seq）；提交=消费方下一次拉取 fromSeq 推进（隐式
 //   连续提交）或终态确认；ring 槽仅随游标推进释放。已送达未确认的末片保留
 //   在 ring——丢包重试 fromSeq=seq 得到同内容重放（(epoch,rid,seq) 同键同
 //   内容——幂等仅同进程内保证）。
-// - 未就绪=204 hold ≤20s（hold 期产出即返回；204 不续 TTL）+x-odai-next-seq。
+// - 未就绪=204 hold ≤20s（hold 期产出即返回；204 不续 TTL）+x-odai-next-seq；
+//   hold 注册 abort 监听后同步复查预中止（ai-fly engine.ts 5.2-P1 同款）。
 // - 空闲 TTL=最后 200 拉取活动+120s；绝对寿命=创建+10min 硬上界（到点未
 //   终态即 expired——先 abort 上游再释放占位）。
 // - done：上游 EOF 后，末片拉取带 x-odai-done:1；下一次拉取（终态确认）=
 //   摘要 200 零 body；此后拉取=摘要重放（body 分片即弃，旧 seq 不可再拉）。
 // - 终态摘要 LRU 独立 ≤4MiB（done/error 摘要可重放；cancelled/expired 404
-//   族标记）；不占活跃 ring 预算（活跃 ring=per-rid ≤2MiB）。
+//   族标记）；摘要记录活动时间戳，**随空闲 TTL 过期回收**（replay/sweep 前
+//   判 TTL——过期删除+404 response_expired；重放=活动续期）；不占活跃 ring
+//   预算（活跃 ring=per-rid ≤2MiB）。
 // - 满 buffer=上游读暂停背压（sink.chunk 等待 ring 空间；拉取推进/终态唤醒）。
+//   「确认仍满+注册 waiter」在同一锁内临界区完成（条件变量模式——唤醒后
+//   状态复查；无漏醒窗口）。
 // - 撤钥三态（design §2）：单 keyId 撤销=新 request 403（endpoints 层）；
 //   在途 rid 按创建时快照续拉至终态（本层不因撤钥拒拉取）。全钥失效=
 //   drainForKeys（5s 有界 deadline：在途 settle 或 abort auth_revoked——
@@ -93,8 +99,15 @@ export function createRelayRegistry(opts) {
   const active = new Map();
   /** @type {Map<string, object>} 终态摘要 LRU（插入序=年龄序；访问重插） */
   const summaries = new Map();
+  /**
+   * 摘要字节记账（不变量集中维护）：rid → 该记录的 JSON 字节数。
+   * 与 summaries 键集严格同拍——put/touch/remove 是仅有的变更入口。
+   */
+  const summarySizes = new Map();
   let summaryBytes = 0;
   let sweepTimer = null;
+  /** 终态摘要重放面的单飞占位（P1-1：全部 response 调用统一——rid 级）。 */
+  const replayInFlight = new Set();
 
   // -------------------------------------------------------------------------
   // 内部：终态申请（全部转移的汇聚点——锁内调用；先 abort 上游再释放占位）
@@ -129,19 +142,85 @@ export function createRelayRegistry(opts) {
    */
 
   /**
-   * 终态摘要/标记入 LRU（超 4MiB 逐最旧淘汰）。
+   * 终态摘要/标记入 LRU（§3.2「随空闲 TTL 过期回收」——记录终态落盘时的活动
+   * 时间与到期点；超 4MiB 逐最旧淘汰）。summaryBytes/LRU 不变量唯一入口之一。
+   * 锁内同步段（无 await）。
    * @param {string} rid
    * @param {object} record
    */
   function putSummary(rid, record) {
+    const t = now();
+    record.lastActivityAt = t;
+    record.expiresAt = t + idleTtlMs;
+    removeSummary(rid);
+    summaries.set(rid, record);
+    const size = Buffer.byteLength(JSON.stringify(record));
+    summarySizes.set(rid, size);
+    summaryBytes += size;
+    evictSummaryOverflow();
+    startSweepIfNeeded();
+  }
+
+  /**
+   * LRU 触摸（访问重插=年龄重置）+ TTL 续期（重放=拉取活动——空闲语义同拍：
+   * 持续重放保活、停止重放后 idleTtlMs 回收）。墓碑（无 expiresAt）仅触摸
+   * 不续期——过期响应不可通过重放复活。
+   * @param {string} rid
+   */
+  function touchSummary(rid) {
+    const record = summaries.get(rid);
+    if (record === undefined) return;
     summaries.delete(rid);
     summaries.set(rid, record);
-    summaryBytes += Buffer.byteLength(JSON.stringify(record));
+    if (record.expiresAt === undefined) return; // 墓碑：仅 LRU 触摸
+    const t = now();
+    record.lastActivityAt = t;
+    record.expiresAt = t + idleTtlMs;
+    const size = Buffer.byteLength(JSON.stringify(record));
+    summaryBytes += size - (summarySizes.get(rid) ?? 0);
+    summarySizes.set(rid, size);
+    evictSummaryOverflow();
+  }
+
+  /**
+   * 摘要移除（字节记账同步扣减）。summaryBytes/LRU 不变量唯一入口之一。
+   * @param {string} rid
+   */
+  function removeSummary(rid) {
+    const record = summaries.get(rid);
+    if (record === undefined) return;
+    summaries.delete(rid);
+    summaryBytes -= summarySizes.get(rid) ?? 0;
+    summarySizes.delete(rid);
+  }
+
+  /** 超 4MiB 逐最旧淘汰（保至少 1 条——最新记录不自我驱逐）。 */
+  function evictSummaryOverflow() {
     while (summaryBytes > SUMMARY_LRU_MAX_BYTES && summaries.size > 1) {
-      const oldest = summaries.keys().next().value;
-      summaryBytes -= Buffer.byteLength(JSON.stringify(summaries.get(oldest)));
-      summaries.delete(oldest);
+      removeSummary(summaries.keys().next().value);
     }
+  }
+
+  /**
+   * 摘要 TTL 过期（replay/sweep 前置检查）：过期→**墓碑化**（kind=expired——
+   * 该 responseId 的后续重放恒 404 response_expired，与活跃条目过期同拍；
+   * 墓碑无 TTL 不续期，受 LRU 容量驱逐）。字节记账经 removeSummary/直插
+   * 集中维护。
+   * @param {string} rid
+   * @returns {boolean} 本次判定过期（已墓碑化）
+   */
+  function expireSummary(rid) {
+    const record = summaries.get(rid);
+    if (record === undefined) return false;
+    if (record.expiresAt === undefined || now() < record.expiresAt) return false;
+    removeSummary(rid);
+    const tombstone = { kind: TERMINAL_KIND.expired, keyId: record.keyId };
+    summaries.set(rid, tombstone);
+    const size = Buffer.byteLength(JSON.stringify(tombstone));
+    summarySizes.set(rid, size);
+    summaryBytes += size;
+    evictSummaryOverflow();
+    return true;
   }
 
   /**
@@ -208,13 +287,13 @@ export function createRelayRegistry(opts) {
   // -------------------------------------------------------------------------
 
   function startSweepIfNeeded() {
-    if (sweepTimer !== null || active.size === 0) return;
+    if (sweepTimer !== null || (active.size === 0 && summaries.size === 0)) return;
     sweepTimer = setInterval(sweep, sweepIntervalMs);
     sweepTimer.unref?.();
   }
 
   function stopSweepIfIdle() {
-    if (sweepTimer !== null && active.size === 0) {
+    if (sweepTimer !== null && active.size === 0 && summaries.size === 0) {
       clearInterval(sweepTimer);
       sweepTimer = null;
     }
@@ -233,6 +312,11 @@ export function createRelayRegistry(opts) {
         entry.withLock(() => applyTerminal(entry, TERMINAL_KIND.expired));
       }
     }
+    // 终态摘要随空闲 TTL 过期回收（sweep 面——无人重放的摘要不滞留到容量驱逐）
+    for (const rid of [...summaries.keys()]) {
+      expireSummary(rid);
+    }
+    stopSweepIfIdle();
   }
 
   // -------------------------------------------------------------------------
@@ -258,23 +342,30 @@ export function createRelayRegistry(opts) {
         });
       },
       async chunk(piece) {
+        // 条件变量模式：「确认仍满 + 注册 waiter」在同一锁内临界区原子完成——
+        // consumer/终态的唤醒要么发生在注册前（本轮检查即见空间），要么命中已
+        // 注册的 resolver（无漏醒窗口）；唤醒后回到循环头部做状态复查（虚假
+        // 唤醒/竞态推进安全）。dispose/expiry 走 applyTerminal/dropEntry 的
+        // spaceWaiters 全量唤醒——producer 必然 resolve。
         for (;;) {
-          let appended = false;
+          /** @type {Promise<void> | null} null=已追加（或已终态，无需再等） */
+          let wait = null;
           await entry.withLock(() => {
             if (entry.terminalApplied || entry.eof) return;
             if (entry.bufferBytes + piece.length <= perRidBufferBytes) {
               entry.producedSeq += 1;
               entry.pending.push({ seq: entry.producedSeq, buf: Buffer.from(piece) });
               entry.bufferBytes += piece.length;
-              appended = true;
               for (const wake of entry.pullWaiters.splice(0)) wake();
+              return;
             }
+            // 仍满：在**同一临界区内**登记背压 waiter（锁外等待）
+            wait = new Promise((resolve) => {
+              entry.spaceWaiters.push(resolve);
+            });
           });
-          if (appended) return;
-          // 满 buffer=上游读暂停（背压）：等待拉取推进/终态（锁外等待）
-          await new Promise((resolve) => {
-            entry.spaceWaiters.push(resolve);
-          });
+          if (wait === null) return;
+          await wait;
         }
       },
       async end() {
@@ -327,6 +418,9 @@ export function createRelayRegistry(opts) {
   /**
    * 拉取（全部裁决在锁内同步段；hold 等待在锁外——产出/终态/中止/超时四源唤醒，
    * 唤醒注册与单飞占位在同一锁内完成=无漏醒窗口）。
+   * 单飞位覆盖**所有** response 调用路径（ready/terminal/hold 统一）：进入裁决
+   * 前在锁内占位，finally 内释放——同 rid 并发第二个 response 调用（无论分片
+   * 是否就绪）恒 409 pull_in_flight（§3.2 冻结面）。
    * @param {string} rid
    * @param {number} fromSeq
    * @param {string} keyId
@@ -337,7 +431,23 @@ export function createRelayRegistry(opts) {
     const holdMs = Math.min(pullOpts.holdMs ?? 20_000, 20_000);
     if (pullOpts.signal?.aborted) return null;
     const entry = active.get(rid);
-    if (entry === undefined) return terminalReplay(rid, keyId);
+    if (entry === undefined) {
+      // 终态摘要重放面（无 Entry/锁——P1-1 单飞统一）：summaries 命中的 rid 以
+      // in-flight 集合占位（同步决策+延后一拍释放），并发第二调用=409；未知
+      // rid（无摘要）=无状态 404，无需占位。
+      if (!summaries.has(rid)) return terminalReplay(rid, keyId);
+      if (replayInFlight.has(rid)) return jsonResponse(409, { code: "pull_in_flight" });
+      replayInFlight.add(rid);
+      try {
+        return terminalReplay(rid, keyId);
+      } finally {
+        // 释放延后一拍：重放决策虽为同步段，占位窗口覆盖到 promise 完结——
+        // 同步调用窗内的并发第二调用可见占位（409）；串行调用（await 完结后）
+        // 恒见空位。
+        await Promise.resolve();
+        replayInFlight.delete(rid);
+      }
+    }
     // 在途 rid 按创建时授权快照（撤键不撕在途流；keyId 不匹配=对该绑定不可见）
     if (entry.keyId !== keyId) return jsonResponse(404, { code: "response_not_found" });
 
@@ -346,47 +456,61 @@ export function createRelayRegistry(opts) {
     const racedRef = new Promise((resolve) => {
       wakeResolveRef = resolve;
     });
-
-    // ---- 裁决第 1 轮（锁内）：就绪即回；未就绪=登记唤醒+单飞占位 ----
     /** @type {(() => void) | null} */
     let registeredWake = null;
-    const first = await entry.withLock(() => {
-      if (entry.pullInFlight) return { held: false, value: jsonResponse(409, { code: "pull_in_flight" }) };
-      const ready = decideReady(entry, fromSeq);
-      if (ready !== null) return { held: false, value: ready };
-      entry.pullInFlight = true; // 单飞拉取占位（并发第二拉取=409）
-      registeredWake = wakeResolveRef; // 与锁外 raced promise 共享的 resolver
-      entry.pullWaiters.push(registeredWake);
-      return { held: true, value: null };
-    });
-    if (!first.held) return first.value;
+    // 单飞占位标记：finally 统一释放（ready/terminal/hold 全路径同拍）
+    let occupied = false;
+    try {
+      // ---- 裁决第 1 轮（锁内）：占位→就绪即回 / 未就绪=登记唤醒后 hold ----
+      const first = await entry.withLock(() => {
+        if (entry.pullInFlight) return { held: false, value: jsonResponse(409, { code: "pull_in_flight" }) };
+        entry.pullInFlight = true; // 单飞拉取占位（全部 response 路径统一；finally 释放）
+        occupied = true;
+        const ready = decideReady(entry, fromSeq);
+        if (ready !== null) return { held: false, value: ready };
+        registeredWake = wakeResolveRef; // 与锁外 raced promise 共享的 resolver
+        entry.pullWaiters.push(registeredWake);
+        return { held: true, value: null };
+      });
+      if (!first.held) return first.value;
 
-    // ---- hold（≤20s；锁外等待；204 不续 TTL） ----
-    let aborted = false;
-    const onAbort = () => {
-      aborted = true;
-      wakeResolveRef();
-    };
-    const signal = pullOpts.signal;
-    if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(wakeResolveRef, holdMs);
-    timer.unref?.();
-    await racedRef;
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
+      // ---- hold（≤20s；锁外等待；204 不续 TTL） ----
+      let aborted = false;
+      const onAbort = () => {
+        aborted = true;
+        wakeResolveRef();
+      };
+      const signal = pullOpts.signal;
+      if (signal !== undefined) signal.addEventListener("abort", onAbort, { once: true });
+      // 预中止复查（ai-fly engine.ts 5.2-P1 同款）：初始检查后、注册监听前中止的
+      // signal 不再触发监听——注册后同步补发，pull 秒回 null（不等整个 hold）。
+      if (signal !== undefined && signal.aborted) onAbort();
+      const timer = setTimeout(wakeResolveRef, holdMs);
+      timer.unref?.();
+      await racedRef;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
 
-    // ---- 裁决第 2 轮（锁内）：清单飞位→中止 null / 状态优先 / 否则 204 ----
-    return entry.withLock(() => {
-      entry.pullInFlight = false;
-      if (registeredWake !== null) {
-        const i = entry.pullWaiters.indexOf(registeredWake);
-        if (i >= 0) entry.pullWaiters.splice(i, 1);
+      // ---- 裁决第 2 轮（锁内）：状态优先 / 否则 204 ----
+      return await entry.withLock(() => {
+        if (aborted) return null; // 在途拉取 abort（consumer 本地断开路径）
+        const ready = decideReady(entry, fromSeq);
+        if (ready !== null) return ready;
+        return { status: 204, headers: [{ name: HDR_NEXT_SEQ, value: String(entry.committedSeq + 1) }], bodyChunks: [] };
+      });
+    } finally {
+      // 单飞位统一释放（锁内；并摘除未触发的 hold 唤醒登记）。释放登记在并发
+      // 第二拉取的裁决之后——并发窗口内的第二调用恒见占位（409）。
+      if (occupied) {
+        await entry.withLock(() => {
+          entry.pullInFlight = false;
+          if (registeredWake !== null) {
+            const i = entry.pullWaiters.indexOf(registeredWake);
+            if (i >= 0) entry.pullWaiters.splice(i, 1);
+          }
+        });
       }
-      if (aborted) return null; // 在途拉取 abort（consumer 本地断开路径）
-      const ready = decideReady(entry, fromSeq);
-      if (ready !== null) return ready;
-      return { status: 204, headers: [{ name: HDR_NEXT_SEQ, value: String(entry.committedSeq + 1) }], bodyChunks: [] };
-    });
+    }
   }
 
   /**
@@ -448,16 +572,19 @@ export function createRelayRegistry(opts) {
   }
 
   /**
-   * 终态重放（LRU 记录面：done=摘要 200 零 body；expired=404 response_expired；
+   * 终态重放（LRU 记录面：done=摘要 200 零 body；过期=404 response_expired；
    * cancelled=404 response_not_found；error=映射错误——旧 seq body 不可再拉）。
+   * replay 前 TTL 判定：过期即删+404 response_expired（§3.2「终态摘要随空闲
+   * TTL 过期回收」——responseId 在预期过期后不可重放）；未过期=LRU 触摸+TTL
+   * 续期（重放=拉取活动）。
    * @param {string} rid
    * @param {string} keyId 绑定校验（不匹配=对该绑定不可见）
    */
   function terminalReplay(rid, keyId) {
     const record = summaries.get(rid);
     if (record === undefined || record.keyId !== keyId) return jsonResponse(404, { code: "response_not_found" });
-    summaries.delete(rid);
-    summaries.set(rid, record); // LRU 触摸
+    if (expireSummary(rid)) return jsonResponse(404, { code: "response_expired" });
+    touchSummary(rid);
     if (record.kind === TERMINAL_KIND.expired) return jsonResponse(404, { code: "response_expired" });
     if (record.kind === TERMINAL_KIND.cancelled) return jsonResponse(404, { code: "response_not_found" });
     if (record.kind === TERMINAL_KIND.error) {
@@ -478,8 +605,8 @@ export function createRelayRegistry(opts) {
     if (entry === undefined) {
       const record = summaries.get(rid);
       if (record === undefined || record.keyId !== keyId) return jsonResponse(404, { code: "response_not_found" });
-      summaries.delete(rid);
-      summaries.set(rid, record);
+      if (expireSummary(rid)) return jsonResponse(404, { code: "response_expired" });
+      touchSummary(rid);
       if (record.kind === TERMINAL_KIND.expired) return jsonResponse(404, { code: "response_expired" });
       return jsonResponse(200, { status: record.kind }); // 幂等终态重放
     }
@@ -648,11 +775,20 @@ export function createRelayRegistry(opts) {
     closeAll,
     inspect,
     activeCount: () => active.size,
-    /** 生命周期：停扫描计时器（dispose 面）。 */
+    /** 生命周期：停扫描计时器 + 防御性收敛残余活跃 rid（dispose 面）。 */
     dispose: () => {
       if (sweepTimer !== null) {
         clearInterval(sweepTimer);
         sweepTimer = null;
+      }
+      // 兜底：独立 dispose（未经 forward.dispose 的 closeAll 先行）时，仍活跃的
+      // rid 以 error 终态收口——hold/背压 waiter 必然被唤醒（不悬挂到过期）。
+      for (const entry of [...active.values()]) {
+        void entry.withLock(() => {
+          if (!entry.terminalApplied) {
+            applyTerminal(entry, TERMINAL_KIND.error, { code: "aborted", message: "relay closed (dispose)" });
+          }
+        });
       }
     },
   };

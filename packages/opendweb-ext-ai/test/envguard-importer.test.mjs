@@ -68,6 +68,29 @@ test("importer: staging——机器可读 blocked 清单（$env 引用逐字段+
   assert.throws(() => stageAiflyConfig('{"x":1}'), /services/);
 });
 
+test("importer: staging——auth:null + headers.set $env 同样进 blocked（扫描与 auth 解耦；零 ready）", () => {
+  // codex 终审 P1-6：旧实现把 headers 扫描错误绑定到 auth 非空——显式
+  // auth:null 的服务携带 $env 头时被误放行进 ready（两阶段安全投影错误）。
+  const staging = stageAiflyConfig(
+    JSON.stringify({
+      services: [
+        {
+          serviceId: "hhh",
+          name: "no-auth-headers",
+          match: [{ type: "suffix", value: ".noauth.dev" }],
+          upstream: "https://api.noauth.dev",
+          defaultPort: 4400,
+          enabled: true,
+          auth: null, // 显式无 auth——headers 扫描不得依赖 auth 存在性
+          headers: { set: { "x-api-key": "$env:HEADER_ONLY_KEY", "x-plain": "ok" } },
+        },
+      ],
+    }),
+  );
+  assert.deepEqual(staging.blocked, [{ service: "no-auth-headers", field: "headers.set.x-api-key", ref: "$env:HEADER_ONLY_KEY" }]);
+  assert.deepEqual(staging.ready, [], "auth:null + $env 头=完整 blocked、零 ready（零部分激活）");
+});
+
 test("importer: commit——映射转换（literal→{secret}、headers→$secret:）+ 一次性生效；未映射拒绝；codex 不可映射", async (t) => {
   const home = await tempHome("odai-import-");
   t.after(() => rm(home, { recursive: true, force: true }));

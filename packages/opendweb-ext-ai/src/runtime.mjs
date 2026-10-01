@@ -140,7 +140,7 @@ export async function createAiRuntime(opts = {}) {
    * provider 平面：forward plane（域上限构造——有效 admission 门在 wireHandler
    * 入口）+ wire handler + limits + usage 记录门。
    * @type {{
-   *   wireHandler: (req: any, peer: string) => Promise<any>,
+   *   wireHandler: (req: import("./wire/endpoints.mjs").WireHandlerRequest, peer: string) => Promise<import("./wire/endpoints.mjs").WireHandlerResponse | null>,
    *   forwardPlane: ReturnType<typeof createForwardPlane>,
    *   limits: LimitEnforcer,
    * } | null}
@@ -216,7 +216,7 @@ export async function createAiRuntime(opts = {}) {
    * wpk 数据面 handler（createWpkRouter routes.ai 挂点——恒注册；gate 由内核
    * 先行：未启用 503 plugin-disabled）。有效 admission 门在此判定（域上限内的
    * 即时收紧面——onConfigChange 无需重建 plane）。
-   * @param {any} req
+   * @param {import("./wire/endpoints.mjs").WireHandlerRequest} req
    * @param {string} peer
    */
   async function wireHandler(req, peer) {
@@ -269,7 +269,8 @@ export async function createAiRuntime(opts = {}) {
       endpointsLedger = parsed;
     } catch (e) {
       if (/** @type {NodeJS.ErrnoException} */ (e).code === "ENOENT") return;
-      throw new Error(`ai consumer endpoints ledger is malformed (${endpointsFile()})`);
+      // 错误文案不含存储路径（管理/日志面脱敏——P1-8）；结构化诊断走内部异常。
+      throw Object.assign(new Error("ai consumer endpoints ledger is malformed (fix or remove the file manually)"), { code: "corrupt" });
     }
   }
 
@@ -371,7 +372,15 @@ export async function createAiRuntime(opts = {}) {
       createdAt: now(),
     };
     endpointsLedger.endpoints.push(entry);
-    await saveEndpoints();
+    try {
+      await saveEndpoints();
+    } catch (e) {
+      // 账本落盘失败=端点未成立：close listener + 摘账本条目（P2-2——不留孤儿
+      // 端口占用；重试可原端口再起）。异常上抛（真实报错面）。
+      endpointsLedger.endpoints.pop();
+      await listener.close().catch(() => undefined);
+      throw e;
+    }
     activeListeners.set(entry.id, { close: listener.close, startedAt: now() });
     log(`ai consumer: local endpoint 127.0.0.1:${entry.port} -> ${provider.alias}/${entry.serviceId}`);
     return { id: entry.id, endpoint: consumerEndpointView(entry) };

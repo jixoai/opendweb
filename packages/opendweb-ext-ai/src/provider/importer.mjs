@@ -55,8 +55,10 @@ export function stageAiflyConfig(rawText) {
     if (auth !== null && typeof auth === "object" && typeof auth.literal === "string" && auth.literal.startsWith(ENV_REF_PREFIX)) {
       entryBlocked.push({ service: name, field: "auth.literal", ref: auth.literal });
     }
-    // ② headers.set 值的 $env 引用
-    const set = auth !== null && typeof entry.headers === "object" ? entry.headers?.set : undefined;
+    // ② headers.set 值的 $env 引用（与 auth 是否存在/为 null 无关——独立扫描面：
+    // `auth:null` 的服务同样不得携带 $env 头进 ready）
+    const headers = entry.headers;
+    const set = headers !== null && typeof headers === "object" ? headers.set : undefined;
     if (set !== null && typeof set === "object") {
       for (const [headerName, value] of Object.entries(set)) {
         if (typeof value === "string" && value.startsWith(ENV_REF_PREFIX)) {
@@ -142,7 +144,8 @@ export async function commitAiflyImport(staging, store, opts) {
   }
   for (const [varName, secretName] of Object.entries(mappings)) {
     if (!secretExists(secretName)) {
-      throw new Error(`mapping '${varName}' targets secret '${secretName}' which is not in the secrets store; add it first`);
+      // 文案不含目标 secret 名（脱敏纪律）；env 变量名（keyEnv 族）按规范可保留。
+      throw new Error(`mapping '${varName}' targets a secret which is not in the secrets store; add it first`);
     }
   }
   // ② 转换 + 原子写入（transaction：任一失败回滚快照）
