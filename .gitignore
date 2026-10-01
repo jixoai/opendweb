@@ -21,3 +21,6 @@ packages/server-binary/bin/dweb-server-aarch64-apple-darwin
 
 # opendweb CLI 测试以默认 DWEB_HOME 生成的本地数据（测试产物，不入库）
 packages/opendweb/dweb-data/
+
+# hub 本地数据（根 cwd 起 hub start 时的落点）
+dweb-data/
