@@ -120,6 +120,12 @@ export const AUTH_ERR_BODY_SCHEMA = z.strictObject({
   code: z.literal(ERROR_CODE.key_all_invalid),
 });
 
+/** cancel 端点载荷（design §3 端点表：{responseId,epoch}）。 */
+export const CANCEL_BODY_SCHEMA = z.strictObject({
+  responseId: z.string().min(1).max(64),
+  epoch: z.string().min(1).max(64),
+});
+
 // ---------------------------------------------------------------------------
 // 目录载荷（AUTH groups[].services / catalog.catalog.groups[].services 共用）
 // ---------------------------------------------------------------------------

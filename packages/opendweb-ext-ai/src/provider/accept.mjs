@@ -13,7 +13,7 @@ import { AI_OPS, AI_WIRE_PREFIX, notFoundResponse } from "../wire/constants.mjs"
 /**
  * wire 路径解析：`/wpk1/ai/v1/<op>`（+ 可选尾段，response/<rid> 归 op=response）。
  * @param {string} requestPath（含查询串的原始 path）
- * @returns {{ op: string } | null} null=未知子路径（404 同体）
+ * @returns {{ op: string, tail?: string } | null} null=未知子路径（404 同体）
  */
 export function parseWirePath(requestPath) {
   const bare = requestPath.split("?", 2)[0];
@@ -26,7 +26,8 @@ export function parseWirePath(requestPath) {
   if (!AI_OPS.includes(op)) return null;
   // response 允许 <rid> 尾段；其余 op 不带尾段
   if (op === "response") {
-    if (segs.length > 2) return null;
+    if (segs.length > 2 || segs[1] === undefined || segs[1] === "") return null;
+    return { op, tail: segs[1] };
   } else if (segs.length > 1) {
     return null;
   }

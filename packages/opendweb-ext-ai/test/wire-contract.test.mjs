@@ -673,12 +673,14 @@ test("wire: gate op 名与路径解析矩阵", () => {
   assert.deepEqual(parseWirePath("/wpk1/ai/v1/auth"), { op: "auth" });
   assert.deepEqual(parseWirePath("/wpk1/ai/v1/catalog?since=3"), { op: "catalog" });
   assert.deepEqual(parseWirePath("/wpk1/ai/v1/request"), { op: "request" });
-  assert.deepEqual(parseWirePath("/wpk1/ai/v1/response/abc:1"), { op: "response" });
+  // B1：response/<rid> 尾段=中继拉取的 rid（<epoch>:<单调号>）
+  assert.deepEqual(parseWirePath("/wpk1/ai/v1/response/abc:1"), { op: "response", tail: "abc:1" });
   assert.deepEqual(parseWirePath("/wpk1/ai/v1/cancel"), { op: "cancel" });
   assert.equal(parseWirePath("/wpk1/ai/v1"), null);
   assert.equal(parseWirePath("/wpk1/ai/"), null);
   assert.equal(parseWirePath("/wpk1/ai/v1/auth/extra"), null);
   assert.equal(parseWirePath("/wpk1/ai/v1/response/a/b"), null);
+  assert.equal(parseWirePath("/wpk1/ai/v1/response/"), null); // 空 rid=未知子路径
   assert.equal(parseWirePath("/wpk1/ports/proxy/1"), null);
   for (const op of ["auth", "catalog", "request", "response", "cancel"]) {
     assert.equal(opGateName(op), `ai/v1/${op}`);

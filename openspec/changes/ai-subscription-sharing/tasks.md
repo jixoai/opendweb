@@ -35,7 +35,7 @@
       错误 JSON）+钥环/`aifly1.` 导入+fabric 宿主注入面接线
 - [ ] B4 竞态矩阵测试（design §7.3 全清单）
 - [ ] B5 e2e 双进程真内核（全链路+延迟目标 p95）+泄露面扫描测试
-- [ ] **B 门**：A 门 + `cd $WT/packages/opendweb-ext-ai && node --test test/e2e/`（退出码 0）+ 三插件回归（各单行执行，退出码 0）：`cd $WT/packages/opendweb-ext-ports && npm test`；`cd $WT/packages/opendweb-ext-files && npm test`；`cd $WT/packages/opendweb-ext-sync && npm test`。阻断：竞态矩阵任一非 0 或 p95 超标。receipt：
+- [ ] **B 门**：A 门 + `cd $WT/packages/opendweb-ext-ai && node --test "test/e2e/*.test.mjs"`（退出码 0；Node 24 目录实参不可用，用 glob 形式）+ 三插件回归（各单行执行，退出码 0）：`cd $WT/packages/opendweb-ext-ports && npm test`；`cd $WT/packages/opendweb-ext-files && npm test`；`cd $WT/packages/opendweb-ext-sync && npm test`。阻断：竞态矩阵任一非 0 或 p95 超标。receipt：
       `$WT/docs/receipts/ai-plugin/phase-b-e2e.md`（命令+输出尾+延迟 p95 表）。
 
 ## Phase C — UI 页组 + 占位替换 + 生命周期

@@ -12,8 +12,11 @@
 //   ≤8KiB=400 metadata_too_large、x-odai-key-id 绑定三码分立 key_invalid/
 //   key_revoked、413 超限、429 rate_limited/quota_exceeded、404
 //   path_not_offered）→ 200 {responseId,epoch,status,headers}；
-// - POST response/<rid> / POST cancel：Phase B（B1 中继状态机）——当前一律
-//   404 同体（端点已登记、实现未挂）。
+// - POST response/<rid>：头 x-odai-key-id/x-odai-from-seq；就绪=200 单分片+
+//   x-odai-seq/x-odai-done/x-odai-next-seq；未就绪=204 hold ≤20s；终态=摘要
+//   200 零 body；409 invalid_from_seq/pull_in_flight；404 response_not_found/
+//   response_expired（B1 中继状态机——forwardPlane.relay）；
+// - POST cancel：body {responseId,epoch} → 200 {status}（幂等终态重放）。
 //
 // handler 面：与 ext-ports 同款可注入面 `(req, peer) => resp | null`
 // （HttpHandlerRequestLike——Phase C 经 createWpkRouter routes.ai 挂入内核；
@@ -25,6 +28,7 @@ import {
   HDR_KEY_ID,
   HDR_METHOD,
   HDR_PATH,
+  HDR_FROM_SEQ,
   HDR_REV,
   HDR_SERVICE,
   METADATA_HEADER_BUDGET_BYTES,
@@ -35,6 +39,7 @@ import {
 } from "./constants.mjs";
 import {
   AUTH_BODY_SCHEMA,
+  CANCEL_BODY_SCHEMA,
   ERROR_CODE,
   HTTP_METHODS,
   passthroughHeadersError,
@@ -156,13 +161,17 @@ export function serviceIdDuplicateSource(path, body) {
  *   maxConcurrency?: number,
  *   env?: (name: string) => string | undefined,
  *   authorize?: (peer: string, op: string) => boolean | Promise<boolean>,
- *   forwardPlane?: { request: (input: any) => Promise<any>, epoch: string },
+ *   forwardPlane?: { request: (input: any) => Promise<any>, epoch: string, relay?: object },
  *   home?: string,
  *   loader?: (name: string, home: string) => Record<string, unknown> | undefined,
  *   fetchImpl?: typeof fetch,
  *   probeConnect?: (url: URL, ms: number) => Promise<void>,
  *   timeouts?: { connectMs?: number, firstByteMs?: number, stallMs?: number },
  *   holdMs?: number,
+ *   idleTtlMs?: number,
+ *   absoluteLifetimeMs?: number,
+ *   sweepIntervalMs?: number,
+ *   drainDeadlineMs?: number,
  *   sleep?: (ms: number) => Promise<void>,
  *   now?: () => number,
  *   log?: (level: "info" | "warn" | "error", msg: string) => void,
@@ -204,25 +213,33 @@ export function createAiProviderWireHandler(opts) {
       ...(opts.fetchImpl !== undefined ? { fetchImpl: opts.fetchImpl } : {}),
       ...(opts.probeConnect !== undefined ? { probeConnect: opts.probeConnect } : {}),
       ...(opts.timeouts !== undefined ? { timeouts: opts.timeouts } : {}),
+      ...(opts.idleTtlMs !== undefined ? { idleTtlMs: opts.idleTtlMs } : {}),
+      ...(opts.absoluteLifetimeMs !== undefined ? { absoluteLifetimeMs: opts.absoluteLifetimeMs } : {}),
+      ...(opts.sweepIntervalMs !== undefined ? { sweepIntervalMs: opts.sweepIntervalMs } : {}),
+      ...(opts.drainDeadlineMs !== undefined ? { drainDeadlineMs: opts.drainDeadlineMs } : {}),
       now,
+      ...(opts.log !== undefined ? { log } : {}),
     });
   const opGate = createOpGate({ ...(opts.authorize !== undefined ? { authorize: opts.authorize } : {}) });
   const directory = () => authDirectoryFromStore(store);
 
   /**
-   * @param {string} op
+   * @param {{ op: string, tail?: string }} parsed
    * @returns {(req: any) => Promise<any>}
    */
-  const dispatch = (op) => {
-    switch (op) {
+  const dispatch = (parsed) => {
+    switch (parsed.op) {
       case "auth":
         return handleAuth;
       case "catalog":
         return handleCatalog;
       case "request":
         return handleRequest;
+      case "response":
+        return (req) => handleResponse(req, parsed.tail);
+      case "cancel":
+        return handleCancel;
       default:
-        // response/cancel=Phase B（B1 中继状态机）；端点登记但不实现——统一 404 同体。
         return async () => notFoundResponse();
     }
   };
@@ -427,6 +444,68 @@ export function createAiProviderWireHandler(opts) {
   }
 
   /**
+   * POST response/<rid>（B1 中继拉取：单飞/连续提交游标/204 hold/终态摘要）。
+   * relay 缺席（注入面无中继的 fake forwardPlane）=端点未挂——404 同体。
+   * @param {any} req
+   * @param {string | undefined} rid
+   */
+  async function handleResponse(req, rid) {
+    if (req.method !== "POST") return notFoundResponse();
+    const relay = forwardPlane.relay;
+    if (relay === undefined || typeof relay.pull !== "function") return notFoundResponse();
+    // 头预算（与 request 同拍：ai 元数据头合计 ≤8KiB）
+    if (metadataHeaderBytes(req.headers) > METADATA_HEADER_BUDGET_BYTES) {
+      return jsonResponse(400, { code: "metadata_too_large", message: "x-odai-* metadata headers exceed 8 KiB" });
+    }
+    const keyId = headerValue(req.headers, HDR_KEY_ID);
+    if (keyId === null || keyId === "") {
+      return jsonResponse(400, { code: "metadata_invalid", message: "x-odai-key-id header is required" });
+    }
+    const fromSeqRaw = headerValue(req.headers, HDR_FROM_SEQ);
+    if (fromSeqRaw === null || !/^\d+$/.test(fromSeqRaw) || Number(fromSeqRaw) > Number.MAX_SAFE_INTEGER) {
+      return jsonResponse(400, { code: "metadata_invalid", message: "x-odai-from-seq header must be a non-negative integer" });
+    }
+    // 请求体必须为空（拉取无载荷；防御性有界读取后忽略）
+    const read = await readBoundedBody(req, 1);
+    if (read.error === "pull") return null;
+    if (read.error === "over-limit") {
+      return jsonResponse(400, { code: "metadata_invalid", message: "response pull must carry an empty body" });
+    }
+    if (req.signal?.aborted) return null;
+    return relay.pull(rid ?? "", Number(fromSeqRaw), keyId, {
+      signal: req.signal,
+      ...(opts.holdMs !== undefined ? { holdMs: opts.holdMs } : {}),
+    });
+  }
+
+  /**
+   * POST cancel（B1：幂等取消——终态后重放同响应）。
+   * @param {any} req
+   */
+  async function handleCancel(req) {
+    if (req.method !== "POST") return notFoundResponse();
+    const relay = forwardPlane.relay;
+    if (relay === undefined || typeof relay.cancel !== "function") return notFoundResponse();
+    const read = await readBoundedBody(req, CONTROL_BODY_LIMIT_BYTES);
+    if (read.error === "pull") return null;
+    if (read.error === "over-limit") {
+      return jsonResponse(400, { code: "metadata_invalid", message: "cancel body exceeds the control-body budget" });
+    }
+    let parsed;
+    try {
+      parsed = read.body.length === 0 ? {} : JSON.parse(read.body.toString("utf8"));
+    } catch {
+      return jsonResponse(400, { code: "metadata_invalid", message: "cancel body is not valid JSON" });
+    }
+    const schema = CANCEL_BODY_SCHEMA.safeParse(parsed);
+    if (!schema.success) {
+      return jsonResponse(400, { code: "metadata_invalid", message: "cancel body must be {responseId,epoch}" });
+    }
+    if (req.signal?.aborted) return null;
+    return relay.cancel(schema.data.responseId, schema.data.epoch, headerValue(req.headers, HDR_KEY_ID) ?? "");
+  }
+
+  /**
    * handler（createWpkRouter routes.ai 挂点；peer=serveHttp 绑定对端）。
    * @param {any} req
    * @param {string} peer
@@ -443,7 +522,7 @@ export function createAiProviderWireHandler(opts) {
       return notFoundResponse();
     }
     try {
-      return await dispatch(parsed.op)(req);
+      return await dispatch(parsed)(req);
     } catch (err) {
       log("error", `ai wire handler error at ${parsed.op}: ${err instanceof Error ? err.message : String(err)}`);
       return jsonResponse(500, { code: ERROR_CODE.internal, message: "internal provider error" });
