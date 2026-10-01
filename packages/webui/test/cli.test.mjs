@@ -28,8 +28,9 @@ function makeIo({ env = {}, isTTY = false } = {}) {
 }
 
 test("parseWebuiArgv mirrors the official parser matrix", () => {
-  assert.deepEqual(parseWebuiArgv(["--token", "abc"]), { token: "abc" });
-  assert.deepEqual(parseWebuiArgv(["--token=abc"]), { token: "abc" });
+  // W11（2026-10-01）：--token 移除——两种形态均为显式迁移错误（非泛型 unknown）
+  assert.throws(() => parseWebuiArgv(["--token", "abc"]), /--token was removed \(W11\)/);
+  assert.throws(() => parseWebuiArgv(["--token=abc"]), /--token was removed \(W11\)/);
   assert.deepEqual(parseWebuiArgv(["--allow-insecure"]), { "allow-insecure": true });
   assert.deepEqual(parseWebuiArgv(["--allow-insecure=false"]), { "allow-insecure": false });
   assert.deepEqual(parseWebuiArgv(["--no-open", "--port", "8080", "--server", "http://127.0.0.1:1"]), {
@@ -40,7 +41,6 @@ test("parseWebuiArgv mirrors the official parser matrix", () => {
   assert.deepEqual(parseWebuiArgv(["--help"]), { help: true });
   assert.deepEqual(parseWebuiArgv(["-h"]), { help: true });
   assert.throws(() => parseWebuiArgv(["--unknown"]), /unknown option/);
-  assert.throws(() => parseWebuiArgv(["--token"]), /missing value/);
   assert.throws(() => parseWebuiArgv(["--port", "abc"]), /expects a number/);
   assert.throws(() => parseWebuiArgv(["bare"]), /unexpected positional/);
 });
@@ -50,33 +50,33 @@ test("--help prints usage without starting anything", async () => {
   const r = await main({ help: true }, io);
   assert.equal(r.exit, 0);
   assert.match(out.join(""), /Usage:/);
-  assert.match(out.join(""), /--token/);
+  // W11：usage 不再声明 --token（提示走向 TTY 隐藏输入/配对面/节点簿）
+  assert.ok(!/--token\s+<string>/.test(out.join("")));
 });
 
 test("invalid port rejected with exit 2 (token not echoed)", async () => {
   const { io, err } = makeIo();
-  const r = await main({ port: 99999, token: "cli-secret-token-42" }, io);
+  const r = await main({ port: 99999 }, io);
   assert.equal(r.exit, 2);
   assert.match(err.join(""), /invalid --port/);
-  assert.ok(!err.join("").includes("cli-secret-token-42"));
 });
 
 test("bad --server refused with exit 1 and allow-insecure hint; no token in output", async () => {
   const { io, err } = makeIo();
-  const r = await main({ server: "http://203.0.113.10:18787", token: "cli-secret-token-42" }, io);
+  const r = await main({ server: "http://203.0.113.10:18787" }, io);
   assert.equal(r.exit, 1);
   assert.match(err.join(""), /plaintext http to a non-loopback host/);
   assert.match(err.join(""), /--allow-insecure/);
-  assert.ok(!err.join("").includes("cli-secret-token-42"));
 });
 
-test("non-TTY with no token source: error lists both channels (--token / DWEB_ADMIN_TOKEN)", async () => {
+test("non-TTY with no token source: error points to hidden prompt / pairing / node book (W11)", async () => {
   const { io, err } = makeIo({ env: {} });
   const r = await main({ server: "http://127.0.0.1:18787" }, io);
   assert.equal(r.exit, 2);
   const text = err.join("");
-  assert.match(text, /--token <token>/);
-  assert.match(text, /DWEB_ADMIN_TOKEN/);
+  assert.match(text, /run in a terminal to type it hidden/);
+  assert.match(text, /node book/);
+  assert.match(text, /W11/);
 });
 
 /** 等待 captured 输出出现 marker（main 注册监听前发信号会丢事件，先等启动完成） */
@@ -89,30 +89,13 @@ async function waitForOutput(captured, marker, { timeoutMs = 5000 } = {}) {
   }
 }
 
-test("argv token prints visibility banner; env token prints env banner", async () => {
-  // argv
-  {
-    const { io, out } = makeIo();
-    const done = main({ server: "http://127.0.0.1:18787", token: "sekret-argv", "no-open": true }, io);
-    await waitForOutput(out, "opendweb-webui listening on");
-    io.signal.emit("SIGINT");
-    assert.equal((await done).exit, 0);
-    const text = out.join("");
-    assert.match(text, /command line is visible to other local processes/);
-    assert.match(text, /shell history, ps/);
-    assert.ok(!text.includes("sekret-argv"), "token value never printed");
-  }
-  // env
-  {
-    const { io, out } = makeIo({ env: { DWEB_ADMIN_TOKEN: "sekret-env" } });
-    const done = main({ server: "http://127.0.0.1:18787", "no-open": true }, io);
-    await waitForOutput(out, "opendweb-webui listening on");
-    io.signal.emit("SIGINT");
-    assert.equal((await done).exit, 0);
-    const text = out.join("");
-    assert.match(text, /DWEB_ADMIN_TOKEN is readable from the process environment/);
-    assert.ok(!text.includes("sekret-env"), "token value never printed");
-  }
+test("W11: env DWEB_ADMIN_TOKEN is warned-and-ignored (fail-closed), value never used nor printed", async () => {
+  const { io, out, err } = makeIo({ env: { DWEB_ADMIN_TOKEN: "sekret-env" }, stdin: { isTTY: false } });
+  const r = await main({ server: "http://127.0.0.1:18787", "no-open": true }, io);
+  assert.equal(r.exit, 2, "non-TTY + env token = refused (env is not a token source anymore)");
+  const text = out.join("") + err.join("");
+  assert.match(text, /DWEB_ADMIN_TOKEN is ignored \(removed, W11\)/);
+  assert.ok(!text.includes("sekret-env"), "token value never printed");
 });
 
 test("setup mode: no --server starts sidecar, prints URL + pairing code (no token needed)", async () => {
@@ -148,10 +131,19 @@ test("TTY prompt reads the token with echo suppressed (secret not in terminal ou
 });
 
 test("allow-insecure banner prints for plaintext non-loopback target", async () => {
+  // W11：token 经 TTY 隐藏输入（argv/env 通道移除后 banner 用例同样走 prompt）
+  const input = new PassThrough();
+  input.isTTY = true;
+  const promptOut = new PassThrough();
+  const promptWrites = [];
+  promptOut.on("data", (c) => promptWrites.push(c.toString("utf8")));
   const { io, out } = makeIo();
-  const done = main({ server: "http://203.0.113.10:18787", token: "t", "allow-insecure": true, "no-open": true }, io);
+  const signal = io.signal;
+  const done = main({ server: "http://203.0.113.10:18787", "allow-insecure": true, "no-open": true }, { ...io, stdin: input, stdout: promptOut });
+  await waitForOutput(promptWrites, "admin token:", { timeoutMs: 3000 });
+  input.write("banner-test-token\n");
   await waitForOutput(out, "NOT encrypted in transit");
-  io.signal.emit("SIGINT");
+  signal.emit("SIGINT");
   assert.equal((await done).exit, 0);
   assert.match(out.join(""), /NOT encrypted in transit/);
 });

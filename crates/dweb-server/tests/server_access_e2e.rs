@@ -147,9 +147,19 @@ impl Server {
         } else {
             cmd.arg("--no-relay");
         }
+        // W11（2026-10-01）：admin token 改走 0600 文件——harness 在此拦截
+        // ("DWEB_ADMIN_TOKEN", v) 条目，转写 <data_dir>/admin-token 并从
+        // 子进程 env 剔除（与生产部署同步迁移；用例代码零改动）。
+        if let Some((_, token)) = envs.iter().find(|(k, _)| *k == "DWEB_ADMIN_TOKEN") {
+            write_admin_token_file(data_dir, token);
+        }
         cmd.args(extra_args)
             .env("DWEB_DATA_DIR", data_dir)
-            .envs(envs.iter().map(|(k, v)| (*k, *v)))
+            .envs(
+                envs.iter()
+                    .filter(|(k, _)| *k != "DWEB_ADMIN_TOKEN")
+                    .map(|(k, v)| (*k, *v)),
+            )
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = cmd.spawn().expect("spawn dweb-server");
@@ -247,6 +257,15 @@ fn parse_listening_addr(line: &str, marker: &str) -> Option<SocketAddr> {
         .trim_end_matches('"')
         .parse()
         .ok()
+}
+
+/// W11：写 0600 admin-token 文件（服务端现在只认这个——见 admin::load_token_from_file）
+fn write_admin_token_file(data_dir: &Path, token: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = data_dir.join("admin-token");
+    std::fs::write(&path, token).expect("write admin-token");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 admin-token");
 }
 
 /// 后台线程持续收集 stdout/stderr 到统一日志缓冲（tracing 默认写 stdout、
@@ -1095,7 +1114,7 @@ async fn e14_admin_api_registers_owner_and_capability_works_immediately() {
         let (status, _body) = http_request(plain.gateway, "/admin/status", "GET", None, &[]).await;
         assert_eq!(
             status, 404,
-            "未配置 DWEB_ADMIN_TOKEN 的实例不挂载 admin 路由"
+            "无 admin-token 文件的实例不挂载 admin 路由"
         );
     }
 

@@ -25,7 +25,8 @@
 ./scripts/walkthrough/webui-demo.sh
 ```
 
-预期输出：一段横幅，其中 **`管理台地址 : http://127.0.0.1:18950` ← 浏览器打开这个**
+启动后终端会提示 `admin token:`——隐藏输入（云端 demo 输入 `demo-admin-token`，
+不回显）。预期输出：一段横幅，其中 **`管理台地址 : http://127.0.0.1:18950` ← 浏览器打开这个**
 （macOS 会自动打开）。终端还会打印一行 `node book add code: XXXX`——这是第五幕
 节点簿添加节点用的配对码，先不管。
 
@@ -43,9 +44,12 @@
 ## 第二幕 · 有人在敲门（终端 2）
 
 ```sh
+# 一次性准备 admin token 文件（W11：token 只走 0600 文件，不再进命令行）
+echo demo-admin-token >/tmp/demo-admin-token && chmod 600 /tmp/demo-admin-token
+
 node scripts/walkthrough/knock.mjs \
   --relay http://39.107.213.167:13340 \
-  --gateway http://39.107.213.167:18787 --token demo-admin-token
+  --gateway http://39.107.213.167:18787 --token-file /tmp/demo-admin-token
 ```
 
 这是"陌生设备模拟器"：用一把一次性钥匙无票连接你的服务器。它会打印自己的
@@ -70,7 +74,7 @@ node scripts/walkthrough/knock.mjs \
 # 终端 2：Ctrl+C 退出，然后用同一把钥匙重敲（= 同一台设备再来）
 node scripts/walkthrough/knock.mjs \
   --relay http://39.107.213.167:13340 \
-  --gateway http://39.107.213.167:18787 --token demo-admin-token \
+  --gateway http://39.107.213.167:18787 --token-file /tmp/demo-admin-token \
   --data-dir /tmp/my-knocker-key
 ```
 

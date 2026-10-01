@@ -93,8 +93,15 @@ async function serverSupportsAdmin() {
   const { startServer } = await import("@jixo/opendweb-server-binary");
   const gateway = await freePort();
   const relay = await freePort();
+  // W11（2026-10-01）：通道无关探测——新二进制只认 <data_dir>/admin-token
+  //（0600 文件）；旧打包二进制仍读 env。双写使探测对两代都成立。
   const prev = process.env.DWEB_ADMIN_TOKEN;
+  const prevData = process.env.DWEB_DATA_DIR;
   process.env.DWEB_ADMIN_TOKEN = "capability-probe-token";
+  const probeDir = await fsp.mkdtemp(path.join(os.tmpdir(), "w11-probe-"));
+  await fsp.writeFile(path.join(probeDir, "admin-token"), "capability-probe-token\n", { mode: 0o600 });
+  await fsp.chmod(path.join(probeDir, "admin-token"), 0o600);
+  process.env.DWEB_DATA_DIR = probeDir;
   let srv = null;
   try {
     srv = await startServer({ gatewayBind: `127.0.0.1:${gateway}`, relayBind: `127.0.0.1:${relay}` });
@@ -106,6 +113,9 @@ async function serverSupportsAdmin() {
   } finally {
     if (prev === undefined) delete process.env.DWEB_ADMIN_TOKEN;
     else process.env.DWEB_ADMIN_TOKEN = prev;
+    if (prevData === undefined) delete process.env.DWEB_DATA_DIR;
+    else process.env.DWEB_DATA_DIR = prevData;
+    await fsp.rm(probeDir, { recursive: true, force: true }).catch(() => {});
     if (srv !== null) await srv.stop();
   }
   return adminCapableCache;

@@ -26,8 +26,9 @@ opendweb webui --server https://srv.example:18787
 npx opendweb-webui --server https://srv.example:18787
 ```
 
-token 获取链：`--token` > 环境变量 `DWEB_ADMIN_TOKEN` > 终端隐藏输入。
-推荐终端隐藏输入或浏览器配对面（见下「argv/env 可见性」）。
+token 获取链（W11 起）：终端隐藏输入（TTY 提示，不回显）；或经浏览器
+配对面提交；或 0600 节点簿 `~/.opendweb/nodes.json` 切换。argv/env 通道
+（`--token` / `DWEB_ADMIN_TOKEN`）已移除——传入即报迁移错误 / 警告并忽略。
 
 ### setup 模式（缺省 `--server`）
 
@@ -60,7 +61,7 @@ Ed25519 签名的审计辅助，验签公钥见 server 的 services.json `server
 | 目标劫持 | 目标生命周期内冻结；无运行时改目标路径；重指向 = 重启 |
 | 明文公网 | `http` 非 loopback 默认拒启；`--allow-insecure` 仅放宽传输加密判断（终端 + UI 双重持续告警），不放宽目标/路径校验 |
 | sidecar 滥用 | 仅绑定 `127.0.0.1`；`/api/*` 仅 `/admin/` 前缀 GET/POST/DELETE；不跟随重定向；不读环境代理变量 |
-| argv/env 可见性 | `--token` 与 `DWEB_ADMIN_TOKEN` 有 OS 级可见性（shell history / ps / 环境读取），help 与启动横幅均有披露；推荐终端隐藏输入或浏览器配对面 |
+| argv/env 通道（已移除，W11） | `--token` 报显式迁移错误；`DWEB_ADMIN_TOKEN` 警告并忽略——凭证只经终端隐藏输入 / 浏览器配对面 / 0600 节点簿落盘（与 server 侧 `<data_dir>/admin-token` 0600 文件同纪律） |
 | UI 越权 | 不提供自注册 / 数据面凭证操作；变更一律二次确认 + 回执 |
 
 **已知接受残余**（与 server.key / 数据面同威胁层级）：本机同用户恶意进程

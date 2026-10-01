@@ -7,15 +7,17 @@
 //
 // 用法：
 //   node scripts/walkthrough/knock.mjs --relay http://39.107.213.167:13340 \
-//        [--gateway http://39.107.213.167:18787 --token demo-admin-token]
+//        [--gateway http://39.107.213.167:18787 --token-file /path/to/admin-token]
 //
-// --gateway/--token 可选：提供后每 2s 轮询在线状态（推荐提供，体验完整）。
+// --gateway/--token-file 可选：提供后每 2s 轮询在线状态（推荐提供，体验完整）。
+//   token 从 0600 文件读取（W11：argv 明文 token 通道移除；云端 demo 可
+//   `echo demo-admin-token >/tmp/t && chmod 600 /tmp/t` 后 `--token-file /tmp/t`）。
 // --data-dir 可选：固定设备 key 目录（默认每次运行生成一次性 key）。
 //   「拉黑」演示需要：Ctrl+C 后用同一 --data-dir 重跑 = 同一台设备再次敲门。
 // Ctrl+C 退出（一次性 key 自动清理；固定目录保留）。
 
 import sdk from "../../packages/client-sdk/index.js";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -27,8 +29,13 @@ const argOf = (name) => {
 };
 const RELAY = argOf("relay") ?? "http://39.107.213.167:13340";
 const GATEWAY = argOf("gateway");
-const TOKEN = argOf("token");
+const TOKEN_FILE = argOf("token-file");
 const DATA_DIR = argOf("data-dir");
+if (argOf("token") !== null) {
+  console.error("--token 已移除（W11）：admin token 一律走 0600 文件，用 --token-file <path>");
+  process.exit(2);
+}
+const TOKEN = TOKEN_FILE ? readFileSync(TOKEN_FILE, "utf8").trim() : null;
 
 // iroh NodeId 的 z-base-32 展示 → 64 hex（服务端/管理面口径）
 const ZB = "ybndrfg8ejkmcpqxot1uwisza345h769";
@@ -78,7 +85,7 @@ log("   → 在敲门台点「定位为访客」（或拉黑试试），我会�
 console.log("");
 
 if (!GATEWAY || !TOKEN) {
-  log("（未提供 --gateway/--token，不做在线轮询；保持运行中，Ctrl+C 退出）");
+  log("（未提供 --gateway/--token-file，不做在线轮询；保持运行中，Ctrl+C 退出）");
   for (;;) await sleep(60_000);
 }
 

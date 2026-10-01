@@ -5,7 +5,7 @@
 //   - 默认不启动（[H3]）：本模块不引入任何隐式启动路径；hub.json 不存在时
 //     所有子命令只指引 init，零副作用。
 //   - hub-token（CSPRNG 32B base64url，0600 原子写）绝不出现在 argv/plist/
-//     启动脚本/日志/输出/卡片/URL；链入口以 env DWEB_ADMIN_TOKEN 注入
+//     启动脚本/日志/输出/卡片/URL；admin token 经 0600 admin-token 文件（W11）
 //     （覆盖继承值——四宿主同一注入点）。
 //   - hub.pid 三元组 {pid, start_identity, argv_digest}：stop/status 三重
 //     核验（pid 活+启动时刻+命令摘要），任一不符=不发信号只报告。
@@ -517,7 +517,7 @@ export async function verifyAdminMounted(base, token, fetchImpl) {
     return { ok: false, reason: `admin probe failed: ${/** @type {Error} */ (e).message}` };
   }
   if (noAuth.status === 404) {
-    return { ok: false, reason: "admin API is not mounted (/admin/status returned 404) - the admin token env did not reach the server" };
+    return { ok: false, reason: "admin API is not mounted (/admin/status returned 404) - the server did not pick up <data_dir>/admin-token (W11: file channel; check file presence/0600 perms and server binary version)" };
   }
   if (noAuth.status !== 401) {
     return { ok: false, reason: `expected HTTP 401 without a token, got ${noAuth.status}` };
@@ -537,8 +537,8 @@ export async function verifyAdminMounted(base, token, fetchImpl) {
 // ---- 统一执行链（hub start --foreground；detached/系统服务同链） -------------------
 
 /**
- * 中枢前台执行链：cwd=DWEB_HOME → hub.lock → env 冻结注入（DWEB_DATA_DIR/
- * DWEB_ADMIN_TOKEN 覆盖继承；绝不进 argv）→ 配置=config_path 显式（无则无
+ * 中枢前台执行链：cwd=DWEB_HOME → hub.lock → env 冻结注入（DWEB_DATA_DIR
+ * 覆盖继承；admin token 落 0600 admin-token 文件——W11，env/argv 通道移除）→ 配置=config_path 显式（无则无
  * 配置，不依赖 cwd 发现）→ 插件钩子 → startServer → readiness → data_dir
  * 落点核实 + admin 双探 → 服务直至信号/退出（单飞停机级联，锁随停释放）。
  * 任何启动失败：停机 + 清 hub.lock + 非零退出（不假成功）。
@@ -576,10 +576,14 @@ export async function runHubForeground(c) {
   };
 
   // ---- env 冻结（单一注入点：前台/detached/LaunchAgent/Startup 四宿主同路径）：
-  // hub.json 的 data_dir/binds 与 hub-token 内容覆盖继承环境
+  // hub.json 的 data_dir/binds 覆盖继承环境。W11（Owner 裁决 2026-10-01）：
+  // admin token 不再走 env——启动器把 hub-token 同步落 <data_dir>/admin-token
+  //（0600），服务端 load_token_from_file 唯一读取（argv/env 凭证通道移除）。
   const env = process.env;
   env.DWEB_DATA_DIR = dataDir;
-  env.DWEB_ADMIN_TOKEN = token;
+  const adminTokenFile = path.join(dataDir, "admin-token");
+  fs.writeFileSync(adminTokenFile, token, { mode: 0o600 });
+  fs.chmodSync(adminTokenFile, 0o600); // writeFileSync 的 mode 不作用于已存在文件——显式 chmod 幂等
   env.DWEB_GATEWAY_BIND = gatewayBind;
   env.DWEB_RELAY_HTTP_BIND = relayBind;
   env.DWEB_ACCESS_MODE = "restricted"; // 家庭预设：门禁开启
@@ -1605,8 +1609,8 @@ export async function hubCard(argv, c) {
 
 /**
  * hub open [深链]：本机中枢管理员入口——读 hub.json/hub-token，spawn webui
- * 薄壳（本 phase 用其现有 bin 形态；token 经 env DWEB_ADMIN_TOKEN 注入，
- * 绝不入 argv/URL），解析 sidecar 监听地址后开浏览器（可带深链）；进程驻留
+ * 薄壳（W11：env token 注入移除——webui 经 DWEB_HOME 走 row-2 hub-local
+ * 的 0600 hub-token 进程内通道；token 不入 argv/env/URL），解析 sidecar 监听地址后开浏览器（可带深链）；进程驻留
  * 至信号退出。
  * @param {string[]} argv
  * @param {Required<HubCtx>} c
@@ -1635,12 +1639,15 @@ export async function hubOpen(argv, c) {
       1,
     );
   }
+  // W11（2026-10-01）：env token 注入移除——不传 --server、DWEB_HOME 指向
+  // hub.json 所在 home，webui 走 row-2 hub-local 分流（0600 hub-token 进程内
+  // 读取注入内存；同源同 token，管理面等价）。
   const child = c.spawnImpl(
     process.execPath,
-    [webuiCli, "--server", base, "--no-open"],
+    [webuiCli, "--no-open"],
     {
       stdio: ["ignore", "pipe", "inherit"],
-      env: { ...process.env, DWEB_ADMIN_TOKEN: token, DWEB_HOME: c.home },
+      env: { ...process.env, DWEB_HOME: c.home },
     },
   );
   let settled = false;

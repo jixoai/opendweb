@@ -172,7 +172,7 @@ test("postConnect normalization: sidecar envelope codes flow through the injecta
 // ---- 失败态文案矩阵（六路 + retry 语义；健康灯四态） --------------------------------
 
 const MATRIX = [
-	{ name: "not-enabled", code: "admin-not-enabled", copy: "DWEB_ADMIN_TOKEN", where: "detail", retry: true },
+	{ name: "not-enabled", code: "admin-not-enabled", copy: "admin-token", where: "detail", retry: true },
 	{ name: "unauthorized", code: "unauthorized", copy: "管理凭证无效", where: "title", retry: false },
 	{ name: "http-502", code: "http-502", copy: "服务器内部错误", where: "title", retry: true },
 	{ name: "network", code: "network", copy: "网络错误", where: "detail", retry: true },

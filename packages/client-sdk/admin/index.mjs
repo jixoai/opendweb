@@ -284,7 +284,7 @@ export class AdminClient {
   /**
    * 专用启用探测（spec「status 探测矩阵」，r3-P1-2 签名冻结）：
    * `Promise<true>`——仅 200 resolve true，其余一律 reject AdminError。
-   * 404 = admin-not-enabled（未配置 DWEB_ADMIN_TOKEN 即未挂载）；401 =
+   * 404 = admin-not-enabled（无 0600 admin-token 文件即未挂载，W11）；401 =
    * unauthorized（已挂载但凭证错——不是 not-enabled）；任意其它非 200 =
    * `http-<status>`；fetch reject = network；超时 = timeout。探测判别的是
    * 路由存在性而非 body 形态（代理剥 body 场景依然成立）。

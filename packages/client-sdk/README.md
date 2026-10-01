@@ -28,17 +28,20 @@ import { decodeInvite } from "@jixo/opendweb-client-sdk/token";
 
 ## `./admin` — Server 管理 API 客户端
 
-管理面挂载条件：dweb-server 以非空 `DWEB_ADMIN_TOKEN` 启动才挂载 `/admin/*`
-（否则 probeEnabled 探测为 `admin-not-enabled`）。
+管理面挂载条件（W11 起）：dweb-server 在数据目录存在权限恰为 0600 的
+`<data_dir>/admin-token` 文件（非空）时才挂载 `/admin/*`；`DWEB_ADMIN_TOKEN`
+env 已移除（若被继承则警告并忽略）。无该文件时 probeEnabled 探测为
+`admin-not-enabled`。
 
 ### 用法
 
 ```js
+import { readFileSync } from "node:fs";
 import { AdminClient, AdminError } from "@jixo/opendweb-client-sdk/admin";
 
 const admin = new AdminClient({
   baseUrl: "http://127.0.0.1:8080", // dweb-server gateway 地址
-  token: process.env.DWEB_ADMIN_TOKEN, // 见「admin token 安全注意」
+  token: readFileSync("<data_dir>/admin-token", "utf8").trim(), // 0600 文件（W11）；见「admin token 安全注意」
   timeoutMs: 10_000, // 默认 10s（AbortSignal.timeout）
 });
 
@@ -70,7 +73,7 @@ const { disconnected, receipts } = await admin.disconnect({ endpointId: hex64 })
 | 服务端响应 | 结果 |
 | --- | --- |
 | `200` | resolve `true` |
-| `404` | reject `code: "admin-not-enabled"`（未配置 `DWEB_ADMIN_TOKEN`，`/admin/*` 未挂载） |
+| `404` | reject `code: "admin-not-enabled"`（无 0600 `admin-token` 文件，`/admin/*` 未挂载） |
 | `401` | reject `code: "unauthorized"`（已挂载但凭证错——**不是** not-enabled） |
 | 其它任意非 200（502/503/未知 5xx…） | reject `code: "http-<status>"` |
 | fetch 传输层失败（连接拒绝/DNS…） | reject `code: "network"`（`status: null`） |
@@ -175,19 +178,18 @@ const cap = decodeCapability(relayCapTokenString);
 
 ## admin token 安全注意
 
-`DWEB_ADMIN_TOKEN` 是管理面的唯一凭证（Bearer，服务端常量时间比较）——
-泄露即放开 owner 注册表与断连动作。处理建议：
+`admin-token` 文件内容（W11：`<data_dir>/admin-token`，0600）是管理面的唯一凭证
+（Bearer，服务端常量时间比较）——泄露即放开 owner 注册表与断连动作。处理建议：
 
-- **不进 argv**：`--token` 类参数对 `ps` 可见、进 shell history；SDK 侧同样
-  不要把 token 写进日志或错误信息（`AdminClient` 构造后 token 为私有字段，
+- **不进 argv/env**：`--token` 参数对 `ps` 可见、进 shell history；env 可被同用户
+  进程读取。W11 起两条通道已在 dweb-server 侧移除（env 被警告并忽略）；SDK 侧
+  同样不要把 token 写进日志或错误信息（`AdminClient` 构造后 token 为私有字段，
   `AdminError` 不携带 token）。
 - **不进 CI/部署明文**：CI 日志、环境 dump、制品清单都会留痕；用 secret
-  注入并限制掩码范围。
-- **env 有 OS 级可见性**：`DWEB_ADMIN_TOKEN` 环境变量可被同用户进程读取，
-  只是把可见面从 argv 收窄，不是消除。
+  注入并限制掩码范围；落盘形态保持 0600。
 - **推荐形态：本地 sidecar 注入**（参考 `@jixo/opendweb-webui`
-  `packages/webui`）：token 获取链为 CLI `--token` > 环境变量
-  `DWEB_ADMIN_TOKEN` > 终端隐藏输入，取到后**只驻 sidecar 进程内存**——
-  不落盘、不进浏览器、不进日志；sidecar 仅绑定 `127.0.0.1`，对远端
-  dweb-server 做 Bearer 注入 + `/admin/` 前缀白名单反向代理。浏览器/脚本
-  只与本机 sidecar 通信，永远接触不到 token 本体。
+  `packages/webui`）：token 获取链为终端隐藏输入 / 浏览器配对面 / 0600 节点簿
+  （`~/.opendweb/nodes.json`），取到后**只驻 sidecar 进程内存**——不进 argv/env、
+  不进浏览器、不进日志；sidecar 仅绑定 `127.0.0.1`，对远端 dweb-server 做
+  Bearer 注入 + `/admin/` 前缀白名单反向代理。浏览器/脚本只与本机 sidecar
+  通信，永远接触不到 token 本体。

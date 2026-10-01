@@ -31,7 +31,8 @@
 //!   + 访客两级配额与在线投影（SAR 1a）
 //! - [`callback`]：CallbackProvider webhook 决策器（协议卫生/SSRF/缓存/
 //!   并发防护/disconnect 通知 + 复合 generation 缓存键，task 1.5b + SAR 1a）
-//! - [`admin`]：gateway 受保护管理面（Bearer DWEB_ADMIN_TOKEN；owners CRUD
+//! - [`admin`]：gateway 受保护管理面（Bearer `<data_dir>/admin-token` 0600
+//!   文件凭证，W11——env/argv 通道已移除；owners CRUD
 //!   + 注册回执签名 + status 运行态投影 + 访客增量投影，task 3.1 + SAR 1a）
 //!
 //! e2e 集成矩阵（task 1.9 + SAR 1a）在 tests/（黑盒二进制 + 真 iroh

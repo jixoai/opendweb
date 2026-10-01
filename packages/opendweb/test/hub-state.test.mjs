@@ -830,9 +830,12 @@ test("hub open: running hub spawns webui sidecar with token via env only (never 
     const token = (await fsp.readFile(hubTokenFile(home), "utf8")).trim();
     assert.ok(!captured.args.includes(token), "token never in argv");
     assert.ok(!captured.args.some((a) => String(a).includes(token)), "token never in any argv element");
-    assert.equal(captured.env.DWEB_ADMIN_TOKEN, token, "token injected via env");
+    // W11（2026-10-01）：hub open 的 spawn 不再传 --server/env token——webui 经
+    // DWEB_HOME 走 row-2 hub-local 的 0600 hub-token 进程内通道
+    assert.equal(captured.env.DWEB_ADMIN_TOKEN, undefined, "env token channel removed (W11)");
     assert.equal(captured.env.DWEB_HOME, home);
-    assert.match(captured.args.join(" "), /--server http:\/\/127\.0\.0\.1:8787/);
+    assert.ok(!captured.args.includes("--server"), "no --server: home resolution targets the hub");
+    assert.ok(!captured.args.some((a) => String(a).includes(token)), "token never in any argv element");
     // 浏览器 URL：sidecar origin + 深链，且不含 token
     assert.equal(opened.length, 1);
     assert.match(opened[0], /^http:\/\/127\.0\.0\.1:\d+\/#\/knock$/);

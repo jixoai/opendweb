@@ -4,12 +4,16 @@
 //! （本地配置管理者）与 Relay Owner（registry 内 fabric root）是不同身份，
 //! 服务端 MUST NOT 提供 Owner 自助注册，注册是 Admin 动作（spec 冻结））。
 //!
-//! **admin token 方案（design §6.2「admin token 签发验证」的实现裁定）**：
-//! `Authorization: Bearer <DWEB_ADMIN_TOKEN>`——env 配置的静态 token，部署期
-//! 生成；未配置/空 = main 完全不挂载 admin 路由（404，零暴露面）。
+//! **admin token 方案（design §6.2「admin token 签发验证」的实现裁定；W11
+//! Owner 裁决 2026-10-01 收敛为文件唯一）**：`Authorization: Bearer
+//! <token>`——token 从 `<data_dir>/admin-token`（0600 私有文件）读取，部署期
+//! 由运维生成（如 `umask 077 && openssl rand -hex 32 > admin-token`）；文件
+//! 缺失/空/权限宽松 = main 完全不挂载 admin 路由（404，零暴露面；fail-closed
+//! 而非告警降级）。argv（`--token`）与 env（`DWEB_ADMIN_TOKEN`）凭证通道已
+//! 移除——env 残留仅触发启动警告并忽略。
 //! 备选方案「server.key 对 challenge 签名」被否决：需要交互式握手
 //! （challenge→sign→verify 三步）才能证明持有 server.key 派生凭证，而 admin
-//! API 是低频运维面，静态 token 在 admin 信任域（本地 env/配置，与
+//! API 是低频运维面，静态 token 在 admin 信任域（本地 0600 文件，与
 //! callback_token 同级信任模型：泄露 = 管理面泄露，不影响密码学层）足够，
 //! 且免除握手状态机。server.key 仍只签注册回执、不签 capability（§6.2
 //! 收窄原则不变）。
@@ -128,7 +132,50 @@ pub(crate) fn op_label(op_code: u8) -> &'static str {
     }
 }
 
-/// admin API 共享状态（main 在 DWEB_ADMIN_TOKEN 存在时构造并挂载）。
+/// admin token 文件唯一读取（W11 Owner 裁决 2026-10-01：argv/env 凭证通道
+/// 移除）。`<data_dir>/admin-token`：缺失 = None（admin 面不挂载，与旧 env
+/// 缺省同语义）；存在但权限非 0600 / 空 / 读取失败 = error + None（fail-closed
+/// 拒绝挂载——宽松权限文件里的管理凭证本身就是配置错误，静默接受等于把
+/// 泄露面合法化）。换行容忍（echo > 追加的尾部 \n 不致死锁运维）。
+pub fn load_token_from_file(data_dir: &std::path::Path) -> Option<String> {
+    let path = data_dir.join("admin-token");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::error!("admin-token file {} unreadable ({e}); admin API not mounted", path.display());
+            return None;
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.permissions().mode() & 0o777 != 0o600 => {
+                tracing::error!(
+                    "admin-token file {} must be 0600 (got {:o}); admin API not mounted (fail-closed)",
+                    path.display(),
+                    meta.permissions().mode() & 0o777
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!("admin-token file {} stat failed ({e}); admin API not mounted", path.display());
+                return None;
+            }
+            _ => {}
+        }
+    }
+    let token = String::from_utf8_lossy(&bytes).trim().to_string();
+    if token.is_empty() {
+        tracing::error!("admin-token file {} is empty; admin API not mounted", path.display());
+        return None;
+    }
+    Some(token)
+}
+
+/// admin API 共享状态（main 在 `<data_dir>/admin-token`（0600）存在且合法
+/// 时构造并挂载——W11：argv/env 凭证通道已移除）。
 /// `gate` = relay gate（restricted 模式；open 模式 None——无验证链即无
 /// 在线统计，status 如实投影为空集合）。`relay_clients` = iroh-relay
 /// 在线连接表句柄（task 3.2b 踢存量用；`Server::relay_service()` →
@@ -190,8 +237,8 @@ impl AdminState {
     }
 }
 
-/// 挂载 admin 路由（仅当 DWEB_ADMIN_TOKEN 已配置时由 main 调用；
-/// 未配置 = 不挂载 = 404 零暴露）。Phase 1c 三角色增量路由（roles）同
+/// 挂载 admin 路由（仅当 `<data_dir>/admin-token` 0600 文件有效（W11）时由
+/// main 调用；无文件 = 不挂载 = 404 零暴露）。Phase 1c 三角色增量路由（roles）同
 /// state/同 auth_guard，先 merge 再统一上 Bearer 层。
 pub fn router(state: AdminState) -> Router {
     Router::new()

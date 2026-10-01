@@ -118,9 +118,29 @@ async function writeOneLease(home, { server = "http://192.168.2.13:8787", expire
 }
 
 /** CLI main() 的受控 io（信号驱动退出；不自动开浏览器）。 */
-async function runMain(args, { home, env = {} }, { injectHomeDir = true } = {}) {
+async function runMain(args, { home, env = {}, ttyToken } = {}, { injectHomeDir = true } = {}) {
   const lines = [];
   const signal = new EventEmitter();
+  // W11（2026-10-01）：argv/env token 通道移除——显式 --server 用例的凭证经
+  // 假 TTY 隐藏输入注入（PassThrough + isTTY=true 复刻 cli.test 的 prompt 桩）
+  let stdin = {};
+  if (typeof ttyToken === "string") {
+    const { PassThrough } = await import("node:stream");
+    const input = new PassThrough();
+    input.isTTY = true;
+    const promptOut = new PassThrough();
+    promptOut.on("data", (c) => lines.push(c.toString("utf8").trimEnd()));
+    queueMicrotask(() => {
+      const wait = setInterval(() => {
+        if (lines.some((l) => l.includes("admin token:"))) {
+          clearInterval(wait);
+          input.write(`${ttyToken}\n`);
+        }
+      }, 10);
+      setTimeout(() => clearInterval(wait), 5000).unref?.();
+    });
+    stdin = { stdin: input, stdout: promptOut };
+  }
   const p = main(args, {
     env: { ...process.env, ...env, DWEB_HOME: home },
     log: (l) => lines.push(l),
@@ -129,7 +149,7 @@ async function runMain(args, { home, env = {} }, { injectHomeDir = true } = {}) 
     // injectHomeDir=false 复刻 `hub open` 的 spawn 形态：DWEB_HOME 只经 env 注入，
     // CLI 必须自行 homeRoot(env) 解析（走查 D1：显式 --server 路径数据面恒注入）
     ...(injectHomeDir ? { homeDir: home } : {}),
-    stdin: {},
+    ...stdin,
   });
   const settle = (ms) =>
     new Promise((resolve) => {
@@ -199,7 +219,7 @@ test("dispatch row 1: explicit --server keeps the baseline (ready admin, node bo
     },
   });
   t.after(() => upstream.close());
-  const run = await runMain({ server: upstream.url, token: "row1-token" }, { home: tmpdir() });
+  const run = await runMain({ server: upstream.url }, { home: tmpdir(), ttyToken: "row1-token" });
   t.after(() => run.finish());
   const state = JSON.parse((await request(run.port, { path: "/sidecar/state" })).text);
   assert.equal(state.phase, "ready");
@@ -254,7 +274,7 @@ test("dispatch row 2: hub service not running -> admin stance + hub projection r
 
 test("dispatch row 1 + `hub open` shape: explicit --server with local hub.json serves /sidecar/hub 200 (D1 access-card data plane)", async (t) => {
   // 走查 D1：`hub open`（hub.mjs hubOpen）spawn webui CLI 的精确形态——显式
-  // --server 指向本机中枢 bind base、DWEB_HOME 只经 env、token 经 env。本机
+  // --server 指向本机中枢 bind base、DWEB_HOME 只经 env、token 经隐藏输入。本机
   // hub.json 存在 → /sidecar/hub 200（接入卡片模型字段齐备）——与无参 row-2
   // 路径的数据面行为一致；hub_local 标记仍仅 row-2 自动形态触发（显式目标
   // 不标——远端/本机中枢由调用方声明，CLI 不擅自升格）。
@@ -264,8 +284,8 @@ test("dispatch row 1 + `hub open` shape: explicit --server with local hub.json s
   t.after(() => upstream.close());
   await writeHubState(home, { gatewayBind: `0.0.0.0:${upstream.port}` });
   const run = await runMain(
-    { server: `http://127.0.0.1:${upstream.port}`, token: "T".repeat(43) },
-    { home },
+    { server: `http://127.0.0.1:${upstream.port}` },
+    { home, ttyToken: "T".repeat(43) },
     { injectHomeDir: false },
   );
   t.after(() => run.finish());
@@ -298,8 +318,8 @@ test("dispatch row 1 baseline: explicit --server on a machine WITHOUT hub.json k
   });
   t.after(() => upstream.close());
   const run = await runMain(
-    { server: `http://127.0.0.1:${upstream.port}`, token: "T".repeat(43) },
-    { home },
+    { server: `http://127.0.0.1:${upstream.port}` },
+    { home, ttyToken: "T".repeat(43) },
     { injectHomeDir: false },
   );
   t.after(() => run.finish());

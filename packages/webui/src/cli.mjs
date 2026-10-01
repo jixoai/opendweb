@@ -3,8 +3,8 @@
 // 壳层化——运行时在 src/core/，本文件只留壳职责）。
 // 意图（2026-09-22，webui-console Phase A）：
 // 1. URL/port 校验自担（契约不扩展 schema 能力）；
-// 2. token 获取链 --token > DWEB_ADMIN_TOKEN > TTY 交互（回显关闭）；
-//    argv/env 途径打印 OS 可见性提醒横幅；
+// 2. token 获取链（W11 2026-10-01：argv/env 通道移除）TTY 隐藏交互；
+//    hub.json 本机中枢走 0600 hub-token 进程内读取；
 // 3. 启动 sidecar：打印访问 URL（setup 态同时打印一次性配对码）；
 //    --no-open 跳过浏览器（darwin `open`，其它平台仅打印 URL）；
 // 4. SIGINT/SIGTERM 清理退出（B5：close 完成后 2s unref 宽限——原生数据面
@@ -27,18 +27,10 @@ import { resolveLaunch } from "./core/home.mjs";
 /** bin 直跑形态的参数声明（与 plugin.mjs 的 manifest args 同集） */
 const ARG_SPEC = {
   server: "string",
-  token: "string",
   port: "number",
   "allow-insecure": "boolean",
   "no-open": "boolean",
   setup: "boolean",
-};
-
-const TOKEN_VISIBILITY_NOTE = {
-  argv:
-    "note: token passed on the command line is visible to other local processes (shell history, ps); prefer the hidden terminal prompt or the browser pairing flow",
-  env:
-    "note: token passed via DWEB_ADMIN_TOKEN is readable from the process environment; prefer the hidden terminal prompt or the browser pairing flow",
 };
 
 const INSECURE_BANNER =
@@ -47,8 +39,8 @@ const INSECURE_BANNER =
 const USAGE = `opendweb-webui - local management console (sidecar + UI)
 
 Usage:
-  opendweb-webui [--server <string>] [--token <string>] [--port <number>] [--allow-insecure] [--no-open] [--setup]
-      ${TOKEN_VISIBILITY_NOTE.argv}
+  opendweb-webui [--server <string>] [--port <number>] [--allow-insecure] [--no-open] [--setup]
+      (no --token: the admin token is typed hidden at the prompt, or via the browser pairing flow / 0600 node book — W11)
 
 Default (no --server) resolves the home-hub launch mode: a local hub.json
 connects this machine's hub as admin (hub-token stays in-process); leases or
@@ -77,7 +69,16 @@ export function parseWebuiArgv(argv) {
     const eq = token.indexOf("=");
     const name = (eq === -1 ? token : token.slice(0, eq)).slice(2);
     const type = ARG_SPEC[name];
-    if (!type) throw new Error(`unknown option --${name}`);
+    if (!type) {
+      if (name === "token") {
+        // W11（Owner 裁决 2026-10-01）：--token 移除——显式迁移错误而非泛型
+        // unknown option（老脚本一眼看到出路）
+        throw new Error(
+          "--token was removed (W11): type the token hidden at the prompt, use the browser pairing flow, or the 0600 node book",
+        );
+      }
+      throw new Error(`unknown option --${name}`);
+    }
     if (type === "boolean") {
       out[name] = eq === -1 ? true : token.slice(eq + 1) === "true";
       continue;
@@ -147,19 +148,21 @@ export async function main(args, io = {}) {
     target = v.value;
   }
 
-  // token 获取链：--token > DWEB_ADMIN_TOKEN > TTY 交互（仅 ready 启动需要；
-  // setup 模式的 token 经浏览器配对面提交，不进本进程 argv/env）
+  // token 获取链（W11 Owner 裁决 2026-10-01：argv/env 凭证通道移除）：
+  // TTY 隐藏交互（回显关闭）> 报错指引（仅显式 --server 的 ready 启动需要；
+  // setup 模式经浏览器配对面提交；hub.json 本机中枢走 0600 hub-token 进程内
+  // 读取——下方 home 分流；节点簿 0600 nodes.json 承载远端节点的持久凭证）。
+  // env DWEB_ADMIN_TOKEN 残留：警告并忽略（fail-closed 不回退）。
   let token = "";
-  /** @type {"argv" | "env" | "tty" | null} */
+  /** @type {"tty" | null} */
   let tokenSource = null;
+  if (typeof env.DWEB_ADMIN_TOKEN === "string" && env.DWEB_ADMIN_TOKEN !== "") {
+    stderr.write(
+      "warning: DWEB_ADMIN_TOKEN is ignored (removed, W11); use the hidden terminal prompt, the browser pairing flow, or the 0600 node book\n",
+    );
+  }
   if (target !== null) {
-    if (typeof args.token === "string" && args.token !== "") {
-      token = args.token;
-      tokenSource = "argv";
-    } else if (typeof env.DWEB_ADMIN_TOKEN === "string" && env.DWEB_ADMIN_TOKEN !== "") {
-      token = env.DWEB_ADMIN_TOKEN;
-      tokenSource = "env";
-    } else if (stdin.isTTY === true) {
+    if (stdin.isTTY === true) {
       token = await promptHidden("admin token: ", { stdin, stdout });
       tokenSource = "tty";
       if (token === "") {
@@ -168,7 +171,7 @@ export async function main(args, io = {}) {
       }
     } else {
       stderr.write(
-        "error: webui: no admin token available; pass --token <token> or set DWEB_ADMIN_TOKEN (or run in a terminal to type it hidden)\n",
+        "error: webui: no admin token available; run in a terminal to type it hidden (argv/env token channels were removed, W11), or connect the server via the node book / browser pairing flow\n",
       );
       return { exit: 2 };
     }
@@ -243,7 +246,6 @@ export async function main(args, io = {}) {
   } else {
     log(`proxying to ${target.scheme}://${target.hostHeader}${hubLocal ? " (local hub)" : ""}`);
     if (target.insecure) log(INSECURE_BANNER);
-    if (tokenSource === "argv" || tokenSource === "env") log(TOKEN_VISIBILITY_NOTE[tokenSource]);
   }
 
   if (args["no-open"] !== true) {

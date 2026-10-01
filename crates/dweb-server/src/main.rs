@@ -475,7 +475,8 @@ async fn main() -> Result<()> {
     if let Some(bytes_per_second) = client_rx {
         tracing::info!("relay client_rx rate limit: {bytes_per_second} bytes/s");
     }
-    // admin API（task 3.1 + 3.2b）：DWEB_ADMIN_TOKEN 存在才挂路由——未配置
+    // admin API（task 3.1 + 3.2b）：token 仅从 0600 文件 <data_dir>/admin-token
+    // 读取（W11 Owner 裁决 2026-10-01：argv/env 凭证通道移除）——未配置
     // = /admin/* 404 零暴露（静态 token 方案与 admin 信任域论证见 admin.rs
     // 模块注释）。registry/relay gate 以 Arc 共享：API 注册即时生效于
     // 验证链（同进程同一 OwnerRegistry 快照替换）。构造在 relay::start
@@ -495,11 +496,18 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|server| server.relay_service())
         .map(|service| service.clients().clone());
-    let admin_router = std::env::var("DWEB_ADMIN_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
+    // W11（Owner 裁决 2026-10-01）：admin token 只认 0600 文件——env 凭证
+    // 通道移除；DWEB_ADMIN_TOKEN 残留出现即警告并忽略（fail-closed：不因此
+    // 挂载，也不因残留而报错中断——旧部署定义里的死变量）。
+    if std::env::var("DWEB_ADMIN_TOKEN").is_ok() {
+        tracing::warn!(
+            "DWEB_ADMIN_TOKEN is ignored (removed, W11): write the admin token to {}/admin-token (0600) instead",
+            access_cfg.data_dir.display()
+        );
+    }
+    let admin_router = access::admin::load_token_from_file(&access_cfg.data_dir)
         .map(|token| {
-            tracing::info!("admin API enabled (Bearer DWEB_ADMIN_TOKEN, /admin/*)");
+            tracing::info!("admin API enabled (Bearer <data_dir>/admin-token, /admin/*)");
             access::admin::router(access::admin::AdminState::new(
                 token,
                 std::sync::Arc::clone(&identity),

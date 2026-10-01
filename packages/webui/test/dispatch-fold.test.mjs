@@ -91,9 +91,11 @@ test("cli e2e: opendweb webui --help renders zero-exec usage through the fold-aw
   const env = await cliProjectEnv();
   const r = await runCli(["webui", "--help"], env);
   assert.equal(r.code, 0, r.err);
-  assert.match(r.out, /opendweb webui webui \[--server <string> --token <string> --port <number> --allow-insecure --no-open --setup\]/);
-  // --token OS 可见性提示由 help 渲染器原样呈现（spec「CLI 面接线」）
-  assert.match(r.out, /--token or DWEB_ADMIN_TOKEN is visible to other local processes/);
+  assert.match(r.out, /opendweb webui webui \[--server <string> --port <number> --allow-insecure --no-open --setup\]/);
+  // W11（2026-10-01）：--token/--token 可见性提示随 argv 通道移除消失；节点簿披露保留
+  assert.ok(!/--token <string>/.test(r.out), "usage no longer declares --token (W11)");
+  assert.ok(!/DWEB_ADMIN_TOKEN is visible/.test(r.out), "argv/env visibility note removed (W11)");
+  assert.match(r.out, /node book entries persist their admin tokens/);
   assert.match(r.out, ASCII, "help output must be all-ASCII");
   // 零执行：run 未被调用（sidecar 从未启动，无监听横幅）
   assert.ok(!r.out.includes("opendweb-webui listening on"), `run executed in help path: ${r.out}`);
@@ -101,14 +103,18 @@ test("cli e2e: opendweb webui --help renders zero-exec usage through the fold-aw
 
 test("cli e2e: folded dispatch reaches the real command (bad --server refused, token never in output)", async () => {
   const env = await cliProjectEnv();
-  // 折叠形态：省略命令 token，--server 直接跟插件名
-  const folded = await runCli(["webui", "--server", "http://203.0.113.10:18787", "--token", "fold-secret-token-7"], env);
+  // 折叠形态：省略命令 token，--server 直接跟插件名（W11：无 --token 可传）
+  const folded = await runCli(["webui", "--server", "http://203.0.113.10:18787"], env);
   assert.equal(folded.code, 1, `stderr: ${folded.err}`);
   assert.match(folded.err, /invalid --server/);
-  assert.ok(!folded.out.includes("fold-secret-token-7") && !folded.err.includes("fold-secret-token-7"), "token must not appear in CLI output");
 
-  // 显式形态等价：同样的 argv（含命令 token）产生同样的失败面
-  const explicit = await runCli(["webui", "webui", "--server", "http://203.0.113.10:18787", "--token", "fold-secret-token-7"], env);
+  // 显式形态等价：同样的 argv 产生同样的失败面；W11 迁移面——--token 显式报错
+  const explicit = await runCli(["webui", "webui", "--server", "http://203.0.113.10:18787"], env);
   assert.equal(explicit.code, 1);
   assert.match(explicit.err, /invalid --server/);
+  // plugin envelope 面：官方 parser 按 manifest 拒（泛型 unknown——manifest
+  // 不声明 token 即防线；bin 直跑面才有 W11 迁移文案，见 cli.test）
+  const legacy = await runCli(["webui", "webui", "--token", "x"], env);
+  assert.notEqual(legacy.code, 0);
+  assert.match(legacy.err, /unknown option --token/);
 });

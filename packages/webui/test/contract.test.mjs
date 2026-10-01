@@ -26,10 +26,11 @@ test("help renders from the real renderer and matches the golden fixture (zero e
   const text = renderPluginHelp({ name: "webui", manifest: plugin });
   const golden = await readFile(path.join(here, "fixtures", "help.txt"), "utf8");
   assert.equal(text + "\n", golden);
-  // --token 可见性提示文案冻结在 fixture 里
-  assert.match(text, /--token or DWEB_ADMIN_TOKEN is visible to other local processes/);
-  assert.match(text, /shell history, ps, env/);
-  assert.match(text, /prefer the hidden terminal prompt or the browser pairing flow/);
+  // W11（2026-10-01）：argv/env 可见性提示随 --token 移除而消失；节点簿
+  // 0600 例外披露文案冻结在 fixture 里
+  assert.ok(!/--token or DWEB_ADMIN_TOKEN/.test(text), "argv/env visibility note removed (W11)");
+  assert.match(text, /node book entries persist their admin tokens/);
+  assert.match(text, /0600, readable by your OS user only/);
   // 全 ASCII
   for (const line of text.split("\n")) {
     for (const ch of line) {
@@ -40,8 +41,8 @@ test("help renders from the real renderer and matches the golden fixture (zero e
 
 test("parseCommandArgs (official) matrix with our declared spec", () => {
   const spec = plugin.commands[0];
-  assert.deepEqual(parseCommandArgs(spec, ["--token", "abc"]), { token: "abc" });
-  assert.deepEqual(parseCommandArgs(spec, ["--token=abc"]), { token: "abc" });
+  // W11：manifest 不再声明 token 参数——官方 parser 对未声明参数即拒
+  assert.throws(() => parseCommandArgs(spec, ["--token", "abc"]), /unknown option/);
   assert.deepEqual(parseCommandArgs(spec, ["--allow-insecure"]), { "allow-insecure": true });
   assert.deepEqual(parseCommandArgs(spec, ["--allow-insecure=false"]), { "allow-insecure": false });
   assert.deepEqual(parseCommandArgs(spec, ["--no-open", "--server", "http://127.0.0.1:1"]), {
@@ -51,7 +52,6 @@ test("parseCommandArgs (official) matrix with our declared spec", () => {
   assert.deepEqual(parseCommandArgs(spec, ["--port", "8080"]), { port: 8080 });
   assert.equal(typeof parseCommandArgs(spec, ["--port=18787"]).port, "number");
   assert.throws(() => parseCommandArgs(spec, ["--unknown", "x"]), /unknown option/);
-  assert.throws(() => parseCommandArgs(spec, ["--token"]), /missing value/);
 });
 
 test("run envelope smoke via dispatchPluginCommand: bad --server exits non-zero, token never in output", async () => {
@@ -62,7 +62,7 @@ test("run envelope smoke via dispatchPluginCommand: bad --server exits non-zero,
   const code = await dispatchPluginCommand({
     manifest: plugin,
     command: "webui",
-    argv: ["--server", "http://203.0.113.10:18787", "--token", "cli-secret-token-42"],
+    argv: ["--server", "http://203.0.113.10:18787"],
     cwd: process.cwd(),
     stdout,
     stderr,
@@ -78,7 +78,7 @@ test("dispatch with --allow-insecure + bad port still validates port (self-owned
   const code = await dispatchPluginCommand({
     manifest: plugin,
     command: "webui",
-    argv: ["--server", "http://127.0.0.1:18787", "--token", "t", "--port", "99999"],
+    argv: ["--server", "http://127.0.0.1:18787", "--port", "99999"],
     cwd: process.cwd(),
     stdout: { write: () => {} },
     stderr: { write: (s) => err.push(s) },

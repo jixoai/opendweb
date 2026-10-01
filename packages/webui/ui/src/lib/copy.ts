@@ -23,14 +23,14 @@ export function errorCopy(error: AdminError | null | undefined): { title: string
       return {
         title: "远端未开启管理面",
         detail:
-          "目标服务器没有配置 DWEB_ADMIN_TOKEN，管理接口处于关闭状态。请在服务器上设置该环境变量并重启，然后回到本页重试。",
+          "目标服务器没有配置管理凭证文件（<数据目录>/admin-token，权限 0600），管理接口处于关闭状态。请在服务器上创建该文件并重启，然后回到本页重试。",
         retry: true,
       };
     case "unauthorized":
       return {
         title: "管理凭证无效",
         detail:
-          "服务器拒绝了当前管理凭证。凭证在连接时已锁定，不能在本页更换——请退出本页，在终端用有效凭证重新运行启动命令：opendweb webui --token <新的管理凭证>（或按原启动命令重启）。",
+          "服务器拒绝了当前管理凭证。凭证在连接时已锁定，不能在本页更换——请退出本页，在终端重新运行启动命令（会在提示处隐藏输入新的管理凭证；或更新服务器上的 admin-token 文件后重启）。",
         retry: false,
       };
     case "no-match":

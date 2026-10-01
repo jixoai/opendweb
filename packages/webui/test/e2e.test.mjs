@@ -12,7 +12,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import path from "node:path";
@@ -76,8 +76,33 @@ class Child {
   }
 }
 
+/** W11：sidecar 的 hub-home 装配（hub.json + 0600 hub-token 指向目标 server） */
+async function writeSidecarHubHome(home, port, token) {
+  await writeFile(
+    path.join(home, "hub.json"),
+    JSON.stringify(
+      {
+        version: 1,
+        data_dir: path.join(home, "hub-data"),
+        gateway_bind: `0.0.0.0:${port}`,
+        relay_bind: "0.0.0.0:3340",
+        autostart: false,
+        initialized_at: "2026-10-01T00:00:00Z",
+      },
+      null,
+      2,
+    ),
+  );
+  await writeFile(path.join(home, "hub-token"), `${token}\n`, { mode: 0o600 });
+  await chmod(path.join(home, "hub-token"), 0o600);
+}
+
 /** 起 dweb-server（restricted + admin token，端口 0 内核分配）并等就绪 */
 async function spawnServer(dataDir) {
+  // W11（2026-10-01）：服务端 admin token 唯一通道 = <data_dir>/admin-token
+  //（0600）——spawn 前落文件，env 注入移除
+  await writeFile(path.join(dataDir, "admin-token"), `${ADMIN_TOKEN}\n`, { mode: 0o600 });
+  await chmod(path.join(dataDir, "admin-token"), 0o600);
   const lines = [];
   const child = spawn(
     defaultServerBin(),
@@ -87,7 +112,6 @@ async function spawnServer(dataDir) {
         ...process.env,
         DWEB_DATA_DIR: dataDir,
         DWEB_ACCESS_MODE: "restricted",
-        DWEB_ADMIN_TOKEN: ADMIN_TOKEN,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -125,10 +149,12 @@ async function spawnServer(dataDir) {
 }
 
 /** 起侧车 CLI 子进程并等 listening 行 */
-async function spawnSidecar(args, { name = "sidecar" } = {}) {
+async function spawnSidecar(args, { name = "sidecar", home = null } = {}) {
   const lines = [];
   const child = spawn(process.execPath, [CLI, ...args, "--no-open"], {
-    env: { ...process.env, DWEB_ADMIN_TOKEN: "" }, // 隔离 env token 途径
+    // W11：env token 通道移除——home 形态经 DWEB_HOME 走 row-2 hub-local 的
+    // 0600 hub-token 进程内通道（spawn 子进程无 TTY，argv/env 均不可用）
+    env: { ...process.env, DWEB_ADMIN_TOKEN: "", ...(home !== null ? { DWEB_HOME: home } : {}) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   drainLines(child.stdout, lines);
@@ -174,7 +200,11 @@ test("e2e: scenario 1 - direct --server startup, passthrough, 401 envelope, owne
   const server = await spawnServer(dataDir);
   children.push(server.child);
 
-  const sidecarA = await spawnSidecar(["--server", `http://127.0.0.1:${server.port}`, "--token", ADMIN_TOKEN], { name: "sidecar-ok" });
+  // W11：显式 --server + --token 的 spawn 形态随 argv 通道移除——凭证经
+  // hub-home（0600 hub-token）注入，row-2 hub-local 管理员通道端到端覆盖
+  const homeA = await mkdtemp(path.join(tmpdir(), "webui-e2e-s1-a-"));
+  await writeSidecarHubHome(homeA, server.port, ADMIN_TOKEN);
+  const sidecarA = await spawnSidecar([], { name: "sidecar-ok", home: homeA });
   children.push(sidecarA.child);
 
   // /api/status 200 透传（envelope/body 原样）
@@ -185,7 +215,9 @@ test("e2e: scenario 1 - direct --server startup, passthrough, 401 envelope, owne
   assert.equal(status.headers["content-type"], "application/json");
 
   // 错 token 侧车：401 envelope 原样透传（远端负责语义，sidecar 不解释）
-  const sidecarB = await spawnSidecar(["--server", `http://127.0.0.1:${server.port}`, "--token", "wrong-token-on-purpose"], { name: "sidecar-bad" });
+  const homeB = await mkdtemp(path.join(tmpdir(), "webui-e2e-s1-b-"));
+  await writeSidecarHubHome(homeB, server.port, "wrong-token-on-purpose");
+  const sidecarB = await spawnSidecar([], { name: "sidecar-bad", home: homeB });
   children.push(sidecarB.child);
   const unauthorized = await request(sidecarB.port, { path: "/api/status" });
   assert.equal(unauthorized.status, 401, unauthorized.text);
@@ -292,7 +324,7 @@ test("e2e: scenario 3 - plaintext public target refused without --allow-insecure
   const lines = [];
   const child = spawn(
     process.execPath,
-    [CLI, "--server", "http://203.0.113.10:18787", "--token", "t", "--no-open"],
+    [CLI, "--server", "http://203.0.113.10:18787", "--no-open"],
     { env: { ...process.env, DWEB_ADMIN_TOKEN: "" }, stdio: ["ignore", "pipe", "pipe"] },
   );
   drainLines(child.stdout, lines);
