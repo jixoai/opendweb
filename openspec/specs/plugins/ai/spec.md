@@ -1,5 +1,5 @@
 # plugins/ai —— ai-subscription-sharing
-## ADDED Requirements
+## Requirements
 
 ### Requirement: AI 订阅共享插件（提供方/消费方双姿态）
 
