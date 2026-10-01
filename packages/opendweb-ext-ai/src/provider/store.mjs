@@ -253,9 +253,9 @@ export class ProviderStore {
     this.#secretsSource =
       opts.secretsSource ?? ((name) => defaultSecretExists(dataDir, name));
     this.#home = opts.home;
-    // 落盘基线（P1-7）：构造时的 enabled 状态=「已在盘上启用」集合——save() 只对
-    // 相对基线**将启用**（新增启用/停用翻转）的服务重跑激活门。
-    this.#persistedEnabled = new Map(data.services.map((s) => [s.serviceId, s.enabled !== false]));
+    // 落盘基线（P1-7/r2-C1）：构造时的安全投影（enabled/keyEnv/auth）=盘上
+    // 状态——save() 对相对基线的新启用或已启用服务的安全面变更重跑激活门。
+    this.#persistedEnabled = new Map(data.services.map((s) => [s.serviceId, s.enabled === false ? "0" : `1|${securityProjection(s)}`]));
   }
 
   #random;
@@ -720,22 +720,22 @@ export class ProviderStore {
 
   /**
    * 唯一落盘写入口：revision 自增 + 原子写 + 监听唤醒。
-   * 激活门兜底（P1-7）：对相对上次落盘基线**将启用**（新增启用/停用→启用翻转）
-   * 的服务重跑 assertServiceActivatable——公开可变 `data`+`save()` 的直接变更
-   * 绕过高层门时在落盘前被拒（fail-closed 零写入；判定失败文件与 revision 均
-   * 不变）。已启用存量不重判（启用时点已过门——secret 事后移除不得毒化无关
-   * 写路径/阻碍停用）。
+   * 激活门兜底（P1-7/r2-C1）：基线记录每服务安全投影（enabled/keyEnv/auth），
+   * 相对基线的**新启用**或**已启用服务的 keyEnv/auth 变更**都在落盘前重跑
+   * assertServiceActivatable（fail-closed 零写入；判定失败文件与 revision 均
+   * 不变）。仅停用方向（enabled→false）不重判——secret 事后移除不得阻碍停用；
+   * 已启用且安全面未变的存量写路径不重判（secret 事后移除不得毒化无关写）。
    */
   async save() {
     const baseline = this.#persistedEnabled ?? new Map();
     for (const service of this.data.services) {
       if (service.enabled === false) continue;
-      if (baseline.get(service.serviceId) === true) continue; // 存量启用——不重判
+      if (baseline.get(service.serviceId) === `1|${securityProjection(service)}`) continue; // 存量启用且安全面未变——不重判
       assertServiceActivatable(service, { env: this.#env, secrets: this.#secretsSource });
     }
     this.data.revision += 1;
     await atomicWrite0600(ProviderStore.filePath(this.dataDir), `${JSON.stringify(this.data, null, 2)}\n`);
-    this.#persistedEnabled = new Map(this.data.services.map((s) => [s.serviceId, s.enabled !== false]));
+    this.#persistedEnabled = new Map(this.data.services.map((s) => [s.serviceId, s.enabled === false ? "0" : `1|${securityProjection(s)}`]));
     for (const cb of [...this.#listeners]) {
       try {
         cb(this.data.revision);
@@ -784,6 +784,16 @@ export class ProviderStore {
  * @param {{ env: (name: string) => string | undefined, secrets: (name: string) => boolean }} ctx
  * @throws {StoreError}
  */
+/**
+ * 安全投影（r2-C1）：激活门关心的服务安全面——keyEnv 名与 auth 槽绑定。
+ * 稳定字符串化供 save() 基线比对（已启用服务改 keyEnv/auth 必触发重判）。
+ * @param {{ keyEnv?: string, auth?: unknown }} service
+ * @returns {string}
+ */
+function securityProjection(service) {
+  return JSON.stringify([service.keyEnv ?? null, service.auth ?? null]);
+}
+
 export function assertServiceActivatable(service, { env, secrets }) {
   if (service.enabled === false) return;
   const keyEnv = service.keyEnv;

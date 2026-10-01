@@ -38,6 +38,7 @@ import { createForwardPlane, validateAdmission } from "./provider/forward.mjs";
 import { createAiProviderWireHandler } from "./wire/endpoints.mjs";
 import { DEFAULT_MAX_CONCURRENCY, MAX_CONCURRENCY_MAX } from "./wire/constants.mjs";
 import { openKeyring } from "./consumer/keyring.mjs";
+import { sanitizeError, diagnosticLogLine } from "./redact.mjs";
 import { createConsumerSession, WireError } from "./consumer/sessions.mjs";
 import { createConsumerGateway } from "./consumer/gateway.mjs";
 import { atomicWrite0600 } from "./fsutil.mjs";
@@ -432,8 +433,9 @@ export async function createAiRuntime(opts = {}) {
         await startConsumerEndpoint({ providerEndpointId: entry.providerEndpointId, serviceId: entry.serviceId, port: entry.port });
       } catch (e) {
         // 恢复失败：保留账本条目（stopped 态）——端口被占/钥环变动后可手动重试
+        // （r2-C2：诊断日志只留 code+错误类名，原始 message 不落日志）
         endpointsLedger.endpoints.push(entry);
-        log(`ai consumer: restore of 127.0.0.1:${entry.port} (${entry.serviceId}) failed: ${e instanceof Error ? e.message : String(e)}`);
+        log(`ai consumer: restore of 127.0.0.1:${entry.port} (${entry.serviceId}) failed: ${diagnosticLogLine("consumer-restore", e)}`);
       }
     }
     await saveEndpoints();
@@ -533,7 +535,8 @@ export async function createAiRuntime(opts = {}) {
         }
         results.push({ ok: true, endpointId: provider.endpointId, alias: provider.alias });
       } catch (e) {
-        results.push({ ok: false, endpointId: provider.endpointId, error: e instanceof Error ? e.message : String(e) });
+        // r2-C2：原始异常 message 可能携带绝对路径/内部标识——统一脱敏投影
+        results.push({ ok: false, endpointId: provider.endpointId, error: sanitizeError(e).message });
       }
     }
     await kr.save();

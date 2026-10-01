@@ -427,7 +427,8 @@ export function createAiManagement(deps) {
           },
         };
       } catch (e) {
-        return err(400, "invalid-link", e instanceof Error ? e.message : String(e));
+        // r2-C2：固定脱敏文案（原始异常可能含绝对路径——如 keyring symlink 拒绝）
+        return err(400, "invalid-link", sanitizeError(e).message);
       }
     }
 
@@ -441,7 +442,8 @@ export function createAiManagement(deps) {
         const out = await addKey(input.key, input.providerRef, kr);
         return { status: 200, body: { added: out.added, provider: { alias: out.provider.alias, endpointId: out.provider.endpointId } } };
       } catch (e) {
-        return err(400, "invalid-key", e instanceof Error ? e.message : String(e));
+        // r2-C2：同上——固定脱敏文案
+        return err(400, "invalid-key", sanitizeError(e).message);
       }
     }
 
@@ -450,6 +452,7 @@ export function createAiManagement(deps) {
       const ref = typeof input.providerRef === "string" && input.providerRef !== "" ? input.providerRef : undefined;
       const out = await consumer.refreshProviders(ref);
       if (ref !== undefined && out.results.length === 1 && out.results[0].ok === false) {
+        // r2-C2：error 已是 refreshProviders 的脱敏投影（runtime 侧 sanitizeError）
         return err(404, "not-found", out.results[0].error ?? "provider not found");
       }
       return { status: 200, body: out };
