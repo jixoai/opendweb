@@ -218,3 +218,19 @@ test("r4-P1: 目录投影 rewrite 白名单+upstream userinfo 剥离", async () 
   assert.equal(safe.detail.rewrite.prefix, "/v1");
   assert.equal(safe.detail.upstream, "https://example.com/v1", "去 userinfo 的安全 URL");
 });
+
+test("r5-P0: 敏感键上下文穿容器（数组/嵌套对象内短凭证零透传）", async () => {
+  const { maskSensitiveSettings, previewClaudeCodeWriter } = await import("../src/consumer/writers/claude-code.mjs");
+  const masked = maskSensitiveSettings(JSON.stringify({ tokens: ["short-cred"], auth: { value: "short-cred" }, env: { ANTHROPIC_BASE_URL: "http://127.0.0.1:14399" } }));
+  assert.ok(!masked.includes("short-cred"), "敏感键容器内短值不得透传");
+  assert.ok(masked.includes("127.0.0.1:14399"), "非敏感 URL 保持可见");
+  // 经 mgmt preview 面的端到端：盘上放敏感容器，preview 响应零透传
+  const home = await tmpDir();
+  const settings = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(settings), { recursive: true });
+  fs.writeFileSync(settings, JSON.stringify({ tokens: ["short-cred"], auth: { value: "short-cred" } }, null, 2));
+  const pv = await previewClaudeCodeWriter({ home, port: 14399 });
+  const blob = JSON.stringify(pv) + pv.diff;
+  assert.ok(!blob.includes("short-cred"), "mgmt preview 响应+diff 零透传");
+  await fsp.rm(home, { recursive: true, force: true });
+});

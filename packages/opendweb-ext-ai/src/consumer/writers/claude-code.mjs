@@ -285,16 +285,22 @@ export function maskSensitiveSettings(text) {
   const MASK = "●●●●";
   const PLACEHOLDER = "sk-aifly-local";
   const sensitiveKey = (k) => /token|key|secret|password|credential|auth/i.test(k);
-  /** @param {unknown} v @param {string | null} key */
-  const walk = (v, key) => {
+  /**
+   * @param {unknown} v
+   * @param {string | null} key 当前属性名（数组元素=null）
+   * @param {boolean} inherited 敏感祖先上下文（r5-P0：进入敏感键后，数组
+   *   元素与任意深度子对象继续继承——容器边界不丢失）
+   */
+  const walk = (v, key, inherited) => {
     if (typeof v === "string") {
       if (v === PLACEHOLDER) return v;
-      if ((key !== null && sensitiveKey(key)) || v.startsWith("sk-")) return MASK;
+      if (inherited || (key !== null && sensitiveKey(key)) || v.startsWith("sk-")) return MASK;
       return v;
     }
     if (v === null || typeof v !== "object") return v;
-    if (Array.isArray(v)) return v.map((item) => walk(item, null));
-    return Object.fromEntries(Object.entries(/** @type {Record<string, unknown>} */ (v)).map(([k, val]) => [k, walk(val, k)]));
+    const selfSensitive = inherited || (key !== null && sensitiveKey(key));
+    if (Array.isArray(v)) return v.map((item) => walk(item, null, selfSensitive));
+    return Object.fromEntries(Object.entries(/** @type {Record<string, unknown>} */ (v)).map(([k, val]) => [k, walk(val, k, selfSensitive)]));
   };
   let obj;
   try {
