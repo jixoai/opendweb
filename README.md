@@ -49,6 +49,17 @@ All packages are published at v0.2.1. Server deployments on other platforms can 
 
 ## Quick start
 
+### Monorepo development
+
+```bash
+# dev mode — run the CLI straight from source with bun (no JS build step):
+pnpm dev hub status          # = bun packages/opendweb/bin/opendweb.mjs hub status
+
+# production mode — run after `pnpm install && pnpm build && pnpm build:rs`
+# (workspace links + webui dist + Rust server binary):
+pnpm opendweb hub init       # = node packages/opendweb/bin/opendweb.mjs hub init
+```
+
 ```bash
 # 1. Start the self-hosted server (gateway + relay) — top-level CLI
 npx opendweb server

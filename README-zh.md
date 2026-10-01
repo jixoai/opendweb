@@ -27,6 +27,17 @@
 - `packages/opendweb-ext-cf` — `@jixo/opendweb-ext-cf` Cloudflare Tunnel 插件
 - `docker/` — 镜像 `ghcr.io/jixoai/opendweb`（rendezvous 8787 + relay 3340）
 
+## Monorepo 开发
+
+```bash
+# 开发模式 —— bun 直跑源码 CLI（免 JS 构建步骤）：
+pnpm dev hub status          # = bun packages/opendweb/bin/opendweb.mjs hub status
+
+# 正式模式 —— 先 pnpm install && pnpm build && pnpm build:rs
+#（workspace 链接 + webui dist + Rust 服务端二进制），然后：
+pnpm opendweb hub init       # = node packages/opendweb/bin/opendweb.mjs hub init
+```
+
 ## 快速开始（体验 example）
 
 ```bash
