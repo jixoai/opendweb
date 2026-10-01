@@ -3,6 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -366,4 +367,63 @@ test("resolveAdaptive: a locked alias resolves its package without the manifest-
     }),
     /declares name "cf" but was invoked as "mycf"/,
   );
+});
+
+// ---- 工作区本地解析回退（dev 模式——pnpm dev webui 仓内直跑） -----------------------
+
+/** 造一个 pnpm workspace：<root>/pnpm-workspace.yaml + packages/<dir> 成员 */
+async function workspaceWith(members) {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "opendweb-ws-"));
+  await fsp.writeFile(path.join(root, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n", "utf8");
+  await fsp.writeFile(path.join(root, "package.json"), JSON.stringify({ name: "ws-root", private: true }), "utf8");
+  for (const [dir, fixture] of members) {
+    await fsp.cp(path.join(FIXTURES, fixture), path.join(root, "packages", dir), { recursive: true });
+  }
+  return root;
+}
+
+test("workspace fallback: repo 内（node_modules 链无副本）按成员包名解析本地包", async () => {
+  const ws = realpathSync(await workspaceWith([["webui-pkg", "opendweb-echo"]]));
+  try {
+    // 嵌套子目录（模拟 pnpm dev 从根脚本进入任意 cwd）也要命中
+    const nested = path.join(ws, "apps", "site");
+    await fsp.mkdir(nested, { recursive: true });
+    const entry = resolvePluginEntry("opendweb-echo", nested);
+    assert.ok(entry !== null, "workspace 成员应被解析");
+    assert.ok(entry.startsWith(path.join(ws, "packages", "webui-pkg")), `入口应落在 workspace 成员内: ${entry}`);
+    assert.ok(entry.endsWith("plugin.js"));
+  } finally {
+    await fsp.rm(ws, { recursive: true, force: true });
+  }
+});
+
+test("workspace fallback: 已安装副本优先于 workspace 源（用户项目语义不变）", async () => {
+  const ws = realpathSync(await workspaceWith([["webui-pkg", "opendweb-echo"]]));
+  try {
+    const proj = await projectWith("opendweb-echo");
+    // workspace 内的独立项目目录（apps/proj）带身份相符 node_modules 副本——
+    // 副本胜出（链上命中先于 workspace 回退；副本不在同名成员内部——那种
+    // 嵌套会触发 Node self-reference，属另一语义面）
+    const nested = path.join(ws, "apps", "proj");
+    await fsp.mkdir(nested, { recursive: true });
+    await fsp.cp(path.join(proj, "node_modules"), path.join(nested, "node_modules"), { recursive: true });
+    const entry = resolvePluginEntry("opendweb-echo", nested);
+    assert.ok(entry !== null && entry.startsWith(path.join(nested, "node_modules", "opendweb-echo")), "node_modules 副本优先");
+    await fsp.rm(proj, { recursive: true, force: true });
+  } finally {
+    await fsp.rm(ws, { recursive: true, force: true });
+  }
+});
+
+test("workspace fallback: 成员无同名包时保持未安装语义（返回 null）", async () => {
+  const ws = realpathSync(await workspaceWith([["other-pkg", "opendweb-echo"]]));
+  try {
+    // 身份匹配按 package.json name——改掉成员名后无匹配（目录名无关）
+    const meta = JSON.parse(await fsp.readFile(path.join(ws, "packages", "other-pkg", "package.json"), "utf8"));
+    meta.name = "opendweb-other";
+    await fsp.writeFile(path.join(ws, "packages", "other-pkg", "package.json"), JSON.stringify(meta, null, 2));
+    assert.equal(resolvePluginEntry("opendweb-echo", ws), null, "无匹配成员=未安装（自愈链不变）");
+  } finally {
+    await fsp.rm(ws, { recursive: true, force: true });
+  }
 });

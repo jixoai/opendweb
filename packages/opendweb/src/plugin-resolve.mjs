@@ -5,7 +5,7 @@
 // - 解析成功后的任何失败（顶层抛错 / safeParse 不合规）= 硬错误，不静默跳过
 // - 全部不可解析 → 报错 + 打印精确 plugin add 命令（无隐式安装）
 import { createRequire } from "node:module";
-import { readFileSync, realpathSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 import { PluginManifestSchema } from "./plugin-contract.mjs";
@@ -150,9 +150,94 @@ function scanPackageRoots(pkg, cwd) {
     // verified 命中即可停：nearest 必在同级或更早层级已捕获
     if (verified !== null) return { nearest, verified };
     const parent = path.dirname(searchDir);
-    if (parent === searchDir) return { nearest, verified };
+    if (parent === searchDir) return workspaceFallback(pkg, cwd, nearest);
     searchDir = parent;
   }
+}
+
+/**
+ * 工作区本地解析回退（dev 模式——`pnpm dev webui`/仓内直跑 CLI）：整个
+ * node_modules 链无身份相符副本时，向上找 pnpm/npm workspace 根
+ * （pnpm-workspace.yaml 的 packages 段或 package.json 的 workspaces 数组），
+ * 按「成员目录 package.json name === pkg」身份匹配（同 verified 判定）。
+ * 仅支持单段 glob（`packages/*` 家族——monorepo 常见形态）；成员里的命中
+ * 目录本身就是身份验证过的包根。用户项目（无 workspace/成员不匹配）语义
+ * 零变化——仍走未安装 → 自愈安装链。
+ * @param {string} pkg
+ * @param {string} cwd
+ * @param {string | null} nearest node_modules 链上的 nearest（保持原值传递）
+ * @returns {{ nearest: string | null, verified: string | null }}
+ */
+function workspaceFallback(pkg, cwd, nearest) {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    for (const pattern of workspacePackagePatterns(dir)) {
+      // 单段 glob：`packages/*` / `pkgs/*`——目录段固定、末段通配
+      const m = /^([^/*]+)\/\*$/.exec(pattern);
+      if (m === null) continue;
+      const groupDir = path.join(dir, m[1]);
+      let members;
+      try {
+        members = readdirSync(groupDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const ent of members) {
+        if (!ent.isDirectory()) continue;
+        const root = path.join(groupDir, ent.name);
+        const meta = readPackageMeta(path.join(root, "package.json"));
+        if (meta !== null && meta.name === pkg) {
+          try {
+            return { nearest, verified: realpathSync(root) };
+          } catch {
+            /* 目录不可达——继续扫 */
+          }
+        }
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return { nearest, verified: null };
+    dir = parent;
+  }
+}
+
+/**
+ * 目录的工作区成员模式列表：pnpm-workspace.yaml 的 packages 段（最小 YAML
+ * 行解析——`packages:` 后的 `- pattern` 列表）或 package.json 的 workspaces
+ * 数组。两者皆无=非 workspace 根（返回空）。
+ * @param {string} dir
+ * @returns {string[]}
+ */
+function workspacePackagePatterns(dir) {
+  const patterns = [];
+  try {
+    const lines = readFileSync(path.join(dir, "pnpm-workspace.yaml"), "utf8").split("\n");
+    let inPackages = false;
+    for (const raw of lines) {
+      const line = raw.replace(/\r$/, "");
+      if (/^packages:\s*$/.test(line)) {
+        inPackages = true;
+        continue;
+      }
+      if (inPackages) {
+        const item = /^\s+-\s+['"]?([^'"#\s]+)['"]?\s*$/.exec(line);
+        if (item !== null) {
+          patterns.push(item[1]);
+          continue;
+        }
+        if (/^\S/.test(line)) inPackages = false; // 段结束
+      }
+    }
+  } catch {
+    /* 无 pnpm-workspace.yaml */
+  }
+  const meta = readPackageMeta(path.join(dir, "package.json"));
+  if (meta !== null && Array.isArray(meta.workspaces)) {
+    for (const w of meta.workspaces) {
+      if (typeof w === "string") patterns.push(w);
+    }
+  }
+  return patterns;
 }
 
 /** @param {string} p @returns {Record<string, unknown> | null} */
