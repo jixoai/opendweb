@@ -178,7 +178,7 @@ allocated → producing →（逐 seq：ready(seq) → in-flight → committed�
 - auth 槽=ai-fly 现行三族单选+可选 bearer：`{secret:<name>} | {script:<name>,
   args?} | {literal:<v>}`（**无 file 族**——文件取值经 `{script:"file"}`，
   与上游一致；r1 proposal 笔误在本版修正）。literal 间接引用仅 `$secret:`。
-- **env 二分法（r2-P1-F/r4 终版：进程内 hook+启动卫生）**：ai-fly hooks 为
+- **env 二分法（r2-P1-F/r4 终版：进程内 hook+ambient env 启动/激活拒绝）**：ai-fly hooks 为
   **宿主进程内 require()**（hook.ts:266），非子进程——v1 **保持进程内执行**
   （内核「可信插件」信任模型的既定边界：hook 脚本与宿主同权限，可读
   `process.env` 与 secrets.json——**本 change 不宣称防御恶意 hook**（其与
