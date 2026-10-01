@@ -1,12 +1,15 @@
 # Design: ai-subscription-sharing
 
-> r1 评审（Codex，2026-10-01，NOT-READY 4.8/10）全部 P0/P1/P2 已处置：
-> §3 重写为具体 JSON-over-HTTP ABI + 中继状态机（P0-1/P0-2）；预算按
-> 编码后最坏计账（P1-1）；SSE 改字节流透明语义+延迟目标（P1-2）；auth
-> 三族统一+env 二分法+两阶段导入（P1-3）；gate 错误面统一 404（P1-4）；
-> 撤钥三态冻结（P1-5）；codex OAuth+rust-fetch 拆后续 change（P1-6/征询③）；
-> 阶段绿门命令化（P1-7）；raw key 对齐上游 Owner 裁决（P2-1）；密钥语法
-> 保持 ai-fly（征询①）；v1 用响应中继不动内核（征询②）。
+> r2 评审（Codex，2026-10-01，NOT-READY 5.8/10）已处置：
+> §3 改 header framing（P0-A：元数据全走 `x-odai-*` 头，body=纯载荷——与
+> 内核 OPEN metadata+DATA 投影（continuity/http.rs）逐层对齐；AUTH 多 key
+> `groups[]/rejected[]`）；§3.2 改**单飞拉取+连续提交游标**（P0-B：禁止
+> fromSeq 越过 committedSeq、无租约竞态、204 hold 语义、全部转移单锁）；
+> 重启幂等降为**同进程重试**（P1-C）；gate 范围收缩为 ai handler 内统一 404
+> （P1-D：内核插件级 404/503 语义不改，op-aware gate 列 follow-up）；请求
+> 绑定 `x-odai-key-id`+5s drain 声明为有意分歧（P1-E）；hook 净化 env+
+> keyEnv 仅提示（P1-F）；rid 绝对寿命上界+终态摘要保留（P1-G）；绿门
+> receipt 路径（P1-H）；rust-fetch 承接条款补发现顺序（P2-I）。
 
 ## 0. 移植总策略
 
@@ -50,11 +53,18 @@ http-protocol.ts`），本设计的 §3 ABI 是它的 wpk1 化重述，不是帧
 `sk-aifly-`/`aifly1.`，征询①采纳——rebrand 留后续，改则常量单点）。wpk1
 gate（peer×op deny-by-default）先过、ai 层密钥校验后过。
 
-**gate 错误面（P1-4 冻结）**：gate 失败（未知 peer/未授权 op/插件停用）
-一律 `404 {error:"not_found"}`——与未知路径同体、固定 body、不解析 key；
-gate 过后才出现 ai 层码（403 `auth_failed` 等）。白名单外路径的
-`path_not_offered` **仅在 gate+key 双过后可出现**（此时路径存在性已无泄露
-面——对端已持有效 key）。响应矩阵进测试（§7）。
+**gate 错误面（r2-P1-D 范围收缩）**：内核 wpk router 语义**不改**（unknown
+-plugin 404 / plugin-disabled 503 / 插件级 gate——fabric.mjs createWpkRouter
+现状）。本 change 的统一 404 纪律作用于 **ai handler 内部**：peer 未授权/
+op 未授权/未知子路径→一律 `404 {error:"not_found"}` byte 级同体、不解析
+key；`path_not_offered` 仅 gate+key 双过后可出现。内核级 op-aware gate 与
+插件禁用面收敛列 follow-up（不在本 change 搭车改内核）。响应矩阵进测试。
+
+**请求绑定 keyId（r2-P1-E）**：AUTH 成功返回 `groups[]`（多 key）；每
+request/response 调用携带 `x-odai-key-id`（auth 所得其一）——quota/usage/
+撤钥判定全部按 keyId。**撤钥三态与 ai-fly 的差异如实声明**：ai-fly 全钥
+失效即 disconnect（engine.ts:322）；本 v1 增加 **5s 有界 drain**（有意分歧，
+为在途流完整性）+单 key 粒度拒绝（ai-fly 为 session 粒度 grant 选择）。
 
 **raw key（P2-1 处置）**：对齐上游 Owner 裁决——raw key 可选存 services.json
 （0600，本机明文与密钥库同威胁模型）；**远程面**（wire 响应/日志/目录披露/
@@ -62,74 +72,91 @@ usage）恒掩码；**webui 本地管理面**允许显式复制动作（127.0.0.
 守卫内，与 ai-fly GUI 同位）。修正 r1 版「仅一次性展示」表述；链接再生成
 （link 复用已存 key）照搬。
 
-**撤钥三态（P1-5 冻结）**：
-- ①单 key 撤销、session 尚有其他有效 key：不断会话；该 key 新请求 403
-  `auth_failed`；在途按流完成（drain）。
+**撤钥三态（P1-5 冻结，粒度=keyId）**：
+- ①单 key 撤销、session 尚有其他有效 key：不断会话；该 keyId 新请求/
+  新拉取 403 `auth_failed`；在途 rid 按 drain 完成（rid 授权在 request 时刻
+  快照——撤钥不撕已在途流）。
 - ②session 全钥失效：drain deadline **5s**（在途 settle 或 abort，错误码
-  `auth_revoked`）；随后断开该 fabric 会话（对齐 ai-fly engine.disconnect）。
+  `auth_revoked`）；随后断开该 fabric 会话（**有意分歧**：ai-fly 即时
+  disconnect，本 v1 加 5s 有界 drain）。
 - ③peer 被 gate 撤销：gate 拒新（404 同体）；在途随 fabric 会话关闭收敛。
-- 三态的 maxConcurrency 占位都在流 terminal（done/cancelled/expired）即释放
-  （不等 TTL）。并发撤钥×在途×拉取竞态进测试矩阵。
+- 三态的 maxConcurrency 占位都在流终态即释放（不等 TTL）。并发撤钥×在途×
+  拉取竞态进测试矩阵。
 
-## 3. wire ABI：`/wpk1/ai/v1/*`（JSON-over-HTTP，P0-1 冻结）
+## 3. wire ABI：`/wpk1/ai/v1/*`（HTTP header framing，r2-P0-A 冻结）
 
-对齐 ai-fly HTTP 投影形态的 wpk1 化重述。serviceId 路由头 `x-odai-service`
-（消费端注入；提供端剥离，**绝不透传上游**）。不兼容变更升 `/wpk1/ai/v2/`。
-gate op 名（内核授权粒度，随前缀带版本）：`ai/v1/auth`、`ai/v1/catalog`、
-`ai/v1/request`、`ai/v1/response`、`ai/v1/cancel`。
+**基于 ai-fly 现行 HTTP 投影形态的新增扩展**（非重述——auth/catalog/service
+头沿用其形状（`src/wire/http-protocol.ts`）；`request/response/cancel` 三端点
+为本 change 新设的中继面，ai-fly 的流式经其自有 keepOpen 隧道承载、不可平移）。
+与内核投影逐层对齐：内核 OPEN metadata（method/path/headers/bodyLength）+
+DATA body（`crates/dweb-fabric/src/continuity/http.rs`）→ **ai 层元数据全部走
+HTTP 头（`x-odai-*`），body=纯载荷字节**——单一无歧义 framing，无 multipart、
+无 metadata-in-body。
+
+- **头预算**：ai 层元数据头合计 ≤8 KiB（provider 超限即 400 `metadata_too_
+  large`）；`x-odai-service` 为 serviceId **唯一来源**（body/查询串中出现
+  同名信息即 400 拒绝——无冲突规则）。
+- gate op 名（内核授权粒度）：`ai/v1/{auth,catalog,request,response,cancel}`；
+  不兼容变更升 `/wpk1/ai/v2/`。
 
 | method+path | 请求 | 成功响应 | 错误 |
 |---|---|---|---|
-| `POST auth` | `{v:1, keys:[≤8]}` | `200 {status:"ok",keyId,catalog,catalogRev}` | gate=404 同体；key 错=`403 {status:"err",code:"auth_failed"}` |
-| `GET catalog?since=<rev>` | — | `200 {refresh:true,catalog,rev}`；无变化 `204`（≤30s 长轮询） | gate=404；未 auth=`403 auth_failed` |
-| `POST request` | JSON 元数据 `{v:1,serviceId,method,path,headers:[{n,v}]}` + **raw body**（octet-stream，≤maxChunkPayload，超限 413） | `200 {responseId,epoch,status,headers}`（上游头就绪即返） | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 auth_failed` |
-| `POST response/<rid>` | `{epoch,fromSeq}` | `200` + raw body=**单分片**（≤maxChunkPayload）+ 头 `x-odai-seq`/`x-odai-done`/`x-odai-lease-ms`/`x-odai-next-seq` | epoch/rid 不符=`404 {code:"response_not_found"}`；过期=`404 {code:"response_expired"}` |
-| `POST cancel` | `{responseId,epoch}` | `200 {status:"cancelled"}`（幂等，终态后重放同响应） | 同上 404 族 |
+| `POST auth` | body `{v:1, keys:[≤8]}` | `200 {status:"ok", groups:[{keyId,groupId,services}], rejected:[{keyId}], catalog, catalogRev}`（**多 key**——ai-fly auth.ts 语义） | 见 §2 gate 范围；key 全错=`403 {code:"auth_failed"}`（部分成功仍 200+rejected） |
+| `GET catalog?since=<rev>` | — | `200 {refresh:true,catalog,rev}`；无变化 `204`（≤30s 长轮询） | 未 auth=`403 auth_failed`；**全量 catalog ≤256 服务/JSON ≤256KiB**（工厂期拒绝超配——服务数超限即不可保存） |
+| `POST request` | 头：`x-odai-service`/`x-odai-method`/`x-odai-path`/`x-odai-key-id`（auth 所得）/`x-odai-headers`（上游头白名单 JSON 数组 ≤4KiB）；body=raw 载荷 ≤maxChunkPayload | `200 {responseId,epoch,status,headers}` | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 auth_failed`（keyId 无效/已撤）；载荷超限 `413`；头预算超限 `400 metadata_too_large` |
+| `POST response/<rid>` | 头：`x-odai-key-id`/`x-odai-from-seq`；body 空 | 就绪=`200` raw 单分片+`x-odai-seq`/`x-odai-done`/`x-odai-next-seq`；未就绪=`204`+`x-odai-next-seq`（**hold ≤30s** 后返回，consumer 重试）；终态后=摘要 `200` 零 body+`x-odai-done:1` | `404 {code:"response_not_found"\|"response_expired"}`；fromSeq≠committedSeq+1=`409 invalid_from_seq`；同 rid 并发第二拉取=`409 pull_in_flight` |
+| `POST cancel` | body `{responseId,epoch}` | `200 {status:"cancelled"}`（幂等终态重放） | 404 族同上 |
 
-**分片用 raw body+头携带元数据**（不做 base64——零膨胀，P1-1 简化）。
+### 3.1 预算与 admission 公式
 
-### 3.1 预算与 admission 公式（P1-1 冻结）
+- `maxChunkPayload = 1 MiB − 16 KiB`。**推导**（最坏叠加）：ai 元数据头
+  8 KiB + 内核 OPEN metadata JSON（requestId/idempotencyKey/method/path/
+  headers 数组——schema 实测 ≤2 KiB，按 4 KiB 余量计）+ 分片响应头 1 KiB +
+  帧定界余量 1 KiB = 14 KiB，向上取整 16 KiB → 编码后落帧 payload ≤1 MiB
+  恒成立（MAX_FRAME=1 MiB 为 payload 上限，continuity/frame.rs）。请求/
+  响应同用此值。
+- 每个 wpk1 调用=独立完整会话流（内核 2 MiB/流、8 MiB/session 记账天然
+  覆盖；catalog 256 KiB 上限同在包络内）。
+- provider 端 admission：在途上游 ≤maxConcurrency（默认 8，域 1–32）；
+  **活跃 ring**（非终态 rid 缓冲）≤maxConcurrency×2 MiB ≤64 MiB（超积工厂
+  拒启）；**终态摘要保留**独立上界 4 MiB LRU（§3.2）。请求体 v1 单片上限=
+  maxChunkPayload（更大列 v2 分块）。
 
-- `maxChunkPayload = 1 MiB − 4 KiB`（worst-case envelope：JSON 元数据+头+
-  分片头，4 KiB 封顶）→ **编码后落帧 payload ≤1 MiB 恒成立**（fabric
-  MAX_FRAME=1 MiB 是 payload 上限，crates/dweb-fabric/src/continuity/frame.rs）。
-- 每个 wpk1 调用（request/response 拉/cancel）=独立完整会话流，按内核既有
-  per-stream 2 MiB / session journal 8 MiB 记账：单调用 1 MiB+envelope 天然
-  在内；**无任何调用超过单流预算**，方向性计账由此闭合。
-- provider 端统一 admission：`在途上游请求 ≤ maxConcurrency（默认 8，域
-  1–32）`；`ring 总量 ≤ maxConcurrency × perRequestBuffer(2 MiB)`，且
-  **乘积 ≤64 MiB**（config 联动校验：超积拒绝启动插件——工厂期错误）。
-- 请求体 v1 单片上限=maxChunkPayload（≈1 MiB−4 KiB；与 ports 同量级；
-  更大请求体列 v2 分块上传）。
-
-### 3.2 响应中继状态机（P0-2 冻结）
+### 3.2 响应中继状态机（r2-P0-B：单飞拉取+连续提交游标）
 
 ```
-allocated → producing →（逐 seq：ready(seq) → leased → committed）→ done
-终态（互斥，terminal arbiter 单点裁决）：done | cancelled | expired
+allocated → producing →（逐 seq：ready(seq) → in-flight → committed）→ done
+终态（互斥，单一 per-rid 互斥锁内裁决）：done | cancelled | expired
 ```
 
-- **responseId = `<epoch>:<单调序号>`**；进程重启→新 epoch，旧 rid 一律
-  `response_not_found`——**不复用、不复活**（跨重启恢复=消费端重新 request，
-  幂等键 `{serviceId,method,path,bodyHash}` 使 provider 可识别重放并返回
-  存活中的既有 rid）。
-- **幂等键 `(epoch, rid, seq)`**：同键重放同内容 200；分片内容由上游字节
-  流序决定，同 seq 异内容=不可能（若发生=内部错误显式 500）。
-- **拉取租约**：`response` 调用返回即租（leaseMs 默认 30_000）；租约内同
-  fromSeq 重拉=重放同分片；租约到期未推进→分片回 ready 可重拉；**隐式
-  提交**：下一次 fromSeq 推进（或 done 确认）即视为此前分片 committed，
-  ring 中对应槽位释放。
-- **done 裁决**：上游 EOF 分片带 `x-odai-done:1`；此后拉取返回零 body+
-  done 头（终态重放），有效期至 TTL。
-- **cancel/done 竞态**：terminal arbiter 先到先定，后到幂等返回既有终态。
-- **TTL（绝对 deadline）**：元数据帧返回时刻 +120s；有拉取活动则续至最后
-  活动 +120s；到期→若仍 producing 先 abort 上游→expired→释放 concurrency
-  占位与 ring。
-- **满 buffer 无拉取**：上游读暂停（背压）持续到 buffer 浅/拉取/TTL 三者
-  之一——TTL 是有界终止保证，无死锁路径；concurrency 占位在 terminal 即
-  释放（不等 TTL）。
-- **取消**：consumer 本地连接断→cancel 调用（+拉取窗内 abort）→上游
-  abort（ai-fly abort 链照搬）。
+- **全部状态转移**（produce/cancel/expiry/commit/拉取）在 per-rid 互斥锁内
+  完成（单线程事件循环+显式临界区；无跨锁竞态面）。
+- **单飞拉取**：同一 rid 同时只允许一个在途 `response` 调用（第二个=409
+  `pull_in_flight`）——取消了租约 token 的全部竞态面。
+- **连续提交游标** `committedSeq`（0..committedSeq 全部已提交的连续前缀）：
+  拉取必须 `fromSeq === committedSeq+1`，否则 409——**禁止越过未提交分片**
+  （无 seq 空洞、无提前释放）。提交=消费方下一次拉取 fromSeq 推进（隐式
+  连续提交）或终态确认；ring 槽仅随游标推进释放。
+- **未就绪语义**：下一分片未产出时 hold ≤30s；期间产出即返回，超时 `204`
+  +`x-odai-next-seq`（consumer 立即重试——与 catalog-watch 同型）。
+- **responseId=`<epoch>:<单调号>`**；epoch=进程启动 CSPRNG（持久化不需要）；
+  **重启=全部在途 rid 404 `response_not_found`**——幂等仅**同进程内**保证
+  （(epoch,rid,seq) 同键同内容重放）；跨重启由消费端重新 request 承接
+  （v1 明确不支持跨重启重放——非幂等上游 POST 的重复执行风险由消费端重试
+  策略自担，文档明示；持久化幂等账本列 follow-up）。
+- **done**：上游 EOF 分片带 done 标记；此后拉取返回终态摘要（零 body+
+  `x-odai-done:1`），**body 分片即弃**（摘要保留见下）。
+- **cancel/done 竞态**：锁内先到定终态，后到幂等返回。
+- **TTL 与绝对寿命**：空闲 TTL=最后活动+120s；**绝对寿命=创建+10 min 硬
+  上界**（不可续期越过后仍存活——到点未 done/cancelled 即 expired，先
+  abort 上游再释放）；204 hold 不续 TTL（仅 200 拉取推进算活动）。
+- **终态摘要保留**：done 后仅保留 `{status,headers,committedSeq}` 摘要可
+  重放（旧 seq body 不可再拉——404 已弃），独立 LRU 上界 4 MiB，随空闲
+  TTL 过期回收；不占活跃 ring 预算。
+- **满 buffer 无拉取**：上游读暂停（背压）至 buffer 浅/拉取/终态三者之一；
+  绝对寿命是有界终止，无死锁路径；concurrency 占位在终态即释放（不等 TTL）。
+- **取消**：consumer 本地连接断→cancel（+在途拉取 abort）→上游 abort
+  （ai-fly abort 链照搬）。
 
 ### 3.3 SSE/流式语义（P1-2 冻结：字节流透明，不做事件对齐）
 
@@ -146,21 +173,31 @@ allocated → producing →（逐 seq：ready(seq) → leased → committed）�
 - auth 槽=ai-fly 现行三族单选+可选 bearer：`{secret:<name>} | {script:<name>,
   args?} | {literal:<v>}`（**无 file 族**——文件取值经 `{script:"file"}`，
   与上游一致；r1 proposal 笔误在本版修正）。literal 间接引用仅 `$secret:`。
-- **env 二分法**：**凭证 env 禁止**（`$env:` 形态、env.cjs、hook 读
-  process.env 中将值注入上游请求的变量）；**运行时配置 env 允许**（
-  CODEX_HOME、EXT_AI_* 开关、路径类）——判定线=「值进入上游请求头/体」。
+- **env 二分法（r2-P1-F 收紧到脚本通道）**：**凭证 env 禁止**且**不可绕**——
+  ①声明面：`$env:` 形态与 env.cjs 不存在；②脚本面：hook 脚本进程仅接收
+  **净化 env**（非凭证 allowlist：PATH/HOME/locale+`EXT_AI_*` 开关），auth
+  路径的 `process.env` fallback（ai-fly hook.ts:434）**删除**；③预设面：
+  presets 的 `keyEnv` 字段降为 **UI 提示**（「该上游通常用此变量名」），
+  服务激活前 MUST 绑定 secret 名（未绑定的预设不可启用）。判定线=值进入
+  上游请求头/体；CODEX_HOME 类运行时 env 不受限。测试含「环境变量里存有
+  等值 secret 但请求不得携带」负向断言。
 - **导入两阶段 staging**：扫描 ai-fly services.json → 返回机器可读
   `{blocked:[{service,field,ref}], ready:[...]}`（安全条目不激活）→ 用户
   完成 $env→secret 映射 → 一次性 commit；**禁止 env 自动快照**。
 
-## 5. codex OAuth + rust-fetch：拆后续 change（征询③采纳）
+## 5. codex OAuth + rust-fetch：拆后续 change（征询③采纳，r2-P2-I 承接条款）
 
 v1 不含：codex 预设（OAuth 登录态）、rust-fetch sidecar、codex 写手、
-`hooks/codex.cjs`。presets 表 17 项 + codex 占位条目（`requires:"ai-codex-oauth"`
-呈现「需后续版本」）。后续 change `ai-codex-oauth` 承接：auth.json 只读
-hook、rust-fetch vendored 打包（生产仅包内+平台匹配+manifest hash 校验；
-显式路径仅 dev flag+绝对路径+权限检查——P1-6 的约束直接写进该 change 的
-requirements）、真订阅验收。本 change tasks Phase D 相应收缩。
+`hooks/codex.cjs`。presets 表 17 项 + codex 占位（`requires:"ai-codex-oauth"`）。
+后续 change `ai-codex-oauth` 承接（其 requirements MUST 冻结）：
+- auth.json 只读 hook（user-agent 去 codexHome 路径）+ codex 写手；
+- **rust-fetch 打包**：crates workspace member 文件清单 + pack 脚本产物
+  清单（vendored bin 路径+manifest）；**发现顺序**=生产仅包内路径+目标
+  平台匹配+manifest hash 校验通过（三条件同时满足才执行；任一不符=
+  `rust_fetch_unavailable` 显式降级）；**禁止 env/PATH fallback 发现**；
+  显式路径仅 dev flag（绝对路径+属主/权限检查）；测试矩阵=缺失/不可执行/
+  被替换（hash 不符）/错误架构四态；
+- 真 ChatGPT 订阅验收（Owner 手工 receipt）。本 change tasks Phase D 相应收缩。
 
 ## 6. 页面与交互（v1）
 
@@ -174,13 +211,17 @@ requirements）、真订阅验收。本 change tasks Phase D 相应收缩。
 ## 7. 测试策略（P1-7 命令化绿门见 tasks）
 
 1. 单测（ai-fly 矩阵移植，vitest→node --test；fake 注入不触原生）。
-2. **wire 契约测试（Phase A 内）**：ABI 表逐端点（含 404 同体三形态、
-   403/404/429 矩阵、413 边界 maxChunkPayload±1、gate op 名）。
-3. **中继竞态矩阵（Phase B 内）**：满 buffer×0/1/2 并发拉、cancel×done
-   交叉、租约过期重拉、TTL 过期×producing、epoch 重启、幂等重放、断线
-   90s 续拉零重复零丢失、5 MiB 长响应、并发撤钥三态。
+2. **wire 契约测试（Phase A 内）**：ABI 表逐端点（含 404 同体三形态 byte
+   级、403/404/409/429 矩阵、413 边界 maxChunkPayload±1、400 头预算超限、
+   serviceId 双源拒绝、gate op 名、admission 超积拒启、catalog 256KiB 上限）。
+3. **中继竞态矩阵（Phase B 内）**：满 buffer×0/1 拉取（并发第二拉取=409）、
+   fromSeq 越前=409、204 hold→产出→返回、cancel×done 交叉、空闲 TTL 过期、
+   绝对寿命 10min 到点 expired（先 abort 上游）、done 后 body 弃+摘要重放、
+   provider 重启（epoch 更替，旧 rid 404）、断线 90s 续拉零重复零丢失、
+   5MiB 长响应、并发撤钥三态×在途×拉取、env 等值负向（secret 在 env 中
+   不得进请求）。
 4. e2e 双进程真内核（全链路+延迟目标 p95 断言）。
-5. 泄露面扫描（argv/env[仅凭证判定线内]/日志/usage/stderr 零凭证）。
+5. 泄露面扫描（argv/净化后 env/日志/usage/stderr 零凭证）。
 6. 回归门：webui 262 面零回归+三插件 e2e 零回归。
 
 ## 8. 风险与分期
