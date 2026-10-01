@@ -72,16 +72,17 @@ usage）恒掩码；**webui 本地管理面**允许显式复制动作（127.0.0.
 守卫内，与 ai-fly GUI 同位）。修正 r1 版「仅一次性展示」表述；链接再生成
 （link 复用已存 key）照搬。
 
-**撤钥三态（P1-5 冻结，粒度=keyId）**：
-- ①单 key 撤销、session 尚有其他有效 key：不断会话；该 keyId 新请求/
-  新拉取 403 `auth_failed`；在途 rid 按 drain 完成（rid 授权在 request 时刻
-  快照——撤钥不撕已在途流）。
+**撤钥三态（P1-5 冻结，粒度=keyId；r3-C3 续拉规则）**：
+- ①单 key 撤销、session 尚有其他有效 key：不断会话；该 keyId **新 request**
+  `403 {code:"key_revoked"}`（对齐上游 REJECTED_CODE）；**已在途 rid 按创建
+  时授权快照放行续拉至终态**（response 拉取不因撤钥 403——drain 语义闭合；
+  仅新 request/新 rid 被拒）。
 - ②session 全钥失效：drain deadline **5s**（在途 settle 或 abort，错误码
   `auth_revoked`）；随后断开该 fabric 会话（**有意分歧**：ai-fly 即时
   disconnect，本 v1 加 5s 有界 drain）。
 - ③peer 被 gate 撤销：gate 拒新（404 同体）；在途随 fabric 会话关闭收敛。
-- 三态的 maxConcurrency 占位都在流终态即释放（不等 TTL）。并发撤钥×在途×
-  拉取竞态进测试矩阵。
+- 三态的 maxConcurrency 占位都在流终态即释放（不等 TTL）。并发撤钥×在途
+  ×拉取竞态进测试矩阵（含「撤钥后在途 rid 仍可续拉」正例）。
 
 ## 3. wire ABI：`/wpk1/ai/v1/*`（HTTP header framing，r2-P0-A 冻结）
 
@@ -101,10 +102,10 @@ HTTP 头（`x-odai-*`），body=纯载荷字节**——单一无歧义 framing�
 
 | method+path | 请求 | 成功响应 | 错误 |
 |---|---|---|---|
-| `POST auth` | body `{v:1, keys:[≤8]}` | `200 {status:"ok", groups:[{keyId,groupId,services}], rejected:[{keyId}], catalog, catalogRev}`（**多 key**——ai-fly auth.ts 语义） | 见 §2 gate 范围；key 全错=`403 {code:"auth_failed"}`（部分成功仍 200+rejected） |
-| `GET catalog?since=<rev>` | — | `200 {refresh:true,catalog,rev}`；无变化 `204`（≤30s 长轮询） | 未 auth=`403 auth_failed`；**全量 catalog ≤256 服务/JSON ≤256KiB**（工厂期拒绝超配——服务数超限即不可保存） |
-| `POST request` | 头：`x-odai-service`/`x-odai-method`/`x-odai-path`/`x-odai-key-id`（auth 所得）/`x-odai-headers`（上游头白名单 JSON 数组 ≤4KiB）；body=raw 载荷 ≤maxChunkPayload | `200 {responseId,epoch,status,headers}` | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 auth_failed`（keyId 无效/已撤）；载荷超限 `413`；头预算超限 `400 metadata_too_large` |
-| `POST response/<rid>` | 头：`x-odai-key-id`/`x-odai-from-seq`；body 空 | 就绪=`200` raw 单分片+`x-odai-seq`/`x-odai-done`/`x-odai-next-seq`；未就绪=`204`+`x-odai-next-seq`（**hold ≤30s** 后返回，consumer 重试）；终态后=摘要 `200` 零 body+`x-odai-done:1` | `404 {code:"response_not_found"\|"response_expired"}`；fromSeq≠committedSeq+1=`409 invalid_from_seq`；同 rid 并发第二拉取=`409 pull_in_flight` |
+| `POST auth` | body `{v:1, keys:[≤8]}` | `200 {v:1, status:"ok", groups:[{keyId,group,limits:{maxConcurrency?,dailyRequests?},services:[ServiceEntry]}]（≥1）, rejected?:[{code:"key_invalid"\|"key_revoked"}]}`（**与 ai-fly frames.ts AUTH_OK 同型**：rejected 仅 code 不带 keyId——有效键集合=groups[].keyId，与输入的对应由此确立） | key 全错=`403 {v:1, code:"key_all_invalid"}`（AUTH_ERR 同型） |
+| `GET catalog?since=<rev>` | — | `200 {v:1, refresh:true, catalog, rev}`；无变化 `204`（**hold ≤20s**——对齐 ai-fly CATALOG_WATCH_TIMEOUT_MS，且留裕量于内核 head deadline 30s 之内） | 未 auth=`403 key_all_invalid`；**全量 catalog ≤256 服务/JSON ≤256KiB**（工厂期拒绝超配——服务数超限即不可保存） |
+| `POST request` | 头：`x-odai-service`/`x-odai-method`/`x-odai-path`/`x-odai-key-id`（auth 所得）/`x-odai-headers`（上游头白名单 JSON 数组 ≤4KiB）；body=raw 载荷 ≤maxChunkPayload | `200 {responseId,epoch,status,headers}` | `404 path_not_offered`；`429 {code:"rate_limited"\|"quota_exceeded"}`；`403 key_all_invalid`（keyId 无效/已撤）；载荷超限 `413`；头预算超限 `400 metadata_too_large` |
+| `POST response/<rid>` | 头：`x-odai-key-id`/`x-odai-from-seq`；body 空 | 就绪=`200` raw 单分片+`x-odai-seq`/`x-odai-done`/`x-odai-next-seq`；未就绪=`204`+`x-odai-next-seq`（**hold ≤20s** 后返回，consumer 重试——同 catalog watch 常量；**必小于内核 head deadline 30s**，consumer 侧不要求调大 head timeout）；终态后=摘要 `200` 零 body+`x-odai-done:1` | `404 {code:"response_not_found"\|"response_expired"}`；fromSeq≠committedSeq+1=`409 invalid_from_seq`；同 rid 并发第二拉取=`409 pull_in_flight` |
 | `POST cancel` | body `{responseId,epoch}` | `200 {status:"cancelled"}`（幂等终态重放） | 404 族同上 |
 
 ### 3.1 预算与 admission 公式
@@ -133,12 +134,15 @@ allocated → producing →（逐 seq：ready(seq) → in-flight → committed�
   完成（单线程事件循环+显式临界区；无跨锁竞态面）。
 - **单飞拉取**：同一 rid 同时只允许一个在途 `response` 调用（第二个=409
   `pull_in_flight`）——取消了租约 token 的全部竞态面。
-- **连续提交游标** `committedSeq`（0..committedSeq 全部已提交的连续前缀）：
-  拉取必须 `fromSeq === committedSeq+1`，否则 409——**禁止越过未提交分片**
-  （无 seq 空洞、无提前释放）。提交=消费方下一次拉取 fromSeq 推进（隐式
-  连续提交）或终态确认；ring 槽仅随游标推进释放。
-- **未就绪语义**：下一分片未产出时 hold ≤30s；期间产出即返回，超时 `204`
-  +`x-odai-next-seq`（consumer 立即重试——与 catalog-watch 同型）。
+- **连续提交游标** `committedSeq`（**初值 −1**——首个合法 `fromSeq=0`，首片
+  seq=0；EOF 空流=零分片+立即 done 摘要）：0..committedSeq 全部已提交的连续
+  前缀。拉取必须 `fromSeq === committedSeq+1`，否则 409——**禁止越过未提交
+  分片**（无 seq 空洞、无提前释放）。提交=消费方下一次拉取 fromSeq 推进
+  （隐式连续提交）或终态确认；ring 槽仅随游标推进释放。
+- **未就绪语义**：下一分片未产出时 hold **≤20s**（同 catalog watch 常量，
+  严小于内核 head deadline 30s——OPEN/发送/头等待的总预算内必返回，consumer
+  无需调大 head timeout）；期间产出即返回，超时 `204`+`x-odai-next-seq`
+  （consumer 立即重试）。deadline 边界（hold 20s vs head 30s）入 e2e。
 - **responseId=`<epoch>:<单调号>`**；epoch=进程启动 CSPRNG（持久化不需要）；
   **重启=全部在途 rid 404 `response_not_found`**——幂等仅**同进程内**保证
   （(epoch,rid,seq) 同键同内容重放）；跨重启由消费端重新 request 承接
@@ -173,14 +177,17 @@ allocated → producing →（逐 seq：ready(seq) → in-flight → committed�
 - auth 槽=ai-fly 现行三族单选+可选 bearer：`{secret:<name>} | {script:<name>,
   args?} | {literal:<v>}`（**无 file 族**——文件取值经 `{script:"file"}`，
   与上游一致；r1 proposal 笔误在本版修正）。literal 间接引用仅 `$secret:`。
-- **env 二分法（r2-P1-F 收紧到脚本通道）**：**凭证 env 禁止**且**不可绕**——
-  ①声明面：`$env:` 形态与 env.cjs 不存在；②脚本面：hook 脚本进程仅接收
-  **净化 env**（非凭证 allowlist：PATH/HOME/locale+`EXT_AI_*` 开关），auth
-  路径的 `process.env` fallback（ai-fly hook.ts:434）**删除**；③预设面：
-  presets 的 `keyEnv` 字段降为 **UI 提示**（「该上游通常用此变量名」），
-  服务激活前 MUST 绑定 secret 名（未绑定的预设不可启用）。判定线=值进入
-  上游请求头/体；CODEX_HOME 类运行时 env 不受限。测试含「环境变量里存有
-  等值 secret 但请求不得携带」负向断言。
+- **env 二分法（r2-P1-F/r3 修正：进程内 hook 的诚实表述）**：ai-fly hooks
+  为**宿主进程内 require()**（hook.ts:266），非子进程——v1 **保持进程内
+  执行**（内核「可信插件」信任模型的既定边界：hook 脚本与宿主同权限、可读
+  `process.env`——这不是 ai 插件能单独收窄的面，文档明示）。凭证 env 闭合
+  由**源头保证**承担：①凭证从不进 env——W11 后 sidecar 进程环境不含任何
+  凭证，上游密钥唯一来源是 0600 secrets.json（auth 槽三族解析不经 env）；
+  ②声明面 `$env:` 形态与 env.cjs 不存在、auth 路径 `process.env` fallback
+  删除（hook 可读到 env，但 env 中无凭证可读）；③预设面 `keyEnv` 降为 UI
+  提示，服务激活前 MUST 绑定 secret 名（未绑定不可启用）。判定线=值进入
+  上游请求头/体；CODEX_HOME 类运行时 env 不受限。负向测试「env 中人为放入
+  等值 secret，请求仍不得携带」保留（证明闭合靠槽解析而非环境清洁）。
 - **导入两阶段 staging**：扫描 ai-fly services.json → 返回机器可读
   `{blocked:[{service,field,ref}], ready:[...]}`（安全条目不激活）→ 用户
   完成 $env→secret 映射 → 一次性 commit；**禁止 env 自动快照**。
@@ -212,14 +219,18 @@ v1 不含：codex 预设（OAuth 登录态）、rust-fetch sidecar、codex 写�
 
 1. 单测（ai-fly 矩阵移植，vitest→node --test；fake 注入不触原生）。
 2. **wire 契约测试（Phase A 内）**：ABI 表逐端点（含 404 同体三形态 byte
-   级、403/404/409/429 矩阵、413 边界 maxChunkPayload±1、400 头预算超限、
-   serviceId 双源拒绝、gate op 名、admission 超积拒启、catalog 256KiB 上限）。
+   级、403 `key_all_invalid`/`key_revoked`、404/409/429 矩阵、413 边界
+   maxChunkPayload±1、400 头预算超限、serviceId 双源拒绝、AUTH 多 key
+   正/部分失败/全失败三态 fixture 序列化断言、gate op 名、admission 超积
+   拒启、catalog 256KiB 上限）。
 3. **中继竞态矩阵（Phase B 内）**：满 buffer×0/1 拉取（并发第二拉取=409）、
-   fromSeq 越前=409、204 hold→产出→返回、cancel×done 交叉、空闲 TTL 过期、
-   绝对寿命 10min 到点 expired（先 abort 上游）、done 后 body 弃+摘要重放、
-   provider 重启（epoch 更替，旧 rid 404）、断线 90s 续拉零重复零丢失、
-   5MiB 长响应、并发撤钥三态×在途×拉取、env 等值负向（secret 在 env 中
-   不得进请求）。
+   fromSeq 越前=409、首片 fromSeq=0（cursor 初值 −1）、204 hold→产出→返回、
+   **hold 20s vs 内核 head deadline 30s 边界**、cancel×done 交叉、空闲 TTL
+   过期、绝对寿命 10min 到点 expired（先 abort 上游）、done 后 body 弃+
+   摘要重放、provider 重启（epoch 更替，旧 rid 404）、断线 90s 续拉零重复
+   零丢失、5MiB 长响应、EOF 空流（零分片立即 done）、并发撤钥三态×在途×
+   拉取（含**撤钥后在途 rid 仍可续拉**正例）、env 等值负向（secret 在 env
+   中不得进请求）。
 4. e2e 双进程真内核（全链路+延迟目标 p95 断言）。
 5. 泄露面扫描（argv/净化后 env/日志/usage/stderr 零凭证）。
 6. 回归门：webui 262 面零回归+三插件 e2e 零回归。

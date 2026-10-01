@@ -1,8 +1,8 @@
 # Tasks: ai-subscription-sharing
 
-> 每门=工作目录+完整命令+预期退出码 0+receipt 路径+阻断条件（r2-P1-H）。
-> 统一跑器=node --test；worktree 根=/Users/kzf/Dev/GitHub/jixoai-labs/opendweb-wt-ai
-> （下文 `$WT`）；receipt 落 `docs/receipts/ai-plugin/`。
+> 每门=工作目录+完整命令+预期退出码 0+receipt 路径+阻断条件（r2-P1-H/r3 补）。
+> 统一跑器=node --test；worktree 根=`/Users/kzf/Dev/GitHub/jixoai-labs/opendweb-wt-ai`
+> （下文 `$WT` 即该字面路径）；receipt 落 `$WT/docs/receipts/ai-plugin/`。
 
 ## Phase A — 提供方纯逻辑 + wire 契约
 
@@ -20,6 +20,7 @@
 - [ ] A6 单测：ai-fly 矩阵移植+wire 契约测试（design §7.2 全清单）
 - [ ] **A 门**：`cd $WT/packages/opendweb-ext-ai && npm test`（退出码 0）+
       `cd $WT/packages/webui && npm test`（退出码 0，零回归）。阻断：任一非 0。
+      receipt：`$WT/docs/receipts/ai-plugin/phase-a.md`（两命令输出尾+用例数）。
 
 ## Phase B — 响应中继 + 消费方端点 + 竞态矩阵
 
@@ -33,9 +34,11 @@
 - [ ] B4 竞态矩阵测试（design §7.3 全清单）
 - [ ] B5 e2e 双进程真内核（全链路+延迟目标 p95）+泄露面扫描测试
 - [ ] **B 门**：A 门 + `cd $WT/packages/opendweb-ext-ai && node --test
-      test/e2e/`（退出码 0）+ 三插件既有 e2e 零回归。阻断：竞态矩阵任一
-      非 0 或 p95 超标。receipt：`docs/receipts/ai-plugin/phase-b-e2e.md`
-      （命令+输出尾+延迟 p95 表）。
+      test/e2e/`（退出码 0）+ 三插件回归各一命令（`cd $WT/packages/
+      opendweb-ext-ports && npm test`；`cd $WT/packages/opendweb-ext-files &&
+      npm test`；`cd $WT/packages/opendweb-ext-sync && npm test`——均退出码
+      0）。阻断：竞态矩阵任一非 0 或 p95 超标。receipt：
+      `$WT/docs/receipts/ai-plugin/phase-b-e2e.md`（命令+输出尾+延迟 p95 表）。
 
 ## Phase C — UI 页组 + 占位替换 + 生命周期
 
@@ -46,9 +49,10 @@
 - [ ] C4 真浏览器走查（ego-browser）：admin/member 两视角截图、启停生命
       周期、密钥本地复制仅本地面
 - [ ] **C 门**：`cd $WT/packages/webui && npm test`（含新增视角/生命周期
-      用例，退出码 0）+ `npm run -w packages/webui build`（退出码 0）+
-      ui-compile。阻断：任一非 0 或走查失败。receipt：
-      `docs/receipts/ai-plugin/phase-c-walkthrough.md`（截图路径+步骤记录）。
+      用例，退出码 0）+ `cd $WT/packages/webui && npm run build`（退出码 0，
+      dist 产物含 ai 页面）+ 真浏览器走查。阻断：任一非 0 或走查失败。
+      receipt：`$WT/docs/receipts/ai-plugin/phase-c-walkthrough.md`
+      （截图路径+步骤记录）。
 
 ## Phase D — claude-code 写手 + 探活 + 预设验证
 
@@ -57,7 +61,8 @@
 - [ ] D3 17 预设逐项冒烟（fake 上游断言头集/路径映射/auth 三族解析/keyEnv
       未绑定不可启用）
 - [ ] **D 门**：`cd $WT/packages/opendweb-ext-ai && npm test`（退出码 0，
-      含 D1-D3 新用例+codex 占位呈现）。阻断：任一非 0。
+      含 D1-D3 新用例+codex 占位呈现）。阻断：任一非 0。receipt：
+      `$WT/docs/receipts/ai-plugin/phase-d.md`（命令输出尾+17 预设冒烟清单）。
 
 ## Phase E — 收尾
 

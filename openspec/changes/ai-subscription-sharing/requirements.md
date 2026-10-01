@@ -51,7 +51,8 @@ maxConcurrency 占位在流终态即释放（不等 TTL）。
 #### Scenario: 撤钥三态
 
 - **WHEN** 分别发生①②③三态且各有在途请求与并发新请求
-- **THEN** ①新请求 403 `auth_failed`、在途完成；②5s 内在途 settle/abort
+- **THEN** ①新 request `403 {code:"key_revoked"}`、在途 rid 按快照续拉完成；
+  ②5s 内在途 settle/abort
   （`auth_revoked`）后会话断开；③新请求 404 同体、在途随会话关闭；三态
   占位即时释放（后续请求不受已撤流配额拖累）
 
@@ -105,14 +106,18 @@ token）→apply，本地 token 一律占位符。
 跨设备面 SHALL 冻结 **header framing ABI**（与内核 OPEN metadata+DATA 投影
 逐层对齐：ai 层元数据全部走 `x-odai-*` HTTP 头，body=纯载荷字节，无
 multipart/metadata-in-body）：`POST auth`（`{v:1,keys:[≤8]}`→200 **多 key**
-`{status:"ok",groups:[{keyId,groupId,services}],rejected:[keyId],catalog,
-catalogRev}`；全错 403 `auth_failed`）；`GET catalog?since=<rev>`（≤30s 长轮
-询；204/200 全量；**全量 ≤256 服务且 JSON ≤256KiB**，超配工厂期拒绝）；
+`{v:1,status:"ok",groups:[{keyId,group,limits:{maxConcurrency?,dailyRequests?},
+services:[ServiceEntry]}]（≥1）,rejected?:[{code:"key_invalid"|"key_revoked"}]}`
+——**与 ai-fly frames.ts AUTH_OK 同型**（rejected 仅 code 不带 keyId；有效
+键集合=groups[].keyId，与输入对应由此确立）；全错 `403 {v:1,code:
+"key_all_invalid"}`）；`GET catalog?since=<rev>`（**hold ≤20s**——对齐
+ai-fly CATALOG_WATCH_TIMEOUT_MS 且严小于内核 head deadline 30s；204/200
+全量；**全量 ≤256 服务且 JSON ≤256KiB**，超配工厂期拒绝）；
 `POST request`（头 `x-odai-service`[**唯一来源**，body/query 同名信息=400]/
 `x-odai-method`/`x-odai-path`/`x-odai-key-id`/`x-odai-headers`[≤4KiB]；
 raw body ≤maxChunkPayload → 200 `{responseId,epoch,status,headers}`）；
 `POST response/<rid>`（头 `x-odai-key-id`/`x-odai-from-seq`；就绪=200 raw
-单分片+`x-odai-seq/x-odai-done/x-odai-next-seq`，未就绪=**204 hold ≤30s**，
+单分片+`x-odai-seq/x-odai-done/x-odai-next-seq`，未就绪=**204 hold ≤20s**，
 终态=摘要 200 零 body；`fromSeq≠committedSeq+1`=409 `invalid_from_seq`；
 并发第二拉取=409 `pull_in_flight`）；`POST cancel`（幂等终态重放）。ai
 元数据头合计 ≤8KiB（超限 400 `metadata_too_large`）。**gate 范围**：内核
@@ -127,7 +132,8 @@ ring（=maxConcurrency×2MiB）≤64MiB 超积工厂拒启；终态摘要 LRU �
 **中继状态机**：`allocated→producing→（ready(seq)→in-flight→committed）→
 done`；全部转移（produce/cancel/expiry/commit/拉取）在 per-rid 互斥锁内；
 **单飞拉取**（同 rid 同时仅一个在途 response 调用）；**连续提交游标**
-`committedSeq`（拉取必须 fromSeq=committedSeq+1——无 seq 空洞、无提前
+`committedSeq`（**初值 −1——首个合法 fromSeq=0、首片 seq=0；EOF 空流=零分片
++立即 done 摘要**；拉取必须 fromSeq=committedSeq+1——无 seq 空洞、无提前
 释放；提交=下次拉取推进或终态确认）；responseId=`<epoch>:<单调号>`，epoch=
 启动 CSPRNG；**幂等仅同进程**（(epoch,rid,seq) 同键同内容重放；重启→全部
 在途 rid 404 `response_not_found`，跨重启重放不支持——非幂等上游 POST 的
@@ -153,9 +159,10 @@ maxConcurrency 占位在流终态即释放。
 #### Scenario: 竞态与恢复矩阵
 
 - **WHEN** 满 buffer×0/1 拉取（并发第二拉取）；fromSeq 越过 committedSeq；
-  204 hold 期间产出分片；cancel×done 交叉；空闲 TTL 过期；绝对寿命 10min
-  到点仍 producing；done 后再拉旧 seq；provider 重启（epoch 更替）；断线
-  90s 内恢复
+  首片 fromSeq=0（cursor 初值 −1）；204 hold 期间产出分片；**hold 20s vs
+  内核 head deadline 30s 边界**；cancel×done 交叉；空闲 TTL 过期；绝对寿命
+  10min 到点仍 producing；done 后再拉旧 seq；EOF 空流；provider 重启（epoch
+  更替）；断线 90s 内恢复；**撤钥后在途 rid 续拉（正例）**
 - **THEN** 按状态机终态收敛：并发第二拉取 409 `pull_in_flight`、越前 409
   `invalid_from_seq`、hold 醒来即返回新分片、先到终态幂等、空闲 TTL/绝对
   寿命到期先 abort 上游再 expired、done 后旧 seq 不可再拉（摘要 only）、
@@ -166,7 +173,7 @@ maxConcurrency 占位在流终态即释放。
 - **WHEN** ai handler 内：peer 未授权 / op 未授权 / 未知子路径 / 双过+错
   keyId / 双过+白名单外路径
 - **THEN** 前三者与未知路径 `404 {error:"not_found"}` byte 级同体；第四
-  `403 auth_failed`；第五 `404 path_not_offered`（仅双过后可出现）；内核
+  `403 {code:"key_revoked"}`；第五 `404 path_not_offered`（仅双过后可出现）；内核
   插件级响应（unknown-plugin 404/plugin-disabled 503）保持现状不属本矩阵
 
 ### Requirement: 配额、限流与用量审计
