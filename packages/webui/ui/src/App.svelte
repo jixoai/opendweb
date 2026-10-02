@@ -9,7 +9,7 @@
 	import { Button } from "$lib/components/ui/button";
 	import { Skeleton } from "$lib/components/ui/skeleton";
 	import { Toaster } from "$lib/components/ui/sonner";
-	import { RefreshCw } from "@lucide/svelte";
+	import { ArrowRight, RefreshCw } from "@lucide/svelte";
 	import { untrack } from "svelte";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import { findPluginRoute } from "$lib/plugin-registry";
@@ -25,8 +25,6 @@
 	import LeaseView from "./components/LeaseView.svelte";
 	import VisitsView from "./components/VisitsView.svelte";
 	import NoHubView from "./components/NoHubView.svelte";
-	import HubAccessCard from "./components/HubAccessCard.svelte";
-	import HubStatusCard from "./components/HubStatusCard.svelte";
 
 	// store 生命周期（hash 监听（含旧路由收敛）+ sidecar state 首拉 + 默认视角裁决）
 	// D2 风暴修复：start/$poll 的同步段会读 sidecar/hash 等响应式源——若被本
@@ -118,31 +116,50 @@
 			<InsecureStrip />
 		{/if}
 		{#if hubPerspective && cs.role === "admin"}
-			<div class="flex flex-1">
-				<SideNav />
-				<main class="flex-1 px-4 py-6 lg:px-8">
-					<div class="mx-auto flex w-full max-w-6xl flex-col gap-6">
-						{#if cs.route.view === "overview"}
-							<!-- 中枢状态卡（hub 本机自动形态且服务未跑）与接入卡片卡（真源）置顶 -->
-							{#if cs.hubLocal && cs.hubData?.running === false}
-								<HubStatusCard />
-							{/if}
-							<HubAccessCard />
-							<OverviewView />
-						{:else if cs.route.view === "tenants"}
-							<TenantsView />
-						{:else if cs.route.view === "visitors"}
-							<VisitorsView />
-						{:else if cs.route.view === "plugin" && pluginEntry !== null && PluginPage !== null}
-							<!-- 插件页（admin）：hub 壳内渲染（SideNav 工具区高亮同源） -->
-							<PluginPage entry={pluginEntry} />
-						{:else}
-							<OnlineView />
-						{/if}
+			{#if cs.adminPlaneDown}
+				<!-- D4 错误单例（2026-10-02）：管理面凭证级失败=整页降级屏（一条错误
+				     + 恢复动作），页面内零逐卡红横幅复制 -->
+				<main class="flex flex-1 items-center justify-center px-4 py-10" data-plane="admin-down">
+					<div class="w-full max-w-lg rounded-lg border bg-card p-8 text-center shadow-sm">
+						<h1 class="text-lg font-semibold">管理凭证已失效</h1>
+						<p class="mt-2 text-sm leading-relaxed text-muted-foreground">
+							这台服务器的管理凭证已失效或不可用，各页面暂时不可管理；已连接的家人不受影响。
+						</p>
+						<p class="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+							两条恢复路径：点右上角的「节点簿」切换到其他已保存的服务器，或在跑控制台的电脑上重新启动一次。
+						</p>
+						<div class="mt-6 flex justify-center gap-2">
+							<Button onclick={() => cs.toggleDetails()}>
+								打开节点簿
+								<ArrowRight data-icon="inline-end" />
+							</Button>
+						</div>
 					</div>
 				</main>
-			</div>
-		{:else if cs.route.view === "plugin" && pluginEntry !== null && PluginPage !== null}
+			{:else}
+				<div class="flex flex-1">
+					<SideNav />
+					<main class="flex-1 px-4 py-6 lg:px-8">
+						<div class="mx-auto flex w-full max-w-6xl flex-col gap-6">
+							{#if cs.route.view === "overview"}
+								<!-- 中枢状态卡与接入卡片移入总览页内（D4：页面身份先于内容，
+								     2026-10-02 视觉审计 P0「版式倒置」） -->
+								<OverviewView />
+							{:else if cs.route.view === "tenants"}
+								<TenantsView />
+							{:else if cs.route.view === "visitors"}
+								<VisitorsView />
+							{:else if cs.route.view === "plugin" && pluginEntry !== null && PluginPage !== null}
+								<!-- 插件页（admin）：hub 壳内渲染（SideNav 工具区高亮同源） -->
+								<PluginPage entry={pluginEntry} />
+							{:else}
+								<OnlineView />
+							{/if}
+						</div>
+					</main>
+				</div>
+			{/if}
+		{:else if cs.route.view === "plugin" && pluginEntry !== null && pluginPageComponent(pluginEntry) !== null}
 			<!-- 插件页（member 姿态的 both 可见页——如插件面板）：独立壳直给 -->
 			<main class="mx-auto flex w-full max-w-4xl flex-1 flex-col px-4 py-6 lg:px-8">
 				<PluginPage entry={pluginEntry} />

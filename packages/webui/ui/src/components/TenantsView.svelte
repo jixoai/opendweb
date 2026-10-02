@@ -12,7 +12,7 @@
 	import * as Table from "$lib/components/ui/table";
 	import * as Field from "$lib/components/ui/field";
 	import { Input } from "$lib/components/ui/input";
-	import { Copy, DoorOpen, KeyRound, LoaderCircle, TriangleAlert, UserRoundPlus, Users } from "@lucide/svelte";
+	import { ArrowRight, Copy, ChevronDown, DoorOpen, KeyRound, LoaderCircle, TriangleAlert, UserRoundPlus, Users } from "@lucide/svelte";
 	import { toast } from "svelte-sonner";
 	import { validateHex64, shortHex } from "$lib/hex";
 	import { fmtDate, fmtLocal, groupInviteCode, leaseState, relativeTime } from "$lib/format";
@@ -20,6 +20,7 @@
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
+	import PageHeader from "./PageHeader.svelte";
 	import ReceiptCard from "./ReceiptCard.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
 	import AliasInlineEdit from "./AliasInlineEdit.svelte";
@@ -68,6 +69,13 @@
 		document.getElementById("owner-fabric-input")?.focus();
 	}
 
+	/** 高级折叠的显式开关（null=跟随「空名册默认展开」规则） */
+	let advOpen = $state<boolean | null>(null);
+	function openAdvanced(): void {
+		advOpen = true;
+		void cs.goRegister();
+	}
+
 	async function issue(e: SubmitEvent): Promise<void> {
 		e.preventDefault();
 		await cs.submitIssueCode();
@@ -92,25 +100,28 @@
 </script>
 
 <section class="flex flex-col gap-5" data-view="tenants">
-	<div class="flex flex-col gap-1">
-		<h2 class="text-lg font-semibold tracking-tight">租户管理</h2>
-		<p class="text-sm text-muted-foreground">
-			租户 = 在这台服务器上拥有自己房间（可被发现、可组网）的一个 Fabric 网络。名册、租期与邀请码都在这里。
-		</p>
-	</div>
+	<PageHeader title="租户" hint="名册、租期与邀请码都在这里。">
+		{#snippet help()}
+			<dl class="grid grid-cols-[96px_1fr] items-baseline gap-x-3 gap-y-1.5">
+				<dt class="shrink-0">租户是什么</dt>
+				<dd>在这台服务器上拥有自己房间（可被发现、可组网）的一台设备网络。每行名册显示两组缩写：网络身份证与房间钥匙（悬停看全文）。</dd>
+				<dt class="shrink-0">名册版本</dt>
+				<dd>v{cs.ownersData?.generation ?? "-"}——每次名册变更后加 1，用于确认变更已生效。</dd>
+				<dt class="shrink-0">手工导入</dt>
+				<dd>适合已经拿到对方两组 64 位十六进制身份串的场景；导入后默认租期 30 天，可随时续期或设为长期。</dd>
+			</dl>
+		{/snippet}
+	</PageHeader>
 
 	{#if cs.ownersError !== null && cs.ownersError !== undefined}
 		<ErrorBanner error={cs.ownersError} onRetry={() => void cs.refreshOwners()} />
 	{/if}
 
-	<div class="grid gap-4 2xl:grid-cols-[minmax(0,1fr)_360px]">
+	<div class="flex flex-col gap-4">
 		<!-- 租户名册表（主角） -->
 		<Card.Root class="gap-4 py-5">
 			<Card.Header class="flex flex-row flex-wrap items-center gap-2">
 				<Card.Title class="text-base">租户名册</Card.Title>
-				<Badge variant="outline" class="font-mono" title="每次租户名册变更后加 1，用于确认变更已生效">
-					名册版本 v{cs.ownersData?.generation ?? "-"}
-				</Badge>
 			</Card.Header>
 			<Card.Content>
 				{#if loading}
@@ -125,32 +136,30 @@
 							<Empty.Media variant="icon"><Users /></Empty.Media>
 							<Empty.Title>这栋楼还没有租户。</Empty.Title>
 							<Empty.Description>
-								受限模式下，名册为空意味着除了你没有人能进楼。开号有两种方式：发一张邀请码让对方自助注册，或手工导入已知的公钥。
+								名册是空的话，除了你没有人能进楼。
 							</Empty.Description>
 						</Empty.Header>
-						<Empty.Content class="flex gap-2">
-							<Button variant="outline" onclick={() => cs.goRegister()}>
-								<UserRoundPlus data-icon="inline-start" />
+						<Empty.Content class="flex gap-4 text-sm">
+							<button type="button" class="cursor-pointer underline-offset-2 hover:underline" onclick={() => cs.goIssueCode()}>
+								去签发邀请码 →
+							</button>
+							<button type="button" class="cursor-pointer text-muted-foreground underline-offset-2 hover:underline" onclick={openAdvanced}>
 								手工导入
-							</Button>
-							<Button onclick={() => cs.goIssueCode()}>
-								<KeyRound data-icon="inline-start" />
-								签发邀请码
-							</Button>
+							</button>
 						</Empty.Content>
 					</Empty.Root>
 					{:else}
 						<!-- 宽度收敛（视觉走查 P1）：身份/时间列 whitespace-normal 允许窄屏降级换行；
 						    「在用」互链并入状态列；动作列 sticky 常显——溢出时续期/注销始终可达 -->
 						<Table.Root>
-							<Table.Header>
-								<Table.Row>
-									<Table.Head>租户（Fabric · 根端点）</Table.Head>
-									<Table.Head>状态 / 租期</Table.Head>
-									<Table.Head>注册时间</Table.Head>
-									<Table.Head class="sticky right-0 z-10 bg-card"></Table.Head>
-								</Table.Row>
-							</Table.Header>
+										<Table.Header>
+											<Table.Row>
+												<Table.Head>租户</Table.Head>
+												<Table.Head>状态 / 租期</Table.Head>
+												<Table.Head>注册时间</Table.Head>
+												<Table.Head class="sticky right-0 z-10 bg-card"></Table.Head>
+											</Table.Row>
+										</Table.Header>
 							<Table.Body>
 								{#each owners as o (o.fabric_id + o.root)}
 									{@const lease = leaseState(typeof o.expires_at === "number" ? o.expires_at : null)}
@@ -169,14 +178,17 @@
 														.map((x) => x.alias)}
 												/>
 												<div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-													<span class="text-xs text-muted-foreground">
-														Fabric <span class="font-mono text-[13px] text-foreground" title={o.fabric_id}>{shortHex(o.fabric_id)}</span>
-														· 根端点 <span class="font-mono text-[13px] text-foreground" title={o.root}>{shortHex(o.root)}</span>
+													<!-- 两组身份缩写（网络身份证 · 房间钥匙；术语解释在页头帮助层） -->
+													<span class="font-mono text-xs text-muted-foreground" title={`网络身份证 ${o.fabric_id}`}>
+														{shortHex(o.fabric_id)}
+													</span>
+													<span class="font-mono text-xs text-muted-foreground" title={`房间钥匙 ${o.root}`}>
+														{shortHex(o.root)}
 													</span>
 													{#if multiRoot.has(o.fabric_id)}
-														<Badge variant="outline" class="h-5 gap-1 border-warning/40 bg-warning/10 px-1.5 text-[11px] text-warning" title="同 Fabric 有多个根端点——别名可以仿名，仿不了缩写；请核对根端点缩写再操作">
+														<Badge variant="outline" class="h-5 gap-1 border-warning/40 bg-warning/10 px-1.5 text-[11px] text-warning" title="同一网络有多个房间钥匙——别名可以仿名，仿不了缩写；请核对第二组缩写再操作">
 															<TriangleAlert class="size-3" />
-															同 Fabric 多根端点
+															多个房间钥匙
 														</Badge>
 													{/if}
 												</div>
@@ -244,22 +256,28 @@
 			</Card.Content>
 		</Card.Root>
 
-		<!-- 手工导入（注册租户的双通道之一） -->
-		<Card.Root class="gap-4 py-5">
-			<Card.Header>
-				<Card.Title class="text-base">手工导入公钥</Card.Title>
-				<Card.Description>
-					已知道对方 Fabric 与根端点时用这里；否则发一张邀请码，让对方在自己客户端完成注册。
-				</Card.Description>
-			</Card.Header>
-			<Card.Content>
+		<!-- 手工导入（高级面：已有对方两组身份串时才用；默认折叠，空名册时展开） -->
+		<details
+			class="group rounded-lg border"
+			open={advOpen ?? false}
+			ontoggle={(e) => (advOpen = (e.currentTarget as HTMLDetailsElement).open)}
+			data-section="manual-import"
+		>
+			<summary
+				class="flex cursor-pointer select-none list-none items-center gap-2 px-4 py-3 text-sm font-medium [&::-webkit-details-marker]:hidden"
+			>
+				<ChevronDown class="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+				高级：手工导入身份串
+				<span class="font-normal text-muted-foreground">已拿到对方的网络身份证与房间钥匙时用；通常发邀请码更简单。</span>
+			</summary>
+			<div class="border-t px-4 py-4">
 				<form
 					class="flex flex-col gap-4"
 					onsubmit={(e) => void register(e)}
 				>
 					<Field.Group>
 						<Field.Field data-invalid={!fabricOk}>
-							<Field.Label for="owner-fabric-input">Fabric</Field.Label>
+							<Field.Label for="owner-fabric-input">网络身份证（64 位十六进制）</Field.Label>
 							<Input
 								id="owner-fabric-input"
 								name="fabricId"
@@ -278,7 +296,7 @@
 							{/if}
 						</Field.Field>
 						<Field.Field data-invalid={!rootOk}>
-							<Field.Label for="owner-root-input">根端点</Field.Label>
+							<Field.Label for="owner-root-input">房间钥匙（64 位十六进制）</Field.Label>
 							<Input
 								id="owner-root-input"
 								name="root"
@@ -300,28 +318,29 @@
 					{#if cs.ownerFormError !== null}
 						<p class="text-sm text-destructive" role="alert">{cs.ownerFormError}</p>
 					{/if}
-					<Button
-						type="submit"
-						disabled={cs.ownerBusy || cs.ownerForm.fabricId === "" || cs.ownerForm.root === "" || !fabricOk || !rootOk}
-					>
-						{#if cs.ownerBusy}
-							<LoaderCircle data-icon="inline-start" class="animate-spin" />
-							提交中…
-						{:else}
-							导入为租户
-						{/if}
-					</Button>
-					<p class="text-xs leading-relaxed text-muted-foreground">导入后默认租期 30 天，可随时续期或设为永久。</p>
+					<div>
+						<Button
+							type="submit"
+							disabled={cs.ownerBusy || cs.ownerForm.fabricId === "" || cs.ownerForm.root === "" || !fabricOk || !rootOk}
+						>
+							{#if cs.ownerBusy}
+								<LoaderCircle data-icon="inline-start" class="animate-spin" />
+								提交中…
+							{:else}
+								导入为租户
+							{/if}
+						</Button>
+					</div>
 				</form>
-			</Card.Content>
-		</Card.Root>
+			</div>
+		</details>
 	</div>
 
 	<!-- 邀请码管理子区块 -->
 	<Card.Root class="gap-4 py-5" data-section="codes">
 		<Card.Header>
 			<Card.Title class="text-base">邀请码</Card.Title>
-			<Card.Description>租户拿到码，在自己客户端完成注册，无需你手工导入。</Card.Description>
+			<Card.Description>租户拿到码，在自己设备上完成注册，无需你手工导入。</Card.Description>
 		</Card.Header>
 		<Card.Content class="flex flex-col gap-5">
 			{#if cs.codesError !== null && cs.codesError !== undefined}
@@ -339,7 +358,6 @@
 						autocomplete="off"
 						placeholder="如「李四团队」——兑换后作为名册别名预填建议"
 					/>
-					<Field.Description>兑换成功后作为名册别名的预填建议。</Field.Description>
 				</Field.Field>
 				<Field.Field>
 					<Field.Label for="code-max-uses">可用次数</Field.Label>
@@ -350,8 +368,7 @@
 						value={cs.codeForm.maxUses}
 						oninput={(e) => cs.onCodeInput("maxUses", e.currentTarget.value)}
 					/>
-					<Field.Description>默认 1。每兑换一次计数减一，用尽作废。</Field.Description>
-				</Field.Field>
+									</Field.Field>
 				<Field.Field>
 					<Field.Label for="code-expires">有效期（天）</Field.Label>
 					<Input
@@ -361,10 +378,9 @@
 						value={cs.codeForm.expiresInDays}
 						oninput={(e) => cs.onCodeInput("expiresInDays", e.currentTarget.value)}
 					/>
-					<Field.Description>默认 7 天。到期未用完的次数自动作废。</Field.Description>
-				</Field.Field>
+									</Field.Field>
 				<Field.Field>
-					<Field.Label for="code-ttl">注册后有效期（天）</Field.Label>
+					<Field.Label for="code-ttl">注册后租期（天）</Field.Label>
 					<Input
 						id="code-ttl"
 						type="number"
@@ -372,8 +388,7 @@
 						value={cs.codeForm.defaultTtlDays}
 						oninput={(e) => cs.onCodeInput("defaultTtlDays", e.currentTarget.value)}
 					/>
-					<Field.Description>默认 30 天。兑换注册后的租期长度。</Field.Description>
-				</Field.Field>
+									</Field.Field>
 				<div class="md:col-span-2 xl:col-span-4">
 					<Button id="code-issue-button" type="submit" disabled={cs.codeBusy}>
 						{#if cs.codeBusy}

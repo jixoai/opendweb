@@ -99,14 +99,24 @@ test("W11: env DWEB_ADMIN_TOKEN is warned-and-ignored (fail-closed), value never
 });
 
 test("setup mode: no --server starts sidecar, prints URL + pairing code (no token needed)", async () => {
-  const { io, out } = makeIo();
-  const done = main({ "no-open": true }, io);
-  await waitForOutput(out, "pairing code:");
-  io.signal.emit("SIGINT");
-  assert.equal((await done).exit, 0);
-  const text = out.join("");
-  assert.match(text, /opendweb-webui listening on http:\/\/127\.0\.0\.1:\d+/);
-  assert.match(text, /pairing code: [A-Z2-7]{13}/);
+  // DWEB_HOME 隔离（默认 ~/.opendweb 可能是中枢形态——no-args 会走 row-2
+  // hub-local 而非 setup 分支；setup 断言必须显式给一个空 home）
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const path = await import("node:path");
+  const home = mkdtempSync(path.join(tmpdir(), "webui-cli-setup-"));
+  try {
+    const { io, out } = makeIo({ env: { DWEB_HOME: home } });
+    const done = main({ "no-open": true }, io);
+    await waitForOutput(out, "pairing code:");
+    io.signal.emit("SIGINT");
+    assert.equal((await done).exit, 0);
+    const text = out.join("");
+    assert.match(text, /opendweb-webui listening on http:\/\/127\.0\.0\.1:\d+/);
+    assert.match(text, /pairing code: [A-Z2-7]{13}/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("TTY prompt reads the token with echo suppressed (secret not in terminal output)", async (t) => {

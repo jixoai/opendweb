@@ -13,6 +13,7 @@
 	import { Input } from "$lib/components/ui/input";
 	import {
 		BellRing,
+		ChevronDown,
 		DoorOpen,
 		LoaderCircle,
 		ShieldCheck,
@@ -25,6 +26,7 @@
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
+	import PageHeader from "./PageHeader.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
 	import AliasInlineEdit from "./AliasInlineEdit.svelte";
 
@@ -70,12 +72,18 @@
 </script>
 
 <section class="flex flex-col gap-5" data-view="visitors">
-	<div class="flex flex-col gap-1">
-		<h2 class="text-lg font-semibold tracking-tight">访客与门禁</h2>
-		<p class="text-sm text-muted-foreground">
-			谁能进楼（访客名册）、谁别再来（黑名单）、谁在敲门（敲门台）——门禁先于一切准入判定。
-		</p>
-	</div>
+	<PageHeader title="访客与门禁" hint="谁在敲门、谁能进楼、谁别再来。">
+		{#snippet help()}
+			<dl class="grid grid-cols-[96px_1fr] items-baseline gap-x-3 gap-y-1.5">
+				<dt class="shrink-0">访客</dt>
+				<dd>获准进楼、但没有自己房间的设备——可以进楼连接，不能被别人找到。等有人敲门时定位，或直接添加已知的设备钥匙。</dd>
+				<dt class="shrink-0">两道门</dt>
+				<dd>楼门（本页）由你决定谁能进——租户名册、访客名册与黑名单。房门（各租户房间内部）由租户自管，本控制台暂不提供租户侧门禁配置。</dd>
+				<dt class="shrink-0">黑名单</dt>
+				<dd>被拉黑的设备即使持有有效通行票也无法接入；黑名单在一切准入判定之前生效。</dd>
+			</dl>
+		{/snippet}
+	</PageHeader>
 
 	{#if open}
 		<!-- 开放模式整页解释态（O-9 已裁决：open 不装 gate） -->
@@ -99,9 +107,7 @@
 						待处理 {cs.knocksData.pending_count}
 					</Badge>
 				{/if}
-				<Card.Description class="w-full">
-					陌生设备尝试连接这台服务器时，请求会出现在这里，等你放行或拒绝。
-				</Card.Description>
+
 			</Card.Header>
 			<Card.Content>
 				{#if cs.knocksError !== null && cs.knocksError !== undefined}
@@ -112,15 +118,7 @@
 						<Skeleton class="h-9 w-full" />
 					</div>
 				{:else if knocks.length === 0}
-					<Empty.Root class="py-6">
-						<Empty.Header>
-							<Empty.Media variant="icon"><BellRing /></Empty.Media>
-							<Empty.Title>现在没有人在敲门。</Empty.Title>
-							<Empty.Description>
-								有陌生设备尝试连接时，请求会出现在这里，等你放行或拒绝。
-							</Empty.Description>
-						</Empty.Header>
-					</Empty.Root>
+					<p class="py-5 text-sm text-muted-foreground" data-empty="knocks">现在没有人在敲门，陌生设备尝试连接时会出现在这里。</p>
 				{:else}
 					<div class="flex flex-col gap-3">
 						{#each knocks as k (k.endpoint_id)}
@@ -180,9 +178,7 @@
 		<Card.Root class="gap-4 py-5" data-section="visitors">
 			<Card.Header>
 				<Card.Title class="text-base">访客名册</Card.Title>
-				<Card.Description>
-					访客 = 获准进楼、但没有自己房间的设备（一个公钥）。访客可以进楼连接（relay 通行），但没有自己的房间。
-				</Card.Description>
+				<Card.Description>可以进楼连接，但没有自己的房间。</Card.Description>
 			</Card.Header>
 			<Card.Content class="flex flex-col gap-4">
 				{#if cs.visitorsError !== null && cs.visitorsError !== undefined}
@@ -192,17 +188,17 @@
 						<Skeleton class="h-9 w-full" />
 						<Skeleton class="h-9 w-full" />
 					</div>
-				{:else if visitors.length === 0}
-					<Empty.Root class="py-6">
-						<Empty.Header>
-							<Empty.Media variant="icon"><ShieldCheck /></Empty.Media>
-							<Empty.Title>还没有访客。</Empty.Title>
-							<Empty.Description>
-								访客可以进楼连接（relay 通行），但没有自己的房间。等有人敲门时定位，或直接添加已知公钥。
-							</Empty.Description>
-						</Empty.Header>
-					</Empty.Root>
-				{:else}
+					{:else if visitors.length === 0}
+						<Empty.Root class="py-6">
+							<Empty.Header>
+								<Empty.Media variant="icon"><ShieldCheck /></Empty.Media>
+								<Empty.Title>还没有访客。</Empty.Title>
+								<Empty.Description>
+									等有人敲门时在上方放行，或用「直接添加访客」录入已知设备。
+								</Empty.Description>
+							</Empty.Header>
+						</Empty.Root>
+					{:else}
 					<Table.Root>
 						<Table.Header>
 							<Table.Row>
@@ -257,61 +253,72 @@
 					</Table.Root>
 				{/if}
 
-				<!-- 添加访客（直接添加已知公钥） -->
-				<form
-					class="flex flex-wrap items-end gap-3"
-					onsubmit={(e) => {
-						e.preventDefault();
-						void cs.submitAddVisitor();
-					}}
-				>
-					<Field.Field data-invalid={!visitorEndpointOk} class="min-w-72 flex-1">
-						<Field.Label for="visitor-endpoint-input" class="text-xs text-muted-foreground">添加访客</Field.Label>
-						<div class="flex flex-wrap gap-2">
-							<Input
-								id="visitor-endpoint-input"
-								class="font-mono text-[13px]"
-								aria-invalid={!visitorEndpointOk}
-								placeholder="端点公钥（64 位十六进制字符）"
-								value={cs.visitorForm.endpointId}
-								oninput={(e) => cs.onVisitorInput("endpointId", e.currentTarget.value)}
-								autocomplete="off"
-								spellcheck="false"
-							/>
-							<Input
-								class="w-40"
-								placeholder="别名（可选）"
-								value={cs.visitorForm.alias}
-								oninput={(e) => cs.onVisitorInput("alias", e.currentTarget.value)}
-								autocomplete="off"
-							/>
-							<Button type="submit" disabled={cs.visitorBusy || cs.visitorForm.endpointId === "" || !visitorEndpointOk}>
-								{#if cs.visitorBusy}
-									<LoaderCircle data-icon="inline-start" class="animate-spin" />
-									添加中…
-								{:else}
-									<UserRoundPlus data-icon="inline-start" />
-									添加访客
+				<!-- 添加访客（高级面：直接添加已知设备钥匙；主路径=敲门台放行） -->
+				<details class="group rounded-lg border" data-section="add-visitor">
+					<summary class="flex cursor-pointer select-none list-none items-center gap-2 px-4 py-3 text-sm font-medium [&::-webkit-details-marker]:hidden">
+						<ChevronDown class="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+						高级：直接添加访客
+						<span class="font-normal text-muted-foreground">已拿到对方的 64 位设备钥匙时用；通常等对方敲门再放行更简单。</span>
+					</summary>
+					<div class="border-t px-4 py-4">
+						<form
+							class="flex flex-wrap items-end gap-3"
+							onsubmit={(e) => {
+								e.preventDefault();
+								void cs.submitAddVisitor();
+							}}
+						>
+							<Field.Field data-invalid={!visitorEndpointOk} class="min-w-72 flex-1">
+								<Field.Label for="visitor-endpoint-input" class="text-xs text-muted-foreground">设备钥匙（64 位十六进制）</Field.Label>
+								<div class="flex flex-wrap gap-2">
+									<Input
+										id="visitor-endpoint-input"
+										class="font-mono text-[13px]"
+										aria-invalid={!visitorEndpointOk}
+										placeholder="64 位十六进制字符"
+										value={cs.visitorForm.endpointId}
+										oninput={(e) => cs.onVisitorInput("endpointId", e.currentTarget.value)}
+										autocomplete="off"
+										spellcheck="false"
+									/>
+									<Input
+										class="w-40"
+										placeholder="别名（可选）"
+										value={cs.visitorForm.alias}
+										oninput={(e) => cs.onVisitorInput("alias", e.currentTarget.value)}
+										autocomplete="off"
+									/>
+									<Button type="submit" disabled={cs.visitorBusy || cs.visitorForm.endpointId === "" || !visitorEndpointOk}>
+										{#if cs.visitorBusy}
+											<LoaderCircle data-icon="inline-start" class="animate-spin" />
+											添加中…
+										{:else}
+											<UserRoundPlus data-icon="inline-start" />
+											添加访客
+										{/if}
+									</Button>
+								</div>
+								{#if !visitorEndpointOk}
+									<Field.Error>需为 64 位十六进制字符（0-9 / a-f）。</Field.Error>
 								{/if}
-							</Button>
-						</div>
-						{#if !visitorEndpointOk}
-							<Field.Error>需为 64 位十六进制字符（0-9 / a-f）。</Field.Error>
-						{/if}
-					</Field.Field>
-				</form>
+							</Field.Field>
+						</form>
+					</div>
+				</details>
 			</Card.Content>
 		</Card.Root>
 
-		<!-- ③ 黑名单 -->
-		<Card.Root class="gap-4 py-5" data-section="blocklist">
-			<Card.Header>
-				<Card.Title class="text-base">黑名单</Card.Title>
-				<Card.Description>
-					被拉黑的设备即使持有有效通行票也无法接入；黑名单在一切准入判定之前生效。
-				</Card.Description>
-			</Card.Header>
-			<Card.Content>
+		<!-- ③ 黑名单（低频管理面：折叠，有货时标题带计数） -->
+		<details class="group rounded-lg border" data-section="blocklist">
+			<summary class="flex cursor-pointer select-none list-none items-center gap-2 px-4 py-3 text-sm font-medium [&::-webkit-details-marker]:hidden">
+				<ChevronDown class="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+				黑名单
+				{#if !blocklistLoading && blocklist.length > 0}
+					<Badge variant="outline" class="text-xs">{blocklist.length} 条</Badge>
+				{/if}
+				<span class="font-normal text-muted-foreground">进不来的设备都在这里。</span>
+			</summary>
+			<div class="border-t px-4 py-4">
 				{#if cs.blocklistError !== null && cs.blocklistError !== undefined}
 					<ErrorBanner error={cs.blocklistError} onRetry={() => void cs.refreshBlocklist()} />
 				{:else if blocklistLoading}
@@ -355,24 +362,8 @@
 						</Table.Body>
 					</Table.Root>
 				{/if}
-			</Card.Content>
-		</Card.Root>
-
-		<!-- ④ 房门说明（解释性静态内容，Phase 2 边界） -->
-		<Card.Root class="gap-3 py-5">
-			<Card.Header>
-				<Card.Title class="text-base">这栋楼有两道门。</Card.Title>
-			</Card.Header>
-			<Card.Content class="text-sm leading-relaxed text-muted-foreground">
-				<p>
-					<strong class="font-medium text-foreground">楼门</strong>（本页）：由你决定谁能进——租户名册、访客名册与黑名单。
-				</p>
-				<p class="mt-1.5">
-					<strong class="font-medium text-foreground">房门</strong>（各租户房间）：租户在自己网络内部的成员名单，由租户自管；「访客到了租户门口，租户开不开门」属于房门规则，当前由
-					Fabric 成员门控承担，本控制台暂不提供租户侧门禁配置。
-				</p>
-			</Card.Content>
-		</Card.Root>
+			</div>
+		</details>
 	{/if}
 
 	<!-- 3a 定位为访客（预填 endpoint_id，可补别名） -->

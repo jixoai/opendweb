@@ -42,40 +42,69 @@
 </script>
 
 <div class="relative" bind:this={root} data-perspective={cs.perspective}>
-	<Button variant="outline" size="sm" aria-haspopup="listbox" aria-expanded={open} onclick={() => (open = !open)} title="切换视角">
-		<span class="text-sm">{PERSPECTIVE_LABEL[cs.perspective]}</span>
-		<ChevronDown data-icon="inline-end" class="text-muted-foreground" />
-	</Button>
-	{#if open}
-		<div
-			role="listbox"
-			aria-label="切换视角"
-			class="absolute right-0 z-30 mt-1.5 flex w-52 flex-col gap-0.5 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
-		>
-			{#each items as item (item.id)}
+	{#if cs.role === "member"}
+		<!-- member 姿态：两个目的地的分段控件（D4 2026-10-02——下拉穿着账户菜单
+		     的外衣，诚实形态是页面切换） -->
+		<div class="flex items-center rounded-md border p-0.5" role="tablist" aria-label="切换视角">
+			{#each items.filter((i) => i.id !== "hub") as item (item.id)}
 				<button
 					type="button"
-					role="option"
+					role="tab"
 					aria-selected={cs.perspective === item.id}
 					class={cn(
-						"flex cursor-pointer items-center gap-2.5 rounded-sm px-2.5 py-2 text-left text-sm transition-colors",
+						"flex cursor-pointer items-center gap-1.5 rounded-sm px-2.5 py-1 text-sm transition-colors",
 						cs.perspective === item.id
 							? "bg-accent font-medium text-accent-foreground"
-							: "hover:bg-accent/60",
+							: "text-muted-foreground hover:text-foreground",
 					)}
 					onclick={() => switchTo(item.id)}
 				>
-					<item.icon class="size-4 shrink-0 text-muted-foreground" />
-					<span>{PERSPECTIVE_LABEL[item.id]}</span>
+					<item.icon class="size-4 shrink-0" aria-hidden="true" />
+					{PERSPECTIVE_LABEL[item.id]}
 					{#if item.badge() !== null && item.badge()! > 0}
-						<Badge variant="outline" class="ml-auto border-warning/40 bg-warning/10 text-warning" title={item.badgeTitle}>
+						<Badge variant="outline" class="border-warning/40 bg-warning/10 text-warning" title={item.badgeTitle}>
 							{item.badge()}
 						</Badge>
-					{:else if cs.perspective === item.id}
-						<Check class="ml-auto size-4 text-muted-foreground" />
 					{/if}
 				</button>
 			{/each}
 		</div>
+	{:else}
+		<Button variant="outline" size="sm" aria-haspopup="listbox" aria-expanded={open} onclick={() => (open = !open)} title="切换视角">
+			<span class="text-sm">{PERSPECTIVE_LABEL[cs.perspective]}</span>
+			<ChevronDown data-icon="inline-end" class="text-muted-foreground" />
+		</Button>
+		{#if open}
+			<div
+				role="listbox"
+				aria-label="切换视角"
+				class="absolute right-0 z-30 mt-1.5 flex w-52 flex-col gap-0.5 rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+			>
+				{#each items as item (item.id)}
+					<button
+						type="button"
+						role="option"
+						aria-selected={cs.perspective === item.id}
+						class={cn(
+							"flex cursor-pointer items-center gap-2.5 rounded-sm px-2.5 py-2 text-left text-sm transition-colors",
+							cs.perspective === item.id
+								? "bg-accent font-medium text-accent-foreground"
+								: "hover:bg-accent/60",
+						)}
+						onclick={() => switchTo(item.id)}
+					>
+						<item.icon class="size-4 shrink-0 text-muted-foreground" />
+						<span>{PERSPECTIVE_LABEL[item.id]}</span>
+						{#if item.badge() !== null && item.badge()! > 0}
+							<Badge variant="outline" class="ml-auto border-warning/40 bg-warning/10 text-warning" title={item.badgeTitle}>
+								{item.badge()}
+							</Badge>
+						{:else if cs.perspective === item.id}
+							<Check class="ml-auto size-4 text-muted-foreground" />
+						{/if}
+					</button>
+				{/each}
+			</div>
+		{/if}
 	{/if}
 </div>

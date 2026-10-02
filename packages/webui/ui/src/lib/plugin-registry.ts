@@ -47,7 +47,7 @@ export interface PluginRouteEntry {
  * 消费方=member——design §1 双姿态共存互不排斥，视角仅 UI 呈现过滤）。
  */
 export const PLUGIN_ROUTE_REGISTRY: readonly PluginRouteEntry[] = [
-	{ routeId: "#/p/host/panel", pluginId: "host", pageId: "panel", title: "插件面板", nav: "tools", icon: "puzzle", visibility: "both", managed: false },
+	{ routeId: "#/p/host/panel", pluginId: "host", pageId: "panel", title: "插件", nav: "tools", icon: "puzzle", visibility: "both", managed: false },
 	{ routeId: "#/p/ports/mappings", pluginId: "ports", pageId: "mappings", title: "端口映射", nav: "tools", icon: "network", visibility: "admin", managed: true },
 	{ routeId: "#/p/files/browser", pluginId: "files", pageId: "browser", title: "文件浏览", nav: "tools", icon: "folder", visibility: "both", managed: true },
 	{ routeId: "#/p/sync/groups", pluginId: "sync", pageId: "groups", title: "同步组", nav: "tools", icon: "refresh", visibility: "admin", managed: true },

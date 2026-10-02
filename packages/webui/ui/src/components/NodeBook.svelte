@@ -38,9 +38,7 @@
 	<Dialog.Content class="sm:max-w-lg" data-panel="node-book">
 		<Dialog.Header>
 			<Dialog.Title>节点簿</Dialog.Title>
-			<Dialog.Description>
-				你在本地保存的多台服务器；凭证只保存在本机私有文件，浏览器不保存。
-			</Dialog.Description>
+			<Dialog.Description>你在本地保存的多台服务器，一次连接一台。</Dialog.Description>
 		</Dialog.Header>
 
 		<div class="flex flex-col gap-5">
@@ -57,25 +55,21 @@
 
 			<!-- 当前节点 -->
 			<section class="flex flex-col gap-2">
-				<h3 class="text-sm font-semibold">当前节点</h3>
+				<h3 class="text-sm font-semibold">当前服务器</h3>
 				<dl class="grid grid-cols-[92px_1fr] items-baseline gap-x-3 gap-y-2 text-sm">
 					<dt class="text-muted-foreground">地址</dt>
 					<dd class="font-mono text-[13px]">{cs.sidecar?.server_host_masked ?? "-"}</dd>
-					<dt class="text-muted-foreground">安全模型</dt>
-					<dd class="leading-relaxed">
-						管理凭证保存在本机（仅本机用户可读的私有文件，权限 0600），浏览器不保存、不回显。
-					</dd>
 				</dl>
 				{#if cs.sidecar?.insecure === true}
 					<div class="rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-warning">
-						连接未加密：当前节点经明文 http 传输，管理凭证与管理流量未加密。
+						连接未加密：当前服务器经明文 http 传输，管理凭证与管理流量未加密。
 					</div>
 				{/if}
 			</section>
 
 			<!-- 已保存节点列表（一次一个当前节点） -->
 			<section class="flex flex-col gap-2">
-				<h3 class="text-sm font-semibold">已保存节点</h3>
+				<h3 class="text-sm font-semibold">已保存的服务器</h3>
 				{#if loading}
 					<div class="flex flex-col gap-2">
 						<Skeleton class="h-10 w-full" />
@@ -83,7 +77,7 @@
 					</div>
 				{:else if nodes.length === 0}
 					<p class="text-sm text-muted-foreground" data-empty="nodes">
-						节点簿是空的。第一次切换到其他节点时，当前节点会自动保存进来。
+						还是空的——第一次切换时，当前服务器会自动保存进来。
 					</p>
 				{:else}
 					<ul class="flex flex-col gap-2">
@@ -112,7 +106,7 @@
 									variant="ghost"
 									size="icon"
 									class="size-7 text-muted-foreground hover:text-destructive"
-									title={n.current ? "当前节点不能删除——先切换到其他节点" : "删除这个节点"}
+									title={n.current ? "当前服务器不能删除——先切换到其他服务器" : "删除这个服务器"}
 									aria-label="删除节点 {nodeLabel(n)}"
 									disabled={n.current}
 									onclick={() => cs.askDeleteNode(n)}
@@ -125,12 +119,12 @@
 				{/if}
 			</section>
 
-			<!-- 添加节点（紧凑三步，同 setup 配对面字段与校验） -->
+			<!-- 添加节点（紧凑表单，同 setup 配对面字段与校验；普通标签——编号只留给路径层） -->
 			<section class="flex flex-col gap-2 border-t pt-4">
-				<h3 class="text-sm font-semibold">添加节点</h3>
+				<h3 class="text-sm font-semibold">添加服务器</h3>
 				<form class="flex flex-col gap-3" onsubmit={(e) => void addNode(e)}>
 					<Field.Field>
-						<Field.Label for="node-server" class="text-xs">① 服务器地址</Field.Label>
+						<Field.Label for="node-server" class="text-xs">服务器地址</Field.Label>
 						<Input
 							id="node-server"
 							placeholder="https://home.example.com:18787"
@@ -142,7 +136,7 @@
 						/>
 					</Field.Field>
 					<Field.Field>
-						<Field.Label for="node-token" class="text-xs">② 管理凭证</Field.Label>
+						<Field.Label for="node-token" class="text-xs">管理凭证</Field.Label>
 						<Input
 							id="node-token"
 							type="password"
@@ -154,11 +148,10 @@
 						/>
 					</Field.Field>
 					<Field.Field>
-						<Field.Label for="node-code" class="text-xs">③ 配对码（终端打印，10 分钟内有效）</Field.Label>
-						<!-- 不做 CSS 大写化：占位符含终端命令「node book add code:」，命令大小写敏感 -->
+						<Field.Label for="node-code" class="text-xs">配对码（启动时打印，10 分钟内有效）</Field.Label>
 						<Input
 							id="node-code"
-							placeholder="终端「node book add code:」一行"
+							placeholder="最新打印的一行码"
 							class="h-8 font-mono"
 							value={cs.addNodeForm.code}
 							oninput={(e) => cs.onAddNodeInput("code", e.currentTarget.value)}
@@ -170,7 +163,7 @@
 						<Field.Label for="node-name" class="text-xs">备注名（可选）</Field.Label>
 						<Input
 							id="node-name"
-							placeholder="如「家里节点」"
+							placeholder="如「家里服务器」"
 							class="h-8"
 							value={cs.addNodeForm.name}
 							oninput={(e) => cs.onAddNodeInput("name", e.currentTarget.value)}
@@ -195,9 +188,7 @@
 			</section>
 		</div>
 
-		<Dialog.Footer>
-			<Button variant="outline" onclick={() => cs.toggleDetails(false)}>关闭</Button>
-		</Dialog.Footer>
+
 	</Dialog.Content>
 </Dialog.Root>
 
@@ -227,6 +218,6 @@
 	onconfirm={() => void cs.confirmDeleteNode()}
 >
 	<p class="text-foreground">
-		只从节点簿删除本地保存的地址与凭证，<strong class="font-medium">不影响那台服务器本身</strong>，也不影响其他节点。
+		只从节点簿删除本地保存的地址与凭证，<strong class="font-medium">不影响那台服务器本身</strong>，也不影响其他服务器。
 	</p>
 </ConfirmDialog>

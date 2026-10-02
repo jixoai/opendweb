@@ -47,7 +47,8 @@
 			aria-expanded={cs.detailsOpen}
 			title="节点簿"
 		>
-			<span class="font-mono text-xs">{cs.sidecar?.server_host_masked ?? "-"}</span>
+			<span class="text-xs">节点簿</span>
+			<span class="max-w-44 truncate font-mono text-xs text-muted-foreground">{cs.sidecar?.server_host_masked ?? "-"}</span>
 			<ChevronDown data-icon="inline-end" class="text-muted-foreground" />
 		</Button>
 	{/if}

@@ -13,6 +13,7 @@
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import ErrorBanner from "./ErrorBanner.svelte";
 	import HexValue from "./HexValue.svelte";
+	import PageHeader from "./PageHeader.svelte";
 	import ReceiptCard from "./ReceiptCard.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
 
@@ -33,21 +34,26 @@
 		cs.connData?.quota?.configured === true ? (cs.connData.quota.max_connections_per_owner ?? "-") : "未设置",
 	);
 	const loading = $derived(cs.connData === null && cs.connError === null);
-	const disconnectNoun = $derived(cs.disconnect?.kind === "fabric" ? "租户" : "端点");
-	const confirmNoun = $derived(cs.connConfirm?.kind === "fabric" ? "租户" : "端点");
+	const disconnectNoun = $derived(cs.disconnect?.kind === "fabric" ? "租户" : "设备");
+	const confirmNoun = $derived(cs.connConfirm?.kind === "fabric" ? "租户" : "设备");
 	const phaseFinal = $derived(
 		cs.disconnect?.phase === "converged" || cs.disconnect?.phase === "unconfirmed",
 	);
 </script>
 
 <section class="flex flex-col gap-5" data-section="online">
-	<!-- 页头（视觉走查 P2：与其余三页「题 + 副注」模式对齐） -->
-	<div class="flex flex-col gap-1">
-		<h2 class="text-lg font-semibold tracking-tight">在线连接</h2>
-		<p class="text-sm text-muted-foreground">
-			谁正在用——按端点、按租户、按访客三组投影；断开是异步指令，发出后在这里观察收敛。
-		</p>
-	</div>
+	<PageHeader title="在线连接" hint="现在谁正在用这台服务器。">
+		{#snippet help()}
+			<dl class="grid grid-cols-[96px_1fr] items-baseline gap-x-3 gap-y-1.5">
+				<dt class="shrink-0">三组视图</dt>
+				<dd>按设备（单台）、按租户（一个网络）、按访客（无房间的设备）三个角度看在线情况。</dd>
+				<dt class="shrink-0">断开</dt>
+				<dd>断开是异步指令——发出后在这里观察收敛，通常几秒内完成。</dd>
+				<dt class="shrink-0">直连/借道</dt>
+				<dd>家人互传的数据优先设备直连；连不上时借道这台服务器中转。</dd>
+			</dl>
+		{/snippet}
+	</PageHeader>
 
 	{#if cs.connError !== null && cs.connError !== undefined}
 		<ErrorBanner error={cs.connError} onRetry={() => void cs.refreshConnections()} />
@@ -159,11 +165,22 @@
 			</Empty.Header>
 		</Empty.Root>
 	{:else if cs.connData !== null}
+		{@const allEmpty = perEndpointAll.length === 0 && perOwnerAll.length === 0 && perVisitorAll.length === 0}
+		{#if allEmpty}
+			<!-- 全空统一空态（critic r1：三个空卡各说一遍「没有」=信息重复） -->
+			<Empty.Root class="border border-dashed" data-empty="online-all">
+				<Empty.Header>
+					<Empty.Media variant="icon"><WifiOff /></Empty.Media>
+					<Empty.Title>现在没有家人在线。</Empty.Title>
+					<Empty.Description>有人连上后，连接会实时出现在这里。</Empty.Description>
+				</Empty.Header>
+			</Empty.Root>
+		{:else}
 		<Card.Root class="gap-4 py-5">
 			<Card.Header>
 				<Card.Title class="text-base">
-					按端点
-					<!-- home-hub F2：本组只含租户票接入的端点（访客单列于「按访客」） -->
+					按设备
+					<!-- home-hub F2 冻结 verbatim：本组只含租户票接入（访客单列于「按访客」） -->
 					<span class="ml-1.5 text-sm font-normal text-muted-foreground">仅租户端点</span>
 				</Card.Title>
 			</Card.Header>
@@ -171,7 +188,7 @@
 				{#if perEndpointAll.length === 0}
 						<!-- 空态风格统一（视觉走查 P2）：左对齐纯文本，与按租户/按访客两组一致 -->
 						<p class="py-6 text-sm text-muted-foreground" data-empty="endpoints">
-							当前没有在线连接。已注册的租户建立组网后，连接会实时出现在这里。
+							当前没有在线连接。已注册的租户连上后，连接会实时出现在这里。
 						</p>
 					{:else if perEndpoint.length === 0}
 						<p class="text-sm text-muted-foreground">该租户当前没有在线连接。</p>
@@ -179,8 +196,8 @@
 					<Table.Root>
 						<Table.Header>
 							<Table.Row>
-								<Table.Head>端点</Table.Head>
-								<Table.Head>Fabric</Table.Head>
+								<Table.Head>设备</Table.Head>
+								<Table.Head>网络</Table.Head>
 								<Table.Head class="text-right">连接数</Table.Head>
 								<Table.Head class="w-2"></Table.Head>
 							</Table.Row>
@@ -190,7 +207,7 @@
 								<Table.Row>
 									<Table.Cell>
 										<div class="flex items-center gap-2">
-											<HexValue value={e.endpoint_id} kind="端点" />
+											<HexValue value={e.endpoint_id} kind="设备" />
 											{#if e.link === "direct" || e.link === "relay"}
 												{@const link = linkLabel(e.link)}
 												<!-- G-3：直连中/借道中（服务端携带 link 字段时标注；缺失不标） -->
@@ -240,7 +257,7 @@
 					<Table.Root>
 						<Table.Header>
 							<Table.Row>
-								<Table.Head>Fabric</Table.Head>
+								<Table.Head>网络</Table.Head>
 								<Table.Head class="text-right">在用 / 上限</Table.Head>
 								<Table.Head class="w-2"></Table.Head>
 							</Table.Row>
@@ -285,7 +302,7 @@
 					<Table.Root>
 						<Table.Header>
 							<Table.Row>
-								<Table.Head>端点</Table.Head>
+								<Table.Head>设备</Table.Head>
 								<Table.Head class="text-right">连接数</Table.Head>
 								<Table.Head class="w-2"></Table.Head>
 							</Table.Row>
@@ -295,7 +312,7 @@
 								<Table.Row>
 									<Table.Cell>
 										<div class="flex items-center gap-2">
-											<HexValue value={v.endpoint_id} kind="端点" />
+											<HexValue value={v.endpoint_id} kind="设备" />
 											{#if v.link === "direct" || v.link === "relay"}
 												{@const link = linkLabel(v.link)}
 												<Badge
@@ -324,11 +341,12 @@
 									</Table.Cell>
 								</Table.Row>
 							{/each}
-						</Table.Body>
-					</Table.Root>
-				{/if}
-			</Card.Content>
+							</Table.Body>
+						</Table.Root>
+					{/if}
+				</Card.Content>
 		</Card.Root>
+		{/if}
 	{/if}
 
 	<!-- 断开确认（知情前置：范围 + 异步性 + 进度承诺） -->
@@ -341,7 +359,7 @@
 	>
 		{#if cs.connConfirm?.kind === "endpoint"}
 			<p class="text-foreground">
-				将向服务器下发断开指令，端点
+				将向服务器下发断开指令，设备
 				<span class="font-mono text-[13px]" title={cs.connConfirm.id}>{shortHex(cs.connConfirm.id)}</span>
 				的 <strong class="font-medium">{cs.connConfirm.count} 条连接</strong>会被关闭。
 			</p>

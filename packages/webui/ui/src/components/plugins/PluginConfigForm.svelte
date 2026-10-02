@@ -1,17 +1,31 @@
 <script lang="ts">
-	// 插件配置表单（webui-plugin-kernel Phase 0）——服务端 configSchema 驱动的
-	// 通用 renderer（string→输入框 / number→数字输入 / boolean→复选）。值改动进
-	// store 草稿（pluginConfigDraft），保存=PUT /sidecar/plugins/<id>/config（服务
-	// 端二次校验：未知键/类型不符/缺 required 一律 400）。空 schema=诚实占位
-	// （配置面随插件运行时在后续 Phase 接入——Phase 0 三插件均无配置项）。
+	// 插件配置表单（webui-plugin-kernel Phase 0 + D4 2026-10-02）：服务端
+	// configSchema 驱动的通用 renderer。工程键名一律映射为人类标签+单位
+	//（视觉审计：把开发者配置文件贴进家庭 UI 是最大的 AI 味）；未映射键
+	// 退回键名但保留等宽体。保存=PUT（服务端二次校验：未知键/类型不符/缺
+	// required 一律 400）。空 schema=诚实占位。
 	import { Button } from "$lib/components/ui/button";
 	import { Input } from "$lib/components/ui/input";
-	import { Label } from "$lib/components/ui/label";
 	import { toast } from "svelte-sonner";
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import type { WebuiPluginEntry } from "$lib/api";
 
 	let { plugin }: { plugin: WebuiPluginEntry } = $props();
+
+	/** 工程键 → 人类标签（跨插件通用键；插件专属键按前缀归并） */
+	const LABELS: Record<string, { label: string; unit?: string }> = {
+		maxBodyMiB: { label: "单次传输上限", unit: "MB" },
+		stagingTtlSeconds: { label: "暂存保留时长", unit: "秒" },
+		intervalMs: { label: "扫描间隔", unit: "毫秒" },
+		debounceMs: { label: "变更防抖", unit: "毫秒" },
+		maxConcurrency: { label: "同时请求数" },
+		dailyRequests: { label: "每日请求上限", unit: "次" },
+		usageLog: { label: "记录用量日志" },
+	};
+
+	function labelOf(key: string): { label: string; unit?: string } {
+		return LABELS[key] ?? { label: key };
+	}
 
 	const entries = $derived(Object.entries(plugin.config_schema?.properties ?? {}));
 	const draft = $derived(cs.pluginConfigDraft[plugin.id]);
@@ -30,12 +44,13 @@
 </script>
 
 {#if entries.length === 0}
-	<p class="text-sm text-muted-foreground">暂无可配置项——配置面随插件运行时（后续版本）接入。</p>
+	<p class="text-sm text-muted-foreground">暂无可配置项。</p>
 {:else if draft === undefined}
 	<p class="text-sm text-muted-foreground">正在载入配置…</p>
 {:else}
 	<div class="flex flex-col gap-4">
 		{#each entries as [key, def] (key)}
+			{@const meta = labelOf(key)}
 			<div class="flex flex-col gap-1.5">
 				{#if def.type === "boolean"}
 					<label class="flex items-center gap-2.5 text-sm" for={`cfg-${plugin.id}-${key}`}>
@@ -47,10 +62,12 @@
 							onchange={(e) => cs.setPluginConfigDraft(plugin.id, key, (e.target as HTMLInputElement).checked)}
 							disabled={busy}
 						/>
-						{key}{plugin.config_schema.required?.includes(key) ? " *" : ""}
+						{meta.label}{plugin.config_schema.required?.includes(key) ? " *" : ""}
 					</label>
 				{:else}
-					<Label for={`cfg-${plugin.id}-${key}`}>{key}{plugin.config_schema.required?.includes(key) ? " *" : ""}</Label>
+					<label class="text-sm" for={`cfg-${plugin.id}-${key}`}>
+						{meta.label}{meta.unit !== undefined ? `（${meta.unit}）` : ""}{plugin.config_schema.required?.includes(key) ? " *" : ""}
+					</label>
 					<Input
 						id={`cfg-${plugin.id}-${key}`}
 						type={def.type === "number" ? "number" : "text"}
@@ -62,7 +79,7 @@
 								def.type === "number" ? Number((e.target as HTMLInputElement).value) : (e.target as HTMLInputElement).value,
 							)}
 						disabled={busy}
-						class="max-w-sm font-mono text-sm"
+						class="max-w-xs text-sm"
 					/>
 				{/if}
 			</div>

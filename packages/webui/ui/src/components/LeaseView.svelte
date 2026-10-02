@@ -60,7 +60,7 @@
 <section class="flex flex-col gap-5" data-view="lease">
 	<div class="flex flex-col gap-1">
 		<h2 class="text-lg font-semibold tracking-tight">我的租约</h2>
-		<p class="text-sm text-muted-foreground">这台设备加入过的网络——还剩几天、现在连得上吗，打开即答。</p>
+		<p class="text-sm text-muted-foreground">这台设备加入过的网络。</p>
 	</div>
 
 	{#if cs.leasesError !== null && cs.leasesError !== undefined}
@@ -141,11 +141,11 @@
 									<Pencil class="size-3.5 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
 								</button>
 							{/if}
-							<span class="font-mono text-[13px] text-muted-foreground" title={l.server}>{l.server}</span>
-							<span class="text-xs text-muted-foreground" title={`根端点 ${l.root}`}>
-								我的身份：{l.alias ?? "-"}（{shortHex(l.root)}）
+	
+							<span class="text-xs text-muted-foreground" title={`钥匙全文 ${l.root}`}>
+								钥匙 <span class="font-mono">({shortHex(l.root)})</span>
 							</span>
-							<!-- 状态列：语义色克制（黄临期/红到期，不整行染色） -->
+							<!-- 状态列：语义色克制（黄临期/红到期，不整行染色）；长期不数天数 -->
 							{#if state.state === "expired"}
 								<Badge variant="outline" class="border-destructive/40 bg-destructive/10 text-destructive">已到期</Badge>
 							{:else if state.state === "expiring"}
@@ -153,7 +153,9 @@
 							{:else}
 								<span class="text-sm text-muted-foreground">{state.label}</span>
 							{/if}
-							<span class="text-xs text-muted-foreground">到期 {fmtDate(l.expires_at)}</span>
+							{#if state.state !== "permanent"}
+								<span class="text-xs text-muted-foreground">到期 {fmtDate(l.expires_at)}</span>
+							{/if}
 							{#if lastProbeFor(l.server) !== null}
 								{@const lastProbe = lastProbeFor(l.server)}
 								<span class="text-xs text-muted-foreground" title={lastProbe.title}>最近探测：{lastProbe.text}</span>
@@ -175,7 +177,7 @@
 										{:else}
 											<Radar data-icon="inline-start" />
 										{/if}
-										测一下
+										测试连通
 									</Button>
 								{/if}
 								<Button
@@ -212,9 +214,11 @@
 						{#if cs.leaseExpanded === l.id}
 							<div class="flex flex-col gap-2.5 border-t px-4 py-3 text-sm" data-expanded={l.id}>
 								<dl class="grid grid-cols-[120px_1fr] items-baseline gap-x-4 gap-y-2">
-									<dt class="text-muted-foreground">Fabric</dt>
-									<dd><HexValue value={l.fabric_id} kind="Fabric" /></dd>
-									<dt class="text-muted-foreground">中转</dt>
+									<dt class="text-muted-foreground">地址</dt>
+									<dd class="font-mono text-[13px]">{l.server}</dd>
+									<dt class="text-muted-foreground">网络身份证</dt>
+									<dd><HexValue value={l.fabric_id} kind="网络身份证" /></dd>
+									<dt class="text-muted-foreground">中转地址</dt>
 									<dd class="font-mono text-[13px]">{l.relay_url === "" ? "-" : l.relay_url}</dd>
 									{#if l.receipt !== null}
 										<dt class="text-muted-foreground">回执</dt>
@@ -227,7 +231,7 @@
 									<dd class="text-muted-foreground">{fmtLocal(l.registered_at)}</dd>
 								</dl>
 								<p class="leading-relaxed text-muted-foreground">{RENEW_GUIDE}</p>
-								<p class="text-xs text-muted-foreground">能否连上以实际连接为准；「测一下」只做无凭证探测。</p>
+								<p class="text-xs text-muted-foreground">能否连上以实际连接为准；「测试连通」只做无凭证探测。</p>
 							</div>
 						{/if}
 					</div>

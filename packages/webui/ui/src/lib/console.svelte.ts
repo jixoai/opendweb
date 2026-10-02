@@ -359,6 +359,17 @@ class ConsoleStore {
 		return this.sidecar?.hub_local === true;
 	}
 	/**
+	 * admin 管理面整体不可用（D4 错误单例，2026-10-02）：管理 API 持续凭证级失败
+	 * （unauthorized / http-401 / no-target）→ App 层整页降级屏（一条错误 + 恢复
+	 * 动作），页面内不再逐卡复制红横幅。瞬时网络错误（可重试）不算 down。
+	 */
+	get adminPlaneDown(): boolean {
+		if (this.phase !== "ready" || this.role !== "admin") return false;
+		const e = this.statusError;
+		if (e === null) return false;
+		return e.code === "unauthorized" || e.code === "http-401" || e.code === "no-target";
+	}
+	/**
 	 * ports 映射表单的对端选项源：本机租约的 fabric root（home-hub §2——
 	 * lease.root=对端中枢设备的 endpointId；「把中枢那台设备的端口映射到本机」
 	 * 是 v1 主用例）。节点簿是 server 面孔（无 endpointId），不在此列。

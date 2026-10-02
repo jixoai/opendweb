@@ -267,7 +267,9 @@ test("e2e: scenario 2 - setup flow (pairing code from stdout -> connect -> froze
 
   const server = await spawnServer(dataDir);
   children.push(server.child);
-  const sidecar = await spawnSidecar([], { name: "sidecar-setup" });
+  // setup 态（DWEB_HOME 隔离到本用例 temp——默认 ~/.opendweb 可能是中枢形态，
+  // no-args 会走 row-2 而非 setup；测试必须显式隔离）
+  const sidecar = await spawnSidecar([], { name: "sidecar-setup", home: dataDir });
   children.push(sidecar.child);
 
   // setup 态：业务面 503 no-target

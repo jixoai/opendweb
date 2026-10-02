@@ -168,8 +168,8 @@ test("code full text exists only in the issue response fixture; list carries has
 
 test("leaseState: permanent/active/expiring/expired with frozen boundary (now>=expires_at is expired)", () => {
 	const now = 1_000_000_000_000;
-	assert.deepEqual(leaseState(undefined, now), { state: "permanent", daysLeft: null, label: "在租 · 永久" });
-	assert.deepEqual(leaseState(null, now), { state: "permanent", daysLeft: null, label: "在租 · 永久" });
+	assert.deepEqual(leaseState(undefined, now), { state: "permanent", daysLeft: null, label: "租期中 · 长期" });
+	assert.deepEqual(leaseState(null, now), { state: "permanent", daysLeft: null, label: "租期中 · 长期" });
 	assert.equal(leaseState(now, now).state, "expired"); // 等值=过期
 	assert.equal(leaseState(now - 1, now).state, "expired");
 	const five = leaseState(now + 5 * 86_400_000, now);
@@ -177,7 +177,7 @@ test("leaseState: permanent/active/expiring/expired with frozen boundary (now>=e
 	assert.equal(five.label, "临期 · 剩 5 天");
 	const twenty = leaseState(now + 23 * 86_400_000, now);
 	assert.equal(twenty.state, "active");
-	assert.equal(twenty.label, "在租 · 剩 23 天");
+	assert.equal(twenty.label, "租期中 · 剩 23 天");
 	assert.equal(leaseState(now + 7 * 86_400_000, now).state, "expiring"); // 7 天含边界
 	assert.equal(leaseState(now + 8 * 86_400_000, now).state, "active"); // 8 天不含
 });
@@ -528,7 +528,8 @@ test("source regression: roster table width convergence + sticky action column (
 	assert.ok(src.includes("rosterNote(o.note)"), "租户行须消费 note");
 	assert.ok(/class="max-w-md truncate text-xs text-muted-foreground" title=\{note\}/.test(src), "note 呈现须 title 全文+截断");
 	// 侧栏表单并排栅格推至 2xl——1280–1535 档名册占满整行不再被挤到 ~600px
-	assert.ok(src.includes("2xl:grid-cols-[minmax(0,1fr)_360px]"));
+	// D4 单列重排（2026-10-02）：双列 grid 已改单列 + 手工导入高级折叠
+	assert.ok(src.includes('data-section="manual-import"'));
 });
 
 test("source regression: visitors note render / single-alias render / online header / nodebook casing (P0/P2)", () => {
@@ -541,7 +542,7 @@ test("source regression: visitors note render / single-alias render / online hea
 	assert.ok(/<AliasInlineEdit[\s\S]*?abbr=\{shortHex\(v\.endpoint_id\)\}/.test(visitors), "访客行内编辑须携带缩写（同名警示锚点）");
 
 	const online = readFileSync(path.join(UI_SRC, "components", "OnlineView.svelte"), "utf8");
-	assert.ok(online.includes("<h2"), "#/online 须有页头");
+	assert.ok(online.includes("PageHeader"), "#/online 须有页头（统一 PageHeader）");
 	assert.ok(/<p class="py-6 text-sm text-muted-foreground" data-empty="endpoints">/.test(online), "按端点空态为左对齐纯文本（与另两组一致）");
 
 	const nodebook = readFileSync(path.join(UI_SRC, "components", "NodeBook.svelte"), "utf8");

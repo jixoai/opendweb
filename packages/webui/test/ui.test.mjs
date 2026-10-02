@@ -173,7 +173,7 @@ test("postConnect normalization: sidecar envelope codes flow through the injecta
 
 const MATRIX = [
 	{ name: "not-enabled", code: "admin-not-enabled", copy: "admin-token", where: "detail", retry: true },
-	{ name: "unauthorized", code: "unauthorized", copy: "管理凭证无效", where: "title", retry: false },
+	{ name: "unauthorized", code: "unauthorized", copy: "凭证已失效", where: "title", retry: false },
 	{ name: "http-502", code: "http-502", copy: "服务器内部错误", where: "title", retry: true },
 	{ name: "network", code: "network", copy: "网络错误", where: "detail", retry: true },
 	{ name: "timeout", code: "timeout", copy: "超时", where: "detail", retry: true },
@@ -214,10 +214,10 @@ test("sidecar transport-family codes map into semantic equivalents (upstream-* e
 });
 
 test("health light: four semantic states from poll result (§4.2 步 1)", () => {
-	assert.deepEqual(healthCopy(null), { tone: "ok", label: "管理面连接正常" });
+	assert.deepEqual(healthCopy(null), { tone: "ok", label: "连接正常" });
 	assert.equal(healthCopy(new AdminError("network", "x")).label, "连不上服务器");
 	assert.equal(healthCopy(new AdminError("timeout", "x")).label, "连不上服务器");
-	assert.equal(healthCopy(new AdminError("unauthorized", "x")).label, "管理凭证无效");
+	assert.equal(healthCopy(new AdminError("unauthorized", "x")).label, "凭证已失效");
 	assert.equal(healthCopy(new AdminError("admin-not-enabled", "x")).label, "远端未开启管理面");
 	assert.equal(healthCopy(new AdminError("http-502", "x")).label, "服务器内部错误");
 	assert.equal(healthCopy(null).tone, "ok");

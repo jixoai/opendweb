@@ -28,9 +28,9 @@ export function errorCopy(error: AdminError | null | undefined): { title: string
       };
     case "unauthorized":
       return {
-        title: "管理凭证无效",
+        title: "凭证已失效",
         detail:
-          "服务器拒绝了当前管理凭证。凭证在连接时已锁定，不能在本页更换——请退出本页，在终端重新运行启动命令（会在提示处隐藏输入新的管理凭证；或更新服务器上的 admin-token 文件后重启）。",
+          "服务器拒绝了当前管理凭证。凭证在连接时已锁定，不能在本页更换——请重新运行启动命令，按提示输入新的管理凭证；或更新服务器上的凭证文件后重启。",
         retry: false,
       };
     case "no-match":
@@ -89,7 +89,7 @@ export interface HealthCopy {
 /** 健康灯四态文案（§4.2 流 B 步 1 / §4.3 C-1）。 */
 export function healthCopy(error: AdminError | null | undefined): HealthCopy {
   if (error === null || error === undefined) {
-    return { tone: "ok", label: "管理面连接正常" };
+    return { tone: "ok", label: "连接正常" };
   }
   const raw = typeof error?.code === "string" ? error.code : "";
   // sidecar 传输族兜底码归入语义等价类（与 errorCopy 同一映射）
@@ -101,11 +101,11 @@ export function healthCopy(error: AdminError | null | undefined): HealthCopy {
         : raw === "upstream-too-large"
           ? "http-502"
           : raw;
-  if (code === "unauthorized") return { tone: "bad", label: "管理凭证无效" };
+  if (code === "unauthorized") return { tone: "bad", label: "凭证已失效" };
   if (code === "admin-not-enabled") return { tone: "bad", label: "远端未开启管理面" };
   if (code.startsWith("http-5")) return { tone: "bad", label: "服务器内部错误" };
   if (code === "network" || code === "timeout") return { tone: "bad", label: "连不上服务器" };
-  return { tone: "bad", label: "管理面异常" };
+  return { tone: "bad", label: "连接异常" };
 }
 
 /** 配对面错误码 → 语义化文案（/sidecar/connect 失败面，§5.3 成品文案）。 */

@@ -50,12 +50,17 @@ export interface LeaseState {
 
 export function leaseState(expiresAt: number | null | undefined, now: number = Date.now()): LeaseState {
   if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) {
-    return { state: "permanent", daysLeft: null, label: "在租 · 永久" };
+    return { state: "permanent", daysLeft: null, label: "租期中 · 长期" };
+  }
+  // 台账 wire 上「永久」以 2100 年哨兵时间戳承载（server 端 null 投影）——
+  // 按长期呈现，绝不说「剩 26754 天」
+  if (expiresAt >= 4_102_444_800_000) {
+    return { state: "permanent", daysLeft: null, label: "租期中 · 长期" };
   }
   if (now >= expiresAt) return { state: "expired", daysLeft: 0, label: "已到期" };
   const daysLeft = Math.max(1, Math.ceil((expiresAt - now) / 86_400_000));
   if (daysLeft <= 7) return { state: "expiring", daysLeft, label: `临期 · 剩 ${daysLeft} 天` };
-  return { state: "active", daysLeft, label: `在租 · 剩 ${daysLeft} 天` };
+  return { state: "active", daysLeft, label: `租期中 · 剩 ${daysLeft} 天` };
 }
 
 /** 邀请码展示分组：`dwebc1.` 前缀 + 本体每 4 字符一组（4-4-4-4；只对 dwebc1. 形态重组，其他字符串原样）。 */

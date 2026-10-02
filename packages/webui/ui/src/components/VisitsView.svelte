@@ -14,6 +14,8 @@
 
 	const visits = $derived(Array.isArray(cs.visitsData?.visits) ? cs.visitsData!.visits : []);
 	const loading = $derived(cs.visitsData === null && cs.visitsError === null);
+	// 空态探测入口的候选目标（有租约才有可探测的楼）
+	const leases = $derived(Array.isArray(cs.leasesData?.leases) ? cs.leasesData!.leases : []);
 
 	function reachableOf(v: (typeof visits)[number]): boolean {
 		return v.last_probe?.result === "reachable";
@@ -23,7 +25,7 @@
 <section class="flex flex-col gap-5" data-view="visits">
 	<div class="flex flex-col gap-1">
 		<h2 class="text-lg font-semibold tracking-tight">我的到访</h2>
-		<p class="text-sm text-muted-foreground">到访过的楼哪些还通、上次什么时候——打开即答；探测是主动动作。</p>
+		<p class="text-sm text-muted-foreground">到访过的楼哪些还通、上次什么时候。</p>
 	</div>
 
 	{#if cs.visitsError !== null && cs.visitsError !== undefined}
@@ -42,6 +44,28 @@
 				<Empty.Title>还没有到访记录。</Empty.Title>
 				<Empty.Description>你敲开一栋楼的门、被放行之后，这里会记下这栋楼。</Empty.Description>
 			</Empty.Header>
+			{#if cs.role === "member" && leases.length === 0}
+				<Empty.Content>
+					<p class="text-xs text-muted-foreground">先在「我的租约」加入一栋楼，这里才开始有得测。</p>
+				</Empty.Content>
+			{:else if cs.role === "member"}
+				<Empty.Content>
+					<Button
+						variant="outline"
+						size="sm"
+						disabled={cs.probeBusy !== null}
+						onclick={() => void cs.probeServerTarget(leases[0].server)}
+						title="无凭证探测这台服务器现在是否可达"
+					>
+						{#if cs.probeBusy === leases[0].server}
+							<LoaderCircle data-icon="inline-start" class="animate-spin" />
+						{:else}
+							<Radar data-icon="inline-start" />
+						{/if}
+						测试连通
+					</Button>
+				</Empty.Content>
+			{/if}
 		</Empty.Root>
 	{:else}
 		<Card.Root class="gap-4 py-5">
@@ -82,7 +106,7 @@
 									{:else}
 										<Radar data-icon="inline-start" />
 									{/if}
-									测一下
+									测试连通
 								</Button>
 							{/if}
 						</div>
