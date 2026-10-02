@@ -14,6 +14,9 @@ const pkgRoot = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   root: "ui",
+  // 静态资产目录是 static/（非 vite 默认的 public/）——favicon 等 root 级文件
+  // 经此复制进 dist 根；漏配则 /opendweb-icon.svg 404（2026-10-03 favicon 事故）。
+  publicDir: "static",
   plugins: [tailwindcss(), svelte()],
   resolve: {
     alias: {
