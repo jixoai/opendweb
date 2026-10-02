@@ -45,7 +45,7 @@
 	{#if cs.role === "member"}
 		<!-- member 姿态：两个目的地的分段控件（D4 2026-10-02——下拉穿着账户菜单
 		     的外衣，诚实形态是页面切换） -->
-		<div class="flex items-center rounded-md border p-0.5" role="tablist" aria-label="切换视角">
+		<div class="flex items-center rounded-md border border-terminal-foreground/25 p-0.5" role="tablist" aria-label="切换视角">
 			{#each items.filter((i) => i.id !== "hub") as item (item.id)}
 				<button
 					type="button"
@@ -54,8 +54,8 @@
 					class={cn(
 						"flex cursor-pointer items-center gap-1.5 rounded-sm px-2.5 py-1 text-sm transition-colors",
 						cs.perspective === item.id
-							? "bg-accent font-medium text-accent-foreground"
-							: "text-muted-foreground hover:text-foreground",
+							? "bg-terminal-foreground font-medium text-terminal"
+							: "text-terminal-muted hover:text-terminal-foreground",
 					)}
 					onclick={() => switchTo(item.id)}
 				>
@@ -70,9 +70,17 @@
 			{/each}
 		</div>
 	{:else}
-		<Button variant="outline" size="sm" aria-haspopup="listbox" aria-expanded={open} onclick={() => (open = !open)} title="切换视角">
+		<Button
+			variant="outline"
+			size="sm"
+			class="border-terminal-foreground/30 bg-transparent text-terminal-foreground hover:bg-terminal-hover hover:text-terminal-foreground"
+			aria-haspopup="listbox"
+			aria-expanded={open}
+			onclick={() => (open = !open)}
+			title="切换视角"
+		>
 			<span class="text-sm">{PERSPECTIVE_LABEL[cs.perspective]}</span>
-			<ChevronDown data-icon="inline-end" class="text-muted-foreground" />
+			<ChevronDown data-icon="inline-end" />
 		</Button>
 		{#if open}
 			<div

@@ -112,7 +112,7 @@
 		<div class="grid grid-cols-2 gap-3 xl:grid-cols-4" data-quickstats>
 			<button
 				type="button"
-				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left transition-colors hover:bg-accent/60"
+				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left shadow-xs transition-colors hover:bg-accent/60 hover:shadow-sm"
 				onclick={() => cs.goOnline(null)}
 			>
 				<span class="text-xs text-muted-foreground">在线连接</span>
@@ -120,7 +120,7 @@
 			</button>
 			<button
 				type="button"
-				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left transition-colors hover:bg-accent/60"
+				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left shadow-xs transition-colors hover:bg-accent/60 hover:shadow-sm"
 				onclick={() => cs.goTenants()}
 			>
 				<span class="text-xs text-muted-foreground">租户{expiringCount > 0 ? `（${expiringCount} 个临期）` : ""}</span>
@@ -128,7 +128,7 @@
 			</button>
 			<button
 				type="button"
-				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left transition-colors hover:bg-accent/60"
+				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left shadow-xs transition-colors hover:bg-accent/60 hover:shadow-sm"
 				onclick={() => cs.goVisitors()}
 			>
 				<span class="text-xs text-muted-foreground">待处理敲门</span>
@@ -136,7 +136,7 @@
 			</button>
 			<button
 				type="button"
-				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left transition-colors hover:bg-accent/60"
+				class="flex flex-col justify-center gap-0.5 rounded-lg border px-4 py-3 text-left shadow-xs transition-colors hover:bg-accent/60 hover:shadow-sm"
 				onclick={() => cs.goIssueCode()}
 			>
 				<span class="text-xs text-muted-foreground">可用邀请码</span>

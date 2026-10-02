@@ -12,7 +12,7 @@ importers:
     devDependencies:
       '@napi-rs/cli':
         specifier: 3.7.0
-        version: 3.7.0(@emnapi/runtime@1.11.2)(@types/node@22.20.1)
+        version: 3.7.0(@emnapi/runtime@1.9.2)(@types/node@22.20.1)
       '@types/node':
         specifier: ^22
         version: 22.20.1
@@ -186,6 +186,12 @@ importers:
     devDependencies:
       '@fontsource-variable/inter':
         specifier: ^5.3.0
+        version: 5.3.0
+      '@fontsource-variable/jetbrains-mono':
+        specifier: ^5.2.8
+        version: 5.3.0
+      '@fontsource/share-tech-mono':
+        specifier: ^5.2.7
         version: 5.3.0
       '@internationalized/date':
         specifier: ^3.12.0
@@ -3146,7 +3152,7 @@ snapshots:
     dependencies:
       svelte: 5.57.1
 
-  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.11.2)(@types/node@22.20.1)':
+  '@napi-rs/cli@3.7.0(@emnapi/runtime@1.9.2)(@types/node@22.20.1)':
     dependencies:
       '@inquirer/prompts': 8.6.0(@types/node@22.20.1)
       '@napi-rs/cross-toolchain': 1.0.3
@@ -3161,7 +3167,7 @@ snapshots:
       semver: 7.8.5
       typanion: 3.14.0
     optionalDependencies:
-      '@emnapi/runtime': 1.11.2
+      '@emnapi/runtime': 1.9.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'

@@ -14,6 +14,7 @@
 	import { consoleStore as cs } from "$lib/console.svelte";
 	import { findPluginRoute } from "$lib/plugin-registry";
 	import { pluginPageComponent } from "$lib/plugin-pages";
+	import BrandMark from "./components/BrandMark.svelte";
 	import SetupWizard from "./components/SetupWizard.svelte";
 	import TopBar from "./components/TopBar.svelte";
 	import SideNav from "./components/SideNav.svelte";
@@ -85,7 +86,8 @@
 
 {#if bootFailed}
 	<div class="flex min-h-svh items-center justify-center px-6">
-		<div class="w-full max-w-md rounded-lg border bg-card p-8 text-center shadow-sm">
+		<div class="w-full max-w-md rounded-lg border bg-card p-8 text-center shadow-md">
+			<BrandMark class="mx-auto mb-4 size-12 opacity-60" />
 			<h1 class="text-lg font-semibold">控制台后台没有响应</h1>
 			<p class="mt-2 text-sm leading-relaxed text-muted-foreground">
 				本地 sidecar 进程可能已退出。请回到终端查看输出，或重新运行启动命令打开新页面。
@@ -98,7 +100,8 @@
 	</div>
 {:else if bootLoading}
 	<div class="flex min-h-svh items-center justify-center px-6">
-		<div class="w-full max-w-md rounded-lg border bg-card p-8 shadow-sm">
+		<div class="flex w-full max-w-md flex-col items-center rounded-lg border bg-card p-8 shadow-md">
+			<BrandMark class="mb-4 size-14 animate-pulse" />
 			<h1 class="text-lg font-semibold">正在连接服务器…</h1>
 			<div class="mt-4 flex flex-col gap-2">
 				<Skeleton class="h-4 w-3/4" />

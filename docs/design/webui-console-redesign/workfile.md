@@ -97,3 +97,44 @@ D4=dyHyiTD2…（锐利收敛→仪器感减法）；D2=P8NNWWn8…（栅格标�
   critic 截图捕获。建议后续加「模板标识符静态扫描」或组件渲染冒烟测试。
 - 批量 python patch 中途 assert 失败会静默丢失后续 patch（本轮多次）——每次批后必须
   逐项 grep 验证落盘。
+
+## T4 品牌化视觉迁移（2026-10-03，Owner 反馈「icon 没用 + 格调一般般」）
+
+### 做了什么
+- **根因**：webui 此前是 shadcn 默认 zinc/Inter/空 favicon，与品牌零关联；而 Owner 的
+  jixoai 设计语言（与 packages/website 同源）已存在，opendweb 四色 icon 资产在 assets/ 闲置。
+- **token 层迁移**（app.css 全量重写）：--brand-hue 87 琥珀（icon 黄节点 #fdd309 家族；dark -4°）；
+  中性色纯无彩；--secondary 固定黄/--accent 固定蓝（jixoai 跨项目常量）；--destructive/border/input
+  黑白翻转；radius 全系 0 + corner-shape bevel；阴影量表重定义为硬偏移（--shadow-xs 1px…2xl 8px，
+  --shadow-color 随模式翻转）；--terminal 族（恒深终端条）；JetBrains Mono 全局 + Share Tech Mono 字标
+  （@fontsource-variable/jetbrains-mono + @fontsource/share-tech-mono）。
+- **组件层**：BrandMark.svelte（icon 内联 SVG，id 前缀 odw-）；TopBar 终端条恒深 + 品牌位；
+  HealthLight/PerspectiveSwitcher 终端适配；App boot/bootFailed + SetupWizard 品牌露出；
+  favicon（svg+png+apple-touch）；Card ring-border + shadow-sm；主/outline 按钮 shadow-xs→hover sm；
+  总览统计磁贴（border 按钮）补 shadow-xs→hover sm。
+- **截图存档**：brand/ 5 张（浅×3+深×2，1 CSS px=1 图像 px）。
+
+### vision critic 两轮
+- r1 **6.5/10**：识别度立住（终端纸带/工单气质），但报 4 个深色 P0/P1 + 阴影缺席。
+- **取证纠偏（本轮关键）**：4 个 P0/P1 经像素取证 + CDP 时间轴采样确认全部是**主题切换 ~100ms
+  颜色过渡的截帧伪影**（t0 时刻文字色为过渡中间值 oklab 0.467；截在 5% 处即 vision 读到的
+  #1e1e1e/#454545/#c8c8c8）；沉降 700ms 重拍后四处对比度实测 6.4-16:1。
+- r2（修复后终审）**8.5/10**：四项确认闭合；token 纪律像素级一致；唯一 P2=磁贴无阴影 → 已补齐。
+
+### 真 bug 修复（伪影之外）
+1. **刷新丢深色主题**：TopBar 只写 localStorage 无读取方 → index.html 首帧前内联 boot 脚本
+   （唯一读取方）+ TopBar 初始态以 localStorage 为真源。
+2. Card 描边不统一（ring-foreground/10 vs border-border）→ ring-border；shadow-xs→sm。
+3. 统计磁贴零阴影（P2）→ shadow-xs + hover:shadow-sm。
+
+### 采纳/豁免记录（r2 critic 建议中不改项）
+- 三黄并存（按钮琥珀/icon 黄/高亮黄）：primary-secondary 分色是 jixoai 法则本身；icon 色是固定资产。
+- 「家里人怎么连」卡头 QR 图形：是 QrCode 功能图标（该卡主职能就是二维码分享），非品牌位缺失。
+- P3 虚线空态卡中灰描边：占位弱化语义，有意为之。P3 分数坐标横边发虚：记录待布局取整轮处理。
+
+### 工程教训（新条目候选）
+- **主题切换后立即截图 = 过渡帧伪影**：颜色 transition ~100ms，click→screenshot 会拍到中间值，
+  呈「暗底+浅色 token 文字」嵌合态；必须沉降 ≥500ms 或 reload 后拍。像素取证前先怀疑时序。
+- **sidecar dist 热更新但浏览器缓存 stale bundle**：类名在 JS bundle 里，旧 JS 静默渲染旧类；
+  Page.reload ignoreCache:true 才可靠，goto 不够。
+- fullPage 截图 1:1 前提：先 CDP 读 documentElement.scrollWidth 对齐视口宽，否则缩略图洗掉 1-2px 细节。

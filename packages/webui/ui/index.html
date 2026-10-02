@@ -6,8 +6,19 @@
     <meta name="robots" content="noindex" />
     <!-- 会话 capability 经 URL query 引导（home-hub 2a design §5.1）：页面不外发 referrer -->
     <meta name="referrer" content="no-referrer" />
-    <link rel="icon" href="data:," />
+    <link rel="icon" type="image/svg+xml" href="/opendweb-icon.svg" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/opendweb-icon.png" />
+    <link rel="apple-touch-icon" href="/opendweb-icon.png" />
     <title>opendweb 服务器控制台</title>
+    <!-- 主题持久化在首帧前应用（TopBar 只写 localStorage；此处是唯一读取方，
+         防刷新闪回浅色） -->
+    <script>
+      try {
+        if (localStorage.getItem("opendweb-webui-theme") === "dark") {
+          document.documentElement.classList.add("dark");
+        }
+      } catch {}
+    </script>
   </head>
   <body>
     <!-- 应用根节点标记：dist 冒烟集成测试断言 id="app" -->

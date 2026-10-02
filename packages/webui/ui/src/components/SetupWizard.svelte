@@ -19,6 +19,7 @@
 	import { fmtDate } from "$lib/format";
 	import type { SidecarNode } from "$lib/api";
 	import { consoleStore as cs } from "$lib/console.svelte";
+	import BrandMark from "./BrandMark.svelte";
 	import ConfirmDialog from "./ConfirmDialog.svelte";
 
 	type Path = "remote" | "local" | "saved";
@@ -95,8 +96,12 @@
 	<div class="flex min-h-svh items-center justify-center px-6 py-10">
 		<Card.Root class="w-full max-w-2xl">
 			<Card.Header>
+				<div class="mb-1 flex items-center gap-2.5">
+					<BrandMark class="size-8" />
+					<span class="font-nav text-lg tracking-wide">opendweb</span>
+				</div>
 				<Card.Description class="text-xs font-medium tracking-wide text-muted-foreground">
-					opendweb 服务器控制台 · 首次设置
+					服务器控制台 · 首次设置
 				</Card.Description>
 				<Card.Title class="text-2xl font-semibold">把控制台接上你的服务器</Card.Title>
 				<Card.Description class="text-sm leading-relaxed">
